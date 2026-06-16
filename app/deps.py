@@ -54,9 +54,8 @@ def get_llm_provider() -> LLMProvider:
     """Return the configured LLM provider.
 
     Gemini is selected ONLY when `LLM_PROVIDER=gemini` is set explicitly.
-    Having a `GEMINI_API_KEY` is necessary but not sufficient — the provider
-    abstraction is still wiring-up, and `GeminiProvider.generate*` raises
-    NotImplementedError. We refuse to fall into that path by accident.
+    Having a `GEMINI_API_KEY` is necessary but not sufficient, so local/test
+    runs stay deterministic unless Gemini is explicitly requested.
     """
     settings = get_settings()
     if settings.llm_provider == "gemini":

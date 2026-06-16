@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# Centralised so tests, deps, and the smoke scripts agree on the canonical
+# set of accepted provider names. The settings layer is the single place that
+# turns user-facing forms (Gemini / GEMINI / Mock) into the lowercase
+# canonical value the rest of the codebase consumes.
+SUPPORTED_LLM_PROVIDERS: tuple[str, ...] = ("mock", "gemini")
 
 
 class Settings(BaseSettings):
@@ -26,7 +34,11 @@ class Settings(BaseSettings):
 
     llm_provider: Literal["mock", "gemini"] = "mock"
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-1.5-pro"
+    # Default updated 2026-06: Google's `gemini-1.5-pro` returns 404 unavailable
+    # on the v1beta endpoint for many new keys. `gemini-3.5-flash` is the
+    # smallest model that currently answers across all surfaces we test
+    # against. Override via env when the account exposes a different model.
+    gemini_model: str = "gemini-3.5-flash"
 
     api_key: str = "dev-key"
 
@@ -37,6 +49,28 @@ class Settings(BaseSettings):
     # real uploads need it.
     max_upload_files_per_run: int = 10
     max_upload_bytes_per_file: int = 50 * 1024 * 1024  # 50 MiB
+
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def _normalize_llm_provider(cls, v: Any) -> Any:
+        """Accept any case in env (Gemini / GEMINI / mock / MOCK).
+
+        Normalisation lives here so the Literal stays the source of truth for
+        which provider names are legal — every other consumer just reads
+        `settings.llm_provider` and gets the canonical lowercase form.
+        """
+        if isinstance(v, str):
+            stripped = v.strip()
+            if not stripped:
+                return "mock"
+            lowered = stripped.lower()
+            if lowered not in SUPPORTED_LLM_PROVIDERS:
+                raise ValueError(
+                    f"LLM_PROVIDER={v!r} is not supported; "
+                    f"expected one of {SUPPORTED_LLM_PROVIDERS} (case-insensitive)."
+                )
+            return lowered
+        return v
 
 
 @lru_cache(maxsize=1)

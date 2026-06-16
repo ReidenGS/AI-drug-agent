@@ -26,6 +26,33 @@ uvicorn app.main:app --reload
 # 文档：http://localhost:8000/docs
 ```
 
+## LLM provider 配置
+
+默认仍使用 deterministic `MockLLMProvider`，本地测试和 CI 不需要 Gemini key。
+需要做真实 Gemini smoke 时，在 `.env` 或当前 shell 中设置：
+
+```bash
+LLM_PROVIDER=gemini          # Gemini / GEMINI / gemini 都接受（settings 自动归一化）
+GEMINI_API_KEY=your_key_here
+GEMINI_MODEL=gemini-3.5-flash  # 默认；可被环境变量覆盖
+```
+
+**模型选择**：`GEMINI_MODEL` 可被环境变量覆盖。如果 Google API 返回
+`404 model unavailable`，说明当前账号没开通该模型；请改成当前账号可用的
+Gemini model（比如某些账号只看得到 `gemini-1.5-flash` 或 `gemini-3.5-flash`）。
+切换模型只需改 env 变量，无需改代码。
+
+可选 live smoke：
+
+```bash
+python3 scripts/run_gemini_provider_smoke.py
+python3 scripts/run_gemini_step1_6_smoke.py
+```
+
+未设置 `LLM_PROVIDER=gemini` 或 `GEMINI_API_KEY` 时，上述脚本会 clean skip 并以
+exit 0 结束。脚本只验证 `LLMProvider.generate_json` 和 Step 1→6 最小路径，不启用
+真实 external MCP wrapper API。
+
 ## Step 1 — Run ingestion 入口
 
 Step 1 现在有两种 ingestion 入口，**都**最终走 `IntakeService.submit(...)`，产出同一种
