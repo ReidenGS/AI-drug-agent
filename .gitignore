@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Python build / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# Test artifacts
+.pytest_cache/
+
+# Local dev storage (used when STORAGE_MODE=local)
+.localstore/
+
+# Env / secrets
+.env
+.env.local
