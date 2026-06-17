@@ -85,13 +85,37 @@ def test_candidate_context_agent_produces_table_with_target_material(
 def test_candidate_context_agent_blocks_skipped_tools(
     local_storage, registry_service, workflow_state_service
 ):
+    """Inject `_ni` overrides for the Step 5 ChEMBL bindings the agent calls
+    so we still exercise the `dependency_unavailable` path.
+
+    Background: after the Step 5 close-out audit, all ChEMBL Step 5
+    wrappers route through `ToolUniverseAdapter`, so the real BINDINGS
+    no longer raise `NotImplementedError` in mock mode. We force the
+    legacy `_ni` shape here to keep the dependency-unavailable contract
+    covered."""
     run_id = _setup_run(local_storage, registry_service, workflow_state_service)
-    # Use real (unwired) ChEMBL bindings → dependency_unavailable
+
+    from app.mcp.tools._registry import _all_bindings
+
+    def _ni(*_a, **_kw):
+        raise NotImplementedError
+
+    base = dict(_all_bindings())
+    for name in (
+        "ChEMBL_search_molecules",
+        "ChEMBL_get_molecule",
+        "ChEMBL_search_drugs",
+        "ChEMBL_get_drug",
+        "ChEMBL_search_similarity",
+        "ChEMBL_search_substructure",
+    ):
+        base[name] = _ni
+
     agent = CandidateContextAgent(
         storage=local_storage,
         registry=registry_service,
         workflow_state=workflow_state_service,
-        mcp_client=LocalMCPClient(),
+        mcp_client=LocalMCPClient(bindings=base),
     )
     table = agent.run(run_id)
     persisted = local_storage.read_json(

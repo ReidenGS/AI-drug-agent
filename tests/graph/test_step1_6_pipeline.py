@@ -165,6 +165,9 @@ def test_pipeline_graph_tolerates_dep_unavailable_in_step6(
     """
     from app.mcp.tools._registry import _all_bindings
 
+    def _force_ni(*_a, **_kw):
+        raise NotImplementedError
+
     bindings = dict(_all_bindings())
     bindings.update(
         {
@@ -173,6 +176,21 @@ def test_pipeline_graph_tolerates_dep_unavailable_in_step6(
             "ChEMBL_search_substructure": lambda **kw: {"hits": []},
         }
     )
+    # Force every Step 6 wrapper back to `_ni` so the agent's lane plan
+    # exercises the `dependency_unavailable` path even after the recent
+    # batch of Step 6 ToolUniverseAdapter wire-ups.
+    for name in (
+        "DrugProps_pains_filter",
+        "DrugProps_lipinski_filter",
+        "DrugProps_calculate_qed",
+        "BindingDB_get_targets_by_compound",
+        "PROSITE_scan_sequence",
+        "EBIProteins_get_epitopes",
+        "EBIProteins_get_antigen",
+        "EBIProteins_get_features",
+        "ProteinsPlus_profile_structure_quality",
+    ):
+        bindings[name] = _force_ni
     mcp = LocalMCPClient(inventory=inventory, bindings=bindings)
     graph = build_pipeline_graph(
         storage=local_storage,

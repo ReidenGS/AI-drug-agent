@@ -105,20 +105,38 @@ class LocalMCPClient:
                 "step_id": step_id,
             }
         fn = self._bindings[tool_name]
+        call_kwargs = dict(kwargs)
+        # Live-mode injection: only when settings opt in AND tool is on the
+        # explicit allowlist. Callers who pass `_live` themselves keep control.
+        if "_live" not in call_kwargs:
+            try:
+                from ..settings import get_settings
+
+                if get_settings().should_use_live(tool_name):
+                    call_kwargs["_live"] = True
+            except Exception:  # noqa: BLE001 - settings must never break tool dispatch
+                pass
         try:
-            payload = fn(**kwargs)
-            return {"run_status": "success", "tool_name": tool_name, "payload": payload}
+            payload = fn(**call_kwargs)
+            return {
+                "run_status": "success",
+                "tool_name": tool_name,
+                "payload": payload,
+                "executor": _classify_executor(payload),
+            }
         except NotImplementedError:
             return {
                 "run_status": "dependency_unavailable",
                 "tool_name": tool_name,
                 "reason": "wrapper_not_wired",
+                "executor": "deferred",
             }
         except Exception as e:  # noqa: BLE001
             return {
                 "run_status": "failed",
                 "tool_name": tool_name,
                 "error_message": str(e),
+                "executor": "error",
             }
 
 
@@ -296,6 +314,23 @@ class FastMCPClient:
         if remote_async is not None and asyncio.iscoroutinefunction(remote_async):
             return await remote_async(tool_name, params)
         return await asyncio.to_thread(self._remote.call_tool_sync, tool_name, params)
+
+
+def _classify_executor(payload: Any) -> str:
+    """Tag the executor that produced the wrapper payload.
+
+    Used for audit/visibility — agents and tests can read
+    `result["executor"]` to tell `tooluniverse` (live adapter path) from
+    `mock` (deterministic mock envelope) without parsing wrapper-specific
+    shapes. Never touches raw payload contents beyond the two recognized
+    discriminator fields.
+    """
+    if isinstance(payload, dict):
+        if payload.get("executor") == "tooluniverse":
+            return "tooluniverse"
+        if payload.get("status") == "mocked":
+            return "mock"
+    return "unknown"
 
 
 def _skipped_payload(agent_name: str, step_id: str, tool_name: str) -> dict:

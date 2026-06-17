@@ -50,6 +50,27 @@ class Settings(BaseSettings):
     max_upload_files_per_run: int = 10
     max_upload_bytes_per_file: int = 50 * 1024 * 1024  # 50 MiB
 
+    # MCP wrapper live-mode policy. Default OFF — tests and pipeline smokes
+    # MUST NOT touch the network unless explicitly enabled. Even when ON, only
+    # tools listed in `mcp_live_tool_allowlist` (comma-separated) get
+    # `_live=True`; everything else stays on the deterministic mock envelope.
+    mcp_live_tools: bool = False
+    mcp_live_tool_allowlist: str = ""
+    # Timeout (seconds) for outbound live HTTP requests in tool wrappers
+    # that still use httpx (i.e. wrappers NOT yet migrated to the
+    # ToolUniverse adapter). Migrated wrappers ignore this — TU owns its
+    # own timeout policy.
+    mcp_live_http_timeout: float = 15.0
+
+    def live_tool_allowlist_set(self) -> frozenset[str]:
+        raw = self.mcp_live_tool_allowlist or ""
+        return frozenset(name.strip() for name in raw.split(",") if name.strip())
+
+    def should_use_live(self, tool_name: str) -> bool:
+        if not self.mcp_live_tools:
+            return False
+        return tool_name in self.live_tool_allowlist_set()
+
     @field_validator("llm_provider", mode="before")
     @classmethod
     def _normalize_llm_provider(cls, v: Any) -> Any:

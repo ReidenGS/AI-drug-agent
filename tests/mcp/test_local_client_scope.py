@@ -17,14 +17,16 @@ def test_local_client_blocks_out_of_scope_tool():
 
 
 def test_local_client_allows_in_scope_tool():
+    """An in-scope tool whose wrapper is still `_ni` returns
+    `dependency_unavailable`. `ADMETAI_predict_toxicity` is in Step 6
+    scope and is deferred (TU uses local `admet_ai` + torch model weights
+    — see audit doc). Update this test if/when that wrapper migrates."""
     client = LocalMCPClient()
     res = client.call_tool(
-        agent_name="candidate_context_agent",
-        step_id="step_05",
-        tool_name="ChEMBL_search_molecules",
-        query="MMAE",
+        agent_name="developability_agent",
+        step_id="step_06",
+        tool_name="ADMETAI_predict_toxicity",
     )
-    # ChEMBL_search_molecules wrapper is unimplemented → dependency_unavailable.
     assert res["run_status"] == "dependency_unavailable"
 
 

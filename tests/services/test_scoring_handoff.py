@@ -112,9 +112,17 @@ def test_step10_partial_when_no_compound_hits(
     def _ni(**_):
         raise NotImplementedError
 
-    for name in ("ZINC_search_compounds", "ZINC_get_compound",
-                 "ZINC_search_by_smiles", "ZINC_search_by_properties",
-                 "ZINC_get_purchasable"):
+    # Disable every wrapper Step 9 can reach so compound_screening_artifact
+    # ends up empty. This list intentionally mirrors AGENT_TOOL_OVERRIDES for
+    # ("structure_and_design_agent", "step_09"); when new wrappers get
+    # adapter-wired (e.g. ChEMBL_search_molecules), update this list too.
+    for name in (
+        "ZINC_search_compounds", "ZINC_get_compound",
+        "ZINC_search_by_smiles", "ZINC_search_by_properties",
+        "ZINC_get_purchasable",
+        "ChEMBL_search_molecules", "ChEMBL_search_similarity",
+        "ChEMBL_search_substructure",
+    ):
         bindings[name] = _ni
     sd_mcp = LocalMCPClient(
         inventory=ToolInventoryService(

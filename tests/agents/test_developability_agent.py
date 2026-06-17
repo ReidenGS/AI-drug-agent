@@ -161,15 +161,31 @@ def test_step6_only_calls_step6_inventory_tools(
 def test_step6_handles_unwired_wrappers_gracefully(
     local_storage, registry_service, workflow_state_service
 ):
-    """Without injected bindings or inventory, the default LocalMCPClient
-    returns `dependency_unavailable` for all unwired Step 6 tools. The step
-    must still produce a partial summary, not crash."""
+    """The dependency-unavailable path on Step 6 must keep producing a
+    partial summary instead of crashing.
+
+    After the Step 6 batch-1 migration, several Step 6 wrappers
+    (`DrugProps_pains_filter`, `BindingDB_get_targets_by_compound`,
+    `PROSITE_scan_sequence`, `EBIProteins_get_epitopes`,
+    `EBIProteins_get_antigen`) are `tooluniverse_adapter`-backed and
+    return success envelopes in mock mode. To keep the
+    `dependency_unavailable` contract under test, force every binding to
+    `_ni` so `LocalMCPClient` surfaces `dependency_unavailable`
+    end-to-end.
+    """
+    from app.mcp.tools._registry import _all_bindings
+
+    def _force_ni(*_a, **_kw):
+        raise NotImplementedError
+
+    forced = {name: _force_ni for name in dict(_all_bindings())}
+
     run_id = _seed_through_step_5(local_storage, registry_service, workflow_state_service)
     agent = DevelopabilityAgent(
         storage=local_storage,
         registry=registry_service,
         workflow_state=workflow_state_service,
-        mcp_client=LocalMCPClient(),  # no inventory, no bindings overrides
+        mcp_client=LocalMCPClient(bindings=forced),
     )
     summary = agent.run(run_id)
     persisted = local_storage.read_json(
