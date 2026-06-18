@@ -18,3 +18,8 @@ dist/
 # Env / secrets
 .env
 .env.local
+
+# Local/private non-English notes
+README_CN.md
+docs/*_CN.md
+docs/*local*.md
