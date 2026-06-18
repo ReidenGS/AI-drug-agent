@@ -141,14 +141,27 @@ def _shape_instruction(task: str) -> str:
             '"argument_construction_reason":"string","missing_fields":["string"]}'
         )
     return (
-        '{"task_intent":{"task_type":"adc_design"},"mentioned_entities":{},'
+        '{"task_intent":{"task_type":"adc_design","primary_intent":'
+        '"new_adc_design","secondary_intents":[]},"mentioned_entities":{},'
         '"referenced_inputs":[],'
         '"requested_outputs":["ranked_candidates"],'
-        '"user_constraints":[],"parse_warnings":[]}\n'
+        '"user_constraints":[],"parse_warnings":[],'
+        '"normalized_entities":[],"entity_decompositions":[],'
+        '"clarification_questions":[]}\n'
+        "`task_intent.primary_intent` MUST be one of "
+        '"new_adc_design", "existing_adc_evaluation", '
+        '"developability_assessment", "structure_analysis", '
+        '"compound_screening", "literature_review", "patent_ip_review", '
+        '"optimization", "unclear_or_needs_clarification". '
+        "`task_intent.secondary_intents` is a list drawn from the same enum.\n"
         "`requested_outputs` MUST be a JSON array of plain strings drawn from "
         "this enum only: "
         '"ranked_candidates", "report", "evidence_summary", '
-        '"patent_or_ip_summary", "optimization_suggestions". '
+        '"literature_review_summary", "patent_or_ip_summary", '
+        '"optimization_suggestions", "developability_summary", '
+        '"structure_validation_report", "compound_screening_results", '
+        '"entity_normalization_summary", "workflow_recommendation", '
+        '"data_gap_summary", "case_study_summary". '
         "Do not return objects, do not invent new keys, do not return entity "
         "names inside `requested_outputs`. Omit values you are unsure about."
     )
@@ -277,8 +290,16 @@ _REQUESTED_OUTPUTS_ENUM = frozenset(
         "ranked_candidates",
         "report",
         "evidence_summary",
+        "literature_review_summary",
         "patent_or_ip_summary",
         "optimization_suggestions",
+        "developability_summary",
+        "structure_validation_report",
+        "compound_screening_results",
+        "entity_normalization_summary",
+        "workflow_recommendation",
+        "data_gap_summary",
+        "case_study_summary",
     }
 )
 
@@ -286,6 +307,7 @@ _REQUESTED_OUTPUTS_ENUM = frozenset(
 # canonical Step 2 enum. Only add aliases the canonical doc semantically
 # supports — never invent new enum values.
 _REQUESTED_OUTPUTS_ALIASES = {
+    # ranked_candidates
     "adc_candidate": "ranked_candidates",
     "adc_candidates": "ranked_candidates",
     "candidate": "ranked_candidates",
@@ -294,11 +316,40 @@ _REQUESTED_OUTPUTS_ALIASES = {
     "final_ranking": "ranked_candidates",
     "ranking": "ranked_candidates",
     "ranked_candidate": "ranked_candidates",
+    # evidence / literature
     "evidence": "evidence_summary",
+    "literature": "literature_review_summary",
+    "literature_summary": "literature_review_summary",
+    "literature_review": "literature_review_summary",
+    # patent / IP
     "patent": "patent_or_ip_summary",
     "ip_summary": "patent_or_ip_summary",
     "patent_summary": "patent_or_ip_summary",
+    # optimization
     "optimization": "optimization_suggestions",
+    "optimization_suggestion": "optimization_suggestions",
+    # developability
+    "developability": "developability_summary",
+    "developability_report": "developability_summary",
+    # structure
+    "structure_report": "structure_validation_report",
+    "structure_summary": "structure_validation_report",
+    # compound screening
+    "compound_screening": "compound_screening_results",
+    "screening_results": "compound_screening_results",
+    "compound_screen": "compound_screening_results",
+    # entity normalization
+    "entity_normalization": "entity_normalization_summary",
+    "normalization_summary": "entity_normalization_summary",
+    # workflow / gap / case study
+    "workflow": "workflow_recommendation",
+    "workflow_suggestion": "workflow_recommendation",
+    "gap_analysis": "data_gap_summary",
+    "gap_summary": "data_gap_summary",
+    "missing_inputs": "data_gap_summary",
+    "case_study": "case_study_summary",
+    "benchmark": "case_study_summary",
+    "benchmark_summary": "case_study_summary",
 }
 
 
@@ -356,7 +407,15 @@ def _candidate_label(item: Any) -> str | None:
 def _validate_structured_query_rest(data: dict) -> dict:
     if not isinstance(data.get("mentioned_entities"), dict):
         raise GeminiProviderError("structured_query response requires object `mentioned_entities`")
-    for key in ("referenced_inputs", "requested_outputs", "user_constraints", "parse_warnings"):
+    for key in (
+        "referenced_inputs",
+        "requested_outputs",
+        "user_constraints",
+        "parse_warnings",
+        "normalized_entities",
+        "entity_decompositions",
+        "clarification_questions",
+    ):
         if key not in data:
             data[key] = []
         if not isinstance(data[key], list):

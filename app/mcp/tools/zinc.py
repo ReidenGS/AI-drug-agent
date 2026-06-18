@@ -33,7 +33,7 @@ def _mocked_hit(*, source: str, **payload) -> dict[str, Any]:
     }
 
 
-def ZINC_search_compounds(query: str, *, _live: bool = False) -> dict[str, Any]:
+def ZINC_search_compounds(query: str, *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
     if not query:
         raise ValueError("ZINC_search_compounds requires a non-empty query")
     if _live:
@@ -41,7 +41,7 @@ def ZINC_search_compounds(query: str, *, _live: bool = False) -> dict[str, Any]:
     return _mocked_hit(source="ZINC_search_compounds", query=query)
 
 
-def ZINC_get_compound(zinc_id: str, *, _live: bool = False) -> dict[str, Any]:
+def ZINC_get_compound(zinc_id: str, *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
     if not zinc_id:
         raise ValueError("ZINC_get_compound requires a non-empty zinc_id")
     if _live:
@@ -49,7 +49,7 @@ def ZINC_get_compound(zinc_id: str, *, _live: bool = False) -> dict[str, Any]:
     return _mocked_hit(source="ZINC_get_compound", zinc_id=zinc_id)
 
 
-def ZINC_search_by_smiles(smiles: str, *, _live: bool = False) -> dict[str, Any]:
+def ZINC_search_by_smiles(smiles: str, *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
     if not smiles:
         raise ValueError("ZINC_search_by_smiles requires a non-empty smiles")
     if _live:
@@ -57,13 +57,13 @@ def ZINC_search_by_smiles(smiles: str, *, _live: bool = False) -> dict[str, Any]
     return _mocked_hit(source="ZINC_search_by_smiles", smiles=smiles)
 
 
-def ZINC_search_by_properties(properties: dict | None = None, *, _live: bool = False) -> dict[str, Any]:
+def ZINC_search_by_properties(properties: dict | None = None, *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
     if _live:
         raise NotImplementedError("ZINC live mode disabled: upstream is captcha-gated")
     return _mocked_hit(source="ZINC_search_by_properties", properties=properties or {})
 
 
-def ZINC_get_purchasable(zinc_id: str, *, _live: bool = False) -> dict[str, Any]:
+def ZINC_get_purchasable(zinc_id: str, *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
     if not zinc_id:
         raise ValueError("ZINC_get_purchasable requires a non-empty zinc_id")
     if _live:

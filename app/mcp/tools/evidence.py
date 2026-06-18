@@ -6,7 +6,7 @@ is NO parallel manual httpx implementation in this file, by design.
 Wrappers whose names are not yet supported by ToolUniverse raise
 `NotImplementedError` on `_live=True`.
 
-Audit doc: `项目文件/ToolUniverse_Runtime_Integration_Audit_v0.1.md`.
+Audit doc: `\u9879\u76ee\u6587\u4ef6/ToolUniverse_Runtime_Integration_Audit_v0.1.md`.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ def LiteratureSearchTool(
 
 
 def EuropePMC_search_articles(
-    query: str, *, page_size: int = 25, _live: bool = False
+    query: str, *, page_size: int = 25, _live: bool = False, **_extra: Any,
 ) -> dict[str, Any]:
     if not query:
         raise ValueError("EuropePMC_search_articles requires a non-empty query")
@@ -66,7 +66,7 @@ def EuropePMC_search_articles(
     return _tu("EuropePMC_search_articles", {"query": query, "limit": page_size})
 
 
-def openalex_search_works(query: str, *, _live: bool = False) -> dict[str, Any]:
+def openalex_search_works(query: str, *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
     if not query:
         raise ValueError("openalex_search_works requires a non-empty query")
     if not _live:
@@ -74,7 +74,7 @@ def openalex_search_works(query: str, *, _live: bool = False) -> dict[str, Any]:
     return _tu("openalex_search_works", {"query": query})
 
 
-def PubTator3_LiteratureSearch(query: str, *, _live: bool = False) -> dict[str, Any]:
+def PubTator3_LiteratureSearch(query: str, *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
     if not query:
         raise ValueError("PubTator3_LiteratureSearch requires a non-empty query")
     if not _live:
@@ -82,19 +82,28 @@ def PubTator3_LiteratureSearch(query: str, *, _live: bool = False) -> dict[str, 
     return _tu("PubTator3_LiteratureSearch", {"query": query})
 
 
-def PubTator3_get_annotations(pmid: str, *, _live: bool = False) -> dict[str, Any]:
-    """Legacy wrapper accepts a single `pmid`; TU expects `pmids` (plural,
-    comma-separated). We forward the value as `pmids` so a single id or a
-    comma-separated list both work."""
-    if not pmid:
-        raise ValueError("PubTator3_get_annotations requires a non-empty pmid")
+def PubTator3_get_annotations(
+    pmid: str = "",
+    *,
+    pmids: str = "",
+    _live: bool = False,
+    **_extra: Any,
+) -> dict[str, Any]:
+    """Legacy wrapper accepts a single `pmid`; TU's official schema requires
+    `pmids` (comma-separated). Both kwargs are accepted; if both are
+    provided the official `pmids` value wins (after equality check)."""
+    from ._arg_compat import pick
+
+    value = pick(pmids, pmid, name="pmids") or ""
+    if not value:
+        raise ValueError("PubTator3_get_annotations requires pmid / pmids")
     if not _live:
-        return _mocked(source="PubTator3_get_annotations", query=pmid)
-    return _tu("PubTator3_get_annotations", {"pmids": pmid})
+        return _mocked(source="PubTator3_get_annotations", query=value)
+    return _tu("PubTator3_get_annotations", {"pmids": value})
 
 
 def SemanticScholar_search_papers(
-    query: str, *, limit: int = 5, _live: bool = False
+    query: str, *, limit: int = 5, _live: bool = False, **_extra: Any,
 ) -> dict[str, Any]:
     if not query:
         raise ValueError("SemanticScholar_search_papers requires a non-empty query")
@@ -112,6 +121,7 @@ def MultiAgentLiteratureSearch(
     quality_threshold: float = 0.5,
     *,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Iterative multi-agent literature search (TU `ComposeTool`).
 

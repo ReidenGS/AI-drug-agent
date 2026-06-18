@@ -43,12 +43,16 @@ def _all_bindings() -> list[ToolBinding]:
         zinc,
         evidence,
         patent,
+        oligo_dna,
+        rna_databases,
+        utility_meta,
     )
 
     modules = [
         sabdab, chembl, rcsb_pdbe, alphafold, nvidianim, pdbe_pisa,
         proteins_plus, ebi_proteins, developability_compounds,
         sequence_features, variant, zinc, evidence, patent,
+        oligo_dna, rna_databases, utility_meta,
     ]
     out: list[ToolBinding] = []
     for m in modules:

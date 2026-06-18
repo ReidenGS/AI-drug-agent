@@ -10,7 +10,7 @@ raw search results — only:
     counts and lengths
 
 Run:
-  /Users/jackiewen/Desktop/desk/实习工作/国外ai医药/测试文件/.venv/bin/python \
+  /path/to/project-test-venv/bin/python \
       scripts/probe_multi_agent_literature_search.py
 """
 

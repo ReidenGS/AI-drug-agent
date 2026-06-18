@@ -151,6 +151,101 @@ def has_tool(tool_name: str) -> bool:
         return False
 
 
+# ── official tool metadata (description + parameter schema) ───────────────
+#
+# Progressive tool selection (`app/agents/tool_selection_policy.py`) prefers
+# the OFFICIAL ToolUniverse metadata over the hand-written `CAPABILITY_REGISTRY`
+# entries — Stage 1 description and Stage 2 parameter schema both come from
+# TU when TU recognizes the name. These helpers expose just enough of TU's
+# metadata API for the selector while keeping the same hard rules as
+# `call_tool`:
+#
+# - Lazy: never touches the TU registry until first call.
+# - Scope-filtered: the underlying `_get_universe()` already loads with
+#   `include_tools=<inventory-scoped names>`, so any tool name absent from
+#   the inventory returns `None` here too.
+# - Test-friendly: monkeypatching `_get_universe` to a `FakeUniverse` works.
+# - Safe degradation: when `tooluniverse` is not installed (ImportError) or
+#   the lookup fails, helpers return `None` / `[]` so the selector keeps
+#   working off the hand-written fallback instead of crashing.
+# - Logs nothing: we never log the full spec or parameter blob — only the
+#   tool name on a failure path, never the schema or description bodies.
+
+
+def _safe_universe() -> Any | None:
+    """Return the lazy TU singleton or `None` if it can't be built.
+
+    Differs from `_get_universe` by swallowing `ToolUniverseAdapterError`
+    so metadata callers can fall back instead of crashing.
+    """
+    try:
+        return _get_universe()
+    except ToolUniverseAdapterError:
+        return None
+
+
+def get_tool_specification(tool_name: str) -> dict[str, Any] | None:
+    """Return the TU official tool spec dict for one tool, or `None`."""
+    if not tool_name:
+        return None
+    universe = _safe_universe()
+    if universe is None:
+        return None
+    try:
+        specs = universe.get_tool_specification_by_names([tool_name]) or []
+    except Exception:  # noqa: BLE001 — TU metadata path must never crash callers
+        # We deliberately do NOT log spec contents here.
+        return None
+    for spec in specs:
+        if isinstance(spec, dict) and spec.get("name") == tool_name:
+            return spec
+    return None
+
+
+def get_tool_specifications(
+    tool_names: list[str] | tuple[str, ...] | frozenset[str],
+) -> dict[str, dict[str, Any]]:
+    """Bulk-fetch official specs for a list of tool names.
+
+    The returned dict only contains entries TU recognized — callers can
+    treat missing keys as "use fallback". Inventory scope is already
+    enforced by the singleton's `include_tools=` filter; the public API
+    contract is "the caller passed in the agent's allowed set" — we do
+    NOT widen scope by fetching anything else.
+    """
+    names = [n for n in (tool_names or []) if n]
+    if not names:
+        return {}
+    universe = _safe_universe()
+    if universe is None:
+        return {}
+    try:
+        specs = universe.get_tool_specification_by_names(list(names)) or []
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for spec in specs:
+        if isinstance(spec, dict):
+            name = spec.get("name")
+            if name in names:
+                out[name] = spec
+    return out
+
+
+def get_required_parameters(tool_name: str) -> list[str]:
+    """Return the TU-declared required parameter names for a tool, or []."""
+    if not tool_name:
+        return []
+    universe = _safe_universe()
+    if universe is None:
+        return []
+    try:
+        req = universe.get_required_parameters(tool_name) or []
+    except Exception:  # noqa: BLE001
+        return []
+    return [str(p) for p in req if p]
+
+
 def call_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     """Invoke a ToolUniverse tool and normalize the response.
 

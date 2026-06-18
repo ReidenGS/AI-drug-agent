@@ -4,7 +4,7 @@ Thin MCP binding layer. `_live=False` (default) returns deterministic
 mock envelopes. `_live=True` for the wired subset routes through
 `ToolUniverseAdapter`. Other wrappers stay `_ni` until promoted.
 
-Audit doc: `项目文件/ToolUniverse_Runtime_Integration_Audit_v0.1.md`.
+Audit doc: `\u9879\u76ee\u6587\u4ef6/ToolUniverse_Runtime_Integration_Audit_v0.1.md`.
 """
 
 from __future__ import annotations
@@ -79,11 +79,16 @@ def iPTMnet_get_ptm_sites(
     uniprot_id: str = "",
     *,
     ptm_type: str | None = None,
+    operation: str | None = None,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Get PTM sites from iPTMnet by UniProt accession."""
     if not uniprot_id or not isinstance(uniprot_id, str):
         raise ValueError("iPTMnet_get_ptm_sites requires a non-empty uniprot_id")
+    from ._arg_compat import resolve_operation
+
+    op = resolve_operation(operation, "get_ptm_sites")
     if not _live:
         return {
             "status": "mocked",
@@ -92,7 +97,7 @@ def iPTMnet_get_ptm_sites(
             "ptm_type": ptm_type,
             "ptm_sites": [],
         }
-    args: dict[str, Any] = {"operation": "get_ptm_sites", "uniprot_id": uniprot_id}
+    args: dict[str, Any] = {"operation": op, "uniprot_id": uniprot_id}
     if ptm_type:
         args["ptm_type"] = ptm_type
     return _tu("iPTMnet_get_ptm_sites", args)

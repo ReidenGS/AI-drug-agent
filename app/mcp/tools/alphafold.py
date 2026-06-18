@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 
-def alphafold_get_prediction(uniprot: str, *, _live: bool = False) -> dict[str, Any]:
+def alphafold_get_prediction(uniprot: str, *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
     if not uniprot or not isinstance(uniprot, str):
         raise ValueError("alphafold_get_prediction requires a non-empty UniProt id")
     if not _live:

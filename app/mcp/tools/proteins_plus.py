@@ -9,7 +9,14 @@ from __future__ import annotations
 from typing import Any
 
 
-def ProteinsPlus_profile_structure_quality(pdb_id_or_path: str, *, _live: bool = False) -> dict[str, Any]:
+def ProteinsPlus_profile_structure_quality(
+    pdb_id_or_path: str = "",
+    *,
+    pdb_id: str = "",
+    _live: bool = False,
+    **_extra: Any,
+) -> dict[str, Any]:
+    pdb_id_or_path = pdb_id_or_path or pdb_id
     if not pdb_id_or_path:
         raise ValueError("ProteinsPlus_profile_structure_quality requires input")
     if not _live:

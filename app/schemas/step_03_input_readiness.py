@@ -18,6 +18,12 @@ class BasicADCInputPresence(BaseModel):
     linker_present: bool = False
     structure_or_sequence_present: bool = False
     constraints_present: bool = False
+    # Step 3 batch 3 additions — finer signals required by the production
+    # plan (Step1_4_Orchestration_Component_Plan_v0.1.md §Step 3).
+    adc_task_intent_present: bool = False
+    structure_input_present: bool = False
+    sequence_input_present: bool = False
+    candidate_file_present: bool = False
     # Evidence: which artifact/field surfaced the signal.
     target_evidence: Optional[str] = None
     antibody_evidence: Optional[str] = None
@@ -25,6 +31,10 @@ class BasicADCInputPresence(BaseModel):
     linker_evidence: Optional[str] = None
     structure_or_sequence_evidence: Optional[str] = None
     constraints_evidence: Optional[str] = None
+    adc_task_intent_evidence: Optional[str] = None
+    structure_input_evidence: Optional[str] = None
+    sequence_input_evidence: Optional[str] = None
+    candidate_file_evidence: Optional[str] = None
 
 
 FileRole = Literal[
@@ -55,6 +65,9 @@ GapCategory = Literal[
     "payload_or_linker",
     "structure_or_sequence",
     "constraints",
+    "task_intent",
+    "raw_user_query",
+    "uploaded_file",
     "other",
 ]
 

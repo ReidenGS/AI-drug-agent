@@ -22,7 +22,7 @@ from app.services.tool_inventory_service import ToolInventoryService
 def inventory() -> ToolInventoryService:
     xlsx = os.environ.get(
         "TOOL_INVENTORY_XLSX",
-        str(Path(__file__).resolve().parents[2].parent / "项目文件" / "ToolUniversity_inventory_v0.2.xlsx"),
+        str(Path(__file__).resolve().parents[2].parent / "\u9879\u76ee\u6587\u4ef6" / "ToolUniversity_inventory_v0.2.xlsx"),
     )
     if not Path(xlsx).exists():
         pytest.skip(f"Inventory xlsx not available at {xlsx}")

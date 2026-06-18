@@ -24,7 +24,7 @@ Argument mappings (legacy wrapper → TU schema):
     ChEMBL_get_assay_activities(assay_chembl_id, limit, offset) → {assay_chembl_id__exact, limit, offset}
     ChEMBL_search_binding_sites(...)       → {target_chembl_id?, site_name__contains?, limit, offset}
 
-Audit doc: `项目文件/ToolUniverse_Runtime_Integration_Audit_v0.1.md`.
+Audit doc: `\u9879\u76ee\u6587\u4ef6/ToolUniverse_Runtime_Integration_Audit_v0.1.md`.
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def _fields(value: list[str] | tuple[str, ...] | None, *, allowed: set[str]) -> 
 
 
 def ChEMBL_search_molecules(
-    query: str = "", *, limit: int = 20, _live: bool = False
+    query: str = "", *, limit: int = 20, _live: bool = False, **_extra: Any,
 ) -> dict[str, Any]:
     """Search ChEMBL molecules by free-text name/alias.
 
@@ -82,7 +82,7 @@ def ChEMBL_search_molecules(
     return _tu("ChEMBL_search_molecules", args)
 
 
-def ChEMBL_get_molecule(chembl_id: str = "", *, _live: bool = False) -> dict[str, Any]:
+def ChEMBL_get_molecule(chembl_id: str = "", *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
     """Fetch a single ChEMBL molecule by ID (e.g. CHEMBL25).
 
     Mock mode returns an empty envelope; live mode forwards `chembl_id`
@@ -102,7 +102,7 @@ def ChEMBL_get_molecule(chembl_id: str = "", *, _live: bool = False) -> dict[str
 
 
 def ChEMBL_search_drugs(
-    query: str = "", *, limit: int = 20, _live: bool = False
+    query: str = "", *, limit: int = 20, _live: bool = False, **_extra: Any,
 ) -> dict[str, Any]:
     """Search ChEMBL drug records by free-text name."""
     if not _live:
@@ -118,7 +118,7 @@ def ChEMBL_search_drugs(
     return _tu("ChEMBL_search_drugs", args)
 
 
-def ChEMBL_get_drug(drug_chembl_id: str = "", *, _live: bool = False) -> dict[str, Any]:
+def ChEMBL_get_drug(drug_chembl_id: str = "", *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
     """Fetch a single ChEMBL drug record by ID (e.g. CHEMBL1201581).
 
     TU requires `drug_chembl_id`; the wrapper enforces it before routing.
@@ -141,6 +141,7 @@ def ChEMBL_search_activities(
     *,
     limit: int = 25,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     if not target_chembl_id and not molecule_chembl_id:
         raise ValueError(
@@ -169,6 +170,7 @@ def ChEMBL_search_similarity(
     limit: int = 20,
     offset: int = 0,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Tanimoto similarity search by SMILES.
 
@@ -203,6 +205,7 @@ def ChEMBL_search_substructure(
     limit: int = 20,
     offset: int = 0,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Substructure search by SMILES."""
     if not smiles:
@@ -231,6 +234,7 @@ def ChEMBL_search_documents(
     limit: int = 20,
     offset: int = 0,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Search ChEMBL documents (publications).
 
@@ -264,6 +268,7 @@ def ChEMBL_search_compound_structural_alerts(
     limit: int = 20,
     offset: int = 0,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Search ChEMBL compound structural alerts.
 
@@ -289,10 +294,18 @@ def ChEMBL_search_compound_structural_alerts(
 def ChEMBL_get_molecule_targets(
     molecule_chembl_id: str = "",
     *,
+    molecule_chembl_id__exact: str = "",
     limit: int = 500,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Get unique targets associated with a ChEMBL molecule ID."""
+    from ._arg_compat import pick
+
+    molecule_chembl_id = pick(
+        molecule_chembl_id__exact, molecule_chembl_id,
+        name="molecule_chembl_id",
+    ) or ""
     if not molecule_chembl_id:
         raise ValueError("ChEMBL_get_molecule_targets requires a non-empty molecule_chembl_id")
     if not _live:
@@ -327,6 +340,7 @@ def ChEMBL_search_targets(
     limit: int = 20,
     offset: int = 0,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Search ChEMBL targets by ID, name, organism, or target type."""
     selected_fields = _fields(fields, allowed=_TARGET_FIELDS)
@@ -357,11 +371,18 @@ def ChEMBL_search_targets(
 def ChEMBL_get_target_activities(
     target_chembl_id: str = "",
     *,
+    target_chembl_id__exact: str = "",
     limit: int = 20,
     offset: int = 0,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Get activity data for a ChEMBL target ID."""
+    from ._arg_compat import pick
+
+    target_chembl_id = pick(
+        target_chembl_id__exact, target_chembl_id, name="target_chembl_id",
+    ) or ""
     if not target_chembl_id:
         raise ValueError("ChEMBL_get_target_activities requires a non-empty target_chembl_id")
     if not _live:
@@ -388,6 +409,7 @@ def ChEMBL_get_drug_mechanisms(
     limit: int = 20,
     offset: int = 0,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Get mechanisms of action by ChEMBL drug ID or drug name."""
     if not drug_chembl_id and not drug_name:
@@ -428,6 +450,7 @@ def ChEMBL_search_assays(
     limit: int = 20,
     offset: int = 0,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Search ChEMBL assays by assay, type, or target filters."""
     selected_fields = _fields(fields, allowed=_ASSAY_FIELDS)
@@ -455,11 +478,18 @@ def ChEMBL_search_assays(
 def ChEMBL_get_target_assays(
     target_chembl_id: str = "",
     *,
+    target_chembl_id__exact: str = "",
     limit: int = 20,
     offset: int = 0,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Get assays associated with a ChEMBL target ID."""
+    from ._arg_compat import pick
+
+    target_chembl_id = pick(
+        target_chembl_id__exact, target_chembl_id, name="target_chembl_id",
+    ) or ""
     if not target_chembl_id:
         raise ValueError("ChEMBL_get_target_assays requires a non-empty target_chembl_id")
     if not _live:
@@ -482,11 +512,18 @@ def ChEMBL_get_target_assays(
 def ChEMBL_get_assay_activities(
     assay_chembl_id: str = "",
     *,
+    assay_chembl_id__exact: str = "",
     limit: int = 20,
     offset: int = 0,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Get activity data for a ChEMBL assay ID."""
+    from ._arg_compat import pick
+
+    assay_chembl_id = pick(
+        assay_chembl_id__exact, assay_chembl_id, name="assay_chembl_id",
+    ) or ""
     if not assay_chembl_id:
         raise ValueError("ChEMBL_get_assay_activities requires a non-empty assay_chembl_id")
     if not _live:
@@ -513,6 +550,7 @@ def ChEMBL_search_binding_sites(
     limit: int = 20,
     offset: int = 0,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Search ChEMBL binding sites by target or site name."""
     if not _live:

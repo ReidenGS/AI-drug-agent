@@ -36,7 +36,7 @@ from app.services.tool_inventory_service import ToolInventoryService
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_XLSX = (
-    _PROJECT_ROOT.parent / "项目文件" / "ToolUniversity_inventory_v0.2.xlsx"
+    _PROJECT_ROOT.parent / "\u9879\u76ee\u6587\u4ef6" / "ToolUniversity_inventory_v0.2.xlsx"
 )
 
 

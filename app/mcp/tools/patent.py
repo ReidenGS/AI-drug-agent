@@ -10,7 +10,7 @@ design.
 `NotImplementedError` and the MCPClient surfaces it as
 `dependency_unavailable`.
 
-Audit doc: `项目文件/ToolUniverse_Runtime_Integration_Audit_v0.1.md`.
+Audit doc: `\u9879\u76ee\u6587\u4ef6/ToolUniverse_Runtime_Integration_Audit_v0.1.md`.
 """
 
 from __future__ import annotations
@@ -39,8 +39,16 @@ def PubChem_get_associated_patents_by_CID(cid: str, *, _live: bool = False) -> d
 
 
 def drugbank_get_drug_references_by_drug_name_or_id(
-    drug_name_or_id: str, *, _live: bool = False
+    drug_name_or_id: str = "",
+    *,
+    query: str = "",
+    case_sensitive: bool | None = None,
+    exact_match: bool | None = None,
+    limit: int | None = None,
+    _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
+    drug_name_or_id = drug_name_or_id or query
     if not drug_name_or_id:
         raise ValueError(
             "drugbank_get_drug_references_by_drug_name_or_id requires a non-empty arg"
@@ -60,7 +68,9 @@ def drugbank_get_drug_references_by_drug_name_or_id(
 
 
 def FDA_OrangeBook_get_patent_info(
-    brand_name: str = "", application_number: str = "", *, _live: bool = False
+    brand_name: str = "", application_number: str = "",
+    *, operation: str | None = None,
+    _live: bool = False, **_extra: Any,
 ) -> dict[str, Any]:
     if not brand_name and not application_number:
         raise ValueError(

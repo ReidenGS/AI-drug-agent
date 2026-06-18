@@ -23,16 +23,30 @@ class FakeUniverse:
         *,
         tools: dict[str, Callable[[dict], Any]] | None = None,
         names: list[str] | None = None,
+        specs: dict[str, dict] | None = None,
+        required: dict[str, list[str]] | None = None,
     ) -> None:
         self._tools = tools or {}
         self._names = names or list(self._tools.keys())
+        self._specs = dict(specs or {})
+        self._required = dict(required or {})
         self.calls: list[dict] = []
+        self.spec_lookups: list[tuple[str, ...]] = []
+        self.required_lookups: list[str] = []
 
     def load_tools(self, **_kwargs: Any) -> None:
         return None
 
     def get_available_tools(self, name_only: bool = True) -> list[str]:
         return list(self._names)
+
+    def get_tool_specification_by_names(self, names: list[str]) -> list[dict]:
+        self.spec_lookups.append(tuple(names))
+        return [self._specs[n] for n in names if n in self._specs]
+
+    def get_required_parameters(self, name: str) -> list[str]:
+        self.required_lookups.append(name)
+        return list(self._required.get(name, []))
 
     def run_one_function(
         self,
@@ -59,8 +73,12 @@ def install_universe(monkeypatch: pytest.MonkeyPatch):
         *,
         tools: dict[str, Callable[[dict], Any]] | None = None,
         names: list[str] | None = None,
+        specs: dict[str, dict] | None = None,
+        required: dict[str, list[str]] | None = None,
     ) -> FakeUniverse:
-        fake = FakeUniverse(tools=tools, names=names)
+        fake = FakeUniverse(
+            tools=tools, names=names, specs=specs, required=required
+        )
         tooluniverse_adapter._reset_for_tests()
         monkeypatch.setattr(tooluniverse_adapter, "_get_universe", lambda: fake)
         return fake

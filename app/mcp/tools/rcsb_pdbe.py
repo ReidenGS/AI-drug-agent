@@ -12,7 +12,7 @@ validator. Per the integration audit's "no two execution sources" rule,
 the manual parser was removed and `_live=True` is routed to TU. The
 wrapper signature now matches TU's expected input.
 
-Audit doc: `项目文件/ToolUniverse_Runtime_Integration_Audit_v0.1.md`.
+Audit doc: `\u9879\u76ee\u6587\u4ef6/ToolUniverse_Runtime_Integration_Audit_v0.1.md`.
 """
 
 from __future__ import annotations
@@ -57,7 +57,12 @@ def CrystalStructure_validate(
     alpha: float | None = None,
     beta: float | None = None,
     gamma: float | None = None,
+    operation: str | None = None,
+    Z: int | None = None,
+    mw: float | None = None,
+    reported_density: float | None = None,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Crystal structure validation wrapper.
 
@@ -83,13 +88,16 @@ def CrystalStructure_validate(
         args["pdb_id_or_path"] = pdb_id_or_path
     for name, value in (
         ("a", a), ("b", b), ("c", c), ("alpha", alpha), ("beta", beta), ("gamma", gamma),
+        ("Z", Z), ("mw", mw), ("reported_density", reported_density),
     ):
         if value is not None:
             args[name] = value
+    if operation:
+        args["operation"] = operation
     if not args:
         raise ValueError(
             "CrystalStructure_validate live mode requires either cell parameters "
-            "(a/b/c/alpha/beta/gamma) or a `pdb_id_or_path`."
+            "(a/b/c/alpha/beta/gamma + Z/mw) or a `pdb_id_or_path`."
         )
     return _tu("CrystalStructure_validate", args)
 

@@ -12,7 +12,7 @@ Argument mappings (legacy wrapper → TU schema):
     TheraSAbDab_search_therapeutics(query)         → {query}
     iedb_search_bcr_sequences(limit, offset, …)    → {limit, offset, filters?}
 
-Audit doc: `项目文件/ToolUniverse_Runtime_Integration_Audit_v0.1.md`.
+Audit doc: `\u9879\u76ee\u6587\u4ef6/ToolUniverse_Runtime_Integration_Audit_v0.1.md`.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ def _tu(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def SAbDab_search_structures(
-    query: str = "", *, limit: int = 50, _live: bool = False
+    query: str = "", *, limit: int = 50, _live: bool = False, **_extra: Any,
 ) -> dict[str, Any]:
     """Search SAbDab structural antibody database.
 
@@ -51,7 +51,7 @@ def SAbDab_search_structures(
     return _tu("SAbDab_search_structures", args)
 
 
-def SAbDab_get_structure(pdb_id: str = "", *, _live: bool = False) -> dict[str, Any]:
+def SAbDab_get_structure(pdb_id: str = "", *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
     """Fetch antibody structure details from SAbDab by PDB ID.
 
     TU accepts `pdb_code` as an alias; the wrapper exposes only the
@@ -71,7 +71,7 @@ def SAbDab_get_structure(pdb_id: str = "", *, _live: bool = False) -> dict[str, 
     return _tu("SAbDab_get_structure", {"pdb_id": pdb_id})
 
 
-def TheraSAbDab_search_by_target(target: str = "", *, _live: bool = False) -> dict[str, Any]:
+def TheraSAbDab_search_by_target(target: str = "", *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
     """Find therapeutic antibodies targeting a given antigen."""
     if not target:
         raise ValueError("TheraSAbDab_search_by_target requires a non-empty target")
@@ -85,7 +85,7 @@ def TheraSAbDab_search_by_target(target: str = "", *, _live: bool = False) -> di
     return _tu("TheraSAbDab_search_by_target", {"target": target})
 
 
-def TheraSAbDab_search_therapeutics(query: str = "", *, _live: bool = False) -> dict[str, Any]:
+def TheraSAbDab_search_therapeutics(query: str = "", *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
     """Search Thera-SAbDab therapeutic antibodies by name."""
     if not query:
         raise ValueError("TheraSAbDab_search_therapeutics requires a non-empty query")
@@ -105,6 +105,7 @@ def iedb_search_bcr_sequences(
     offset: int = 0,
     filters: dict | None = None,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Search IEDB B-cell receptor / antibody sequences.
 

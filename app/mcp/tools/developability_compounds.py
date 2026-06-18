@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from ._arg_compat import resolve_operation
+
 
 _VALID_DRUGLIKENESS_RULES = {"lipinski", "ghose", "veber", "egan", "muegge"}
 
@@ -136,7 +138,9 @@ def SwissADME_calculate_adme(
     smiles: str = "",
     *,
     molecule_name: str | None = None,
+    operation: str | None = None,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """SwissADME bulk ADME calculation.
 
@@ -148,6 +152,7 @@ def SwissADME_calculate_adme(
     """
     if not smiles:
         raise ValueError("SwissADME_calculate_adme requires a non-empty smiles string")
+    op = resolve_operation(operation, "calculate_adme")
     if not _live:
         return {
             "status": "mocked",
@@ -158,7 +163,7 @@ def SwissADME_calculate_adme(
         }
     from ..tooluniverse_adapter import call_tool
 
-    args: dict[str, Any] = {"operation": "calculate_adme", "smiles": smiles}
+    args: dict[str, Any] = {"operation": op, "smiles": smiles}
     if molecule_name:
         args["molecule_name"] = molecule_name
     return call_tool("SwissADME_calculate_adme", args)
@@ -168,7 +173,9 @@ def SwissADME_check_druglikeness(
     smiles: str = "",
     *,
     rules: list[str] | None = None,
+    operation: str | None = None,
     _live: bool = False,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """SwissADME drug-likeness rule check.
 
@@ -181,6 +188,7 @@ def SwissADME_check_druglikeness(
         raise ValueError(
             "SwissADME_check_druglikeness requires a non-empty smiles string"
         )
+    op = resolve_operation(operation, "check_druglikeness")
     normalized_rules: list[str] | None = None
     if rules is not None:
         normalized_rules = [str(r).lower() for r in rules]
@@ -200,7 +208,7 @@ def SwissADME_check_druglikeness(
         }
     from ..tooluniverse_adapter import call_tool
 
-    args: dict[str, Any] = {"operation": "check_druglikeness", "smiles": smiles}
+    args: dict[str, Any] = {"operation": op, "smiles": smiles}
     if normalized_rules:
         args["rules"] = normalized_rules
     return call_tool("SwissADME_check_druglikeness", args)

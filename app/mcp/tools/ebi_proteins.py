@@ -4,7 +4,7 @@ Thin MCP binding layer. `_live=False` (default) returns a deterministic
 mock envelope. `_live=True` for the wired subset routes through
 `ToolUniverseAdapter`. No manual httpx implementation here.
 
-Audit doc: `项目文件/ToolUniverse_Runtime_Integration_Audit_v0.1.md`.
+Audit doc: `\u9879\u76ee\u6587\u4ef6/ToolUniverse_Runtime_Integration_Audit_v0.1.md`.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ def _tu(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def EBIProteins_get_features(
-    accession: str = "", *, types: str = "", _live: bool = False
+    accession: str = "", *, types: str = "", _live: bool = False, **_extra: Any,
 ) -> dict[str, Any]:
     if not accession or not isinstance(accession, str):
         raise ValueError("EBIProteins_get_features requires a non-empty accession")
@@ -40,7 +40,7 @@ def EBIProteins_get_features(
     return _tu("EBIProteins_get_features", args)
 
 
-def EBIProteins_get_epitopes(accession: str = "", *, _live: bool = False) -> dict[str, Any]:
+def EBIProteins_get_epitopes(accession: str = "", *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
     """Get experimentally-determined immune epitope regions for a protein.
 
     TU required: `accession` (UniProt). Mock returns empty envelope.
@@ -57,7 +57,7 @@ def EBIProteins_get_epitopes(accession: str = "", *, _live: bool = False) -> dic
     return _tu("EBIProteins_get_epitopes", {"accession": accession})
 
 
-def EBIProteins_get_antigen(accession: str = "", *, _live: bool = False) -> dict[str, Any]:
+def EBIProteins_get_antigen(accession: str = "", *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
     """Get predicted antigenic regions for a protein.
 
     TU required: `accession` (UniProt). Mock returns empty envelope.

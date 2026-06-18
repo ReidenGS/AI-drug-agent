@@ -69,6 +69,13 @@ class _Signals:
     has_linker: bool
     has_structure_or_sequence: bool
     readiness_status: str  # "ready" | "needs_user_input"
+    # Step 13/14 fall back to text-search context (target keywords,
+    # candidate names, payload names, explicit IDs, uploaded reference
+    # files) when entity gaps would otherwise force them blocked. If
+    # NONE of those signals are present, evidence/patent become blocked
+    # too — running them with empty context wastes LLM tokens and tool
+    # calls.
+    has_query_context: bool
 
 
 class WorkflowSetupService:
@@ -139,26 +146,51 @@ class WorkflowSetupService:
 def _gather_signals(*, readiness: dict, structured_query: dict) -> _Signals:
     presence = readiness.get("basic_adc_input_presence") or {}
     entities = structured_query.get("mentioned_entities") or {}
-    ref_id_types = {
-        ref.get("id_type")
-        for ref in (structured_query.get("referenced_inputs") or [])
+    referenced_inputs = [
+        ref for ref in (structured_query.get("referenced_inputs") or [])
         if isinstance(ref, dict)
-    }
+    ]
+    ref_id_types = {ref.get("id_type") for ref in referenced_inputs}
+    has_target = bool(presence.get("target_or_antigen_present")) or bool(
+        entities.get("target_or_antigen_text")
+    )
+    has_antibody = bool(presence.get("antibody_candidate_present")) or bool(
+        entities.get("antibody_candidate_text")
+    )
+    has_payload = bool(presence.get("payload_present")) or bool(
+        entities.get("payload_text")
+    )
+    has_linker = bool(presence.get("linker_present")) or bool(
+        entities.get("linker_text")
+    )
+    has_struct_or_seq = (
+        bool(presence.get("structure_or_sequence_present"))
+        or "pdb_id" in ref_id_types
+        or "uniprot_id" in ref_id_types
+    )
+    # "Meaningful query context" for Step 13/14: ANY entity, ANY referenced
+    # ID, or ANY user_goal_summary text. Evidence/patent agents can search
+    # off bare keywords; we only block them when literally nothing useful
+    # would survive the prompt.
+    user_goal = (structured_query.get("task_intent") or {}).get(
+        "user_goal_summary"
+    ) or ""
+    has_query_context = bool(
+        has_target
+        or has_antibody
+        or has_payload
+        or has_linker
+        or referenced_inputs
+        or (isinstance(user_goal, str) and user_goal.strip())
+    )
     return _Signals(
-        has_target=bool(presence.get("target_or_antigen_present"))
-        or bool(entities.get("target_or_antigen_text")),
-        has_antibody=bool(presence.get("antibody_candidate_present"))
-        or bool(entities.get("antibody_candidate_text")),
-        has_payload=bool(presence.get("payload_present"))
-        or bool(entities.get("payload_text")),
-        has_linker=bool(presence.get("linker_present"))
-        or bool(entities.get("linker_text")),
-        has_structure_or_sequence=(
-            bool(presence.get("structure_or_sequence_present"))
-            or "pdb_id" in ref_id_types
-            or "uniprot_id" in ref_id_types
-        ),
+        has_target=has_target,
+        has_antibody=has_antibody,
+        has_payload=has_payload,
+        has_linker=has_linker,
+        has_structure_or_sequence=has_struct_or_seq,
         readiness_status=readiness.get("input_readiness_status", "needs_user_input"),
+        has_query_context=has_query_context,
     )
 
 
@@ -203,6 +235,7 @@ def _decide_per_step(s: _Signals) -> tuple[list[PlannedStep], list[SkippedStep]]
             lane_flags={
                 "target_discovery_lane": True,
                 "antibody_discovery_lane": not s.has_antibody,
+                "antibody_lane": s.has_antibody,
                 "compound_lane": bool(s.has_payload or s.has_linker),
                 "structure_lane": s.has_structure_or_sequence,
             },
@@ -281,22 +314,57 @@ def _decide_per_step(s: _Signals) -> tuple[list[PlannedStep], list[SkippedStep]]
             step_id, "run", "scoring/handoff/ranking always attempted post Step 9",
         ))
 
-    # Step 13/14 — evidence + patent. Never globally blocked on entity gaps;
-    # they may still find context from names. Compound-specific patent calls
-    # will be skipped downstream if payload absent.
-    planned.append(_planned(
-        "step_13_evidence", "run",
-        "evidence search always attempted (uses target/candidate/payload names if present)",
-        lane_flags={"compound_lane": s.has_payload},
-    ))
-    planned.append(_planned(
-        "step_14_patent_ip", "run",
-        "patent / prior-art always attempted",
-        lane_flags={
-            "compound_lane": s.has_payload,
-            "regulatory_lane": True,
-        },
-    ))
+    # Step 13/14 — evidence + patent. Not globally blocked on entity gaps
+    # alone; they may still find context from names. They only block when
+    # there is literally no query context to search with — empty target,
+    # empty entities, no referenced IDs, no user-goal text. Compound-specific
+    # patent calls are scoped by the lane_flag, not the planned_status.
+    evidence_lane_flags = {
+        "evidence_lane": s.has_query_context,
+        "compound_lane": s.has_payload,
+        "antibody_lane": s.has_antibody,
+    }
+    patent_lane_flags = {
+        "patent_lane": s.has_query_context,
+        "compound_lane": s.has_payload,
+        "antibody_lane": s.has_antibody,
+        "regulatory_lane": True,
+    }
+    if not s.has_query_context:
+        planned.append(_planned(
+            "step_13_evidence", "blocked",
+            "no query context (no target / candidate / payload / referenced "
+            "IDs / user goal) — evidence search would have nothing to search",
+            lane_flags=evidence_lane_flags,
+        ))
+        skipped.append(SkippedStep(
+            step_id="step_13_evidence",
+            reason_type="missing_input",
+            reason="no query context for evidence search",
+        ))
+        planned.append(_planned(
+            "step_14_patent_ip", "blocked",
+            "no query context (no target / candidate / payload / referenced "
+            "IDs / user goal) — patent search would have nothing to search",
+            lane_flags=patent_lane_flags,
+        ))
+        skipped.append(SkippedStep(
+            step_id="step_14_patent_ip",
+            reason_type="missing_input",
+            reason="no query context for patent search",
+        ))
+    else:
+        planned.append(_planned(
+            "step_13_evidence", "run",
+            "evidence search always attempted (uses target/candidate/payload "
+            "names if present)",
+            lane_flags=evidence_lane_flags,
+        ))
+        planned.append(_planned(
+            "step_14_patent_ip", "run",
+            "patent / prior-art always attempted",
+            lane_flags=patent_lane_flags,
+        ))
 
     return planned, skipped
 

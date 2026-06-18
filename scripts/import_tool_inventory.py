@@ -21,7 +21,7 @@ from app.services.tool_inventory_service import ToolInventoryService  # noqa: E4
 def main() -> None:
     xlsx = os.environ.get(
         "TOOL_INVENTORY_XLSX",
-        str(ROOT.parent / "项目文件" / "ToolUniversity_inventory_v0.2.xlsx"),
+        str(ROOT.parent / "\u9879\u76ee\u6587\u4ef6" / "ToolUniversity_inventory_v0.2.xlsx"),
     )
     svc = ToolInventoryService(xlsx)
     entries = svc.load()

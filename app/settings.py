@@ -42,7 +42,7 @@ class Settings(BaseSettings):
 
     api_key: str = "dev-key"
 
-    tool_inventory_xlsx: str = "../项目文件/ToolUniversity_inventory_v0.2.xlsx"
+    tool_inventory_xlsx: str = "../\u9879\u76ee\u6587\u4ef6/ToolUniversity_inventory_v0.2.xlsx"
 
     # Step 1 multipart upload limits (per-request, server-side; never trust the
     # frontend). Defaults are intentionally conservative — bump via env when
