@@ -25,7 +25,7 @@ must not call tools, build tool arguments, or check input completeness.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from ..llm.provider import LLMProvider
 from ..schemas.step_01_raw_request_record import RawRequestRecord
@@ -104,6 +104,10 @@ Entity extraction + normalization:
   (payload). `vc-MMAE` → valine-citrulline linker (inferred) + MMAE
   payload (explicit). Every component carries `inferred=True` unless the
   user explicitly wrote that component.
+- `entity_decompositions[].components[]` entries MUST use
+  `canonical_name` for the component label. Do NOT use `component_name`,
+  `name`, `label`, or `value` for component objects. Each component object
+  should include `canonical_name` and, when known, `component_type`.
 
 Identifier extraction:
 
@@ -131,12 +135,15 @@ Requested outputs:
 
 User constraints, warnings, clarifications:
 
-- `user_constraints` preserves the user's literal phrasing — do NOT
-  reinterpret it into numeric thresholds, DAR ranges, or scientific
-  tolerances unless the user wrote those numbers themselves.
-- `parse_warnings` are INTERNAL parser warnings — they document
-  ambiguity, dropped values, inferred resolutions you are not confident
-  about, or low-confidence extractions. They are not shown to the end
+- `user_constraints` MUST be a JSON array of OBJECTS. Each object has at
+  least `{"constraint_text": "<the user's literal phrasing>",
+  "source": "user"}`. Do NOT emit plain strings here. Preserve the
+  user's phrasing — do not reinterpret into numeric thresholds, DAR
+  ranges, or scientific tolerances unless the user wrote those numbers.
+- `parse_warnings` MUST be a JSON array of plain STRINGS — short
+  English sentences describing parser ambiguity, dropped values,
+  inferred resolutions you are not confident about, or low-confidence
+  extractions. Do NOT emit objects here. They are not shown to the end
   user verbatim.
 - `clarification_questions` are USER-FACING short questions surfaced
   back to the operator. Add one when a required component for the
@@ -265,6 +272,254 @@ def backfill_mentioned_entities(
     return out
 
 
+def _coerce_warning_entry(item: Any) -> Optional[str]:
+    """Compact-stringify a `parse_warnings` entry from a drifted LLM payload.
+
+    Real Gemini occasionally returns dict-shaped warnings like
+    ``{"warning_code": "X", "message": "...", "confidence": 0.6}`` instead
+    of the schema-required plain strings. We compact those into a single
+    line; unknown shapes degrade to ``str(item)``; ``None`` / empty drops
+    silently (returns ``None``).
+    """
+    if item is None:
+        return None
+    if isinstance(item, str):
+        s = item.strip()
+        return s or None
+    if isinstance(item, dict):
+        # Prefer the most informative fields, but always include code+message
+        # when both are present so downstream readers can grep either.
+        code = item.get("warning_code") or item.get("code")
+        message = item.get("message") or item.get("text") or item.get("warning")
+        confidence = item.get("confidence")
+        parts: list[str] = []
+        if code:
+            parts.append(str(code))
+        if message:
+            parts.append(str(message))
+        if not parts:
+            # Fallback: dump compact key/value pairs of any string-ish content.
+            kv = [f"{k}={v}" for k, v in item.items() if isinstance(v, (str, int, float, bool))]
+            if kv:
+                parts.append("; ".join(kv))
+        if confidence is not None and isinstance(confidence, (int, float)):
+            parts.append(f"confidence={float(confidence):.2f}")
+        joined = " | ".join(parts).strip()
+        return joined or None
+    if isinstance(item, (list, tuple)):
+        text = ", ".join(str(x) for x in item if x is not None)
+        return text or None
+    text = str(item).strip()
+    return text or None
+
+
+def _coerce_constraint_entry(item: Any) -> Optional[dict[str, Any]]:
+    """Coerce a `user_constraints` entry into the canonical dict shape.
+
+    Schema requires ``list[dict]``. Real Gemini sometimes returns plain
+    strings like ``"DAR<=4"``. We wrap those into
+    ``{"constraint_text": str, "source": "llm_output"}``; dict entries
+    pass through but pick up ``source="llm_output"`` if the LLM omitted
+    one and ``constraint_text`` if a free-form text field exists under
+    another common key. ``None`` / empty drops silently.
+    """
+    if item is None:
+        return None
+    if isinstance(item, str):
+        s = item.strip()
+        if not s:
+            return None
+        return {"constraint_text": s, "source": "llm_output"}
+    if isinstance(item, dict):
+        out: dict[str, Any] = dict(item)
+        if not out.get("constraint_text"):
+            for alt in ("text", "value", "description", "constraint"):
+                v = out.get(alt)
+                if isinstance(v, str) and v.strip():
+                    out["constraint_text"] = v.strip()
+                    break
+        out.setdefault("source", "llm_output")
+        return out
+    text = str(item).strip()
+    if not text:
+        return None
+    return {"constraint_text": text, "source": "supervisor_coerced"}
+
+
+_COMPONENT_NAME_ALIASES = ("component_name", "name", "label", "value")
+_COMPONENT_ROLE_VALUES = {"antibody", "payload", "linker", "linker_payload", "other"}
+_ENTITY_TYPE_ALIASES = {
+    "target": "target_or_antigen",
+    "antigen": "target_or_antigen",
+    "target-antigen": "target_or_antigen",
+    "target antigen": "target_or_antigen",
+    "target_or_antigen": "target_or_antigen",
+    "disease": "disease_or_indication",
+    "indication": "disease_or_indication",
+    "disease-or-indication": "disease_or_indication",
+    "disease indication": "disease_or_indication",
+    "payload-linker": "linker_payload",
+    "payload linker": "linker_payload",
+    "linker-payload": "linker_payload",
+    "linker payload": "linker_payload",
+    "linker_payload": "linker_payload",
+    "small_molecule": "compound",
+    "small-molecule": "compound",
+    "small molecule": "compound",
+}
+
+
+def _component_name_value(item: dict[str, Any]) -> str | None:
+    value = item.get("canonical_name")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    for key in _COMPONENT_NAME_ALIASES:
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _normalize_entity_components(payload: dict[str, Any]) -> None:
+    decompositions = payload.get("entity_decompositions")
+    if not isinstance(decompositions, list):
+        return
+
+    warnings = payload.get("parse_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    payload["parse_warnings"] = warnings
+
+    for decomp_index, decomp in enumerate(decompositions):
+        if not isinstance(decomp, dict):
+            warnings.append(
+                f"dropped entity_decompositions[{decomp_index}]: expected object"
+            )
+            continue
+        components = decomp.get("components")
+        if not isinstance(components, list):
+            if components is not None:
+                warnings.append(
+                    f"dropped entity_decompositions[{decomp_index}].components: expected list"
+                )
+            decomp["components"] = []
+            continue
+
+        normalized_components: list[dict[str, Any]] = []
+        for comp_index, component in enumerate(components):
+            if not isinstance(component, dict):
+                warnings.append(
+                    "dropped "
+                    f"entity_decompositions[{decomp_index}].components[{comp_index}]: "
+                    "expected object"
+                )
+                continue
+            canonical_name = _component_name_value(component)
+            if not canonical_name:
+                warnings.append(
+                    "dropped "
+                    f"entity_decompositions[{decomp_index}].components[{comp_index}]: "
+                    "missing canonical_name"
+                )
+                continue
+
+            out = dict(component)
+            out["canonical_name"] = canonical_name
+            component_type = out.get("component_type")
+            if (
+                "role" not in out
+                and isinstance(component_type, str)
+                and component_type in _COMPONENT_ROLE_VALUES
+            ):
+                out["role"] = component_type
+            normalized_components.append(out)
+
+        decomp["components"] = normalized_components
+
+
+def _normalize_entity_type_value(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    lowered = raw.lower().replace("_", " ")
+    compact = " ".join(lowered.replace("/", " ").split())
+    return (
+        _ENTITY_TYPE_ALIASES.get(raw)
+        or _ENTITY_TYPE_ALIASES.get(raw.lower())
+        or _ENTITY_TYPE_ALIASES.get(compact)
+        or _ENTITY_TYPE_ALIASES.get(compact.replace(" ", "-"))
+        or raw
+    )
+
+
+def _normalize_normalized_entity_types(payload: dict[str, Any]) -> None:
+    normalized_entities = payload.get("normalized_entities")
+    if not isinstance(normalized_entities, list):
+        return
+
+    warnings = payload.get("parse_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    payload["parse_warnings"] = warnings
+
+    for i, entity in enumerate(normalized_entities):
+        if not isinstance(entity, dict):
+            continue
+        original = entity.get("entity_type")
+        normalized = _normalize_entity_type_value(original)
+        if normalized is None:
+            continue
+        if normalized != original:
+            entity["entity_type"] = normalized
+            warnings.append(
+                f"normalized normalized_entities[{i}].entity_type from {original!r} to {normalized!r}"
+            )
+
+
+def normalize_llm_payload_for_step2(payload: dict) -> dict:
+    """Defensive coercer applied at the Step 2 parse boundary.
+
+    Handles real schema-drift cases observed against live HER2 ADC inputs:
+
+    1. ``parse_warnings`` returned as ``list[dict]`` instead of ``list[str]``.
+    2. ``user_constraints`` returned as ``list[str]`` instead of ``list[dict]``.
+    3. Entity decomposition components returned with alias keys such as
+       ``component_name`` instead of the schema-required ``canonical_name``.
+
+    Idempotent: payloads already matching the schema pass through unchanged
+    (no spurious wrapping, no duplicate sources). Never raises — unknown
+    item types degrade to ``str()`` / drop instead of breaking validation.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    out = dict(payload)
+
+    raw_warnings = out.get("parse_warnings")
+    if isinstance(raw_warnings, list):
+        coerced_warnings: list[str] = []
+        for item in raw_warnings:
+            s = _coerce_warning_entry(item)
+            if s:
+                coerced_warnings.append(s)
+        out["parse_warnings"] = coerced_warnings
+
+    raw_constraints = out.get("user_constraints")
+    if isinstance(raw_constraints, list):
+        coerced_constraints: list[dict[str, Any]] = []
+        for item in raw_constraints:
+            d = _coerce_constraint_entry(item)
+            if d:
+                coerced_constraints.append(d)
+        out["user_constraints"] = coerced_constraints
+
+    _normalize_entity_components(out)
+    _normalize_normalized_entity_types(out)
+
+    return out
+
+
 def build_supervisor_user_prompt(raw_request_record: dict) -> str:
     """The user-message portion of the Step 2 LLM call.
 
@@ -310,6 +565,10 @@ class SupervisorAgent:
             },
             system=SUPERVISOR_SYSTEM_PROMPT,
         )
+        # Defensive coercion for real-LLM schema drift on the two fields
+        # most often returned in the wrong shape (parse_warnings as dicts,
+        # user_constraints as strings). Idempotent for conformant payloads.
+        llm_payload = normalize_llm_payload_for_step2(llm_payload or {})
 
         # Agent fills the deterministic fields, never the LLM.
         normalized_entities = [

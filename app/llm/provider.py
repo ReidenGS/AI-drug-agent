@@ -55,6 +55,88 @@ def _mock_stage1_selection(schema: dict) -> dict:
     return {"selections": selections, "selection_metadata": {"strategy": "mock_signals_match"}}
 
 
+def _mock_stage1_multi_lane(schema: dict) -> dict:
+    """Deterministic per-candidate multi-lane Stage 1 selector mock.
+
+    For each lane in `schema["lanes"]`, picks at most `max_tools_per_lane`
+    tools from the intersection of the catalog and the lane's
+    `allowed_tools` whose `coarse_input_requirements` intersect the lane's
+    `signals`. Returns a flat `selections` list tagged with `lane_type`.
+    """
+    catalog = schema.get("compact_catalog") or []
+    name_to_entry = {
+        e.get("tool_name"): e for e in catalog
+        if isinstance(e, dict) and e.get("tool_name")
+    }
+    lanes = schema.get("lanes") or []
+    cap = int(schema.get("max_tools_per_lane") or 2)
+    selections: list[dict] = []
+    for lane in lanes:
+        lane_type = lane.get("lane_type")
+        allowed = [t for t in (lane.get("allowed_tools") or []) if isinstance(t, str)]
+        signals = lane.get("signals") or {}
+        available = {k for k, v in signals.items() if v}
+        picks: list[dict] = []
+        for tool_name in allowed:
+            entry = name_to_entry.get(tool_name)
+            if not entry:
+                continue
+            reqs = entry.get("coarse_input_requirements") or []
+            if reqs and not any(r in available for r in reqs):
+                continue
+            picks.append({
+                "lane_type": lane_type,
+                "tool_name": tool_name,
+                "selection_reason": (
+                    f"coarse_input {sorted(set(reqs) & available)} satisfied by lane signals"
+                    if reqs else "lane fallback (no coarse input requirements)"
+                ),
+                "priority": 1,
+                "required_context": sorted(set(reqs) & available),
+            })
+            if len(picks) >= cap:
+                break
+        selections.extend(picks)
+    return {
+        "selections": selections,
+        "selection_metadata": {"strategy": "mock_multi_lane_signals_match"},
+    }
+
+
+def _mock_stage2_multi_tool(schema: dict) -> dict:
+    """Deterministic per-candidate multi-tool Stage 2 arg-construction mock.
+
+    For each tool in `schema["tools"]`, copies any schema-required property
+    that exists in that tool's per-lane `arg_hints`. Missing required
+    fields surface as `missing_fields` per tool; the caller then tries
+    deterministic mapping or marks the plan skipped.
+    """
+    tools_in = schema.get("tools") or []
+    tools_out: list[dict] = []
+    for t in tools_in:
+        if not isinstance(t, dict):
+            continue
+        full_schema = t.get("full_schema") or {}
+        arg_hints = t.get("arg_hints") or {}
+        properties = full_schema.get("properties") or {}
+        args: dict = {}
+        for name in properties:
+            if name in arg_hints:
+                args[name] = arg_hints[name]
+        tools_out.append({
+            "lane_type": t.get("lane_type"),
+            "tool_name": t.get("tool_name"),
+            "arguments": args,
+            "argument_construction_reason": (
+                f"filled {sorted(args.keys())} from per-lane arg_hints"
+            ),
+            "missing_fields": [
+                n for n in (full_schema.get("required") or []) if n not in args
+            ],
+        })
+    return {"tools": tools_out}
+
+
 def _mock_stage2_arguments(schema: dict) -> dict:
     """Deterministic Stage 2 arg construction mock.
 
@@ -184,6 +266,10 @@ class MockLLMProvider:
             return _mock_stage1_selection(schema)
         if task == "tool_selection_stage_2":
             return _mock_stage2_arguments(schema)
+        if task == "tool_selection_stage_1_multi_lane":
+            return _mock_stage1_multi_lane(schema)
+        if task == "tool_selection_stage_2_multi_tool":
+            return _mock_stage2_multi_tool(schema)
 
         raw = (schema or {}).get("raw_request_record") or {}
         ctx = raw.get("user_provided_context") or {}

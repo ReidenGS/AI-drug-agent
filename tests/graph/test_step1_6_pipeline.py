@@ -28,11 +28,14 @@ def inventory():
 def _intake_request() -> dict:
     return {
         "intake_request": {
-            "raw_user_query": "HER2 ADC, vc-MMAE payload, DAR 4",
+            "raw_user_query": (
+                "HER2 ADC, target UniProt P04626, vc-MMAE payload, "
+                "payload SMILES CCO, DAR 4"
+            ),
             "user_provided_context": {
-                "target_or_antigen_text": "HER2",
+                "target_or_antigen_text": "HER2 (UniProt P04626)",
                 "candidate_text": "Trastuzumab analog",
-                "payload_linker_text": "vc-MMAE",
+                "payload_linker_text": "vc-MMAE; payload SMILES CCO",
             },
         }
     }

@@ -1,45 +1,72 @@
-"""PatentIPAgent — Step 14 (deterministic patent / prior-art scan).
+"""PatentIPAgent — Step 14 hint-driven patent / prior-art normalization MVP.
 
-Reads Step 2/5/9/10/12 artifacts and routes patent queries to Step 14 MCP
-tools. No legal opinion is produced; the artifact carries the canonical
-`legal_disclaimer` so callers cannot mistake this for an attorney review.
+Reads Step 2 / 5 / 9 / 10 / 12 artifacts (Step 5 required) and routes patent
+queries to the Step 14 MCP tools. Queries are driven by Step 5
+`candidate_context_table.downstream_query_hints` so the search scope follows
+professor guidance and is NEVER antibody-centered by default:
 
-Scope fallback order (most-specific first):
+    linker_payload → payload → linker → compound → target → complete_adc
+    → antibody (only when Step 5 explicitly captured one)
 
-    Step 12 ranking_table (when ranking_status="completed" and ranked_candidates non-empty)
-        → Step 10 scoring_handoff_package.candidate_ids
-        → Step 9 compound_screening_artifact compound hits / Step 5 compound candidates
-        → Step 2 structured_query mentioned_entities.payload_text / linker_text
+Inferred query expansion adds two patent-specific roles:
+- `conjugation_chemistry` — only when linker / payload / linker_payload hint
+  exists; the synthesized term references the existing hint entity.
+- `use_or_indication` — only when a target hint exists; the synthesized term
+  references the target entity. Both carry
+  `query_term_source="inferred_expansion"`.
 
-The chosen source is recorded on every tool call via
-`tool_input_summary.shortlist_source` so audit / tests can tell which Step
-provided the scope.
+Antibody queries are emitted only when Step 5 wrote an antibody hint (i.e.
+the user explicitly supplied an antibody candidate).
 
-Tool routing:
-- compound.pubchem_cid       → `PubChem_get_associated_patents_by_CID`
-- payload_name / drug name   → `drugbank_get_drug_references_by_drug_name_or_id`
-- payload_name (also)        → `FDA_OrangeBook_get_patent_info(brand_name=…)`
-- structured_query payload   → DrugBank + Orange Book even when Step 5 has
-                                no compound_component candidate (text-only
-                                fallback).
+Tool routing (all calls go through the inventory-scoped MCP client; no new
+external API client):
+- `PubChem_get_associated_patents_by_CID` — per compound candidate with
+  `pubchem_cid` identifier.
+- `drugbank_get_drug_references_by_drug_name_or_id` — per
+  compound-candidate payload/linker/compound name AND per text hint
+  (linker_payload/payload/linker/compound/target/complete_adc/antibody/
+  conjugation_chemistry/use_or_indication).
+- `FDA_OrangeBook_get_patent_info` — same as DrugBank.
 
-Orange Book records:
-- `source_database="FDA_OrangeBook"`
-- `matched_entity_type="drug_application_or_regulatory_reference"`
-- raw product / patent / exclusivity tables stay in
-  `tool_outputs/step_14/{tool_call_id}.json` and are referenced via
-  `tool_call_records[].tool_output_ref`. They are NEVER inlined into
-  `patent_records[]`.
+Scope fallback order for **candidate-bound** queries only (PubChem CID +
+compound-candidate name flows):
+
+    Step 12 ranking_table (when `ranking_status="completed"` and
+        `ranked_candidates` non-empty)
+    → Step 10 scoring_handoff_package
+    → Step 5 candidates
+
+Entity-level hint queries carry their own `shortlist_source` derived from
+the hint's origin (e.g. `mentioned_entities.payload_text` →
+`step_02_structured_query`; otherwise `step_05_downstream_hint`).
+
+Per successful tool call, raw payload lands at
+`tool_outputs/step_14/{tool_call_id}.json`. Compact prior-art hits are
+extracted (title, patent_number, assignee, year, link, claim_focus), then
+deduped across all tool calls by patent_number (preferred) or
+(normalized_title + normalized_assignee). Deterministic IP-relevance scoring
+ranks the merged literature/patent hits. Step 14 NEVER writes
+`ranking_table.json` — ADC candidate ranking remains owned by Step 12.
+
+If wrappers raise `NotImplementedError` (or the MCP client returns
+`dependency_unavailable`), the step still completes with
+`patent_review_status="partial"`.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, Iterable, Optional
 
 from ..agents.tool_selection_policy import (
     SelectionContext,
     ToolInvocationPlan,
     select_and_build_invocations,
+)
+from ..agents.step_14_prior_art import (
+    MergedHit,
+    dedup_and_sort_by_relevance,
+    extract_hits,
 )
 from ..llm.provider import LLMProvider, MockLLMProvider
 from ..mcp.client import MCPClient
@@ -60,6 +87,47 @@ _AGENT_NAME = "patent_ip_agent"
 _STEP_ID = "step_14"
 _ARTIFACT_KEY = "patent_prior_art_table.json"
 
+# Demo-friendly default; the public ceiling allows production-scale review.
+DEFAULT_TOTAL_LIMIT = 50
+MAX_TOTAL_LIMIT = 1000
+DEFAULT_PER_QUERY_LIMIT = 25
+
+# Hint role priority. Payload / linker first; antibody only when Step 5 hint
+# present; complete_adc is comparator scope and sits late.
+_ROLE_PRIORITY: tuple[str, ...] = (
+    "linker_payload",
+    "payload",
+    "linker",
+    "compound",
+    "target",
+    "complete_adc",
+    "antibody",
+)
+
+# Hint roles → text tools that get called with the hint entity.
+_TEXT_TOOLS = (
+    "drugbank_get_drug_references_by_drug_name_or_id",
+    "FDA_OrangeBook_get_patent_info",
+)
+
+# Tool name → source_database label used in extracted records.
+_TOOL_SOURCE_DB: dict[str, str] = {
+    "PubChem_get_associated_patents_by_CID": "PubChem",
+    "drugbank_get_drug_references_by_drug_name_or_id": "DrugBank",
+    "FDA_OrangeBook_get_patent_info": "FDA_OrangeBook",
+}
+
+
+@dataclass
+class _QueryPlan:
+    role: str               # query_role (linker_payload, payload, …, conjugation_chemistry, …)
+    term: str               # query_term (entity text or CID)
+    term_source: str        # query_term_source (e.g. mentioned_entities.payload_text)
+    tools: tuple[str, ...]  # which tools to call for this plan
+    shortlist_source: str   # provenance label recorded on every call
+    candidate_id: Optional[str] = None
+    matched_entity_type: str = "unknown"
+
 
 class PatentIPAgent:
     name = _AGENT_NAME
@@ -79,18 +147,22 @@ class PatentIPAgent:
         self.mcp_client = mcp_client
         self.llm = llm or MockLLMProvider()
 
-    def run(self, run_id: str) -> PatentPriorArtTable:
+    def run(
+        self,
+        run_id: str,
+        *,
+        total_limit: int = DEFAULT_TOTAL_LIMIT,
+        per_query_limit: int = DEFAULT_PER_QUERY_LIMIT,
+    ) -> PatentPriorArtTable:
+        total_limit = max(1, min(int(total_limit), MAX_TOTAL_LIMIT))
+        per_query_limit = max(1, min(int(per_query_limit), MAX_TOTAL_LIMIT))
+
         reg = self.registry.get(run_id)
         if not reg.active_artifacts.candidate_context_table_id:
             raise WorkflowStateError("Step 14 requires Step 5 candidate_context_table")
 
         cct = self.storage.read_json(
             self.storage.run_key(run_id, "candidate_context_table.json")
-        )
-        compound_screening = (
-            self.storage.read_json(self.storage.run_key(run_id, "compound_screening_artifact.json"))
-            if reg.active_artifacts.structure_variant_and_compound_screening_id
-            else None
         )
         sq = (
             self.storage.read_json(self.storage.run_key(run_id, "inputs/structured_query.json"))
@@ -108,194 +180,66 @@ class PatentIPAgent:
             else None
         )
 
+        downstream_hints = cct.get("downstream_query_hints") or []
+        candidates = cct.get("candidate_records") or []
         compound_candidates = [
-            c for c in cct.get("candidate_records") or []
-            if c.get("candidate_type") == "compound_component"
+            c for c in candidates if c.get("candidate_type") == "compound_component"
         ]
-        compound_hits = (compound_screening or {}).get("compound_hits") or []
 
-        # Resolve scope: which candidate_ids to operate on, and which source
-        # supplied that decision (recorded on every tool call summary).
+        # Candidate scope (only constrains candidate-bound plans).
         scope_ids, scope_source = _resolve_scope(
             ranking=ranking, handoff=handoff,
-            cct_candidate_ids=[c.get("candidate_id") for c in cct.get("candidate_records") or []],
+            cct_candidate_ids=[c.get("candidate_id") for c in candidates],
         )
         if scope_ids:
             compound_candidates = [
                 c for c in compound_candidates if c.get("candidate_id") in scope_ids
             ]
 
-        tool_calls: list[ToolCallRecord] = []
-        patent_records: list[PatentRecord] = []
-
-        # ── PubChem patents (compound hits with pubchem_cid identifier) ──
-        for candidate in compound_candidates:
-            for ident in candidate.get("identifiers") or []:
-                if ident.get("id_type") != "pubchem_cid":
-                    continue
-                cid = ident.get("id_value")
-                if not cid:
-                    continue
-                for plan in self._plans_for_patent(
-                    tool_names=["PubChem_get_associated_patents_by_CID"],
-                    signal="pubchem_cid",
-                    arg_hints={"cid": cid, "pubchem_cid": cid},
-                ):
-                    tc = self._call_tool(
-                        run_id=run_id, tool_name=plan.tool_name,
-                        kwargs=plan.arguments,
-                        label=f"pubchem:{candidate.get('candidate_id')}:{cid}",
-                        extra_input_summary={
-                            "shortlist_source": scope_source,
-                            "candidate_id": candidate.get("candidate_id"),
-                            **_selection_summary(plan),
-                        },
-                    )
-                    tool_calls.append(tc)
-                    if tc.run_status == "success":
-                        patent_records.append(self._record(
-                            candidate_id=candidate.get("candidate_id", ""),
-                            matched_entity_type="compound",
-                            matched_material_id=None,
-                            source_database="PubChem",
-                            source_ref=tc.tool_output_ref,
-                            notes_limitations=(
-                                f"Raw payload at tool_output_ref={tc.tool_output_ref}."
-                            ),
-                        ))
-
-        # ── DrugBank references (per payload / linker / compound name) ───
-        for candidate in compound_candidates:
-            name = _first_material_value(candidate, {"payload_name", "linker_name", "compound_name"})
-            if not name:
-                continue
-            for plan in self._plans_for_patent(
-                tool_names=["drugbank_get_drug_references_by_drug_name_or_id"],
-                signal="drug_name_or_id",
-                arg_hints={"drug_name_or_id": name, "compound_name": name, "query": name},
-            ):
-                tc = self._call_tool(
-                    run_id=run_id, tool_name=plan.tool_name,
-                    kwargs=plan.arguments,
-                    label=f"drugbank:{candidate.get('candidate_id')}:{name}",
-                    extra_input_summary={
-                        "shortlist_source": scope_source,
-                        "candidate_id": candidate.get("candidate_id"),
-                        **_selection_summary(plan),
-                    },
-                )
-                tool_calls.append(tc)
-                if tc.run_status == "success":
-                    patent_records.append(self._record(
-                        candidate_id=candidate.get("candidate_id", ""),
-                        matched_entity_type=_entity_type_for(candidate),
-                        matched_material_id=None,
-                        source_database="DrugBank",
-                        source_ref=tc.tool_output_ref,
-                        notes_limitations=(
-                            f"Raw DrugBank references at tool_output_ref={tc.tool_output_ref}."
-                        ),
-                    ))
-
-        # ── FDA Orange Book (per payload / linker / compound name) ───────
-        for candidate in compound_candidates:
-            name = _first_material_value(candidate, {"payload_name", "linker_name", "compound_name"})
-            if not name:
-                continue
-            for plan in self._plans_for_patent(
-                tool_names=["FDA_OrangeBook_get_patent_info"],
-                signal="brand_name",
-                arg_hints={"brand_name": name, "compound_name": name, "query": name},
-            ):
-                tc = self._call_tool(
-                    run_id=run_id, tool_name=plan.tool_name,
-                    kwargs=plan.arguments,
-                    label=f"orangebook:{candidate.get('candidate_id')}:{name}",
-                    extra_input_summary={
-                        "shortlist_source": scope_source,
-                        "candidate_id": candidate.get("candidate_id"),
-                        **_selection_summary(plan),
-                    },
-                )
-                tool_calls.append(tc)
-                if tc.run_status == "success":
-                    # IMPORTANT: do NOT inline product/patent/exclusivity rows.
-                    patent_records.append(self._record(
-                        candidate_id=candidate.get("candidate_id", ""),
-                        matched_entity_type="drug_application_or_regulatory_reference",
-                        matched_material_id=None,
-                        source_database="FDA_OrangeBook",
-                        source_ref=tc.tool_output_ref,
-                        notes_limitations=(
-                            "Orange Book product-level rows are stored by reference; "
-                            "this normalized row only records the search context."
-                        ),
-                    ))
-
-        # ── structured_query payload/linker text fallback ────────────────
-        # If Step 5 had no compound_component candidate (so the per-candidate
-        # loops above issued zero compound queries), but structured_query
-        # mentions a payload or linker, scan DrugBank + Orange Book on that
-        # text directly. This covers user-typed payloads that never made it
-        # into Step 5's candidate_records (e.g. "the warhead is MMAE" without
-        # a payload_linker_text context field).
-        compound_call_count = sum(
-            1 for tc in tool_calls
-            if tc.tool_name in {
-                "drugbank_get_drug_references_by_drug_name_or_id",
-                "FDA_OrangeBook_get_patent_info",
-                "PubChem_get_associated_patents_by_CID",
-            }
+        plans = list(
+            _build_query_plans(
+                downstream_hints=downstream_hints,
+                compound_candidates=compound_candidates,
+                scope_source=scope_source,
+                sq_entities=(sq or {}).get("mentioned_entities") if sq else None,
+            )
         )
-        if compound_call_count == 0 and sq is not None:
-            entities = sq.get("mentioned_entities") or {}
-            sq_payload_text = entities.get("payload_text") or entities.get("linker_text")
-            if sq_payload_text:
-                for tool_name in (
-                    "drugbank_get_drug_references_by_drug_name_or_id",
-                    "FDA_OrangeBook_get_patent_info",
-                ):
-                    kwargs = (
-                        {"drug_name_or_id": sq_payload_text}
-                        if tool_name.startswith("drugbank")
-                        else {"brand_name": sq_payload_text}
-                    )
-                    signal = "brand_name" if tool_name.startswith("FDA") else "drug_name_or_id"
-                    for plan in self._plans_for_patent(
-                        tool_names=[tool_name],
-                        signal=signal,
-                        arg_hints={**kwargs, "compound_name": sq_payload_text, "query": sq_payload_text},
-                    ):
-                        tc = self._call_tool(
-                            run_id=run_id, tool_name=plan.tool_name, kwargs=plan.arguments,
-                            label=f"sq_fallback:{sq_payload_text}",
-                            extra_input_summary={
-                                "shortlist_source": "step_02_structured_query",
-                                "candidate_id": None,
-                                **_selection_summary(plan),
-                            },
-                        )
-                        tool_calls.append(tc)
-                        if tc.run_status == "success":
-                            patent_records.append(self._record(
-                                candidate_id="",
-                                matched_entity_type=(
-                                    "drug_application_or_regulatory_reference"
-                                    if plan.tool_name.startswith("FDA")
-                                    else "payload"
-                                ),
-                                matched_material_id=None,
-                                source_database=(
-                                    "FDA_OrangeBook" if plan.tool_name.startswith("FDA")
-                                    else "DrugBank"
-                                ),
-                                source_ref=tc.tool_output_ref,
-                                notes_limitations=(
-                                    f"Query derived from structured_query "
-                                    f"mentioned_entities (no Step 5 compound candidate). "
-                                    f"Raw payload at tool_output_ref={tc.tool_output_ref}."
-                                ),
-                            ))
+
+        tool_calls: list[ToolCallRecord] = []
+        all_raw_hits = []
+        # Track which tool_calls produced at least one extracted hit so we
+        # only emit synthetic search-execution receipts for the "empty raw"
+        # case (preserves backward-compat assertions like "at least one OB
+        # row exists").
+        productive_tc_ids: set[str] = set()
+        for plan in plans[:max(1, total_limit)]:
+            for tool_name in plan.tools:
+                tc, hits = self._call_and_extract(
+                    run_id=run_id,
+                    plan=plan,
+                    tool_name=tool_name,
+                    per_query_limit=per_query_limit,
+                )
+                tool_calls.append(tc)
+                if hits:
+                    productive_tc_ids.add(tc.tool_call_id)
+                    all_raw_hits.extend(hits)
+
+        merged_hits = dedup_and_sort_by_relevance(all_raw_hits)[:total_limit]
+
+        patent_records: list[PatentRecord] = []
+        # Extracted prior-art rows.
+        for m in merged_hits:
+            patent_records.append(_record_from_merged(m))
+        # Synthetic receipt rows: one per successful tool call whose payload
+        # contained no extractable hits. Keeps "at least one OB row /
+        # at least one DrugBank row" coverage for empty mock envelopes.
+        for tc in tool_calls:
+            if tc.run_status != "success":
+                continue
+            if tc.tool_call_id in productive_tc_ids:
+                continue
+            patent_records.append(_record_from_receipt(tc))
 
         review_status = self._status(tool_calls, patent_records)
         table = PatentPriorArtTable(
@@ -305,9 +249,10 @@ class PatentIPAgent:
             patent_records=patent_records,
             tool_call_records=tool_calls,
             patent_review_notes=(
-                "Step 14 ran in MVP mode; tool wrappers may return mocked data "
-                "(`status='mocked'`). Raw upstream payloads are referenced via "
-                "tool_call_records[].tool_output_ref."
+                "Step 14 normalized prior-art rows are compact. Raw "
+                "upstream payloads are referenced via "
+                "tool_call_records[].tool_output_ref / "
+                "patent_records[].source_refs."
             ),
         )
 
@@ -321,52 +266,26 @@ class PatentIPAgent:
         return table
 
     # ── helpers ─────────────────────────────────────────────────────────
-    def _plans_for_patent(
-        self, *, tool_names: list[str], signal: str, arg_hints: dict[str, Any]
-    ) -> list[ToolInvocationPlan]:
-        def fallback() -> list[ToolInvocationPlan]:
-            return [
-                ToolInvocationPlan(
-                    tool_name=name,
-                    selection_reason="deterministic Step 14 patent fallback",
-                    arguments=_patent_argument_mapping(name, arg_hints),
-                    argument_construction_reason="deterministic patent argument mapping",
-                    selected_by="deterministic_fallback",
-                )
-                for name in tool_names
-            ]
-
-        plans = select_and_build_invocations(
-            agent_name=_AGENT_NAME,
-            step_id=_STEP_ID,
-            mcp_client=self.mcp_client,
-            llm=self.llm,
-            context=SelectionContext(
-                signals={signal: True, "compound_name": bool(arg_hints.get("compound_name"))},
-                arg_hints=arg_hints,
-                note=f"step_14 {signal}",
-            ),
-            deterministic_fallback=fallback,
-            deterministic_argument_mapping=_patent_argument_mapping,
-        )
-        selected = [p for p in plans if p.tool_name in set(tool_names)]
-        return selected or fallback()
-
-    def _call_tool(
+    def _call_and_extract(
         self,
         *,
         run_id: str,
+        plan: _QueryPlan,
         tool_name: str,
-        kwargs: dict[str, Any],
-        label: str,
-        extra_input_summary: Optional[dict[str, Any]] = None,
-    ) -> ToolCallRecord:
+        per_query_limit: int,
+    ) -> tuple[ToolCallRecord, list]:
+        arg_hints = _arg_hints_for_plan(plan, per_query_limit=per_query_limit)
+        invocation = self._invocation_plan(
+            tool_name=tool_name, plan=plan, arg_hints=arg_hints
+        )
         tc_id = new_tool_call_id()
         started = now_iso()
         result = self.mcp_client.call_tool(
-            agent_name=_AGENT_NAME, step_id=_STEP_ID, tool_name=tool_name, **kwargs
+            agent_name=_AGENT_NAME, step_id=_STEP_ID,
+            tool_name=invocation.tool_name, **invocation.arguments,
         )
         finished = now_iso()
+
         output_ref = None
         output_artifact_id = None
         if "payload" in result:
@@ -375,39 +294,83 @@ class PatentIPAgent:
                 run_id, "tool_outputs", "step_14", f"{tc_id}.json"
             )
             self.storage.write_json(output_key, {
-                "tool_call_id": tc_id, "tool_name": tool_name,
-                "label": label, "input": kwargs, "output": result["payload"],
+                "tool_call_id": tc_id, "tool_name": invocation.tool_name,
+                "label": _label_for_plan(plan), "input": invocation.arguments,
+                "output": result["payload"],
             })
             output_ref = output_key
-        return ToolCallRecord(
-            tool_call_id=tc_id, tool_name=tool_name,
+
+        summary: dict[str, Any] = {
+            "label": _label_for_plan(plan),
+            **invocation.arguments,
+            "candidate_id": plan.candidate_id,
+            "shortlist_source": plan.shortlist_source,
+            "query_role": plan.role,
+            "query_term": plan.term,
+            "query_term_source": plan.term_source,
+            **_selection_summary(invocation),
+        }
+        tc = ToolCallRecord(
+            tool_call_id=tc_id, tool_name=invocation.tool_name,
             agent_name=_AGENT_NAME, step_id=_STEP_ID,
             run_status=result.get("run_status", "pending"),
             started_at=started, finished_at=finished,
-            tool_input_summary={"label": label, **kwargs, **(extra_input_summary or {})},
+            tool_input_summary=summary,
             tool_output_artifact_id=output_artifact_id,
             tool_output_ref=output_ref,
             error_message=result.get("error_message"),
         )
 
-    @staticmethod
-    def _record(
-        *, candidate_id: str, matched_entity_type: str,
-        matched_material_id: Optional[str], source_database: str,
-        source_ref: Optional[str], notes_limitations: Optional[str],
-    ) -> PatentRecord:
-        return PatentRecord(
-            patent_record_id=new_artifact_id("patent_record"),
-            candidate_id=candidate_id,
-            matched_entity_type=matched_entity_type,  # type: ignore[arg-type]
-            matched_material_id=matched_material_id,
-            source_database=source_database,  # type: ignore[arg-type]
-            source_ref=source_ref,
-            notes_limitations=notes_limitations,
+        hits: list = []
+        if tc.run_status == "success" and "payload" in result:
+            hits = extract_hits(
+                result["payload"],
+                source_tool=invocation.tool_name,
+                source_database=_TOOL_SOURCE_DB.get(invocation.tool_name, "other"),
+                source_ref=output_ref,
+                query_role=plan.role,
+                query_term=plan.term,
+                query_term_source=plan.term_source,
+                candidate_id=plan.candidate_id or "",
+            )
+        return tc, hits
+
+    def _invocation_plan(
+        self, *, tool_name: str, plan: _QueryPlan, arg_hints: dict[str, Any]
+    ) -> ToolInvocationPlan:
+        def fallback() -> list[ToolInvocationPlan]:
+            return [
+                ToolInvocationPlan(
+                    tool_name=tool_name,
+                    selection_reason="deterministic Step 14 hint-driven plan",
+                    arguments=_patent_argument_mapping(tool_name, arg_hints),
+                    argument_construction_reason="deterministic patent argument mapping",
+                    selected_by="deterministic_fallback",
+                )
+            ]
+
+        plans = select_and_build_invocations(
+            agent_name=_AGENT_NAME,
+            step_id=_STEP_ID,
+            mcp_client=self.mcp_client,
+            llm=self.llm,
+            context=SelectionContext(
+                signals={"query_role": plan.role, "compound_name": bool(arg_hints.get("compound_name"))},
+                arg_hints=arg_hints,
+                note=f"step_14 role={plan.role}",
+            ),
+            deterministic_fallback=fallback,
+            deterministic_argument_mapping=_patent_argument_mapping,
         )
+        for p in plans:
+            if p.tool_name == tool_name:
+                return p
+        return fallback()[0]
 
     @staticmethod
-    def _status(calls: list[ToolCallRecord], records: list[PatentRecord]) -> str:
+    def _status(
+        calls: list[ToolCallRecord], records: list[PatentRecord]
+    ) -> str:
         if not calls:
             return "failed"
         any_success = any(t.run_status == "success" for t in calls)
@@ -421,22 +384,216 @@ class PatentIPAgent:
         return "partial"
 
 
+# ── query-plan construction ─────────────────────────────────────────────────
+
+
+def _build_query_plans(
+    *,
+    downstream_hints: list[dict],
+    compound_candidates: list[dict],
+    scope_source: str,
+    sq_entities: Optional[dict],
+) -> Iterable[_QueryPlan]:
+    """Build the deterministic order of patent-search plans.
+
+    Order: hint-driven entity plans (in `_ROLE_PRIORITY`) → inferred
+    expansion (`conjugation_chemistry`, `use_or_indication`) →
+    candidate-bound compound flow (PubChem on `pubchem_cid`, DrugBank+OB on
+    payload/linker/compound name) → structured_query payload-text fallback
+    when neither hint nor candidate produced a query.
+    """
+    yielded_anything = False
+    # Hint-driven entity plans.
+    by_role: dict[str, list[dict]] = {}
+    for h in downstream_hints or []:
+        role = h.get("role")
+        if role:
+            by_role.setdefault(role, []).append(h)
+    for role in _ROLE_PRIORITY:
+        for hint in by_role.get(role, []):
+            entity = (hint.get("entity") or "").strip()
+            if not entity:
+                continue
+            shortlist = _hint_source_to_shortlist(hint.get("source") or "")
+            yield _QueryPlan(
+                role=role,
+                term=entity,
+                term_source=hint.get("source") or "downstream_query_hints",
+                tools=_TEXT_TOOLS,
+                shortlist_source=shortlist,
+                matched_entity_type=_entity_type_for_role(role),
+            )
+            yielded_anything = True
+
+    # Inferred expansion: conjugation_chemistry / use_or_indication.
+    payload_hints = (
+        by_role.get("linker_payload", []) + by_role.get("payload", []) + by_role.get("linker", [])
+    )
+    if payload_hints:
+        entity = (payload_hints[0].get("entity") or "").strip()
+        if entity:
+            yield _QueryPlan(
+                role="conjugation_chemistry",
+                term=f"{entity} conjugation chemistry",
+                term_source="inferred_expansion",
+                tools=_TEXT_TOOLS,
+                shortlist_source="step_05_downstream_hint",
+                matched_entity_type="linker_payload",
+            )
+    target_hints = by_role.get("target", [])
+    if target_hints:
+        entity = (target_hints[0].get("entity") or "").strip()
+        if entity:
+            yield _QueryPlan(
+                role="use_or_indication",
+                term=f"{entity} use indication",
+                term_source="inferred_expansion",
+                tools=_TEXT_TOOLS,
+                shortlist_source="step_05_downstream_hint",
+                matched_entity_type="target",
+            )
+
+    # Candidate-bound compound flow.
+    for cand in compound_candidates:
+        cid = cand.get("candidate_id") or ""
+        # PubChem on pubchem_cid identifier.
+        for ident in cand.get("identifiers") or []:
+            if ident.get("id_type") != "pubchem_cid":
+                continue
+            cid_value = ident.get("id_value")
+            if not cid_value:
+                continue
+            yield _QueryPlan(
+                role="compound",
+                term=str(cid_value),
+                term_source="candidate_identifier.pubchem_cid",
+                tools=("PubChem_get_associated_patents_by_CID",),
+                shortlist_source=scope_source,
+                candidate_id=cid,
+                matched_entity_type="compound",
+            )
+            yielded_anything = True
+        # DrugBank + Orange Book on payload/linker/compound name materials.
+        name = _first_material_value(cand, {"payload_name", "linker_name", "compound_name"})
+        if name:
+            yield _QueryPlan(
+                role=_entity_role_for_compound(cand),
+                term=name,
+                term_source="candidate_material",
+                tools=_TEXT_TOOLS,
+                shortlist_source=scope_source,
+                candidate_id=cid,
+                matched_entity_type=_entity_type_for_role(_entity_role_for_compound(cand)),
+            )
+            yielded_anything = True
+
+    # Structured-query payload-text fallback when nothing else fired.
+    if not yielded_anything and sq_entities:
+        sq_text = sq_entities.get("payload_text") or sq_entities.get("linker_text")
+        if sq_text:
+            yield _QueryPlan(
+                role="payload",
+                term=str(sq_text),
+                term_source="mentioned_entities.payload_text",
+                tools=_TEXT_TOOLS,
+                shortlist_source="step_02_structured_query",
+                matched_entity_type="payload",
+            )
+
+
+def _hint_source_to_shortlist(source: str) -> str:
+    if source.startswith("mentioned_entities."):
+        return "step_02_structured_query"
+    return "step_05_downstream_hint"
+
+
+def _entity_role_for_compound(candidate: dict) -> str:
+    materials = candidate.get("materials") or []
+    types = {m.get("material_type") for m in materials}
+    if "payload_name" in types and "linker_name" in types:
+        return "linker_payload"
+    if "payload_name" in types:
+        return "payload"
+    if "linker_name" in types:
+        return "linker"
+    return "compound"
+
+
+def _entity_type_for_role(role: str) -> str:
+    mapping = {
+        "linker_payload": "linker_payload",
+        "payload": "payload",
+        "linker": "linker",
+        "compound": "compound",
+        "target": "target",
+        "complete_adc": "full_adc_construct",
+        "antibody": "antibody_sequence",
+        "conjugation_chemistry": "linker_payload",
+        "use_or_indication": "target",
+    }
+    return mapping.get(role, "unknown")
+
+
+def _arg_hints_for_plan(plan: _QueryPlan, *, per_query_limit: int) -> dict[str, Any]:
+    if plan.role == "compound" and plan.term and plan.term.isdigit():
+        return {
+            "cid": plan.term,
+            "pubchem_cid": plan.term,
+            "query": plan.term,
+            "limit": per_query_limit,
+        }
+    return {
+        "drug_name_or_id": plan.term,
+        "brand_name": plan.term,
+        "compound_name": plan.term,
+        "query": plan.term,
+        "limit": per_query_limit,
+    }
+
+
+def _label_for_plan(plan: _QueryPlan) -> str:
+    base = f"{plan.role}:{plan.term}"
+    if plan.candidate_id:
+        return f"{base}|candidate={plan.candidate_id}"
+    return base
+
+
+def _patent_argument_mapping(tool_name: str, arg_hints: dict) -> dict[str, Any]:
+    if tool_name == "PubChem_get_associated_patents_by_CID":
+        return {"cid": arg_hints.get("cid") or arg_hints.get("pubchem_cid") or ""}
+    if tool_name == "drugbank_get_drug_references_by_drug_name_or_id":
+        return {
+            "drug_name_or_id": (
+                arg_hints.get("drug_name_or_id")
+                or arg_hints.get("compound_name")
+                or arg_hints.get("query")
+                or ""
+            )
+        }
+    if tool_name == "FDA_OrangeBook_get_patent_info":
+        return {
+            "brand_name": (
+                arg_hints.get("brand_name")
+                or arg_hints.get("compound_name")
+                or arg_hints.get("query")
+                or ""
+            )
+        }
+    return {"query": arg_hints.get("query") or arg_hints.get("compound_name") or ""}
+
+
 def _resolve_scope(
     *,
     ranking: Optional[dict],
     handoff: Optional[dict],
     cct_candidate_ids: list,
 ) -> tuple[set[str], str]:
-    """Return (allowed_candidate_ids, source).
+    """Return (allowed_candidate_ids, source) for candidate-bound queries.
 
     Precedence:
     1. `step_12_ranking` — when ranking_status="completed" AND ranked candidates exist.
     2. `step_10_handoff` — when scoring_handoff_package was prepared.
     3. `step_05_candidates` — final fallback over the full Step 5 list.
-
-    Returning `set()` means "no Step 5 candidate filter" — the agent will scan
-    every compound candidate, and the structured_query payload-text fallback
-    further down may still produce queries when even Step 5 is empty.
     """
     if ranking and ranking.get("ranking_status") == "completed":
         ranked = {rc.get("candidate_id") for rc in ranking.get("ranked_candidates") or []}
@@ -460,28 +617,6 @@ def _first_material_value(candidate: dict, types: set[str]) -> Optional[str]:
     return None
 
 
-def _entity_type_for(candidate: dict) -> str:
-    materials = candidate.get("materials") or []
-    types = {m.get("material_type") for m in materials}
-    if "payload_name" in types and "linker_name" in types:
-        return "linker_payload"
-    if "payload_name" in types:
-        return "payload"
-    if "linker_name" in types:
-        return "linker"
-    return "compound"
-
-
-def _patent_argument_mapping(tool_name: str, arg_hints: dict) -> dict[str, Any]:
-    if tool_name == "PubChem_get_associated_patents_by_CID":
-        return {"cid": arg_hints.get("cid") or arg_hints.get("pubchem_cid") or ""}
-    if tool_name == "drugbank_get_drug_references_by_drug_name_or_id":
-        return {"drug_name_or_id": arg_hints.get("drug_name_or_id") or arg_hints.get("compound_name") or arg_hints.get("query") or ""}
-    if tool_name == "FDA_OrangeBook_get_patent_info":
-        return {"brand_name": arg_hints.get("brand_name") or arg_hints.get("compound_name") or arg_hints.get("query") or ""}
-    return {"query": arg_hints.get("query") or arg_hints.get("compound_name") or ""}
-
-
 def _selection_summary(plan: ToolInvocationPlan) -> dict[str, Any]:
     return {
         "selected_by": plan.selected_by,
@@ -491,3 +626,84 @@ def _selection_summary(plan: ToolInvocationPlan) -> dict[str, Any]:
         "validation_status": plan.validation_status,
         "validation_warnings": plan.validation_warnings,
     }
+
+
+# ── record assembly ─────────────────────────────────────────────────────────
+
+
+def _record_from_merged(m: MergedHit) -> PatentRecord:
+    # Orange-Book-sourced rows keep regulatory entity type for backward
+    # compatibility with downstream consumers; PubChem rows are compound;
+    # other sources inherit from the query role.
+    if "FDA_OrangeBook" in m.sources:
+        matched_entity = "drug_application_or_regulatory_reference"
+    elif "PubChem" in m.sources:
+        matched_entity = "compound"
+    else:
+        matched_entity = _entity_type_for_role(m.query_role or "unknown")
+
+    rationale = "; ".join(m.rationale) if m.rationale else None
+    return PatentRecord(
+        patent_record_id=new_artifact_id("patent_record"),
+        candidate_id=m.candidate_id or "",
+        matched_entity_type=matched_entity,  # type: ignore[arg-type]
+        matched_material_id=None,
+        source_database=(
+            m.source_database
+            if m.source_database in {"PubChem", "DrugBank", "FDA_OrangeBook", "USPTO"}
+            else "other"
+        ),  # type: ignore[arg-type]
+        patent_title=m.title,
+        patent_number=m.patent_number,
+        publication_date=m.publication_date,
+        assignee=m.assignee,
+        source_url=m.link,
+        source_ref=m.source_refs[0] if m.source_refs else None,
+        notes_limitations=(
+            "Prior-art row derived from compact extraction; full claims / "
+            "description / abstract remain in tool_output_ref artifacts."
+        ),
+        query_role=m.query_role,
+        query_term=m.query_term,
+        query_term_source=m.query_term_source,
+        publication_year=m.publication_year,
+        jurisdiction=m.jurisdiction,
+        claim_focus=m.claim_focus,
+        sources=list(m.sources),
+        source_refs=list(m.source_refs),
+        ip_relevance_score=round(m.score, 3),
+        relevance_rationale=rationale,
+    )
+
+
+def _record_from_receipt(tc: ToolCallRecord) -> PatentRecord:
+    """Synthetic record for a successful tool call whose payload had no
+    extractable hits (e.g. default mock envelopes with empty `records: []`).
+    Carries no patent_number / title so downstream tests can ignore it
+    when checking real prior-art rows.
+    """
+    summary = tc.tool_input_summary or {}
+    db = _TOOL_SOURCE_DB.get(tc.tool_name, "other")
+    if db == "FDA_OrangeBook":
+        matched_entity = "drug_application_or_regulatory_reference"
+    elif db == "PubChem":
+        matched_entity = "compound"
+    else:
+        matched_entity = _entity_type_for_role(summary.get("query_role") or "unknown")
+    return PatentRecord(
+        patent_record_id=new_artifact_id("patent_record"),
+        candidate_id=summary.get("candidate_id") or "",
+        matched_entity_type=matched_entity,  # type: ignore[arg-type]
+        matched_material_id=None,
+        source_database=db if db in {"PubChem", "DrugBank", "FDA_OrangeBook", "USPTO"} else "other",  # type: ignore[arg-type]
+        source_ref=tc.tool_output_ref,
+        notes_limitations=(
+            "Search-execution receipt; raw payload contained no extractable "
+            "patent hits. Raw payload remains in tool_output_ref."
+        ),
+        query_role=summary.get("query_role"),
+        query_term=summary.get("query_term"),
+        query_term_source=summary.get("query_term_source"),
+        sources=[db] if db != "other" else [],
+        source_refs=[tc.tool_output_ref] if tc.tool_output_ref else [],
+    )

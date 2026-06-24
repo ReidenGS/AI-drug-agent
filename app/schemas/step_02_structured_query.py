@@ -85,9 +85,11 @@ class NormalizedEntity(BaseModel):
 class EntityComponent(BaseModel):
     role: Literal["antibody", "payload", "linker", "linker_payload", "other"] = "other"
     canonical_name: str
+    component_type: Optional[str] = None
     canonical_id: Optional[str] = None
     canonical_id_source: Optional[str] = None
     inferred: bool = True
+    source: Optional[str] = None
     notes: Optional[str] = None
 
 

@@ -58,6 +58,18 @@ class PatentRecord(BaseModel):
     source_url: Optional[str] = None
     source_ref: Optional[str] = None
     notes_limitations: Optional[str] = None
+    # ── Step 14 systematic prior-art normalization additive fields ─────
+    # Compact provenance / scoring; raw payload stays out by design.
+    query_role: Optional[str] = None
+    query_term: Optional[str] = None
+    query_term_source: Optional[str] = None
+    publication_year: Optional[int] = None
+    jurisdiction: Optional[str] = None
+    claim_focus: Optional[str] = None
+    sources: list[str] = Field(default_factory=list)
+    source_refs: list[str] = Field(default_factory=list)
+    ip_relevance_score: Optional[float] = None
+    relevance_rationale: Optional[str] = None
 
 
 class PatentPriorArtTable(BaseModel):

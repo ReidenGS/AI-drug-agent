@@ -9,12 +9,13 @@ import pytest
 import app.deps as deps
 from app.llm.gemini_provider import GeminiProvider
 from app.llm.provider import MockLLMProvider
-from app.settings import get_settings
+from app.settings import Settings, get_settings
 
 
 def _clear_caches() -> None:
     for fn in (
         get_settings,
+        deps.get_settings,
         deps.get_storage,
         deps.get_registry_service,
         deps.get_workflow_state_service,
@@ -22,12 +23,15 @@ def _clear_caches() -> None:
         deps.get_mcp_client,
         deps.get_llm_provider,
     ):
-        fn.cache_clear()
+        cache_clear = getattr(fn, "cache_clear", None)
+        if cache_clear:
+            cache_clear()
 
 
 @pytest.fixture(autouse=True)
 def _reset(monkeypatch):
     _clear_caches()
+    monkeypatch.setattr(deps, "get_settings", lambda: Settings(_env_file=None))
     yield
     _clear_caches()
 
@@ -36,6 +40,14 @@ def test_default_provider_is_mock(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "mock")
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     assert isinstance(deps.get_llm_provider(), MockLLMProvider)
+
+
+def test_provider_selection_tests_ignore_project_dotenv(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    settings = deps.get_settings()
+    assert settings.llm_provider == "openai"
+    assert settings.openai_api_key == ""
 
 
 def test_gemini_api_key_alone_does_not_select_gemini(monkeypatch):
@@ -114,3 +126,54 @@ def test_default_gemini_model_is_2_5_flash():
     from app.settings import Settings
 
     assert Settings.model_fields["gemini_model"].default == "gemini-3.5-flash"
+
+
+# ── OpenAI provider selection ───────────────────────────────────────────────
+
+
+from app.llm.openai_provider import OpenAIProvider  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "raw_value",
+    ["openai", "OpenAI", "OPENAI", "  openai  ", "OpEnAi"],
+    ids=lambda v: repr(v),
+)
+def test_openai_case_variants_all_select_openai(monkeypatch, raw_value):
+    monkeypatch.setenv("LLM_PROVIDER", raw_value)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-key")
+    assert isinstance(deps.get_llm_provider(), OpenAIProvider)
+
+
+def test_explicit_openai_requires_key(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(ValueError) as excinfo:
+        deps.get_llm_provider()
+    msg = str(excinfo.value)
+    assert "OPENAI_API_KEY" in msg
+    # No key material leakage in the error.
+    assert "sk-" not in msg
+
+
+def test_openai_api_key_alone_does_not_select_openai(monkeypatch):
+    """Mirrors the Gemini guard: a key in env must NOT silently flip the
+    provider; only explicit ``LLM_PROVIDER=openai`` does."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-key")
+    assert isinstance(deps.get_llm_provider(), MockLLMProvider)
+
+
+def test_openai_model_env_value_is_passed_to_provider(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-key")
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-4.1-nano")
+    provider = deps.get_llm_provider()
+    assert isinstance(provider, OpenAIProvider)
+    assert provider.model == "gpt-4.1-nano"
+
+
+def test_default_openai_model_pinned():
+    from app.settings import Settings
+
+    assert Settings.model_fields["openai_model"].default == "gpt-4.1-mini"

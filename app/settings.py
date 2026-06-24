@@ -13,7 +13,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # set of accepted provider names. The settings layer is the single place that
 # turns user-facing forms (Gemini / GEMINI / Mock) into the lowercase
 # canonical value the rest of the codebase consumes.
-SUPPORTED_LLM_PROVIDERS: tuple[str, ...] = ("mock", "gemini")
+SUPPORTED_LLM_PROVIDERS: tuple[str, ...] = ("mock", "gemini", "openai")
 
 
 class Settings(BaseSettings):
@@ -32,13 +32,20 @@ class Settings(BaseSettings):
 
     sqs_queue_url: str = ""
 
-    llm_provider: Literal["mock", "gemini"] = "mock"
+    llm_provider: Literal["mock", "gemini", "openai"] = "mock"
     gemini_api_key: str = ""
     # Default updated 2026-06: Google's `gemini-1.5-pro` returns 404 unavailable
     # on the v1beta endpoint for many new keys. `gemini-3.5-flash` is the
     # smallest model that currently answers across all surfaces we test
     # against. Override via env when the account exposes a different model.
     gemini_model: str = "gemini-3.5-flash"
+
+    # OpenAI provider — JSON-only LLM channel; never used to call MCP tools
+    # or external biomedical APIs.
+    openai_api_key: str = ""
+    # `gpt-4.1-mini` is a small JSON-capable model. Override via env for
+    # heavier benchmark runs.
+    openai_model: str = "gpt-4.1-mini"
 
     api_key: str = "dev-key"
 

@@ -19,6 +19,21 @@ class EvidenceRecord(BaseModel):
     key_finding: str = ""
     source: str = ""
     confidence_score: float = 0.0
+    # ── Systematic review hardening (additive) ──────────────────────────────
+    # Filled when the evidence record is derived from a deduplicated literature
+    # hit (title / DOI / year / theme). Raw abstract / full payload stay in
+    # `tool_outputs/step_13/{tool_call_id}.json`; only compact references are
+    # carried here.
+    title: Optional[str] = None
+    doi: Optional[str] = None
+    link: Optional[str] = None
+    year: Optional[int] = None
+    theme: Optional[str] = None
+    query_role: Optional[str] = None
+    query_term: Optional[str] = None
+    relevance_score: Optional[float] = None
+    sources: list[str] = Field(default_factory=list)
+    source_refs: list[str] = Field(default_factory=list)
 
 
 class ScientificEvidenceTable(BaseModel):

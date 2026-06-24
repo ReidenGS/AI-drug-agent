@@ -96,6 +96,14 @@ def test_step2_target_only_request_marks_payload_gap():
     assert any("payload" in w.lower() for w in sq.parse_warnings)
 
 
+def test_step2_prompt_requires_component_canonical_name():
+    assert "entity_decompositions[].components[]" in SUPERVISOR_SYSTEM_PROMPT
+    assert "MUST use\n  `canonical_name`" in SUPERVISOR_SYSTEM_PROMPT
+    assert "Do NOT use `component_name`" in SUPERVISOR_SYSTEM_PROMPT
+    assert "`name`, `label`, or `value`" in SUPERVISOR_SYSTEM_PROMPT
+    assert "when known, `component_type`" in SUPERVISOR_SYSTEM_PROMPT
+
+
 @pytest.mark.parametrize(
     "query,id_type,value",
     [

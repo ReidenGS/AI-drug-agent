@@ -240,17 +240,20 @@ def test_step14_uses_step12_ranking_shortlist_for_compound_targets(
         workflow_state=workflow_state_service, mcp_client=_mcp(),
     ).run(run_id)
 
-    # Every compound-search call should reference the ranked candidate.
-    compound_calls = [
+    # Every candidate-bound compound-search call should reference the ranked
+    # candidate. Hint-driven entity-level calls (target / complete_adc /
+    # antibody / inferred conjugation / use_or_indication) are not bound to
+    # a single candidate and are exercised by other tests.
+    candidate_bound = [
         tc for tc in table.tool_call_records
         if tc.tool_name in {
             "drugbank_get_drug_references_by_drug_name_or_id",
             "FDA_OrangeBook_get_patent_info",
             "PubChem_get_associated_patents_by_CID",
-        }
+        } and (tc.tool_input_summary or {}).get("candidate_id")
     ]
-    assert compound_calls
-    for tc in compound_calls:
+    assert candidate_bound
+    for tc in candidate_bound:
         assert tc.tool_input_summary["candidate_id"] == ranked_id
         assert tc.tool_input_summary["shortlist_source"] == "step_12_ranking"
 

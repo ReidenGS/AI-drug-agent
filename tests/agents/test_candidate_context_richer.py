@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from app.agents.candidate_context_agent import CandidateContextAgent
 from app.mcp.client import LocalMCPClient
 from app.services.input_readiness_service import InputReadinessService
@@ -21,6 +23,7 @@ def _bootstrap(
     local_storage, registry_service, workflow_state_service, *,
     target="HER2", candidate="Trastuzumab", payload=None, linker=None,
     referenced_inputs=None, uploaded_files=None, raw_context=None,
+    entity_decompositions=None,
 ):
     intake = IntakeService(local_storage, registry_service, workflow_state_service)
     rec = intake.submit(
@@ -44,6 +47,7 @@ def _bootstrap(
             linker_text=linker,
         ),
         referenced_inputs=referenced_inputs or [],
+        entity_decompositions=entity_decompositions or [],
     )
     sq_id = new_artifact_id("structured_query")
     local_storage.write_json(
@@ -206,6 +210,213 @@ def test_step5_smiles_referenced_input_becomes_payload_smiles(
     assert "payload_smiles" in mt or "compound_smiles" in mt
 
 
+def test_step5_extracts_explicit_payload_and_linker_smiles_from_raw_context(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        payload="CCO", linker="vc-MMAE",
+        raw_context={
+            "target_or_antigen_text": "HER2",
+            "candidate_text": "Trastuzumab",
+            "payload_linker_text": "vc-MMAE (payload SMILES CCO; linker SMILES NCC(=O)O)",
+        },
+    )
+    table = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
+    assert any(
+        m.material_type == "payload_smiles" and m.value == "CCO"
+        for c in table.candidate_records for m in c.materials
+    )
+    assert any(
+        m.material_type == "linker_smiles" and m.value == "NCC(=O)O"
+        for c in table.candidate_records for m in c.materials
+    )
+
+
+def test_step5_routes_name_materials_to_chembl_molecules_not_substructure(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        payload="MMAE",
+        linker="valine-citrulline",
+        raw_context={
+            "target_or_antigen_text": "HER2",
+            "candidate_text": "Trastuzumab",
+            "payload_linker_text": "MMAE with valine-citrulline linker",
+        },
+    )
+    calls: list[tuple[str, dict]] = []
+
+    def _record(tool_name: str, payload: dict):
+        def _fn(**kwargs):
+            calls.append((tool_name, kwargs))
+            return payload
+        return _fn
+
+    agent = CandidateContextAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={
+            "SAbDab_search_structures": _record("SAbDab_search_structures", {"hits": []}),
+            "ChEMBL_search_molecules": _record("ChEMBL_search_molecules", {"molecules": []}),
+            "ChEMBL_search_substructure": _record("ChEMBL_search_substructure", {"molecules": []}),
+        }),
+    )
+    table = agent.run(run_id)
+
+    chembl_calls = [c for c in calls if c[0].startswith("ChEMBL")]
+    assert ("ChEMBL_search_molecules", {"query": "MMAE"}) in chembl_calls
+    assert ("ChEMBL_search_molecules", {"query": "valine-citrulline"}) in chembl_calls
+    assert not any(name == "ChEMBL_search_substructure" for name, _ in chembl_calls)
+    persisted = local_storage.read_json(local_storage.run_key(run_id, "candidate_context_table.json"))
+    summaries = [
+        tc["tool_input_summary"] for tc in persisted["tool_call_records"]
+        if tc["tool_name"].startswith("ChEMBL")
+    ]
+    assert {s["query_kind"] for s in summaries} == {"name"}
+    assert {s["query"] for s in summaries}.issuperset({"MMAE", "valine-citrulline"})
+    assert table.context_build_status in {"ok", "partial"}
+
+
+def test_step5_routes_smiles_materials_to_chembl_substructure(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        payload="MMAE",
+        raw_context={
+            "target_or_antigen_text": "HER2",
+            "candidate_text": "Trastuzumab",
+            "payload_linker_text": "MMAE payload SMILES CCO",
+        },
+    )
+    calls: list[tuple[str, dict]] = []
+
+    def _record(tool_name: str, payload: dict):
+        def _fn(**kwargs):
+            calls.append((tool_name, kwargs))
+            return payload
+        return _fn
+
+    agent = CandidateContextAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={
+            "SAbDab_search_structures": _record("SAbDab_search_structures", {"hits": []}),
+            "ChEMBL_search_molecules": _record("ChEMBL_search_molecules", {"molecules": []}),
+            "ChEMBL_search_substructure": _record("ChEMBL_search_substructure", {"molecules": []}),
+        }),
+    )
+    agent.run(run_id)
+
+    assert ("ChEMBL_search_molecules", {"query": "MMAE"}) in calls
+    assert ("ChEMBL_search_substructure", {"smiles": "CCO"}) in calls
+    persisted = local_storage.read_json(local_storage.run_key(run_id, "candidate_context_table.json"))
+    sub = [
+        tc for tc in persisted["tool_call_records"]
+        if tc["tool_name"] == "ChEMBL_search_substructure"
+    ]
+    assert sub
+    assert all(tc["tool_input_summary"]["query_kind"] == "smiles" for tc in sub)
+    assert all(tc["tool_input_summary"]["query"] == "CCO" for tc in sub)
+
+
+def test_step5_skips_mixed_payload_linker_text_as_chembl_query(
+    local_storage, registry_service, workflow_state_service
+):
+    mixed = "vc-MMAE (payload SMILES CCO; linker SMILES NCC(=O)O)"
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        payload=None,
+        linker=None,
+        raw_context={
+            "target_or_antigen_text": "HER2",
+            "candidate_text": "Trastuzumab",
+            "payload_linker_text": mixed,
+        },
+    )
+    calls: list[tuple[str, dict]] = []
+
+    def _record(tool_name: str, payload: dict):
+        def _fn(**kwargs):
+            calls.append((tool_name, kwargs))
+            return payload
+        return _fn
+
+    agent = CandidateContextAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={
+            "SAbDab_search_structures": _record("SAbDab_search_structures", {"hits": []}),
+            "ChEMBL_search_molecules": _record("ChEMBL_search_molecules", {"molecules": []}),
+            "ChEMBL_search_substructure": _record("ChEMBL_search_substructure", {"molecules": []}),
+        }),
+    )
+    agent.run(run_id)
+
+    chembl_queries = [
+        kwargs.get("query") or kwargs.get("smiles")
+        for name, kwargs in calls
+        if name.startswith("ChEMBL")
+    ]
+    assert mixed not in chembl_queries
+    assert "CCO" in chembl_queries
+    assert "NCC(=O)O" in chembl_queries
+
+
+def test_step5_searches_clean_decomposition_component_names_separately(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        payload="vc-MMAE",
+        raw_context={
+            "target_or_antigen_text": "HER2",
+            "candidate_text": "Trastuzumab",
+            "payload_linker_text": "vc-MMAE",
+        },
+        entity_decompositions=[{
+            "original_text": "vc-MMAE",
+            "canonical_name": "vc-MMAE",
+            "components": [
+                {"role": "linker", "canonical_name": "valine-citrulline", "inferred": True},
+                {"role": "payload", "canonical_name": "monomethyl auristatin E", "inferred": False},
+            ],
+        }],
+    )
+    calls: list[tuple[str, dict]] = []
+
+    def _record(tool_name: str, payload: dict):
+        def _fn(**kwargs):
+            calls.append((tool_name, kwargs))
+            return payload
+        return _fn
+
+    CandidateContextAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={
+            "SAbDab_search_structures": _record("SAbDab_search_structures", {"hits": []}),
+            "ChEMBL_search_molecules": _record("ChEMBL_search_molecules", {"molecules": []}),
+            "ChEMBL_search_substructure": _record("ChEMBL_search_substructure", {"molecules": []}),
+        }),
+    ).run(run_id)
+
+    molecule_queries = [
+        kwargs.get("query") for name, kwargs in calls
+        if name == "ChEMBL_search_molecules"
+    ]
+    assert "vc-MMAE" in molecule_queries
+    assert "valine-citrulline" in molecule_queries
+    assert "monomethyl auristatin E" in molecule_queries
+    assert not any(name == "ChEMBL_search_substructure" for name, _ in calls)
+
+
 # ── 6. ZINC id becomes identifier and is NOT labeled ZINC22 ─────────────────
 
 def test_step5_zinc_id_does_not_default_to_zinc22(
@@ -267,3 +478,101 @@ def test_step5_raw_enrichment_does_not_leak_into_normalized_records(
     for tc in persisted["tool_call_records"]:
         if tc.get("run_status") == "success":
             assert tc["tool_output_ref"]
+
+
+def test_step5_promotes_chembl_smiles_and_id_for_payload_candidate(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        payload="MMAE", linker=None,
+        raw_context={
+            "target_or_antigen_text": "HER2",
+            "candidate_text": "Trastuzumab",
+            "payload_linker_text": "MMAE",
+        },
+    )
+    agent = CandidateContextAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={
+            "SAbDab_search_structures": lambda **kw: {"hits": [{"pdb_id": "1n8z"}]},
+            "ChEMBL_search_molecules": lambda **kw: {
+                "hits": [{
+                    "molecule_chembl_id": "CHEMBL1201585",
+                    "pref_name": "MONOMETHYL AURISTATIN E",
+                    "molecule_structures": {"canonical_smiles": "CCO"},
+                    "raw_match": "SECRET_RAW_FIELD_DO_NOT_LEAK",
+                }]
+            },
+        }),
+    )
+    table = agent.run(run_id)
+
+    payload_records = [
+        c for c in table.candidate_records
+        if c.candidate_type == "compound_component"
+        and any(m.material_type == "payload_name" for m in c.materials)
+    ]
+    assert payload_records
+    rec = payload_records[0]
+    assert any(i.id_type == "chembl_id" and i.id_value == "CHEMBL1201585" for i in rec.identifiers)
+    assert any(m.material_type == "payload_smiles" and m.value == "CCO" for m in rec.materials)
+
+    persisted = local_storage.read_json(
+        local_storage.run_key(run_id, "candidate_context_table.json")
+    )
+    import json
+    normalized_blob = json.dumps(persisted["candidate_records"])
+    assert "hits" not in normalized_blob
+    assert "raw_match" not in normalized_blob
+    assert "SECRET_RAW_FIELD_DO_NOT_LEAK" not in normalized_blob
+
+
+def test_step5_promotes_composite_linker_payload_smiles_as_compound_smiles(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        payload="vc-MMAE", linker=None,
+        raw_context={
+            "target_or_antigen_text": "HER2",
+            "candidate_text": "Trastuzumab",
+            "payload_linker_text": "vc-MMAE",
+        },
+        entity_decompositions=[{
+            "original_text": "vc-MMAE",
+            "canonical_name": "vc-MMAE",
+            "components": [
+                {"role": "linker", "canonical_name": "vc", "inferred": False},
+                {"role": "payload", "canonical_name": "MMAE", "inferred": False},
+            ],
+        }],
+    )
+    agent = CandidateContextAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={
+            "SAbDab_search_structures": lambda **kw: {"hits": [{"pdb_id": "1n8z"}]},
+            "ChEMBL_search_molecules": lambda **kw: {
+                "results": [{
+                    "chembl_id": "CHEMBL_COMPOSITE",
+                    "canonical_smiles": "NCCO",
+                    "name": "vc-MMAE",
+                }]
+            },
+        }),
+    )
+    table = agent.run(run_id)
+
+    compound_records = [
+        c for c in table.candidate_records
+        if c.candidate_type == "compound_component"
+    ]
+    assert compound_records
+    assert any(
+        m.material_type == "compound_smiles" and m.value == "NCCO"
+        for c in compound_records for m in c.materials
+    )

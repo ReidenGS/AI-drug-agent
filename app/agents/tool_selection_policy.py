@@ -54,6 +54,12 @@ logger = logging.getLogger(__name__)
 
 SELECTION_POLICY_VERSION = "v1"
 
+# Tightly cap how many tools the per-candidate Stage 1 may pick for any single
+# lane. Together with the "1 Stage 1 + 1 Stage 2 per candidate" call schedule
+# this bounds the LLM budget so a 5-candidate Step 6 stays under ~10 LLM
+# calls (vs. ~42 in the per-lane / per-tool layout).
+MAX_LLM_SELECTED_TOOLS_PER_LANE = 2
+
 
 # ── shared Stage 1 / Stage 2 prompt contract ────────────────────────────────
 #
@@ -124,6 +130,71 @@ Rules:
 SELECTION_STAGE2_USER_PROMPT = (
     "Construct arguments for the selected tool. Use only the provided "
     "official schema and the arg_hints / note from context."
+)
+
+
+# ── Per-candidate multi-lane prompts (1 Stage 1 + 1 Stage 2 per candidate) ──
+#
+# Used exclusively by `select_and_build_per_candidate_invocations`. The
+# regular Stage 1 / Stage 2 prompts above remain in place for callers that
+# still use the legacy one-lane-per-call path (Step 9 / Step 13 / Step 14).
+
+
+SELECTION_STAGE1_MULTI_LANE_SYSTEM_PROMPT = """You are choosing MCP tools for ONE candidate across MULTIPLE lanes.
+
+Rules:
+
+1. You receive ONE compact catalog of tools the current agent is allowed
+   to call. Every entry is in scope — you must not reference any tool
+   outside this catalog.
+2. You also receive `lanes`. Each lane has its own `lane_type`,
+   `allowed_tools`, and `signals`. ONLY pick tools from each lane's
+   `allowed_tools` list — never propose a tool for a lane that is not in
+   that lane's allowed_tools.
+3. For each lane, propose ZERO or more selections from its allowed_tools.
+   Hard cap: `max_tools_per_lane` selections per lane. Returning fewer is
+   allowed; returning more will be truncated.
+4. Each selection is one JSON object:
+   {"lane_type":"...","tool_name":"...","selection_reason":"short text",
+    "priority":<int>,"required_context":["..."]}.
+   Do NOT construct arguments — Stage 2 handles arguments for survivors.
+5. Do NOT invent tool names. Do NOT request `_live`. Do NOT request raw
+   payloads. Return EXACTLY ONE JSON object with `selections`:[...]. No
+   prose, no markdown, no tool calls.
+""".strip()
+
+
+SELECTION_STAGE1_MULTI_LANE_USER_PROMPT = (
+    "Pick tools per lane for this candidate. Use tool_name + lane_type only "
+    "— Stage 2 will handle arguments. Respect each lane's allowed_tools and "
+    "the per-lane tool cap."
+)
+
+
+SELECTION_STAGE2_MULTI_TOOL_SYSTEM_PROMPT = """You are constructing ARGUMENTS for the tools selected for ONE candidate.
+
+Rules:
+
+1. You receive a list of `tools`. Each entry has `lane_type`, `tool_name`,
+   the official `full_schema`, and `arg_hints` for that lane. Construct
+   arguments ONLY from the matching `arg_hints`. Do NOT invent identifiers
+   (SMILES, PDB IDs, UniProt accessions, ChEMBL IDs, brand names, …).
+2. If a required field is missing from a tool's `arg_hints`, leave the
+   field out and continue. Do NOT guess.
+3. Output MUST NOT include the `_live` knob. That flag is set by the MCP
+   client, never by the model.
+4. Do NOT call the tool. Do NOT request additional schema or catalog
+   entries. You are an argument-construction step, not an execution step.
+5. Return EXACTLY ONE JSON object of the shape:
+   {"tools":[{"lane_type":"...","tool_name":"...","arguments":{...},
+              "argument_construction_reason":"short text"}, ...]}.
+   No prose, no markdown, no tool calls.
+""".strip()
+
+
+SELECTION_STAGE2_MULTI_TOOL_USER_PROMPT = (
+    "Construct arguments for the listed tools using each tool's per-lane "
+    "arg_hints and official schema."
 )
 
 
@@ -768,3 +839,292 @@ def _skipped_plan(
         validation_status="skipped",
         validation_warnings=list(validation_warnings),
     )
+
+
+# ── Per-candidate multi-lane selection (Step 6) ─────────────────────────────
+
+
+@dataclass(slots=True)
+class LaneSelectionRequest:
+    """Per-lane payload shipped into the per-candidate selector.
+
+    `allowed_tools` is the closed set of tool names the selector may pick
+    for this lane — narrower than the agent's full Step 6 catalog so
+    cross-lane spillover is impossible.
+    `signals` and `arg_hints` follow the same semantics as
+    `SelectionContext`.
+    """
+
+    lane_type: str
+    allowed_tools: list[str]
+    signals: dict[str, bool]
+    arg_hints: dict[str, Any]
+
+
+def select_and_build_per_candidate_invocations(
+    *,
+    agent_name: str,
+    step_id: str,
+    mcp_client: MCPClient,
+    llm: LLMProvider,
+    candidate_id: str,
+    lanes: list[LaneSelectionRequest],
+    deterministic_fallback: Callable[[str], list[ToolInvocationPlan]],
+    deterministic_argument_mapping: Optional[Callable[[str, dict], dict[str, Any]]] = None,
+    max_tools_per_lane: int = MAX_LLM_SELECTED_TOOLS_PER_LANE,
+) -> dict[str, list[ToolInvocationPlan]]:
+    """One Stage 1 + one Stage 2 LLM call for a candidate, lane-aware.
+
+    Returns plans grouped by lane. Lanes with no valid LLM selection fall
+    back to ``deterministic_fallback(lane_type)`` so Step 6 still produces
+    in-lane work without ever paying more than two LLM calls per
+    candidate.
+
+    Hard guarantees (verified by tests):
+
+    - Stage 1 fires at most once.
+    - Stage 2 fires at most once (and is skipped entirely when there are
+      no survivors).
+    - Cross-lane spillover impossible: each selection must be in the
+      lane's `allowed_tools`, and Stage 2 schemas only describe survivors.
+    - `_live` never appears in either Stage 1 or Stage 2 payload.
+    """
+    out: dict[str, list[ToolInvocationPlan]] = {}
+    if not lanes:
+        return out
+
+    catalog = build_compact_catalog(
+        mcp_client=mcp_client, agent_name=agent_name, step_id=step_id
+    )
+    allowed_names = {e.tool_name for e in catalog}
+    lane_map = {l.lane_type: l for l in lanes}
+
+    if not catalog:
+        for lane in lanes:
+            out[lane.lane_type] = deterministic_fallback(lane.lane_type)
+        return out
+
+    # ── Stage 1 (one call, multi-lane payload) ──────────────────────────
+    stage1_payload: dict[str, Any] = {
+        "task": "tool_selection_stage_1_multi_lane",
+        "agent_name": agent_name,
+        "step_id": step_id,
+        "candidate_id": candidate_id,
+        "compact_catalog": [e.model_dump() for e in catalog],
+        "lanes": [
+            {
+                "lane_type": l.lane_type,
+                "allowed_tools": list(l.allowed_tools),
+                "signals": l.signals,
+            }
+            for l in lanes
+        ],
+        "max_tools_per_lane": max_tools_per_lane,
+    }
+    try:
+        stage1 = llm.generate_json(
+            SELECTION_STAGE1_MULTI_LANE_USER_PROMPT,
+            schema=stage1_payload,
+            system=SELECTION_STAGE1_MULTI_LANE_SYSTEM_PROMPT,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Stage 1 multi-lane LLM call failed (%s); using deterministic fallback", e
+        )
+        for lane in lanes:
+            out[lane.lane_type] = deterministic_fallback(lane.lane_type)
+        return out
+
+    raw_sel = (stage1 or {}).get("selections") or []
+    by_lane_raw: dict[str, list[dict]] = {}
+    seen: set[tuple[str, str]] = set()
+    for entry in raw_sel:
+        if not isinstance(entry, dict):
+            continue
+        lt = entry.get("lane_type")
+        tn = entry.get("tool_name")
+        if lt not in lane_map or not isinstance(tn, str):
+            continue
+        if tn not in allowed_names:
+            continue
+        if tn not in lane_map[lt].allowed_tools:
+            continue
+        if (lt, tn) in seen:
+            continue
+        seen.add((lt, tn))
+        by_lane_raw.setdefault(lt, []).append(entry)
+    # Hard cap per lane.
+    for lt in list(by_lane_raw):
+        if len(by_lane_raw[lt]) > max_tools_per_lane:
+            by_lane_raw[lt] = by_lane_raw[lt][:max_tools_per_lane]
+
+    # Resolve schemas (drops tools with no callable signature into skipped).
+    stage2_items: list[tuple[str, str, dict, dict]] = []  # (lane, tool, entry, schema)
+    schema_skipped: list[tuple[str, ToolInvocationPlan]] = []
+    for lt, entries in by_lane_raw.items():
+        for entry in entries:
+            tn = entry["tool_name"]
+            schema = signature_schema_for(tn)
+            if schema is None:
+                schema_skipped.append((lt, _skipped_plan(
+                    tool_name=tn,
+                    reason=entry.get("selection_reason") or "",
+                    priority=int(entry.get("priority") or 0),
+                    required_context=list(entry.get("required_context") or []),
+                    selected_by="llm",
+                    validation_warnings=["no callable signature found"],
+                )))
+            else:
+                stage2_items.append((lt, tn, entry, schema))
+
+    # ── Stage 2 skip-when-deterministic-satisfies ───────────────────────
+    # If deterministic argument mapping already produces valid args (no
+    # missing required fields) for EVERY survivor, skip Stage 2 entirely
+    # and use those deterministic args. Saves one LLM round-trip per
+    # candidate in the common Step 6 case (smiles / sequence / pdb_id
+    # signals already match the registered tools' required fields).
+    det_args_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+    skip_stage2 = False
+    if stage2_items and deterministic_argument_mapping is not None:
+        all_satisfied = True
+        candidate_args: dict[tuple[str, str], dict[str, Any]] = {}
+        for (lt, tn, _e, sch) in stage2_items:
+            det_raw = deterministic_argument_mapping(tn, lane_map[lt].arg_hints) or {}
+            det_clean, _ = validate_arguments(det_raw, sch)
+            if _missing_required(det_clean, sch):
+                all_satisfied = False
+                break
+            candidate_args[(lt, tn)] = det_clean
+        if all_satisfied:
+            skip_stage2 = True
+            det_args_by_pair = candidate_args
+
+    if skip_stage2:
+        for (lt, tn, entry, _sch) in stage2_items:
+            try:
+                plan = ToolInvocationPlan(
+                    tool_name=tn,
+                    selection_reason=entry.get("selection_reason") or "",
+                    arguments=det_args_by_pair[(lt, tn)],
+                    argument_construction_reason=(
+                        "deterministic argument mapping satisfied required fields; "
+                        "Stage 2 LLM call skipped"
+                    ),
+                    priority=int(entry.get("priority") or 0),
+                    required_context=list(entry.get("required_context") or []),
+                    selected_by="deterministic_fallback",
+                    validation_status="ok",
+                    validation_warnings=[
+                        "stage-2 skipped: deterministic mapping satisfied required args"
+                    ],
+                )
+            except ValidationError:
+                plan = _skipped_plan(
+                    tool_name=tn, reason="model_validation_failed",
+                    priority=0, required_context=[],
+                    selected_by="deterministic_fallback", validation_warnings=[],
+                )
+            out.setdefault(lt, []).append(plan)
+        for (lt, plan) in schema_skipped:
+            out.setdefault(lt, []).append(plan)
+        for lane in lanes:
+            if not out.get(lane.lane_type):
+                out[lane.lane_type] = deterministic_fallback(lane.lane_type)
+        return out
+
+    # ── Stage 2 (one call, only over survivors) ─────────────────────────
+    stage2_args: dict[tuple[str, str], dict[str, Any]] = {}
+    stage2_reason: dict[tuple[str, str], str] = {}
+    if stage2_items:
+        stage2_payload: dict[str, Any] = {
+            "task": "tool_selection_stage_2_multi_tool",
+            "agent_name": agent_name,
+            "step_id": step_id,
+            "candidate_id": candidate_id,
+            "tools": [
+                {
+                    "lane_type": lt,
+                    "tool_name": tn,
+                    "full_schema": sch,
+                    "arg_hints": lane_map[lt].arg_hints,
+                }
+                for (lt, tn, _e, sch) in stage2_items
+            ],
+        }
+        try:
+            stage2 = llm.generate_json(
+                SELECTION_STAGE2_MULTI_TOOL_USER_PROMPT,
+                schema=stage2_payload,
+                system=SELECTION_STAGE2_MULTI_TOOL_SYSTEM_PROMPT,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Stage 2 multi-tool LLM call failed (%s); arguments come from deterministic mapping",
+                e,
+            )
+            stage2 = {}
+        wanted = {(lt, tn) for (lt, tn, _e, _s) in stage2_items}
+        for t in (stage2 or {}).get("tools") or []:
+            if not isinstance(t, dict):
+                continue
+            lt = t.get("lane_type")
+            tn = t.get("tool_name")
+            if (lt, tn) not in wanted:
+                continue
+            args = t.get("arguments")
+            if isinstance(args, dict):
+                stage2_args[(lt, tn)] = args
+            reason = t.get("argument_construction_reason")
+            if isinstance(reason, str):
+                stage2_reason[(lt, tn)] = reason
+
+    # Compose ToolInvocationPlans per (lane, tool) — fall back to
+    # deterministic argument mapping when Stage 2 missed required fields.
+    for (lt, tn, entry, schema) in stage2_items:
+        proposed = stage2_args.get((lt, tn), {})
+        construct_reason = stage2_reason.get((lt, tn), "")
+        cleaned_args, arg_warnings = validate_arguments(proposed, schema)
+        selected_by: Literal["llm", "deterministic_fallback"] = "llm"
+        if _missing_required(cleaned_args, schema) and deterministic_argument_mapping is not None:
+            fb_args = deterministic_argument_mapping(tn, lane_map[lt].arg_hints) or {}
+            fb_clean, fb_warn = validate_arguments(fb_args, schema)
+            if not _missing_required(fb_clean, schema):
+                cleaned_args = fb_clean
+                arg_warnings = [*arg_warnings, *fb_warn,
+                                "stage-2 args fell back to deterministic mapping"]
+                selected_by = "deterministic_fallback"
+        status: Literal["ok", "warning", "skipped"]
+        if _missing_required(cleaned_args, schema):
+            status = "skipped"
+        elif arg_warnings:
+            status = "warning"
+        else:
+            status = "ok"
+        try:
+            plan = ToolInvocationPlan(
+                tool_name=tn,
+                selection_reason=entry.get("selection_reason") or "",
+                arguments=cleaned_args,
+                argument_construction_reason=construct_reason,
+                priority=int(entry.get("priority") or 0),
+                required_context=list(entry.get("required_context") or []),
+                selected_by=selected_by,
+                validation_status=status,
+                validation_warnings=arg_warnings,
+            )
+        except ValidationError:
+            plan = _skipped_plan(
+                tool_name=tn, reason="model_validation_failed",
+                priority=0, required_context=[],
+                selected_by="llm", validation_warnings=arg_warnings,
+            )
+        out.setdefault(lt, []).append(plan)
+
+    for (lt, plan) in schema_skipped:
+        out.setdefault(lt, []).append(plan)
+
+    for lane in lanes:
+        if not out.get(lane.lane_type):
+            out[lane.lane_type] = deterministic_fallback(lane.lane_type)
+
+    return out

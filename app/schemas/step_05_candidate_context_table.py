@@ -22,6 +22,14 @@ class Material(BaseModel):
     value_format: Optional[str] = None
     extraction_status: Literal["extracted", "pending", "failed"] = "extracted"
     validation_status: Literal["valid", "invalid", "unknown"] = "unknown"
+    # Step 5 batch-6 additions (additive, optional):
+    # `role` carries the ADC role we believe this material plays
+    # (target, antibody, payload, linker, linker_payload, structure, …)
+    # so downstream agents don't have to re-classify; `role_status`
+    # records whether that role was user-provided (explicit) or
+    # inferred from an alias decomposition.
+    role: Optional[str] = None
+    role_status: Literal["explicit", "inferred", "unknown"] = "unknown"
 
 
 class ADCLinks(BaseModel):
@@ -44,6 +52,26 @@ class CandidateRecord(BaseModel):
     adc_links: ADCLinks = Field(default_factory=ADCLinks)
     candidate_status: Literal["ready_for_step6", "partially_ready_for_step6"] = "partially_ready_for_step6"
     candidate_notes: Optional[str] = None
+    # Step 5 batch-6 additions (additive, optional). Step 5 is a material /
+    # context organization step; it must distinguish reference ADCs the user
+    # cited (e.g. T-DM1, T-DXd) from novel candidates the user actually
+    # wants the pipeline to generate. None of these fields are required by
+    # legacy callers — defaults preserve prior behavior.
+    candidate_role: Literal[
+        "reference_benchmark",
+        "comparator",
+        "partial_context",
+        "user_provided_candidate",
+        "material_only",
+        "unknown",
+    ] = "unknown"
+    is_generated_candidate: bool = False
+    context_status: Literal[
+        "complete_reference", "partial", "material_pool", "unknown"
+    ] = "unknown"
+    data_gaps: list[str] = Field(default_factory=list)
+    missing_material_roles: list[str] = Field(default_factory=list)
+    context_notes: list[str] = Field(default_factory=list)
 
 
 class CandidateContextTable(BaseModel):
@@ -58,3 +86,9 @@ class CandidateContextTable(BaseModel):
     # tool outputs stay outside `candidate_records[]` and can still be
     # audited (per IO Schema §Step 5/Step 6 tool_output_ref convention).
     tool_call_records: list[ToolCallRecord] = Field(default_factory=list)
+    # Step 5 batch-6 addition (additive): downstream-step search hints,
+    # prioritized linker-payload / payload / linker / compound / target /
+    # complete ADC. Antibody is included ONLY when the user explicitly
+    # provided one. Each entry: {"entity": str, "role": str,
+    # "explicit_or_inferred": "explicit"|"inferred", "source": str}.
+    downstream_query_hints: list[dict] = Field(default_factory=list)

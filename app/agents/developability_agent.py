@@ -12,9 +12,16 @@ from __future__ import annotations
 from typing import Any, Iterable, Optional
 
 from ..agents.tool_selection_policy import (
+    LaneSelectionRequest,
+    MAX_LLM_SELECTED_TOOLS_PER_LANE,
     SelectionContext,
     ToolInvocationPlan,
-    select_and_build_invocations,
+    select_and_build_per_candidate_invocations,
+)
+from ..agents.step_06_interpretation import (
+    aggregate_lane_risk,
+    interpret_tool_payload,
+    lane_summary as build_lane_summary,
 )
 from ..llm.provider import LLMProvider, MockLLMProvider
 from ..mcp.client import MCPClient
@@ -43,12 +50,12 @@ _LANE_TOOLS: tuple[tuple[LaneType, str, tuple[str, ...]], ...] = (
     (
         "payload_linker_compound_liability",
         "DrugProps_pains_filter",
-        ("payload_name", "linker_name", "payload_smiles", "linker_smiles", "compound_smiles"),
+        ("payload_smiles", "linker_smiles", "compound_smiles"),
     ),
     (
         "antibody_protein_sequence_liability",
         "PROSITE_scan_sequence",
-        ("antibody_name", "antibody_heavy_chain_sequence", "antibody_light_chain_sequence"),
+        ("antibody_heavy_chain_sequence", "antibody_light_chain_sequence", "target_sequence"),
     ),
     (
         "antigen_protein_feature_context",
@@ -63,9 +70,40 @@ _LANE_TOOLS: tuple[tuple[LaneType, str, tuple[str, ...]], ...] = (
     (
         "compound_bioactivity_prior_context",
         "ChEMBL_search_activities",
-        ("payload_name", "compound_name", "compound_smiles"),
+        ("compound_smiles",),
     ),
 )
+
+
+# Per-lane closed set of tool names the per-candidate LLM selector may pick.
+# Narrower than the agent's full Step 6 catalog so cross-lane spillover is
+# impossible. Order matters only for the deterministic mock selector's
+# preference; the agent treats this as an unordered allowed set.
+_LANE_ALLOWED_TOOLS: dict[str, tuple[str, ...]] = {
+    "payload_linker_compound_liability": (
+        "DrugProps_pains_filter",
+        "DrugProps_lipinski_filter",
+        "DrugProps_calculate_qed",
+        "SwissADME_calculate_adme",
+        "SwissADME_check_druglikeness",
+        "ADMETAI_predict_toxicity",
+        "ADMETAI_predict_physicochemical_properties",
+    ),
+    "antibody_protein_sequence_liability": (
+        "PROSITE_scan_sequence",
+        "IEDB_predict_mhci_binding",
+    ),
+    "antigen_protein_feature_context": (
+        "EBIProteins_get_features",
+        "EBIProteins_get_epitopes",
+    ),
+    "structure_interface_quality": (
+        "ProteinsPlus_profile_structure_quality",
+    ),
+    "compound_bioactivity_prior_context": (
+        "ChEMBL_search_activities",
+    ),
+}
 
 
 def _material_types(candidate: dict) -> set[str]:
@@ -126,11 +164,13 @@ class DevelopabilityAgent:
 
         for candidate in candidates:
             lane_results: list[LaneResult] = []
-            mat_types = _material_types(candidate)
+            candidate_id = candidate.get("candidate_id", "unknown")
 
+            # ── 1. Partition lanes into "skipped (missing input)" and "active". ──
+            active_specs: list[tuple[LaneType, str, tuple[str, ...], str]] = []
             for lane_type, fallback_tool, activator_types in _LANE_TOOLS:
-                activator_match = mat_types.intersection(activator_types)
-                if not activator_match:
+                lane_input = _lane_input(candidate, lane_type)
+                if lane_input is None:
                     lane_results.append(
                         LaneResult(
                             lane_type=lane_type,
@@ -140,35 +180,60 @@ class DevelopabilityAgent:
                             tool_call_records=[],
                             liability_flags=[],
                             lane_risk_category="unknown",
-                            lane_summary=(
-                                f"no candidate materials matched {sorted(activator_types)[0]} family"
-                            ),
+                            lane_summary=_lane_missing_summary(lane_type, activator_types),
                         )
                     )
                     continue
+                arg_value = lane_input
+                active_specs.append((lane_type, fallback_tool, activator_types, arg_value))
 
-                arg_value = _material_value(candidate, activator_types) or ""
-                context = _selection_context(candidate, lane_type, arg_value)
-                plans = select_and_build_invocations(
+            # ── 2. One Stage 1 + one Stage 2 LLM call across all active lanes. ──
+            plans_by_lane: dict[str, list[ToolInvocationPlan]] = {}
+            if active_specs:
+                requests: list[LaneSelectionRequest] = []
+                for (lane_type, _fb_tool, _act_types, arg_value) in active_specs:
+                    ctx = _selection_context(candidate, lane_type, arg_value)
+                    requests.append(
+                        LaneSelectionRequest(
+                            lane_type=lane_type,
+                            allowed_tools=list(_allowed_tools_for_lane(lane_type, ctx)),
+                            signals=dict(ctx.signals),
+                            arg_hints=dict(ctx.arg_hints),
+                        )
+                    )
+
+                fb_by_lane = {
+                    lane_type: (fb_tool, arg_value)
+                    for (lane_type, fb_tool, _act, arg_value) in active_specs
+                }
+
+                def _deterministic_for_lane(lt: str) -> list[ToolInvocationPlan]:
+                    fb_tool, arg_value = fb_by_lane[lt]
+                    return [_fallback_plan(fb_tool, arg_value)]
+
+                plans_by_lane = select_and_build_per_candidate_invocations(
                     agent_name=_AGENT_NAME,
                     step_id=_STEP_ID,
                     mcp_client=self.mcp_client,
                     llm=self.llm,
-                    context=context,
-                    deterministic_fallback=lambda ft=fallback_tool, av=arg_value: [
-                        _fallback_plan(ft, av)
-                    ],
+                    candidate_id=candidate_id,
+                    lanes=requests,
+                    deterministic_fallback=_deterministic_for_lane,
                     deterministic_argument_mapping=_deterministic_argument_mapping,
+                    max_tools_per_lane=MAX_LLM_SELECTED_TOOLS_PER_LANE,
                 )
-                if not plans:
-                    plans = [_fallback_plan(fallback_tool, arg_value)]
+
+            # ── 3. Execute the plans lane by lane and assemble lane results. ────
+            for (lane_type, fallback_tool, _act_types, arg_value) in active_specs:
+                plans = plans_by_lane.get(lane_type) or [_fallback_plan(fallback_tool, arg_value)]
 
                 tool_records: list[ToolCallRecord] = []
+                lane_flags: list[dict] = []
                 lane_input_status = "insufficient"
                 for plan in plans:
-                    tc, one_input_status = self._call_lane_plan(
+                    tc, one_input_status, payload = self._call_lane_plan(
                         run_id=run_id,
-                        candidate_id=candidate.get("candidate_id", "unknown"),
+                        candidate_id=candidate_id,
                         plan=plan,
                     )
                     tool_records.append(tc)
@@ -178,7 +243,20 @@ class DevelopabilityAgent:
                         any_lane_ran = True
                     if tc.run_status in {"failed", "dependency_unavailable"}:
                         any_lane_failed_or_dep = True
+                    if tc.run_status == "success" and payload is not None:
+                        lane_flags.extend(
+                            interpret_tool_payload(
+                                tc.tool_name,
+                                payload,
+                                source_ref=tc.tool_output_ref,
+                                lane_type=lane_type,
+                            )
+                        )
 
+                any_success = any(r.run_status == "success" for r in tool_records)
+                all_dep_unavail = bool(tool_records) and all(
+                    r.run_status == "dependency_unavailable" for r in tool_records
+                )
                 lane_results.append(
                     LaneResult(
                         lane_type=lane_type,
@@ -186,9 +264,22 @@ class DevelopabilityAgent:
                         input_status=lane_input_status,
                         selected_tools=[p.tool_name for p in plans],
                         tool_call_records=tool_records,
-                        liability_flags=[],  # never embed raw payload here
-                        lane_risk_category="unknown",
-                        lane_summary=_aggregate_lane_summary(tool_records),
+                        liability_flags=lane_flags,
+                        lane_risk_category=aggregate_lane_risk(
+                            lane_flags,
+                            any_success=any_success,
+                            all_dependency_unavailable=all_dep_unavail,
+                        ),
+                        lane_summary=_compose_lane_summary(
+                            lane_type=lane_type,
+                            candidate=candidate,
+                            base_summary=build_lane_summary(
+                                tool_records_summary=_aggregate_lane_summary(tool_records),
+                                flags=lane_flags,
+                                any_success=any_success,
+                                lane_type=lane_type,
+                            ),
+                        ),
                     )
                 )
 
@@ -244,7 +335,7 @@ class DevelopabilityAgent:
         run_id: str,
         candidate_id: str,
         plan: ToolInvocationPlan,
-    ) -> tuple[ToolCallRecord, str]:
+    ) -> tuple[ToolCallRecord, str, Any]:
         tc_id = new_tool_call_id()
         started = now_iso()
         input_status = "sufficient" if plan.arguments else "insufficient"
@@ -261,7 +352,7 @@ class DevelopabilityAgent:
                 finished_at=finished,
                 tool_input_summary=_tool_input_summary(plan, candidate_id),
                 error_message="tool invocation plan validation_status=skipped",
-            ), input_status
+            ), input_status, None
 
         result = self.mcp_client.call_tool(
             agent_name=_AGENT_NAME,
@@ -302,7 +393,7 @@ class DevelopabilityAgent:
             tool_output_artifact_id=output_artifact_id,
             tool_output_ref=output_ref,
             error_message=result.get("error_message"),
-        ), input_status
+        ), input_status, result.get("payload")
 
 
 def _selection_context(candidate: dict, lane_type: LaneType, arg_value: str) -> SelectionContext:
@@ -336,12 +427,16 @@ def _selection_context(candidate: dict, lane_type: LaneType, arg_value: str) -> 
     }
     arg_hints: dict[str, Any] = {
         "query": arg_value,
-        "smiles": smiles or arg_value,
+        "smiles": smiles,
         "sequence": sequence or arg_value,
         "protein_sequence": sequence or arg_value,
         "pdb_id_or_path": pdb_like or arg_value,
         "pdb_id": _first_identifier_value(identifiers, {"pdb_id"}) or arg_value,
         "uniprot_id": uniprot or arg_value,
+        # `accession` mirrors uniprot_id so Stage 2 / deterministic
+        # mapping can satisfy EBIProteins_get_features / _get_epitopes,
+        # whose official TU schemas require `accession`, not `query`.
+        "accession": uniprot or arg_value,
         "compound_name": compound_name or arg_value,
         "chembl_id": chembl or arg_value,
     }
@@ -352,11 +447,101 @@ def _selection_context(candidate: dict, lane_type: LaneType, arg_value: str) -> 
     )
 
 
+def _compose_lane_summary(
+    *,
+    lane_type: LaneType,
+    candidate: dict,
+    base_summary: str,
+) -> str:
+    """Wrap the base lane summary with candidate-level provenance hints.
+
+    For the compound bioactivity lane, surface whether the chembl_id used
+    by the lane came from a substructure search (upper-bound identity)
+    rather than a name-confirmed exact match. Substructure-derived prior
+    context is still valuable but should not be misread as exact identity.
+    """
+    if lane_type != "compound_bioactivity_prior_context":
+        return base_summary
+    notes = [n for n in (candidate.get("context_notes") or []) if isinstance(n, str)]
+    gaps = [g for g in (candidate.get("data_gaps") or []) if isinstance(g, str)]
+    substructure = any(
+        "substructure-derived" in n.lower() for n in notes
+    ) or any(
+        "substructure_derived" in g.lower() for g in gaps
+    )
+    if not substructure:
+        return base_summary
+    return (
+        f"{base_summary}; chembl_id origin=substructure-derived (upper-bound prior "
+        "context, not confirmed exact identity)"
+    )
+
+
+def _lane_missing_summary(lane_type: LaneType, activator_types: tuple[str, ...]) -> str:
+    """Human-readable skipped-lane summary that matches the lane's real input.
+
+    Most lanes activate off candidate ``materials`` of a specific family; the
+    bioactivity prior lane activates off a typed ``chembl_id`` identifier, so
+    its skipped summary points at the identifier family instead of a SMILES
+    family the lane does NOT use.
+    """
+    if lane_type == "compound_bioactivity_prior_context":
+        return "no candidate identifiers matched chembl_id family"
+    if lane_type == "antigen_protein_feature_context":
+        return "no candidate identifiers matched uniprot_id family"
+    return f"no candidate materials matched {sorted(activator_types)[0]} family"
+
+
+def _lane_input(candidate: dict, lane_type: LaneType) -> Optional[str]:
+    """Return the typed input that can safely drive a Step 6 lane.
+
+    This intentionally does not treat display names as typed scientific
+    inputs. A payload/linker name is not a SMILES string, an antibody name
+    is not a sequence, and a target name is not a UniProt accession.
+    """
+    materials = _materials(candidate)
+    identifiers = _identifiers(candidate)
+
+    if lane_type == "payload_linker_compound_liability":
+        return _first_material_value(
+            materials, {"payload_smiles", "linker_smiles", "compound_smiles"}
+        )
+    if lane_type == "antibody_protein_sequence_liability":
+        return _first_material_value(
+            materials,
+            {
+                "antibody_heavy_chain_sequence",
+                "antibody_light_chain_sequence",
+                "target_sequence",
+            },
+        )
+    if lane_type == "antigen_protein_feature_context":
+        return _first_identifier_value(identifiers, {"uniprot_id", "accession"})
+    if lane_type == "structure_interface_quality":
+        return (
+            _first_material_value(materials, {"structure_file", "structure_ref"})
+            or _first_identifier_value(identifiers, {"pdb_id"})
+        )
+    if lane_type == "compound_bioactivity_prior_context":
+        return _first_identifier_value(identifiers, {"chembl_id"})
+    return None
+
+
+def _allowed_tools_for_lane(lane_type: LaneType, ctx: SelectionContext) -> tuple[str, ...]:
+    """Narrow static lane tools using available typed inputs."""
+    tools = list(_LANE_ALLOWED_TOOLS.get(lane_type, ()))
+    if lane_type == "compound_bioactivity_prior_context" and not ctx.signals.get("chembl_id"):
+        # Activities lookup needs ChEMBL-style identifiers. Name-only or
+        # SMILES-only context must not be routed into this tool.
+        tools = [t for t in tools if t != "ChEMBL_search_activities"]
+    return tuple(tools)
+
+
 def _fallback_plan(tool_name: str, arg_value: str) -> ToolInvocationPlan:
     return ToolInvocationPlan(
         tool_name=tool_name,
         selection_reason="deterministic Step 6 lane fallback",
-        arguments=_deterministic_argument_mapping(tool_name, {"query": arg_value, "smiles": arg_value, "sequence": arg_value, "pdb_id_or_path": arg_value}),
+        arguments=_deterministic_argument_mapping(tool_name, {"query": arg_value}),
         argument_construction_reason="deterministic lane argument mapping",
         selected_by="deterministic_fallback",
     )
@@ -366,13 +551,22 @@ def _deterministic_argument_mapping(tool_name: str, arg_hints: dict) -> dict[str
     if tool_name == "ProteinsPlus_profile_structure_quality":
         return {"pdb_id_or_path": arg_hints.get("pdb_id_or_path") or arg_hints.get("pdb_id") or arg_hints.get("query") or ""}
     if tool_name in {"ZINC_search_by_smiles", "DrugProps_pains_filter", "DrugProps_lipinski_filter", "DrugProps_calculate_qed", "SwissADME_calculate_adme", "SwissADME_check_druglikeness", "ADMETAI_predict_toxicity", "ADMETAI_predict_physicochemical_properties"}:
-        return {"smiles": arg_hints.get("smiles") or arg_hints.get("query") or ""}
+        return {"smiles": arg_hints.get("smiles") or ""}
     if tool_name == "PROSITE_scan_sequence":
-        return {"sequence": arg_hints.get("sequence") or arg_hints.get("protein_sequence") or arg_hints.get("query") or ""}
-    if tool_name == "EBIProteins_get_features":
-        return {"query": arg_hints.get("uniprot_id") or arg_hints.get("query") or ""}
+        return {"sequence": arg_hints.get("sequence") or arg_hints.get("protein_sequence") or ""}
+    if tool_name in {"EBIProteins_get_features", "EBIProteins_get_epitopes"}:
+        # TU official schema for both EBI tools requires `accession`.
+        return {
+            "accession": (
+                arg_hints.get("accession")
+                or arg_hints.get("uniprot_id")
+                or arg_hints.get("query")
+                or ""
+            )
+        }
     if tool_name == "ChEMBL_search_activities":
-        return {"query": arg_hints.get("chembl_id") or arg_hints.get("compound_name") or arg_hints.get("smiles") or arg_hints.get("query") or ""}
+        chembl = arg_hints.get("chembl_id")
+        return {"molecule_chembl_id": chembl} if chembl else {}
     return {"query": arg_hints.get("query") or arg_hints.get("compound_name") or arg_hints.get("smiles") or ""}
 
 
