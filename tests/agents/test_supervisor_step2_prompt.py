@@ -104,6 +104,38 @@ def test_step2_prompt_requires_component_canonical_name():
     assert "when known, `component_type`" in SUPERVISOR_SYSTEM_PROMPT
 
 
+def test_step2_prompt_requires_typed_smiles_referenced_inputs():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "`mentioned_entities.payload_text`, `mentioned_entities.linker_text`, and" in sp
+    assert "are NAME / LABEL fields" in sp
+    assert "Do NOT put bare SMILES strings into `payload_text` or `linker_text`" in sp
+    assert "`payload SMILES <value>`, `linker SMILES <value>`" in sp
+    assert '"source": "payload_smiles"' in sp
+    assert '"source": "linker_smiles"' in sp
+    assert '"source": "compound_smiles"' in sp
+    assert "If the name and SMILES appear" in sp
+    assert "inconsistent, add a `parse_warnings` entry" in sp
+
+
+def test_step2_prompt_typed_smiles_few_shot_keeps_smiles_out_of_name_fields():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "Evaluate a TROP2 ADC with antibody sacituzumab analog" in sp
+    assert "Payload SMILES C1=CC=C2C(=C1)C(=O)N(C)C3=CC=CC=C23" in sp
+    assert "Linker SMILES NCCOC(=O)O" in sp
+    assert '"payload_text": "SN-38 carbonate"' in sp
+    assert '"linker_text": "SN-38 carbonate"' in sp
+    assert (
+        '{"id_type": "smiles", "value": '
+        '"C1=CC=C2C(=C1)C(=O)N(C)C3=CC=CC=C23", "source": "payload_smiles"}'
+    ) in sp
+    assert (
+        '{"id_type": "smiles", "value": "NCCOC(=O)O", '
+        '"source": "linker_smiles"}'
+    ) in sp
+    assert '"payload_text": "C1=CC' not in sp
+    assert '"linker_text": "NCCOC' not in sp
+
+
 @pytest.mark.parametrize(
     "query,id_type,value",
     [

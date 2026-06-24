@@ -306,3 +306,140 @@ def test_supervisor_normalizes_entity_type_aliases_before_pydantic():
     warnings = " | ".join(sq.parse_warnings)
     assert "payload-linker" in warnings
     assert "linker_payload" in warnings
+
+
+def test_supervisor_repairs_explicit_payload_smiles_in_payload_text():
+    raw = _raw()
+    raw["raw_user_query"] = (
+        "Evaluate HER2 ADC with payload-linker vc-MMAE. payload SMILES CCO."
+    )
+    drift = _drifted_payload(
+        mentioned_entities={"target_or_antigen_text": "HER2", "payload_text": "CCO"}
+    )
+    agent = SupervisorAgent(llm=_DriftedLLM(drift))
+    sq = agent.parse_raw_to_structured_query(raw)
+    assert sq.mentioned_entities.payload_text is None
+    assert {
+        "id_type": "smiles",
+        "value": "CCO",
+        "source": "payload_smiles",
+    } in sq.referenced_inputs
+    assert any("payload_text" in w and "payload_smiles" in w for w in sq.parse_warnings)
+
+
+def test_supervisor_repairs_explicit_linker_smiles_in_linker_text():
+    raw = _raw()
+    raw["raw_user_query"] = (
+        "Evaluate HER2 ADC with vc-MMAE. linker SMILES NCC(=O)O."
+    )
+    drift = _drifted_payload(
+        mentioned_entities={
+            "target_or_antigen_text": "HER2",
+            "linker_text": "NCC(=O)O",
+        }
+    )
+    agent = SupervisorAgent(llm=_DriftedLLM(drift))
+    sq = agent.parse_raw_to_structured_query(raw)
+    assert sq.mentioned_entities.linker_text is None
+    assert {
+        "id_type": "smiles",
+        "value": "NCC(=O)O",
+        "source": "linker_smiles",
+    } in sq.referenced_inputs
+    assert not any(r.get("value") == "NCC(=O)O)" for r in sq.referenced_inputs)
+    assert any("linker_text" in w and "linker_smiles" in w for w in sq.parse_warnings)
+
+
+def test_supervisor_extracts_parenthetical_labeled_smiles_without_closing_context_paren():
+    raw = _raw()
+    raw["raw_user_query"] = "Evaluate HER2 ADC with vc-MMAE."
+    raw["user_provided_context"]["payload_linker_text"] = (
+        "vc-MMAE (payload SMILES CCO; linker SMILES NCC(=O)O)"
+    )
+    drift = _drifted_payload(
+        mentioned_entities={
+            "target_or_antigen_text": "HER2",
+            "payload_text": "vc-MMAE",
+            "linker_text": "vc-MMAE",
+        }
+    )
+    agent = SupervisorAgent(llm=_DriftedLLM(drift))
+    sq = agent.parse_raw_to_structured_query(raw)
+    refs = {
+        (r.get("id_type"), r.get("value"), r.get("source"))
+        for r in sq.referenced_inputs
+    }
+    assert ("smiles", "CCO", "payload_smiles") in refs
+    assert ("smiles", "NCC(=O)O", "linker_smiles") in refs
+    assert ("smiles", "NCC(=O)O)", "linker_smiles") not in refs
+
+
+def test_supervisor_cleans_typed_smiles_after_normalized_entity_backfill():
+    raw = _raw()
+    raw["raw_user_query"] = "Assess HER2 ADC. payload SMILES CCO."
+    drift = _drifted_payload(
+        mentioned_entities={"target_or_antigen_text": "HER2"},
+        normalized_entities=[
+            {
+                "original_text": "CCO",
+                "canonical_name": "CCO",
+                "entity_type": "payload",
+                "explicit_or_inferred": "explicit",
+            }
+        ],
+    )
+    agent = SupervisorAgent(llm=_DriftedLLM(drift))
+    sq = agent.parse_raw_to_structured_query(raw)
+    assert sq.mentioned_entities.payload_text is None
+    assert {
+        "id_type": "smiles",
+        "value": "CCO",
+        "source": "payload_smiles",
+    } in sq.referenced_inputs
+
+
+def test_supervisor_preserves_real_payload_and_linker_names_with_typed_smiles():
+    raw = _raw()
+    raw["raw_user_query"] = (
+        "Evaluate HER2 ADC with payload MMAE and linker vc-MMAE. "
+        "payload SMILES CCO. linker SMILES NCC(=O)O."
+    )
+    drift = _drifted_payload(
+        mentioned_entities={
+            "target_or_antigen_text": "HER2",
+            "payload_text": "MMAE",
+            "linker_text": "vc-MMAE",
+        }
+    )
+    agent = SupervisorAgent(llm=_DriftedLLM(drift))
+    sq = agent.parse_raw_to_structured_query(raw)
+    assert sq.mentioned_entities.payload_text == "MMAE"
+    assert sq.mentioned_entities.linker_text == "vc-MMAE"
+    refs = {
+        (r.get("id_type"), r.get("value"), r.get("source"))
+        for r in sq.referenced_inputs
+    }
+    assert ("smiles", "CCO", "payload_smiles") in refs
+    assert ("smiles", "NCC(=O)O", "linker_smiles") in refs
+
+
+def test_supervisor_preserves_sn38_carbonate_name_with_typed_smiles():
+    raw = _raw()
+    raw["raw_user_query"] = (
+        "Evaluate a TROP2 ADC with linker-payload SN-38 carbonate. "
+        "Payload SMILES C1=CC=C2C(=C1)C(=O)N(C)C3=CC=CC=C23."
+    )
+    drift = _drifted_payload(
+        mentioned_entities={
+            "target_or_antigen_text": "TROP2",
+            "payload_text": "SN-38 carbonate",
+        }
+    )
+    agent = SupervisorAgent(llm=_DriftedLLM(drift))
+    sq = agent.parse_raw_to_structured_query(raw)
+    assert sq.mentioned_entities.payload_text == "SN-38 carbonate"
+    assert {
+        "id_type": "smiles",
+        "value": "C1=CC=C2C(=C1)C(=O)N(C)C3=CC=CC=C23",
+        "source": "payload_smiles",
+    } in sq.referenced_inputs

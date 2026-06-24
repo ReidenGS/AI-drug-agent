@@ -25,6 +25,7 @@ must not call tools, build tool arguments, or check input completeness.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 from ..llm.provider import LLMProvider
@@ -79,6 +80,18 @@ Entity extraction + normalization:
 
 - For each entity in `mentioned_entities`, preserve the literal user
   phrasing as the value. Do not overwrite it with the canonical form.
+- `mentioned_entities.payload_text`, `mentioned_entities.linker_text`, and
+  `mentioned_entities.antibody_candidate_text` are NAME / LABEL fields.
+  Do NOT put bare SMILES strings into `payload_text` or `linker_text`.
+  If the user writes `payload SMILES <value>`, `linker SMILES <value>`,
+  or `compound SMILES <value>`, emit it in `referenced_inputs` as
+  `{"id_type": "smiles", "value": "<value>", "source": "payload_smiles"}`
+  or `{"id_type": "smiles", "value": "<value>", "source": "linker_smiles"}`
+  or `{"id_type": "smiles", "value": "<value>", "source": "compound_smiles"}`.
+  If the user gives both a named reagent/component and a SMILES string, preserve both:
+  keep names in `mentioned_entities` / `normalized_entities` and keep
+  SMILES in `referenced_inputs`. If the name and SMILES appear
+  inconsistent, add a `parse_warnings` entry rather than replacing the name.
 - For every mentioned biomedical entity (target, disease, antibody,
   payload, linker, drug name, compound) ALSO emit a `normalized_entities`
   record. Each record MUST contain:
@@ -108,6 +121,32 @@ Entity extraction + normalization:
   `canonical_name` for the component label. Do NOT use `component_name`,
   `name`, `label`, or `value` for component objects. Each component object
   should include `canonical_name` and, when known, `component_type`.
+
+Typed-SMILES example:
+
+User:
+"Evaluate a TROP2 ADC with antibody sacituzumab analog, linker-payload SN-38 carbonate. Payload SMILES C1=CC=C2C(=C1)C(=O)N(C)C3=CC=CC=C23. Linker SMILES NCCOC(=O)O. Use PDB 7XYZ for antigen context."
+
+Expected output sketch:
+{
+  "mentioned_entities": {
+    "target_or_antigen_text": "TROP2",
+    "antibody_candidate_text": "sacituzumab analog",
+    "payload_text": "SN-38 carbonate",
+    "linker_text": "SN-38 carbonate"
+  },
+  "referenced_inputs": [
+    {"id_type": "smiles", "value": "C1=CC=C2C(=C1)C(=O)N(C)C3=CC=CC=C23", "source": "payload_smiles"},
+    {"id_type": "smiles", "value": "NCCOC(=O)O", "source": "linker_smiles"},
+    {"id_type": "pdb_id", "value": "7XYZ", "source": "user"}
+  ],
+  "normalized_entities": [
+    {"original_text": "TROP2", "canonical_name": "TACSTD2", "entity_type": "target_or_antigen"},
+    {"original_text": "sacituzumab analog", "canonical_name": "sacituzumab analog", "entity_type": "antibody"},
+    {"original_text": "SN-38 carbonate", "canonical_name": "SN-38 carbonate", "entity_type": "linker_payload"}
+  ],
+  "parse_warnings": []
+}
 
 Identifier extraction:
 
@@ -348,6 +387,11 @@ def _coerce_constraint_entry(item: Any) -> Optional[dict[str, Any]]:
 
 _COMPONENT_NAME_ALIASES = ("component_name", "name", "label", "value")
 _COMPONENT_ROLE_VALUES = {"antibody", "payload", "linker", "linker_payload", "other"}
+_LABELED_SMILES_RE = re.compile(
+    r"\b(?P<role>payload|linker|compound)\s+SMILES\s*[:=]?\s*"
+    r"(?P<value>[A-Za-z0-9@+\-\[\]\(\)=#$%/\\\.]+)",
+    re.IGNORECASE,
+)
 _ENTITY_TYPE_ALIASES = {
     "target": "target_or_antigen",
     "antigen": "target_or_antigen",
@@ -367,6 +411,128 @@ _ENTITY_TYPE_ALIASES = {
     "small-molecule": "compound",
     "small molecule": "compound",
 }
+
+
+def _raw_text_chunks_for_step2(raw_request_record: dict | None) -> list[str]:
+    if not isinstance(raw_request_record, dict):
+        return []
+    chunks: list[str] = []
+    query = raw_request_record.get("raw_user_query")
+    if isinstance(query, str) and query.strip():
+        chunks.append(query)
+    ctx = raw_request_record.get("user_provided_context") or {}
+    if isinstance(ctx, dict):
+        for value in ctx.values():
+            if isinstance(value, str) and value.strip():
+                chunks.append(value)
+    return chunks
+
+
+def _clean_labeled_smiles_value(value: str) -> str:
+    cleaned = value.strip().rstrip(".,;")
+    while cleaned.endswith(")") and cleaned.count(")") > cleaned.count("("):
+        cleaned = cleaned[:-1].rstrip()
+    while cleaned.endswith("]") and cleaned.count("]") > cleaned.count("["):
+        cleaned = cleaned[:-1].rstrip()
+    return cleaned
+
+
+def _extract_labeled_smiles_refs(
+    raw_request_record: dict | None,
+) -> list[dict[str, str]]:
+    refs: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for chunk in _raw_text_chunks_for_step2(raw_request_record):
+        for match in _LABELED_SMILES_RE.finditer(chunk):
+            role = match.group("role").lower()
+            value = _clean_labeled_smiles_value(match.group("value"))
+            if not value:
+                continue
+            key = (role, value)
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append(
+                {"id_type": "smiles", "value": value, "source": f"{role}_smiles"}
+            )
+    return refs
+
+
+def _is_smiles_like_text(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    s = value.strip()
+    if len(s) < 2 or any(ch.isspace() for ch in s):
+        return False
+    if any(ch in s for ch in "=#[]()/\\@+"):
+        return bool(re.search(r"[A-Za-z]", s))
+    if any(ch.isdigit() for ch in s):
+        return bool(re.search(r"[A-Za-z]", s)) and "-" not in s
+    # Conservative simple organic strings such as CCO or NCCO. This
+    # intentionally excludes names like MMAE, vc-MMAE, valine-citrulline.
+    return bool(re.fullmatch(r"(?:Br|Cl|B|C|N|O|P|S|F|I|c|n|o|s|p){2,}", s))
+
+
+def _ensure_referenced_input(refs: list[Any], new_ref: dict[str, str]) -> None:
+    for existing in refs:
+        if not isinstance(existing, dict):
+            continue
+        if (
+            existing.get("id_type") == new_ref["id_type"]
+            and existing.get("value") == new_ref["value"]
+            and existing.get("source") == new_ref["source"]
+        ):
+            return
+    refs.append(dict(new_ref))
+
+
+def _normalize_typed_smiles_fields(
+    payload: dict[str, Any],
+    raw_request_record: dict | None,
+) -> None:
+    labeled_refs = _extract_labeled_smiles_refs(raw_request_record)
+    if not labeled_refs:
+        return
+
+    refs = payload.get("referenced_inputs")
+    if not isinstance(refs, list):
+        refs = []
+        payload["referenced_inputs"] = refs
+    for ref in labeled_refs:
+        _ensure_referenced_input(refs, ref)
+
+    mentioned = payload.get("mentioned_entities")
+    if not isinstance(mentioned, dict):
+        return
+
+    warnings = payload.get("parse_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+        payload["parse_warnings"] = warnings
+
+    expected_by_field = {
+        "payload_text": {"payload_smiles", "compound_smiles"},
+        "linker_text": {"linker_smiles", "compound_smiles"},
+    }
+    labeled_by_value = {
+        ref["value"]: ref["source"]
+        for ref in labeled_refs
+        if ref.get("value") and ref.get("source")
+    }
+    for field, allowed_sources in expected_by_field.items():
+        value = mentioned.get(field)
+        if not _is_smiles_like_text(value):
+            continue
+        source = labeled_by_value.get(str(value).strip())
+        if source not in allowed_sources:
+            continue
+        mentioned[field] = None
+        note = (
+            f"removed SMILES-like mentioned_entities.{field}; "
+            f"retained as referenced_inputs[source={source}]"
+        )
+        if note not in warnings:
+            warnings.append(note)
 
 
 def _component_name_value(item: dict[str, Any]) -> str | None:
@@ -478,7 +644,10 @@ def _normalize_normalized_entity_types(payload: dict[str, Any]) -> None:
             )
 
 
-def normalize_llm_payload_for_step2(payload: dict) -> dict:
+def normalize_llm_payload_for_step2(
+    payload: dict,
+    raw_request_record: dict | None = None,
+) -> dict:
     """Defensive coercer applied at the Step 2 parse boundary.
 
     Handles real schema-drift cases observed against live HER2 ADC inputs:
@@ -516,6 +685,7 @@ def normalize_llm_payload_for_step2(payload: dict) -> dict:
 
     _normalize_entity_components(out)
     _normalize_normalized_entity_types(out)
+    _normalize_typed_smiles_fields(out, raw_request_record)
 
     return out
 
@@ -568,7 +738,10 @@ class SupervisorAgent:
         # Defensive coercion for real-LLM schema drift on the two fields
         # most often returned in the wrong shape (parse_warnings as dicts,
         # user_constraints as strings). Idempotent for conformant payloads.
-        llm_payload = normalize_llm_payload_for_step2(llm_payload or {})
+        llm_payload = normalize_llm_payload_for_step2(
+            llm_payload or {},
+            raw_request_record,
+        )
 
         # Agent fills the deterministic fields, never the LLM.
         normalized_entities = [
@@ -596,6 +769,15 @@ class SupervisorAgent:
             llm_payload.get("mentioned_entities") or {},
             llm_payload.get("normalized_entities") or [],
         )
+        cleanup_payload = {
+            "mentioned_entities": mentioned_entities_dict,
+            "referenced_inputs": llm_payload.get("referenced_inputs") or [],
+            "parse_warnings": llm_payload.get("parse_warnings") or [],
+        }
+        _normalize_typed_smiles_fields(cleanup_payload, raw_request_record)
+        mentioned_entities_dict = cleanup_payload["mentioned_entities"]
+        llm_payload["referenced_inputs"] = cleanup_payload["referenced_inputs"]
+        llm_payload["parse_warnings"] = cleanup_payload["parse_warnings"]
         sq = StructuredQuery(
             run_id=raw_request_record["run_id"],
             parsed_at=now_iso(),

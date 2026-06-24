@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import re
 from pathlib import PurePosixPath
-from typing import Any, Iterable, NamedTuple, Optional
+from typing import Any, Iterable, Optional
 
 from ..mcp.client import MCPClient
 from ..schemas.common import ToolCallRecord
@@ -40,6 +40,11 @@ from ..services.storage_service import Storage
 from ..services.workflow_state_service import WorkflowStateService
 from ..utils.ids import new_artifact_id, new_tool_call_id
 from ..utils.time import now_iso
+from .step_05_enrichment_registry import (
+    EnrichmentPlan,
+    plan_enrichment_for_record,
+    skipped_low_information_chembl_name_queries,
+)
 
 
 _AGENT_NAME = "candidate_context_agent"
@@ -130,27 +135,11 @@ _LABELED_SMILES_RE = re.compile(
     r"\b(?P<role>payload|linker|compound)\s+smiles\s*[:=]?\s*(?P<value>[A-Za-z0-9@+\-\[\]\(\)=#$%/\\\.]+)",
     re.IGNORECASE,
 )
+_UNIPROT_ACCESSION_RE = re.compile(
+    r"^(?:[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9][A-Z][A-Z0-9]{2}[0-9])(?:-\d+)?$"
+)
 
-_CHEMBL_NAME_MATERIAL_TYPES = {
-    "payload_name",
-    "linker_name",
-    "compound_name",
-    "linker_payload_name",
-}
-_CHEMBL_SMILES_MATERIAL_TYPES = {
-    "payload_smiles",
-    "linker_smiles",
-    "compound_smiles",
-}
 _MIXED_CONTEXT_MARKERS = ("smiles", ";")
-
-
-class _ChEMBLQueryPlan(NamedTuple):
-    tool_name: str
-    query: str
-    query_kind: str
-    query_role: str | None
-    material_type: str
 
 
 class CandidateContextAgent:
@@ -206,6 +195,9 @@ class CandidateContextAgent:
         tool_call_records: list[ToolCallRecord] = []
         candidate_records: list[CandidateRecord] = []
         missing_flags: list[str] = []
+        scoped_step5_tools = self.mcp_client.list_tools(
+            agent_name=_AGENT_NAME, step_id=_STEP_ID
+        )
 
         # Batch-6 inputs from Step 2 enrichment.
         normalized_entities = sq.get("normalized_entities") or []
@@ -244,19 +236,20 @@ class CandidateContextAgent:
             structure_files=structure_files,
             sequence_files=sequence_files,
             raw_user_query=raw_user_query,
+            normalized_entities=normalized_entities,
         )
         if target_cand is None:
             missing_flags.append("mentioned_entities.target_or_antigen_text")
         else:
-            if target_text:
-                tc = self._enrich_with_tool(
-                    run_id=run_id,
-                    tool_name="SAbDab_search_structures",
-                    arg_value=target_text,
-                    label="target",
-                )
-                tool_call_records.append(tc)
-                target_cand.candidate_notes = _notes_for(tc, "target context enrichment")
+            tcs = self._execute_enrichment_plans(
+                run_id=run_id,
+                record=target_cand,
+                scoped_tools=scoped_step5_tools,
+                label="target",
+            )
+            tool_call_records.extend(tcs)
+            if tcs:
+                target_cand.candidate_notes = _notes_for(tcs[-1], "target context enrichment")
             candidate_records.append(target_cand)
 
         # ── antibody candidate ──────────────────────────────────────────────
@@ -271,18 +264,15 @@ class CandidateContextAgent:
         if ab_cand is None:
             missing_flags.append("mentioned_entities.antibody_candidate_text")
         else:
-            if antibody_text:
-                tc = self._enrich_with_tool(
-                    run_id=run_id,
-                    tool_name="SAbDab_search_structures",
-                    arg_value=antibody_text,
-                    label="antibody",
-                )
-                tool_call_records.append(tc)
-                ab_cand.candidate_notes = _notes_for(tc, "antibody context enrichment")
-                _annotate_antibody_sabdab_outcome(
-                    storage=self.storage, record=ab_cand, tc=tc
-                )
+            tcs = self._execute_enrichment_plans(
+                run_id=run_id,
+                record=ab_cand,
+                scoped_tools=scoped_step5_tools,
+                label="antibody",
+            )
+            tool_call_records.extend(tcs)
+            if tcs:
+                ab_cand.candidate_notes = _notes_for(tcs[-1], "antibody context enrichment")
             candidate_records.append(ab_cand)
 
         # ── payload / linker / generic compound candidates ──────────────────
@@ -315,31 +305,15 @@ class CandidateContextAgent:
         if not compound_cands:
             missing_flags.append("mentioned_entities.payload_text")
         for cc in compound_cands:
-            chembl_plans = _plan_chembl_queries(cc)
-            last_tc: ToolCallRecord | None = None
-            for plan in chembl_plans:
-                tc = self._enrich_with_tool(
-                    run_id=run_id,
-                    tool_name=plan.tool_name,
-                    arg_value=plan.query,
-                    label="compound",
-                    tool_arg_name="smiles" if plan.query_kind == "smiles" else "query",
-                    extra_summary={
-                        "query_kind": plan.query_kind,
-                        "query_role": plan.query_role,
-                        "material_type": plan.material_type,
-                    },
-                )
-                last_tc = tc
-                tool_call_records.append(tc)
-                _record_chembl_plan_outcome(
-                    storage=self.storage,
-                    record=cc,
-                    plan=plan,
-                    tc=tc,
-                )
-            if last_tc is not None:
-                cc.candidate_notes = _notes_for(last_tc, "compound context enrichment")
+            tcs = self._execute_enrichment_plans(
+                run_id=run_id,
+                record=cc,
+                scoped_tools=scoped_step5_tools,
+                label="compound",
+            )
+            tool_call_records.extend(tcs)
+            if tcs:
+                cc.candidate_notes = _notes_for(tcs[-1], "compound context enrichment")
             candidate_records.append(cc)
 
         # ── status + persist ────────────────────────────────────────────────
@@ -398,6 +372,7 @@ class CandidateContextAgent:
         structure_files: list[dict],
         sequence_files: list[dict],
         raw_user_query: str = "",
+        normalized_entities: list[dict] | None = None,
     ) -> Optional[CandidateRecord]:
         if not (target_text or refs_by_type.get("uniprot_id") or refs_by_type.get("pdb_id")
                 or structure_files):
@@ -450,6 +425,15 @@ class CandidateContextAgent:
             ("uniprot_id", "pdb_id"),
             source_ids=[sq_artifact_id],
         )
+        context_notes: list[str] = []
+        data_gaps: list[str] = []
+        _extend_target_identifiers_from_normalized_entities(
+            identifiers,
+            normalized_entities or [],
+            sq_artifact_id=sq_artifact_id,
+            context_notes=context_notes,
+            data_gaps=data_gaps,
+        )
         return CandidateRecord(
             candidate_id=new_artifact_id("candidate"),
             candidate_label=target_text or (identifiers[0].id_value if identifiers else "target"),
@@ -463,6 +447,8 @@ class CandidateContextAgent:
             candidate_role="partial_context",
             is_generated_candidate=False,
             context_status="partial",
+            data_gaps=data_gaps,
+            context_notes=context_notes,
         )
 
     def _build_antibody_candidate(
@@ -892,6 +878,67 @@ class CandidateContextAgent:
                 role_status=role_status,
             )
 
+    def _execute_enrichment_plans(
+        self,
+        *,
+        run_id: str,
+        record: CandidateRecord,
+        scoped_tools: Iterable[str],
+        label: str,
+    ) -> list[ToolCallRecord]:
+        plans = plan_enrichment_for_record(
+            record,
+            scoped_tools=scoped_tools,
+            candidate_category=record.candidate_type,
+            name_query_sanitizer=_clean_chembl_name_query,
+            smiles_query_sanitizer=_looks_like_smiles_query,
+        )
+        _annotate_skipped_low_information_chembl_names(
+            record=record,
+            scoped_tools=scoped_tools,
+        )
+        out: list[ToolCallRecord] = []
+        for plan in plans:
+            if plan.known_live_unavailable:
+                tc = _known_unavailable_tool_call(plan=plan, label=label)
+            else:
+                summary = {
+                    "query_kind": plan.query_kind,
+                    "query_role": plan.query_role,
+                    "material_type": plan.material_type,
+                    "capability_type": plan.capability_type,
+                    "output_extractor_type": plan.output_extractor_type,
+                }
+                summary.update(plan.extra_summary)
+                tc = self._enrich_with_tool(
+                    run_id=run_id,
+                    tool_name=plan.tool_name,
+                    arg_value=plan.query,
+                    label=label,
+                    tool_arg_name=plan.schema_arg_name,
+                    extra_summary=summary,
+                )
+            out.append(tc)
+            if plan.output_extractor_type == "compound":
+                _record_chembl_plan_outcome(
+                    storage=self.storage,
+                    record=record,
+                    plan=plan,
+                    tc=tc,
+                )
+            elif plan.output_extractor_type == "sabdab_structure" and record.candidate_type == "antibody":
+                _annotate_antibody_sabdab_outcome(
+                    storage=self.storage, record=record, tc=tc
+                )
+            elif plan.known_live_unavailable:
+                gap = (
+                    f"{plan.tool_name}({plan.query_kind}={plan.query[:80]}): "
+                    f"dependency_unavailable"
+                )
+                if gap not in record.data_gaps:
+                    record.data_gaps.append(gap)
+        return out
+
     def _enrich_with_tool(
         self,
         *,
@@ -1038,47 +1085,7 @@ def _has_role(records: list[CandidateRecord], role: str) -> bool:
     return False
 
 
-def _plan_chembl_queries(record: CandidateRecord) -> list[_ChEMBLQueryPlan]:
-    plans: list[_ChEMBLQueryPlan] = []
-    seen: set[tuple[str, str]] = set()
-
-    for material in record.materials:
-        value = (material.value or "").strip()
-        if not value:
-            continue
-        if material.material_type in _CHEMBL_NAME_MATERIAL_TYPES:
-            query = _clean_chembl_name_query(value, role=material.role)
-            if not query:
-                continue
-            plan = _ChEMBLQueryPlan(
-                tool_name="ChEMBL_search_molecules",
-                query=query,
-                query_kind="name",
-                query_role=material.role,
-                material_type=material.material_type,
-            )
-        elif material.material_type in _CHEMBL_SMILES_MATERIAL_TYPES:
-            if not _looks_like_smiles_query(value):
-                continue
-            plan = _ChEMBLQueryPlan(
-                tool_name="ChEMBL_search_substructure",
-                query=value,
-                query_kind="smiles",
-                query_role=material.role,
-                material_type=material.material_type,
-            )
-        else:
-            continue
-
-        key = (plan.tool_name, plan.query.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        plans.append(plan)
-    return plans
-
-
-def _clean_chembl_name_query(value: str, *, role: str | None = None) -> str | None:
+def _clean_chembl_name_query(value: str, role: str | None = None) -> str | None:
     query = " ".join((value or "").strip().split())
     if not query:
         return None
@@ -1102,6 +1109,28 @@ def _clean_chembl_name_query(value: str, *, role: str | None = None) -> str | No
     return query
 
 
+def _annotate_skipped_low_information_chembl_names(
+    *,
+    record: CandidateRecord,
+    scoped_tools: Iterable[str],
+) -> None:
+    for _material_type, query, _role in skipped_low_information_chembl_name_queries(
+        record,
+        scoped_tools=scoped_tools,
+        candidate_category=record.candidate_type,
+        name_query_sanitizer=_clean_chembl_name_query,
+    ):
+        gap = f"ChEMBL_search_molecules(name={query}): skipped_low_information_alias"
+        if gap not in record.data_gaps:
+            record.data_gaps.append(gap)
+        note = (
+            f"Skipped ChEMBL_search_molecules name query for low-information "
+            f"alias '{query}'."
+        )
+        if note not in record.context_notes:
+            record.context_notes.append(note)
+
+
 def _looks_like_smiles_query(value: str) -> bool:
     query = (value or "").strip()
     if not query or any(ch.isspace() for ch in query):
@@ -1110,6 +1139,88 @@ def _looks_like_smiles_query(value: str) -> bool:
     if "smiles" in lowered or ";" in query:
         return False
     return bool(re.search(r"[A-Za-z]", query))
+
+
+def _known_unavailable_tool_call(*, plan: EnrichmentPlan, label: str) -> ToolCallRecord:
+    now = now_iso()
+    return ToolCallRecord(
+        tool_call_id=new_tool_call_id(),
+        tool_name=plan.tool_name,
+        agent_name=_AGENT_NAME,
+        step_id=_STEP_ID,
+        run_status="dependency_unavailable",
+        started_at=now,
+        finished_at=now,
+        tool_input_summary={
+            "query": plan.query,
+            "label": label,
+            "query_kind": plan.query_kind,
+            "query_role": plan.query_role,
+            "material_type": plan.material_type,
+            "capability_type": plan.capability_type,
+            "output_extractor_type": plan.output_extractor_type,
+            "provenance_policy": plan.provenance_policy,
+            "confidence_policy": plan.confidence_policy,
+            **plan.extra_summary,
+        },
+        error_message=plan.known_unavailable_reason or "known_unavailable",
+    )
+
+
+def _extend_target_identifiers_from_normalized_entities(
+    identifiers: list[Identifier],
+    normalized_entities: list[dict],
+    *,
+    sq_artifact_id: str,
+    context_notes: list[str],
+    data_gaps: list[str],
+) -> None:
+    for ne in normalized_entities or []:
+        if not isinstance(ne, dict):
+            continue
+        if ne.get("entity_type") != "target_or_antigen":
+            continue
+        source = str(ne.get("canonical_id_source") or "").strip().lower()
+        if source != "uniprot":
+            continue
+        accession = str(ne.get("canonical_id") or "").strip()
+        original = str(ne.get("original_text") or ne.get("canonical_name") or "target")
+        if not accession:
+            continue
+        if not _is_uniprot_accession(accession):
+            gap = (
+                "target_uniprot_id_not_promoted:invalid_normalized_entity_accession"
+            )
+            if gap not in data_gaps:
+                data_gaps.append(gap)
+            note = (
+                "Step 2 normalized target entity carried canonical_id_source=UniProt "
+                f"but canonical_id was not accession-like; original_text={original[:80]}"
+            )
+            if note not in context_notes:
+                context_notes.append(note)
+            continue
+        ident = Identifier(
+            id_type="uniprot_id",
+            id_value=accession,
+            source_ids=[sq_artifact_id] if sq_artifact_id else [],
+            confidence=0.8,
+        )
+        _append_identifier_once_value(identifiers, ident)
+
+
+def _is_uniprot_accession(value: str) -> bool:
+    return bool(_UNIPROT_ACCESSION_RE.match((value or "").strip().upper()))
+
+
+def _append_identifier_once_value(identifiers: list[Identifier], ident: Identifier) -> None:
+    if any(
+        existing.id_type == ident.id_type
+        and existing.id_value.lower() == ident.id_value.lower()
+        for existing in identifiers
+    ):
+        return
+    identifiers.append(ident)
 
 
 def _build_downstream_query_hints(

@@ -23,7 +23,7 @@ def _bootstrap(
     local_storage, registry_service, workflow_state_service, *,
     target="HER2", candidate="Trastuzumab", payload=None, linker=None,
     referenced_inputs=None, uploaded_files=None, raw_context=None,
-    entity_decompositions=None,
+    entity_decompositions=None, normalized_entities=None,
 ):
     intake = IntakeService(local_storage, registry_service, workflow_state_service)
     rec = intake.submit(
@@ -48,6 +48,7 @@ def _bootstrap(
         ),
         referenced_inputs=referenced_inputs or [],
         entity_decompositions=entity_decompositions or [],
+        normalized_entities=normalized_entities or [],
     )
     sq_id = new_artifact_id("structured_query")
     local_storage.write_json(
@@ -96,6 +97,125 @@ def test_step5_builds_target_antibody_payload_candidates_from_sq(
     assert "target_antigen_name" in mat_types
     assert "antibody_name" in mat_types
     assert "payload_name" in mat_types
+
+
+def test_step5_promotes_target_uniprot_from_normalized_entities(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        target="HER2",
+        referenced_inputs=[],
+        normalized_entities=[{
+            "original_text": "HER2",
+            "canonical_name": "ERBB2",
+            "canonical_id": "P04626",
+            "canonical_id_source": "UniProt",
+            "entity_type": "target_or_antigen",
+            "explicit_or_inferred": "inferred",
+        }],
+    )
+    table = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
+    target = next(c for c in table.candidate_records if c.candidate_type == "target_antigen")
+    ids = [i for i in target.identifiers if i.id_type == "uniprot_id"]
+    assert len(ids) == 1
+    assert ids[0].id_value == "P04626"
+    assert ids[0].confidence == 0.8
+
+
+def test_step5_does_not_promote_non_target_uniprot_normalized_entity(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        target="HER2",
+        referenced_inputs=[],
+        normalized_entities=[{
+            "original_text": "payload protein",
+            "canonical_name": "payload protein",
+            "canonical_id": "P04626",
+            "canonical_id_source": "UniProt",
+            "entity_type": "payload",
+            "explicit_or_inferred": "inferred",
+        }],
+    )
+    table = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
+    target = next(c for c in table.candidate_records if c.candidate_type == "target_antigen")
+    assert not any(i.id_type == "uniprot_id" for i in target.identifiers)
+
+
+def test_step5_invalid_target_uniprot_canonical_id_records_gap_not_identifier(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        target="HER2",
+        referenced_inputs=[],
+        normalized_entities=[{
+            "original_text": "HER2",
+            "canonical_name": "ERBB2",
+            "canonical_id": "not-a-uniprot",
+            "canonical_id_source": "UniProt",
+            "entity_type": "target_or_antigen",
+            "explicit_or_inferred": "inferred",
+        }],
+    )
+    table = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
+    target = next(c for c in table.candidate_records if c.candidate_type == "target_antigen")
+    assert not any(i.id_type == "uniprot_id" for i in target.identifiers)
+    assert any("target_uniprot_id_not_promoted" in g for g in target.data_gaps)
+    assert any("canonical_id was not accession-like" in n for n in target.context_notes)
+
+
+def test_step5_normalized_uniprot_allows_step6_antigen_feature_lane(
+    local_storage, registry_service, workflow_state_service
+):
+    from app.agents.developability_agent import DevelopabilityAgent
+
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        target="HER2",
+        payload=None,
+        linker=None,
+        referenced_inputs=[],
+        normalized_entities=[{
+            "original_text": "HER2",
+            "canonical_name": "ERBB2",
+            "canonical_id": "P04626",
+            "canonical_id_source": "UniProt",
+            "entity_type": "target_or_antigen",
+            "explicit_or_inferred": "inferred",
+        }],
+    )
+    step5_table = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
+    target_id = next(
+        c.candidate_id
+        for c in step5_table.candidate_records
+        if c.candidate_type == "target_antigen"
+    )
+    DevelopabilityAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={
+            "EBIProteins_get_features": lambda **kw: {"features": []},
+        }),
+    ).run(run_id)
+    persisted = local_storage.read_json(
+        local_storage.run_key(run_id, "structured_liability_summary.json")
+    )
+    target_result = next(
+        cand for cand in persisted["candidate_liability_results"]
+        if cand["candidate_id"] == target_id
+    )
+    lanes = {lane["lane_type"]: lane for lane in target_result["lane_results"]}
+    antigen = lanes["antigen_protein_feature_context"]
+    assert antigen["run_status"] in {"ok", "partial"}
+    assert antigen["input_status"] == "sufficient"
+    assert any(
+        tc["tool_name"] == "EBIProteins_get_features"
+        for tc in antigen["tool_call_records"]
+    )
 
 
 # ── 2. raw context fallback ──────────────────────────────────────────────────
@@ -417,6 +537,55 @@ def test_step5_searches_clean_decomposition_component_names_separately(
     assert not any(name == "ChEMBL_search_substructure" for name, _ in calls)
 
 
+def test_step5_skips_low_information_vc_linker_name_query_and_records_gap(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        payload=None,
+        linker="vc",
+        raw_context={
+            "target_or_antigen_text": "HER2",
+            "candidate_text": "Trastuzumab",
+            "payload_linker_text": "vc linker",
+        },
+    )
+    calls: list[tuple[str, dict]] = []
+
+    def _record(tool_name: str, payload: dict):
+        def _fn(**kwargs):
+            calls.append((tool_name, kwargs))
+            return payload
+        return _fn
+
+    table = CandidateContextAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={
+            "SAbDab_search_structures": _record("SAbDab_search_structures", {"hits": []}),
+            "ChEMBL_search_molecules": _record("ChEMBL_search_molecules", {"molecules": [
+                {"molecule_chembl_id": "CHEMBL_SHOULD_NOT_PROMOTE"}
+            ]}),
+        }),
+    ).run(run_id)
+
+    assert ("ChEMBL_search_molecules", {"query": "vc"}) not in calls
+    linker_records = [
+        c for c in table.candidate_records
+        if c.candidate_type == "compound_component"
+        and any(m.material_type == "linker_name" and m.value == "vc" for m in c.materials)
+    ]
+    assert linker_records
+    rec = linker_records[0]
+    assert not rec.identifiers
+    assert any(
+        gap == "ChEMBL_search_molecules(name=vc): skipped_low_information_alias"
+        for gap in rec.data_gaps
+    )
+    assert any("low-information alias 'vc'" in note for note in rec.context_notes)
+
+
 # ── 6. ZINC id becomes identifier and is NOT labeled ZINC22 ─────────────────
 
 def test_step5_zinc_id_does_not_default_to_zinc22(
@@ -526,6 +695,58 @@ def test_step5_promotes_chembl_smiles_and_id_for_payload_candidate(
     import json
     normalized_blob = json.dumps(persisted["candidate_records"])
     assert "hits" not in normalized_blob
+    assert "raw_match" not in normalized_blob
+    assert "SECRET_RAW_FIELD_DO_NOT_LEAK" not in normalized_blob
+
+
+def test_step5_chembl_id_material_plans_get_molecule_and_promotes_smiles(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        payload=None,
+        linker=None,
+        referenced_inputs=[
+            {"id_type": "chembl_id", "value": "CHEMBL1201585", "source": "raw_request_text"}
+        ],
+        raw_context={
+            "target_or_antigen_text": "HER2",
+            "candidate_text": "Trastuzumab",
+        },
+    )
+    calls: list[tuple[str, dict]] = []
+
+    def _record(tool_name: str, payload: dict):
+        def _fn(**kwargs):
+            calls.append((tool_name, kwargs))
+            return payload
+        return _fn
+
+    table = CandidateContextAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={
+            "SAbDab_search_structures": _record("SAbDab_search_structures", {"hits": []}),
+            "ChEMBL_get_molecule": _record("ChEMBL_get_molecule", {
+                "molecule_chembl_id": "CHEMBL1201585",
+                "molecule_structures": {"canonical_smiles": "CCO"},
+                "pref_name": "ASPIRIN",
+                "raw_match": "SECRET_RAW_FIELD_DO_NOT_LEAK",
+            }),
+            "ChEMBL_search_molecules": _record("ChEMBL_search_molecules", {"molecules": []}),
+        }),
+    ).run(run_id)
+
+    assert ("ChEMBL_get_molecule", {"chembl_id": "CHEMBL1201585"}) in calls
+    compounds = [c for c in table.candidate_records if c.candidate_type == "compound_component"]
+    assert compounds
+    rec = compounds[0]
+    assert any(i.id_type == "chembl_id" and i.id_value == "CHEMBL1201585" for i in rec.identifiers)
+    assert any(m.material_type == "compound_smiles" and m.value == "CCO" for m in rec.materials)
+
+    persisted = local_storage.read_json(local_storage.run_key(run_id, "candidate_context_table.json"))
+    normalized_blob = json.dumps(persisted["candidate_records"])
     assert "raw_match" not in normalized_blob
     assert "SECRET_RAW_FIELD_DO_NOT_LEAK" not in normalized_blob
 
