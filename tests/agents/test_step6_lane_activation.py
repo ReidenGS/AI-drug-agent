@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.agents.developability_agent import DevelopabilityAgent
+from app.agents.step_06_capability_registry import STEP_06_CAPABILITY_REGISTRY
 from app.mcp.client import LocalMCPClient
 from app.services.intake_service import IntakeService
 from app.utils.ids import new_artifact_id
@@ -50,13 +51,23 @@ _DEFAULT_OK_BINDINGS = {
     "ADMETAI_predict_toxicity": {"status": "mocked", "predictions": {}},
     "ADMETAI_predict_physicochemical_properties": {"status": "mocked", "warnings": []},
     "ChEMBL_search_activities": {"status": "mocked", "results": []},
+    "ChEMBL_search_compound_structural_alerts": {"status": "mocked", "structural_alerts": []},
+    "ChEMBL_get_molecule_targets": {"status": "mocked", "targets": []},
+    "BindingDB_get_targets_by_compound": {"status": "mocked", "targets": []},
     # sequence lane
     "PROSITE_scan_sequence": {"status": "mocked", "motifs": []},
+    "IEDB_predict_mhci_binding": {"status": "mocked", "predictions": []},
     # antigen lane
     "EBIProteins_get_features": {"status": "mocked", "features": []},
     "EBIProteins_get_epitopes": {"status": "mocked", "epitopes": []},
+    "EBIProteins_get_antigen": {"status": "mocked", "antigens": []},
+    "GlyGen_get_glycoprotein": {"status": "mocked", "glycosylation_sites": []},
+    "iPTMnet_get_ptm_sites": {"status": "mocked", "ptm_sites": []},
+    "PDBe_KB_get_interface_residues": {"status": "mocked", "interface_residues": []},
     # structure lane
     "ProteinsPlus_profile_structure_quality": {"status": "mocked", "quality": "ok"},
+    "PDBePISA_get_interfaces": {"status": "mocked", "interfaces": []},
+    "PDBePISA_get_monomer_analysis": {"status": "mocked", "monomers": []},
 }
 
 
@@ -172,11 +183,10 @@ def test_step6_bioactivity_lane_runs_with_chembl_id_identifier_only(
     assert "ChEMBL_search_activities" in tool_names
 
 
-def test_step6_bioactivity_lane_skipped_when_only_smiles_no_chembl_id(
+def test_step6_smiles_runs_bindingdb_prior_without_chembl_id(
     local_storage, registry_service, workflow_state_service
 ):
-    """SMILES-only candidate must NOT activate the bioactivity lane —
-    the lane is reserved for typed ChEMBL identifiers."""
+    """SMILES activates BindingDB prior context, not ChEMBL-ID tools."""
     run_id = _seed_synthetic_cct(
         local_storage, registry_service, workflow_state_service,
         materials=[_material("payload_smiles", "CCO")],
@@ -184,21 +194,18 @@ def test_step6_bioactivity_lane_skipped_when_only_smiles_no_chembl_id(
     DevelopabilityAgent(
         storage=local_storage, registry=registry_service,
         workflow_state=workflow_state_service,
-        mcp_client=LocalMCPClient(bindings=_bindings({})),
+        mcp_client=LocalMCPClient(bindings=_bindings(_DEFAULT_OK_BINDINGS)),
     ).run(run_id)
     persisted = local_storage.read_json(
         local_storage.run_key(run_id, "structured_liability_summary.json")
     )
     lanes = _lane_results(persisted)
     bio = lanes["compound_bioactivity_prior_context"]
-    assert bio["run_status"] == "skipped"
-    assert bio["input_status"] == "missing"
-    # Skipped summary must NOT pretend the lane wants SMILES — the user
-    # explicitly asked us to stop displaying "compound_smiles family" for
-    # this lane.
-    summary = (bio.get("lane_summary") or "").lower()
-    assert "compound_smiles" not in summary, summary
-    assert "chembl_id" in summary, summary
+    assert bio["run_status"] in {"ok", "partial"}
+    assert bio["input_status"] == "sufficient"
+    names = {tc["tool_name"] for tc in bio["tool_call_records"]}
+    assert "BindingDB_get_targets_by_compound" in names
+    assert "ChEMBL_search_activities" not in names
 
 
 # ── 1. payload SMILES only → compound liability + bioactivity lanes only ────
@@ -551,14 +558,8 @@ def test_step6_fake_llm_out_of_scope_tool_is_not_executed(
 # ── 7. Stage 1 / Stage 2 LLM payload boundary (catalog only, no _live) ──────
 
 _STEP6_VALID_TOOLS = {
-    "DrugProps_pains_filter", "DrugProps_lipinski_filter",
-    "DrugProps_calculate_qed", "SwissADME_calculate_adme",
-    "SwissADME_check_druglikeness", "ADMETAI_predict_toxicity",
-    "ADMETAI_predict_physicochemical_properties",
-    "PROSITE_scan_sequence", "EBIProteins_get_features",
-    "EBIProteins_get_epitopes", "ProteinsPlus_profile_structure_quality",
-    "ChEMBL_search_activities", "ChEMBL_search_molecules",
-    "IEDB_predict_mhci_binding",
+    capability.tool_name for capability in STEP_06_CAPABILITY_REGISTRY
+    if capability.lane_type is not None
 }
 
 
@@ -596,6 +597,55 @@ class _RecordingLLM:
                 })
             return {"tools": out}
         return {}
+
+
+class _SelectAllEligibleLLM:
+    name = "select_all_eligible"
+    model = "test"
+
+    def generate(self, prompt: str, *, system: str | None = None, **kw: Any) -> str:
+        raise NotImplementedError
+
+    def generate_json(self, prompt: str, *, schema: dict, system: str | None = None) -> dict:
+        if schema.get("task") == "tool_selection_stage_1_multi_lane":
+            return {
+                "selections": [
+                    {
+                        "lane_type": lane["lane_type"],
+                        "tool_name": tool_name,
+                        "selection_reason": "complementary production coverage",
+                    }
+                    for lane in schema.get("lanes") or []
+                    for tool_name in lane.get("allowed_tools") or []
+                ]
+            }
+        return {"tools": []}
+
+
+def test_step6_five_complementary_smiles_tools_are_not_truncated(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_synthetic_cct(
+        local_storage, registry_service, workflow_state_service,
+        materials=[_material("payload_smiles", "CCO")],
+    )
+    DevelopabilityAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings=_bindings(_DEFAULT_OK_BINDINGS)),
+        llm=_SelectAllEligibleLLM(),
+    ).run(run_id)
+    persisted = local_storage.read_json(
+        local_storage.run_key(run_id, "structured_liability_summary.json")
+    )
+    lane = _lane_results(persisted)["payload_linker_compound_liability"]
+    assert set(lane["selected_tools"]) == {
+        "DrugProps_pains_filter",
+        "DrugProps_lipinski_filter",
+        "DrugProps_calculate_qed",
+        "SwissADME_calculate_adme",
+        "SwissADME_check_druglikeness",
+    }
 
 
 def test_step6_tool_selection_prompt_hides_live_and_uses_progressive_disclosure(
@@ -708,14 +758,17 @@ def test_step6_skips_stage2_when_deterministic_satisfies_required_args(
     persisted = local_storage.read_json(
         local_storage.run_key(run_id, "structured_liability_summary.json")
     )
-    statuses = {
-        tc["tool_input_summary"].get("selected_by", "")
+    provenance = {
+        (
+            tc["tool_input_summary"].get("tool_selection_source"),
+            tc["tool_input_summary"].get("argument_construction_source"),
+        )
         for cand in persisted["candidate_liability_results"]
         for lane in cand["lane_results"]
         for tc in lane["tool_call_records"]
         if tc.get("tool_name") == "DrugProps_pains_filter"
     }
-    assert "deterministic_fallback" in statuses
+    assert ("llm_stage1", "deterministic_mapping") in provenance
 
 
 # ── LLM call-count budget (per-candidate Stage1 + Stage2) ───────────────────
@@ -861,35 +914,6 @@ def test_step6_five_candidates_stay_under_ten_llm_calls(
     assert stage1 == 5
     assert stage2 <= 5
     assert stage1 + stage2 <= 10
-
-
-def test_step6_smoke_candidate_limit_2_stays_under_four_llm_calls(
-    local_storage, registry_service, workflow_state_service
-):
-    """When the smoke trims cct to 2 representative candidates, Step 6
-    must call the LLM at most 4 times (Stage 1 + Stage 2 per candidate)."""
-    llm = _CountingLLM()
-    run_id = _seed_n_candidates(
-        local_storage, registry_service, workflow_state_service, n=5
-    )
-    # Trim cct to 2 representative candidates before running Step 6
-    # (mirroring what the smoke script does).
-    cct_key = local_storage.run_key(run_id, "candidate_context_table.json")
-    cct = local_storage.read_json(cct_key)
-    cct["candidate_records"] = cct["candidate_records"][:2]
-    local_storage.write_json(cct_key, cct)
-
-    DevelopabilityAgent(
-        storage=local_storage, registry=registry_service,
-        workflow_state=workflow_state_service,
-        mcp_client=LocalMCPClient(bindings=_bindings(_DEFAULT_OK_BINDINGS)),
-        llm=llm,
-    ).run(run_id)
-    total = sum(
-        1 for t in llm.tasks
-        if t in {"tool_selection_stage_1_multi_lane", "tool_selection_stage_2_multi_tool"}
-    )
-    assert total <= 4, f"smoke budget exceeded: {total} calls (tasks={llm.tasks})"
 
 
 # ── Stage 2 contains schemas only for the Stage 1 survivors ─────────────────

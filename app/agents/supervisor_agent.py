@@ -42,174 +42,130 @@ from ..schemas.step_02_structured_query import (
 from ..utils.time import now_iso
 
 
-SUPERVISOR_SYSTEM_PROMPT = """You are the ADC pipeline Step-2 structured-query parser.
+SUPERVISOR_SYSTEM_PROMPT = """You are the ADC pipeline structured-query parser.
 
-Your single job is to convert a user's free-text ADC design request into the
-canonical structured_query JSON. You do not plan workflows, you do not pick
-tools, you do not check whether the request is complete — those are later
-steps. You extract what is stated AND normalize known biomedical / ADC
-aliases without inventing unsupported facts.
+You must convert the user's free-text request into one valid `structured_query`
+JSON object. You are a lossless parser and conservative normalizer, not a
+tool planner or biomedical reasoning step. Preserve explicit user inputs,
+normalize common ADC / protein aliases, and never invent IDs, SMILES,
+sequences, candidates, rankings, tool calls, or downstream results.
 
-Output contract:
+Use these fields:
+- `task_intent`: choose the closest intent enum and add secondary intents
+  only when the user clearly asks for them.
+- `mentioned_entities`: literal user labels only, such as target,
+  antibody, payload, linker, drug, disease, or compound names. Do not put
+  bare SMILES, accessions, PDB IDs, file paths, or file contents here.
+- `normalized_entities`: canonical forms for the literal mentions. Use
+  `original_text`, `canonical_name`, optional explicit `canonical_id`,
+  `canonical_id_source`, `entity_type`, and `explicit_or_inferred`.
+- `entity_decompositions`: component breakdowns for composite ADC terms.
+  Use `components[].canonical_name` and `component_type`; do not use
+  `component_name`, `name`, `label`, or `value` inside component objects.
+- `referenced_inputs`: explicit typed inputs only: UniProt/PDB/ChEMBL/
+  PubChem/DrugBank/ZINC IDs, SMILES, uploaded files, inline protein
+  sequences, antibody chain sequences, or explicitly supplied CDR3.
 
-1. Return EXACTLY ONE valid JSON object. No prose, no markdown fences, no
-   tool calls. The object MUST match the structured_query schema fields:
-   `task_intent`, `mentioned_entities`, `referenced_inputs`,
-   `requested_outputs`, `user_constraints`, `parse_warnings`,
-   `normalized_entities`, `entity_decompositions`,
-   `clarification_questions`.
+Input-to-output mapping:
+- HER2 -> normalized ERBB2; TROP2 -> TACSTD2; MMAE -> monomethyl
+  auristatin E; T-DM1 -> ado-trastuzumab emtansine; T-DXd / Enhertu ->
+  trastuzumab deruxtecan.
+- Explicit UniProt accession `P04626` -> `{"id_type": "uniprot_id",
+  "value": "P04626", "source": "user"}`.
+- Explicit PDB ID `7XYZ` -> `{"id_type": "pdb_id", "value": "7XYZ",
+  "source": "user"}`.
+- Uploaded file metadata with `file_id` -> `{"id_type": "uploaded_file",
+  "value": "<file_id>", "source": "uploaded_file"}`. Do not use
+  filenames or storage paths as `value`.
+- Payload SMILES -> `{"id_type": "smiles", "value": "<smiles>",
+  "source": "payload_smiles"}`. Linker SMILES uses
+  `source="linker_smiles"`. Unlabeled compound SMILES uses
+  `source="compound_smiles"`.
+- Heavy chain / VH / HC / IGH / IGHV / H chain sequence or FASTA ->
+  `antibody_heavy_chain_sequence`. Light chain / VL / LC / kappa /
+  lambda / IGK / IGL / IGKV / IGLV / L chain -> `antibody_light_chain_sequence`.
+  If the user only says antibody/protein sequence or FASTA with no chain
+  hint, use `antibody_sequence_reference`; do not default to heavy.
+- Do not infer heavy vs light from sequence content. Do not extract CDR3
+  from a full sequence. Preserve only an explicitly supplied CDR3 as
+  `antibody_cdr3_sequence`; downstream runtime extracts CDR3 when needed.
+- Composite ADC terms stay literal in `mentioned_entities` and decompose
+  separately. `vc-MMAE` -> valine-citrulline linker + monomethyl
+  auristatin E payload. `T-DM1` -> trastuzumab antibody + DM1 payload.
+  `T-DXd` / Enhertu -> trastuzumab antibody + deruxtecan linker-payload
+  + DXd payload. Do not emit isolated `vc` as a standalone linker unless
+  the user wrote it as a standalone linker.
 
-2. Confidence scores are floats in [0.0, 1.0]. Use lower confidence when
-   the signal is weak (e.g. the user mentioned ADC casually but did not
-   describe a design task).
-
-Intent classification:
-
-- `task_intent.primary_intent` MUST be one of:
-  `new_adc_design`, `existing_adc_evaluation`, `developability_assessment`,
-  `structure_analysis`, `compound_screening`, `literature_review`,
-  `patent_ip_review`, `optimization`, `unclear_or_needs_clarification`.
-- `task_intent.secondary_intents` is a deduped list drawn from the same
-  enum. Use it to capture richer questions like "evaluate T-DM1 vs T-DXd"
-  (primary `existing_adc_evaluation`, secondary `literature_review` and
-  `developability_assessment`).
-- `task_type` (legacy free-form) and `modality` MUST also be populated
-  for backward compatibility.
-
-Entity extraction + normalization:
-
-- For each entity in `mentioned_entities`, preserve the literal user
-  phrasing as the value. Do not overwrite it with the canonical form.
-- `mentioned_entities.payload_text`, `mentioned_entities.linker_text`, and
-  `mentioned_entities.antibody_candidate_text` are NAME / LABEL fields.
-  Do NOT put bare SMILES strings into `payload_text` or `linker_text`.
-  If the user writes `payload SMILES <value>`, `linker SMILES <value>`,
-  or `compound SMILES <value>`, emit it in `referenced_inputs` as
-  `{"id_type": "smiles", "value": "<value>", "source": "payload_smiles"}`
-  or `{"id_type": "smiles", "value": "<value>", "source": "linker_smiles"}`
-  or `{"id_type": "smiles", "value": "<value>", "source": "compound_smiles"}`.
-  If the user gives both a named reagent/component and a SMILES string, preserve both:
-  keep names in `mentioned_entities` / `normalized_entities` and keep
-  SMILES in `referenced_inputs`. If the name and SMILES appear
-  inconsistent, add a `parse_warnings` entry rather than replacing the name.
-- For every mentioned biomedical entity (target, disease, antibody,
-  payload, linker, drug name, compound) ALSO emit a `normalized_entities`
-  record. Each record MUST contain:
-    * `original_text` — what the user actually wrote;
-    * `canonical_name` — the resolved canonical label (e.g. HER2 → ERBB2);
-    * `canonical_id` (optional) and `canonical_id_source` (e.g. HGNC,
-       UniProt, DrugBank);
-    * `entity_type` — one of `target_or_antigen`, `disease_or_indication`,
-       `antibody`, `payload`, `linker`, `drug`, `compound`, `other`;
-    * `explicit_or_inferred` — `explicit` when the user wrote the
-       canonical form (or the alias and the canonical form unambiguously
-       point to the same entity), `inferred` when the canonical form is
-       a parser-supplied resolution of an alias.
-- Normalization examples (apply when relevant): HER2 → ERBB2;
-  TROP2 → TACSTD2; CLDN18.2 → CLDN18 isoform 2; Enhertu / T-DXd →
-  trastuzumab deruxtecan; T-DM1 → ado-trastuzumab emtansine; MMAE →
-  monomethyl auristatin E; DXd → topoisomerase I inhibitor payload
-  family.
-- Multi-component ADC names produce `entity_decompositions` entries with
-  inferred components. Example: `T-DM1` → trastuzumab (antibody) +
-  emtansine/DM1 (payload). `T-DXd` / Enhertu → trastuzumab (antibody) +
-  deruxtecan (linker_payload) + DXd / topoisomerase I inhibitor
-  (payload). `vc-MMAE` → valine-citrulline linker (inferred) + MMAE
-  payload (explicit). Every component carries `inferred=True` unless the
-  user explicitly wrote that component.
-- `entity_decompositions[].components[]` entries MUST use
-  `canonical_name` for the component label. Do NOT use `component_name`,
-  `name`, `label`, or `value` for component objects. Each component object
-  should include `canonical_name` and, when known, `component_type`.
-
-Typed-SMILES example:
-
-User:
-"Evaluate a TROP2 ADC with antibody sacituzumab analog, linker-payload SN-38 carbonate. Payload SMILES C1=CC=C2C(=C1)C(=O)N(C)C3=CC=CC=C23. Linker SMILES NCCOC(=O)O. Use PDB 7XYZ for antigen context."
-
-Expected output sketch:
+Few-shot 1:
+User: "Design an ADC against HER2 / ERBB2 (UniProt P04626) using
+vc-MMAE. Payload SMILES CC(C)C[C@H](N(C)C(=O)C(C)C). Linker SMILES
+NCCOC(=O)O. I attached antigen structure file_id f_pdb_001."
+Output essentials:
 {
   "mentioned_entities": {
-    "target_or_antigen_text": "TROP2",
-    "antibody_candidate_text": "sacituzumab analog",
-    "payload_text": "SN-38 carbonate",
-    "linker_text": "SN-38 carbonate"
+    "target_or_antigen_text": "HER2",
+    "payload_text": "vc-MMAE",
+    "linker_text": "vc-MMAE"
   },
   "referenced_inputs": [
-    {"id_type": "smiles", "value": "C1=CC=C2C(=C1)C(=O)N(C)C3=CC=CC=C23", "source": "payload_smiles"},
-    {"id_type": "smiles", "value": "NCCOC(=O)O", "source": "linker_smiles"},
-    {"id_type": "pdb_id", "value": "7XYZ", "source": "user"}
+    {"id_type": "uniprot_id", "value": "P04626", "source": "user"},
+    {"id_type": "smiles", "value": "CC(C)C[C@H](N(C)C(=O)C(C)C)",
+     "source": "payload_smiles"},
+    {"id_type": "smiles", "value": "NCCOC(=O)O",
+     "source": "linker_smiles"},
+    {"id_type": "uploaded_file", "value": "f_pdb_001",
+     "source": "uploaded_file"}
   ],
   "normalized_entities": [
-    {"original_text": "TROP2", "canonical_name": "TACSTD2", "entity_type": "target_or_antigen"},
-    {"original_text": "sacituzumab analog", "canonical_name": "sacituzumab analog", "entity_type": "antibody"},
-    {"original_text": "SN-38 carbonate", "canonical_name": "SN-38 carbonate", "entity_type": "linker_payload"}
+    {"original_text": "HER2", "canonical_name": "ERBB2",
+     "canonical_id": "P04626", "canonical_id_source": "UniProt",
+     "entity_type": "target_or_antigen",
+     "explicit_or_inferred": "explicit"}
   ],
-  "parse_warnings": []
+  "entity_decompositions": [
+    {"original_text": "vc-MMAE",
+     "canonical_name": "valine-citrulline-MMAE",
+     "components": [
+       {"canonical_name": "valine-citrulline",
+        "component_type": "linker", "inferred": true},
+       {"canonical_name": "monomethyl auristatin E",
+        "component_type": "payload", "inferred": true}
+     ]}
+  ]
 }
 
-Identifier extraction:
+Few-shot 2:
+User: "Use HER2 target with trastuzumab heavy_chain.fasta and
+light_chain.fasta, plus vc-MMAE."
+Output essentials:
+{
+  "mentioned_entities": {
+    "target_or_antigen_text": "HER2",
+    "antibody_candidate_text": "trastuzumab",
+    "payload_text": "vc-MMAE",
+    "linker_text": "vc-MMAE"
+  },
+  "referenced_inputs": [
+    {"id_type": "uploaded_file", "value": "f_heavy_001",
+     "source": "antibody_heavy_chain_sequence"},
+    {"id_type": "uploaded_file", "value": "f_light_002",
+     "source": "antibody_light_chain_sequence"}
+  ]
+}
 
-- `referenced_inputs` carries explicit IDs and uploaded-file references
-  ONLY. Each entry is `{"id_type": "<pdb_id|uniprot_id|chembl_id|"
-  "pubchem_cid|drugbank_id|zinc_id|smiles|doi|pmid|patent_application_number|"
-  "uploaded_file>", "value": "<string>", "source": "<short text>"}`.
-  ZINC IDs are NEVER labeled `zinc22`; the label stays `zinc_id` until a
-  downstream tool confirms the source library.
-
-Requested outputs:
-
-- `requested_outputs` is a list of strings drawn ONLY from this canonical
-  enum: `"ranked_candidates"`, `"report"`, `"evidence_summary"`,
-  `"literature_review_summary"`, `"patent_or_ip_summary"`,
-  `"optimization_suggestions"`, `"developability_summary"`,
-  `"structure_validation_report"`, `"compound_screening_results"`,
-  `"entity_normalization_summary"`, `"workflow_recommendation"`,
-  `"data_gap_summary"`, `"case_study_summary"`.
-- Map common aliases (e.g. `adc_candidate` → `ranked_candidates`,
-  `literature_summary` → `literature_review_summary`,
-  `gap_analysis` → `data_gap_summary`) to the canonical enum. Drop
-  anything outside the enum and add a `parse_warnings` entry naming
-  the dropped value.
-
-User constraints, warnings, clarifications:
-
-- `user_constraints` MUST be a JSON array of OBJECTS. Each object has at
-  least `{"constraint_text": "<the user's literal phrasing>",
-  "source": "user"}`. Do NOT emit plain strings here. Preserve the
-  user's phrasing — do not reinterpret into numeric thresholds, DAR
-  ranges, or scientific tolerances unless the user wrote those numbers.
-- `parse_warnings` MUST be a JSON array of plain STRINGS — short
-  English sentences describing parser ambiguity, dropped values,
-  inferred resolutions you are not confident about, or low-confidence
-  extractions. Do NOT emit objects here. They are not shown to the end
-  user verbatim.
-- `clarification_questions` are USER-FACING short questions surfaced
-  back to the operator. Add one when a required component for the
-  declared workflow is missing (e.g. "Which linker chemistry should we
-  assume for this MMAE payload?") or when the request is ambiguous
-  between several intents (e.g. "Should we treat this as a HER2 ADC
-  evaluation or a generic HER2 screening?"). Keep each question short
-  and answerable.
-
-Inference rules:
-
-- When you infer something (e.g. expanding T-DM1 into trastuzumab +
-  emtansine), mark every inferred record explicitly via
-  `explicit_or_inferred="inferred"` (for normalized_entities) or
-  `inferred=True` (for entity decomposition components). Add a
-  matching `parse_warnings` or `clarification_questions` entry when the
-  inference is meaningful.
-- Do NOT invent identifiers, molecules, targets, candidates, or
-  downstream tool inputs that the user did not mention and that are not
-  the canonical resolution of an explicit alias.
-
-Privacy / safety:
-
-- You will NEVER receive raw file bytes. Only file metadata. Treat
-  filenames as advisory text; do not invent contents from them.
-- You will NEVER receive API keys, MCP tool lists, ToolUniverse parameter
-  schemas, or other pipeline state. Do not request them.
+Return exactly one JSON object matching the schema. Keep `parse_warnings`
+as a string array and `user_constraints` as an object array with
+`constraint_text` and `source`. Keep `requested_outputs` within the
+schema enum: `ranked_candidates`, `report`, `evidence_summary`,
+`literature_review_summary`, `patent_or_ip_summary`,
+`optimization_suggestions`, `developability_summary`,
+`structure_validation_report`, `compound_screening_results`,
+`entity_normalization_summary`, `workflow_recommendation`,
+`data_gap_summary`, `case_study_summary`. Do not emit tool plans, MCP
+selections, ToolUniverse arguments, generated ADC candidates, candidate
+rankings, liability flags, literature or patent queries, pose ensembles,
+DAR designs, conjugation site recommendations, raw file bytes, raw FASTA,
+storage paths, prompts, API keys, or raw tool payloads.
 """.strip()
 
 
@@ -402,6 +358,11 @@ _ENTITY_TYPE_ALIASES = {
     "indication": "disease_or_indication",
     "disease-or-indication": "disease_or_indication",
     "disease indication": "disease_or_indication",
+    "antibody_candidate": "antibody",
+    "antibody-candidate": "antibody",
+    "antibody candidate": "antibody",
+    "antibody_candidate_text": "antibody",
+    "antibody candidate text": "antibody",
     "payload-linker": "linker_payload",
     "payload linker": "linker_payload",
     "linker-payload": "linker_payload",
@@ -644,6 +605,133 @@ def _normalize_normalized_entity_types(payload: dict[str, Any]) -> None:
             )
 
 
+_ANTIBODY_HEAVY_CHAIN_SOURCE = "antibody_heavy_chain_sequence"
+_ANTIBODY_LIGHT_CHAIN_SOURCE = "antibody_light_chain_sequence"
+_ANTIBODY_GENERIC_CHAIN_SOURCE = "antibody_sequence_reference"
+
+# Drifted id_type / source aliases the live LLM occasionally returns
+# instead of the canonical antibody-chain source string. We promote
+# only when the alias is unambiguous; ``antibody_sequence``,
+# ``protein_sequence``, ``fasta`` etc. stay generic — we never invent a
+# heavy/light role from a chain-silent alias.
+_ANTIBODY_HEAVY_ID_TYPE_ALIASES = {
+    "heavy_chain_sequence",
+    "vh_sequence",
+    "hc_sequence",
+    "antibody_heavy_chain_sequence",
+    "heavy_chain",
+    "antibody_heavy_chain",
+    "antibody_vh_sequence",
+    "antibody_hc_sequence",
+}
+_ANTIBODY_LIGHT_ID_TYPE_ALIASES = {
+    "light_chain_sequence",
+    "vl_sequence",
+    "lc_sequence",
+    "kappa_sequence",
+    "lambda_sequence",
+    "antibody_light_chain_sequence",
+    "light_chain",
+    "antibody_light_chain",
+    "antibody_vl_sequence",
+    "antibody_lc_sequence",
+    "antibody_kappa_sequence",
+    "antibody_lambda_sequence",
+}
+_ANTIBODY_GENERIC_ID_TYPE_ALIASES = {
+    "antibody_sequence",
+    "antibody_sequence_reference",
+    "protein_sequence",
+    "fasta_sequence",
+    "amino_acid_sequence",
+}
+
+
+def _normalize_antibody_chain_references(payload: dict[str, Any]) -> None:
+    """Promote heavy / light / generic antibody-sequence drift in
+    ``referenced_inputs`` to canonical id_types / source strings.
+
+    Drift comes in two shapes:
+
+    1. The LLM emits an entry with ``id_type`` in
+       ``_ANTIBODY_*_ID_TYPE_ALIASES`` and a literal inline sequence in
+       ``value`` — we rewrite ``id_type`` to the canonical chain string
+       (``antibody_heavy_chain_sequence`` / ``…_light_…`` / generic)
+       and fill ``source="user"`` if missing.
+    2. The LLM emits an ``id_type="uploaded_file"`` entry with a
+       drifted ``source`` (e.g. ``vh_sequence``) — we rewrite the
+       ``source`` to the canonical chain string. The ``value`` (file_id)
+       stays untouched.
+
+    Generic / chain-silent aliases (``antibody_sequence``,
+    ``protein_sequence``, ``fasta``) stay generic — they are coerced to
+    ``antibody_sequence_reference`` so the downstream Step 5 agent sees
+    a stable source string, but they are NEVER promoted to heavy.
+    """
+    refs = payload.get("referenced_inputs")
+    if not isinstance(refs, list):
+        return
+
+    warnings = payload.get("parse_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    payload["parse_warnings"] = warnings
+
+    for entry in refs:
+        if not isinstance(entry, dict):
+            continue
+        id_type = entry.get("id_type")
+        source = entry.get("source")
+        id_type_lower = id_type.lower() if isinstance(id_type, str) else ""
+        source_lower = source.lower() if isinstance(source, str) else ""
+
+        # Case 1: inline drifted id_type.
+        if id_type_lower in _ANTIBODY_HEAVY_ID_TYPE_ALIASES:
+            new_type = _ANTIBODY_HEAVY_CHAIN_SOURCE
+        elif id_type_lower in _ANTIBODY_LIGHT_ID_TYPE_ALIASES:
+            new_type = _ANTIBODY_LIGHT_CHAIN_SOURCE
+        elif id_type_lower in _ANTIBODY_GENERIC_ID_TYPE_ALIASES:
+            new_type = _ANTIBODY_GENERIC_CHAIN_SOURCE
+        else:
+            new_type = None
+        if new_type and id_type != new_type:
+            old_id_type = id_type
+            entry["id_type"] = new_type
+            entry.setdefault("source", "user")
+            warnings.append(
+                f"normalized referenced_inputs.id_type from "
+                f"{old_id_type!r} to {new_type!r}"
+            )
+            id_type = new_type
+            id_type_lower = id_type.lower()
+
+        # Case 2: uploaded_file entry whose source carries a drifted
+        # chain alias. The source is the only place where the chain
+        # hint can live on uploaded_file entries.
+        if id_type == "uploaded_file" and source_lower:
+            if source_lower in _ANTIBODY_HEAVY_ID_TYPE_ALIASES:
+                if source != _ANTIBODY_HEAVY_CHAIN_SOURCE:
+                    entry["source"] = _ANTIBODY_HEAVY_CHAIN_SOURCE
+                    warnings.append(
+                        f"normalized referenced_inputs.source from "
+                        f"{source!r} to {_ANTIBODY_HEAVY_CHAIN_SOURCE!r}"
+                    )
+            elif source_lower in _ANTIBODY_LIGHT_ID_TYPE_ALIASES:
+                if source != _ANTIBODY_LIGHT_CHAIN_SOURCE:
+                    entry["source"] = _ANTIBODY_LIGHT_CHAIN_SOURCE
+                    warnings.append(
+                        f"normalized referenced_inputs.source from "
+                        f"{source!r} to {_ANTIBODY_LIGHT_CHAIN_SOURCE!r}"
+                    )
+            elif source_lower in _ANTIBODY_GENERIC_ID_TYPE_ALIASES:
+                if source != _ANTIBODY_GENERIC_CHAIN_SOURCE:
+                    entry["source"] = _ANTIBODY_GENERIC_CHAIN_SOURCE
+                    warnings.append(
+                        f"normalized referenced_inputs.source from "
+                        f"{source!r} to {_ANTIBODY_GENERIC_CHAIN_SOURCE!r}"
+                    )
+
+
 def normalize_llm_payload_for_step2(
     payload: dict,
     raw_request_record: dict | None = None,
@@ -656,6 +744,11 @@ def normalize_llm_payload_for_step2(
     2. ``user_constraints`` returned as ``list[str]`` instead of ``list[dict]``.
     3. Entity decomposition components returned with alias keys such as
        ``component_name`` instead of the schema-required ``canonical_name``.
+    4. Antibody chain references returned with drifted id_type /
+       source strings (``heavy_chain_sequence`` / ``vh_sequence`` / …).
+       The normalizer promotes unambiguous heavy / light aliases and
+       collapses chain-silent generic aliases — it NEVER fabricates a
+       heavy/light role from a generic alias.
 
     Idempotent: payloads already matching the schema pass through unchanged
     (no spurious wrapping, no duplicate sources). Never raises — unknown
@@ -686,6 +779,7 @@ def normalize_llm_payload_for_step2(
     _normalize_entity_components(out)
     _normalize_normalized_entity_types(out)
     _normalize_typed_smiles_fields(out, raw_request_record)
+    _normalize_antibody_chain_references(out)
 
     return out
 

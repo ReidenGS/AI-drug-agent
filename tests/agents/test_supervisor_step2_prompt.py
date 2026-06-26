@@ -97,42 +97,41 @@ def test_step2_target_only_request_marks_payload_gap():
 
 
 def test_step2_prompt_requires_component_canonical_name():
-    assert "entity_decompositions[].components[]" in SUPERVISOR_SYSTEM_PROMPT
-    assert "MUST use\n  `canonical_name`" in SUPERVISOR_SYSTEM_PROMPT
-    assert "Do NOT use `component_name`" in SUPERVISOR_SYSTEM_PROMPT
-    assert "`name`, `label`, or `value`" in SUPERVISOR_SYSTEM_PROMPT
-    assert "when known, `component_type`" in SUPERVISOR_SYSTEM_PROMPT
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "`entity_decompositions`" in sp
+    assert "`components[].canonical_name`" in sp
+    assert "`component_type`" in sp
+    assert "`component_name`, `name`, `label`, or `value`" in sp
 
 
 def test_step2_prompt_requires_typed_smiles_referenced_inputs():
     sp = SUPERVISOR_SYSTEM_PROMPT
-    assert "`mentioned_entities.payload_text`, `mentioned_entities.linker_text`, and" in sp
-    assert "are NAME / LABEL fields" in sp
-    assert "Do NOT put bare SMILES strings into `payload_text` or `linker_text`" in sp
-    assert "`payload SMILES <value>`, `linker SMILES <value>`" in sp
+    assert "Do not put\n  bare SMILES" in sp
+    assert "Payload SMILES ->" in sp
+    assert "Linker SMILES uses" in sp
+    assert "Unlabeled compound SMILES uses" in sp
     assert '"source": "payload_smiles"' in sp
     assert '"source": "linker_smiles"' in sp
-    assert '"source": "compound_smiles"' in sp
-    assert "If the name and SMILES appear" in sp
-    assert "inconsistent, add a `parse_warnings` entry" in sp
+    assert "compound_smiles" in sp
 
 
 def test_step2_prompt_typed_smiles_few_shot_keeps_smiles_out_of_name_fields():
     sp = SUPERVISOR_SYSTEM_PROMPT
-    assert "Evaluate a TROP2 ADC with antibody sacituzumab analog" in sp
-    assert "Payload SMILES C1=CC=C2C(=C1)C(=O)N(C)C3=CC=CC=C23" in sp
-    assert "Linker SMILES NCCOC(=O)O" in sp
-    assert '"payload_text": "SN-38 carbonate"' in sp
-    assert '"linker_text": "SN-38 carbonate"' in sp
+    assert "Few-shot 1:" in sp
+    assert "Design an ADC against HER2 / ERBB2 (UniProt P04626)" in sp
+    assert "Payload SMILES CC(C)C[C@H](N(C)C(=O)C(C)C)" in sp
+    assert "Linker SMILES\nNCCOC(=O)O" in sp
+    assert '"payload_text": "vc-MMAE"' in sp
+    assert '"linker_text": "vc-MMAE"' in sp
     assert (
         '{"id_type": "smiles", "value": '
-        '"C1=CC=C2C(=C1)C(=O)N(C)C3=CC=CC=C23", "source": "payload_smiles"}'
+        '"CC(C)C[C@H](N(C)C(=O)C(C)C)"'
     ) in sp
     assert (
-        '{"id_type": "smiles", "value": "NCCOC(=O)O", '
-        '"source": "linker_smiles"}'
+        '{"id_type": "smiles", "value": "NCCOC(=O)O",\n'
+        '     "source": "linker_smiles"}'
     ) in sp
-    assert '"payload_text": "C1=CC' not in sp
+    assert '"payload_text": "CC(' not in sp
     assert '"linker_text": "NCCOC' not in sp
 
 
@@ -285,6 +284,116 @@ def test_supervisor_user_prompt_does_not_mention_mcp_or_tooluniverse():
     assert "tool_name" not in low
 
 
+def test_step2_prompt_states_narrow_lossless_role():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "lossless parser and conservative normalizer" in sp
+    assert "not a\ntool planner or biomedical reasoning step" in sp.lower()
+    assert "never invent IDs, SMILES" in sp
+
+
+def test_step2_prompt_uses_second_person_voice():
+    """Wording cleanup: drop third-person 'the LLM' / 'the model' from
+    the prompt body and stop repeating 'Step 2'. The opening role
+    sentence is allowed; the rest of the prompt addresses the model
+    directly."""
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "the LLM" not in sp
+    assert "the model" not in sp
+    # Opening role sentence is in second person, no "Step-2" tag.
+    assert sp.startswith("You are the ADC pipeline structured-query parser.")
+    # Body no longer repeats "Step 2" as a subject.
+    assert "Step 2" not in sp
+    # Body uses imperatives / "You must" / "Do not" framings.
+    assert "You must" in sp
+    assert "Do not" in sp
+
+
+def test_step2_prompt_lists_four_field_responsibilities():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "Use these fields:" in sp
+    assert "`mentioned_entities`: literal user labels only" in sp
+    assert "`normalized_entities`: canonical forms" in sp
+    assert "`entity_decompositions`: component breakdowns" in sp
+    assert "`referenced_inputs`: explicit typed inputs only" in sp
+
+
+def test_step2_prompt_adc_combination_rules_for_vc_mmae_and_t_dm1():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "Composite ADC terms" in sp
+    assert "vc-MMAE" in sp and "T-DM1" in sp and "T-DXd" in sp and "Enhertu" in sp
+    assert "stay literal in `mentioned_entities`" in sp
+    assert "valine-citrulline linker + monomethyl" in sp
+    assert "trastuzumab antibody + DM1 payload" in sp
+
+
+def test_step2_prompt_forbids_isolated_low_information_vc_alias():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "Do not emit isolated `vc`" in sp
+    assert "unless\n  the user wrote it as a standalone linker" in sp
+
+
+def test_step2_prompt_typed_identifier_rules_for_uniprot_pdb_uploaded_smiles():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "Input-to-output mapping:" in sp
+    assert "Explicit UniProt accession" in sp
+    assert "`P04626`" in sp
+    assert "Explicit PDB ID `7XYZ`" in sp
+    assert "Uploaded file metadata with `file_id`" in sp
+    assert '"source": "uploaded_file"' in sp
+    assert "Payload SMILES" in sp
+    assert "Linker SMILES" in sp
+    assert "Unlabeled compound SMILES" in sp
+
+
+def test_step2_prompt_carries_her2_vc_mmae_few_shot():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "Few-shot 1:" in sp
+    assert "Design an ADC against HER2 / ERBB2 (UniProt P04626) using" in sp
+    assert "Payload SMILES CC(C)C[C@H](N(C)C(=O)C(C)C)" in sp
+    assert "Linker SMILES\nNCCOC(=O)O" in sp
+    assert '"payload_text": "vc-MMAE"' in sp
+    assert '"linker_text": "vc-MMAE"' in sp
+    assert (
+        '{"id_type": "uniprot_id", "value": "P04626", "source": "user"}'
+        in sp
+    )
+    assert (
+        '{"id_type": "smiles", "value": "CC(C)C[C@H](N(C)C(=O)C(C)C)",\n'
+        '     "source": "payload_smiles"}'
+    ) in sp
+    assert (
+        '{"id_type": "uploaded_file", "value": "f_pdb_001",\n'
+        '     "source": "uploaded_file"}'
+    ) in sp
+    # The few-shot must NOT teach the LLM to leak SMILES into name fields
+    # or to emit a bare "vc" as a standalone linker_text.
+    assert '"payload_text": "CC(' not in sp
+    assert '"linker_text": "NCCOC' not in sp
+    assert '"linker_text": "vc"' not in sp
+
+
+def test_step2_prompt_few_shot_explains_normalizer_invariants():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "Notes the LLM must follow" not in sp
+    assert '{"id_type": "uniprot_id", "value": "P04626", "source": "user"}' in sp
+    assert "`components[].canonical_name`" in sp
+    assert "`component_name`, `name`, `label`, or `value`" in sp
+
+
+def test_step2_prompt_boundary_block_forbids_downstream_outputs():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    for forbidden_phrase in (
+        "generated ADC candidates",
+        "candidate\nrankings",
+        "liability flags",
+        "tool plans, MCP\nselections",
+        "literature or patent queries",
+        "pose ensembles",
+        "DAR designs",
+    ):
+        assert forbidden_phrase in sp, forbidden_phrase
+
+
 def test_supervisor_system_prompt_enumerates_canonical_outputs():
     sp = SUPERVISOR_SYSTEM_PROMPT
     for required_value in (
@@ -409,3 +518,171 @@ def test_step2_llm_schema_carries_task_and_slim_prompt_inputs():
     blob = json.dumps(prompt_inputs)
     assert "storage_path" not in blob
     assert "/secret/x/" not in blob
+
+
+# ── Antibody heavy / light chain prompt + normalizer tests ──────────────
+
+
+def test_step2_prompt_lists_heavy_chain_signal_keywords():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    sp_lower = sp.lower()
+    for hint in ("heavy chain", "VH", "HC", "IGH", "IGHV"):
+        assert hint.lower() in sp_lower, hint
+    assert "antibody_heavy_chain_sequence" in sp
+
+
+def test_step2_prompt_lists_light_chain_signal_keywords():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    sp_lower = sp.lower()
+    for hint in ("light chain", "VL", "LC", "kappa", "lambda",
+                 "IGK", "IGL", "IGKV", "IGLV"):
+        assert hint.lower() in sp_lower, hint
+    assert "antibody_light_chain_sequence" in sp
+
+
+def test_step2_prompt_forbids_default_to_heavy_when_chain_silent():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "If the user only says antibody/protein sequence or FASTA" in sp
+    assert "do not default to heavy" in sp
+    assert "`antibody_sequence_reference`" in sp
+
+
+def test_step2_prompt_forbids_inferring_chain_from_sequence_content():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "Do not infer heavy vs light from sequence content." in sp
+
+
+def test_step2_prompt_forbids_extracting_cdr3_at_parse_time():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "Do not extract CDR3\n  from a full sequence." in sp
+    assert "antibody_cdr3_sequence" in sp
+
+
+def test_step2_prompt_heavy_light_few_shot_uses_file_ids_only():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "Few-shot 2:" in sp
+    assert "heavy_chain.fasta and\nlight_chain.fasta" in sp
+    assert (
+        '{"id_type": "uploaded_file", "value": "f_heavy_001",\n'
+        '     "source": "antibody_heavy_chain_sequence"}'
+    ) in sp
+    assert (
+        '{"id_type": "uploaded_file", "value": "f_light_002",\n'
+        '     "source": "antibody_light_chain_sequence"}'
+    ) in sp
+    # Raw FASTA / storage paths / filenames must not appear in the few-shot.
+    assert "EVQLVQSGAEVKKPGSSVKVSCKAS" not in sp
+    assert "/store/runs/" not in sp
+    assert '"value": "heavy_chain.fasta"' not in sp
+    assert '"value": "light_chain.fasta"' not in sp
+
+
+def test_step2_referenced_inputs_id_type_enum_includes_chain_signals():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "antibody_heavy_chain_sequence" in sp
+    assert "antibody_light_chain_sequence" in sp
+    assert "antibody_sequence_reference" in sp
+    assert "antibody_cdr3_sequence" in sp
+
+
+# ── Normalizer behaviour ─────────────────────────────────────────────────
+
+
+def _normalize(payload: dict) -> dict:
+    from app.agents.supervisor_agent import normalize_llm_payload_for_step2
+    return normalize_llm_payload_for_step2(payload)
+
+
+def test_normalizer_promotes_heavy_chain_alias_id_type():
+    payload = {
+        "referenced_inputs": [
+            {"id_type": "heavy_chain_sequence",
+             "value": "EVQLVQSGAEVKKPGSSVKVSCKAS"},
+        ],
+        "parse_warnings": [],
+    }
+    out = _normalize(payload)
+    assert out["referenced_inputs"][0]["id_type"] == "antibody_heavy_chain_sequence"
+    assert out["referenced_inputs"][0]["source"] == "user"
+    assert any("heavy_chain_sequence" in w for w in out["parse_warnings"])
+
+
+def test_normalizer_promotes_vh_and_hc_alias_id_types():
+    for alias in ("vh_sequence", "hc_sequence"):
+        out = _normalize({"referenced_inputs": [
+            {"id_type": alias, "value": "EVQLVQSGAEVKKPG"},
+        ], "parse_warnings": []})
+        assert out["referenced_inputs"][0]["id_type"] == (
+            "antibody_heavy_chain_sequence"
+        ), alias
+
+
+def test_normalizer_promotes_light_chain_alias_id_types():
+    for alias in ("light_chain_sequence", "vl_sequence", "lc_sequence",
+                  "kappa_sequence", "lambda_sequence"):
+        out = _normalize({"referenced_inputs": [
+            {"id_type": alias, "value": "DIQMTQSPSSLSASVGD"},
+        ], "parse_warnings": []})
+        assert out["referenced_inputs"][0]["id_type"] == (
+            "antibody_light_chain_sequence"
+        ), alias
+
+
+def test_normalizer_keeps_generic_antibody_sequence_as_generic():
+    """``antibody_sequence`` / ``protein_sequence`` carry no chain
+    information. The normalizer must NOT promote them to heavy; the
+    canonical generic id_type is ``antibody_sequence_reference``."""
+    for alias in ("antibody_sequence", "protein_sequence",
+                  "fasta_sequence", "amino_acid_sequence"):
+        out = _normalize({"referenced_inputs": [
+            {"id_type": alias, "value": "EVQLVQSGAEVKKPGSSVKVSCKAS"},
+        ], "parse_warnings": []})
+        new_type = out["referenced_inputs"][0]["id_type"]
+        assert new_type == "antibody_sequence_reference", (alias, new_type)
+        assert "antibody_heavy_chain_sequence" not in new_type
+        assert "antibody_light_chain_sequence" not in new_type
+
+
+def test_normalizer_repairs_uploaded_file_drifted_source_for_heavy_and_light():
+    payload = {
+        "referenced_inputs": [
+            {"id_type": "uploaded_file", "value": "f_heavy_001",
+             "source": "vh_sequence"},
+            {"id_type": "uploaded_file", "value": "f_light_002",
+             "source": "kappa_sequence"},
+            {"id_type": "uploaded_file", "value": "f_generic_003",
+             "source": "protein_sequence"},
+            {"id_type": "uploaded_file", "value": "f_silent_004",
+             "source": "uploaded_file"},
+        ],
+        "parse_warnings": [],
+    }
+    out = _normalize(payload)
+    refs = out["referenced_inputs"]
+    assert refs[0]["source"] == "antibody_heavy_chain_sequence"
+    assert refs[1]["source"] == "antibody_light_chain_sequence"
+    assert refs[2]["source"] == "antibody_sequence_reference"
+    # Chain-silent uploaded_file source stays as the existing value.
+    assert refs[3]["source"] == "uploaded_file"
+    # file_id values untouched.
+    assert refs[0]["value"] == "f_heavy_001"
+    assert refs[1]["value"] == "f_light_002"
+    assert refs[2]["value"] == "f_generic_003"
+    assert refs[3]["value"] == "f_silent_004"
+
+
+def test_normalizer_is_idempotent_on_canonical_payload():
+    payload = {
+        "referenced_inputs": [
+            {"id_type": "uploaded_file", "value": "f_heavy_001",
+             "source": "antibody_heavy_chain_sequence"},
+            {"id_type": "antibody_light_chain_sequence",
+             "value": "DIQMTQSPSSLSASVGD", "source": "user"},
+        ],
+        "parse_warnings": [],
+    }
+    out = _normalize(payload)
+    assert out["referenced_inputs"][0]["source"] == "antibody_heavy_chain_sequence"
+    assert out["referenced_inputs"][1]["id_type"] == "antibody_light_chain_sequence"
+    assert out["referenced_inputs"][1]["source"] == "user"
+    assert out["parse_warnings"] == []

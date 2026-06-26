@@ -162,12 +162,14 @@ def make_node_step_05(
     registry: ArtifactRegistryService,
     workflow_state: WorkflowStateService,
     mcp_client: MCPClient,
+    llm: LLMProvider | None = None,
 ):
     agent = CandidateContextAgent(
         storage=storage,
         registry=registry,
         workflow_state=workflow_state,
         mcp_client=mcp_client,
+        llm=llm,
     )
 
     def node_step_05(state: PipelineState) -> PipelineState:

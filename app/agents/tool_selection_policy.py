@@ -49,17 +49,11 @@ from pydantic import BaseModel, Field, ValidationError
 from ..llm.provider import LLMProvider
 from ..mcp.client import MCPClient
 from ..mcp.tools._registry import _all_bindings
+from .step_06_capability_registry import STEP_06_CAPABILITY_REGISTRY
 
 logger = logging.getLogger(__name__)
 
 SELECTION_POLICY_VERSION = "v1"
-
-# Tightly cap how many tools the per-candidate Stage 1 may pick for any single
-# lane. Together with the "1 Stage 1 + 1 Stage 2 per candidate" call schedule
-# this bounds the LLM budget so a 5-candidate Step 6 stays under ~10 LLM
-# calls (vs. ~42 in the per-lane / per-tool layout).
-MAX_LLM_SELECTED_TOOLS_PER_LANE = 2
-
 
 # ── shared Stage 1 / Stage 2 prompt contract ────────────────────────────────
 #
@@ -152,8 +146,8 @@ Rules:
    `allowed_tools` list — never propose a tool for a lane that is not in
    that lane's allowed_tools.
 3. For each lane, propose ZERO or more selections from its allowed_tools.
-   Hard cap: `max_tools_per_lane` selections per lane. Returning fewer is
-   allowed; returning more will be truncated.
+   Cover complementary capability categories when they are relevant. Do
+   not duplicate tools that provide the same semantic coverage.
 4. Each selection is one JSON object:
    {"lane_type":"...","tool_name":"...","selection_reason":"short text",
     "priority":<int>,"required_context":["..."]}.
@@ -167,7 +161,7 @@ Rules:
 SELECTION_STAGE1_MULTI_LANE_USER_PROMPT = (
     "Pick tools per lane for this candidate. Use tool_name + lane_type only "
     "— Stage 2 will handle arguments. Respect each lane's allowed_tools and "
-    "the per-lane tool cap."
+    "select complementary tools when the typed inputs support them."
 )
 
 
@@ -221,6 +215,13 @@ class ToolInvocationPlan(BaseModel):
     priority: int = 0
     required_context: list[str] = Field(default_factory=list)
     selected_by: Literal["llm", "deterministic_fallback"]
+    tool_selection_source: Literal[
+        "llm_stage1", "deterministic_fallback", "coverage_policy"
+    ] = "deterministic_fallback"
+    argument_construction_source: Literal[
+        "llm_stage2", "deterministic_mapping", "validated_fallback", "none"
+    ] = "none"
+    stage2_skipped: bool = False
     selection_policy_version: str = SELECTION_POLICY_VERSION
     validation_status: Literal["ok", "warning", "skipped"] = "ok"
     validation_warnings: list[str] = Field(default_factory=list)
@@ -382,6 +383,24 @@ CAPABILITY_REGISTRY: dict[str, dict] = {
         "coarse_input_requirements": ["brand_name", "application_number", "compound_name"],
     },
 }
+
+# Step 6 catalog metadata is generated from its dedicated registry. This
+# assignment intentionally overrides legacy entries above so adding a Step 6
+# capability no longer requires editing this shared policy module.
+for _step6_capability in STEP_06_CAPABILITY_REGISTRY:
+    if _step6_capability.lane_type is None:
+        continue
+    CAPABILITY_REGISTRY[_step6_capability.tool_name] = {
+        "short_description": (
+            _step6_capability.notes
+            or f"Step 6 {_step6_capability.coverage_category.replace('_', ' ')} capability"
+        ),
+        "capability_tags": [
+            _step6_capability.lane_type,
+            _step6_capability.coverage_category,
+        ],
+        "coarse_input_requirements": list(_step6_capability.required_input_slots),
+    }
 
 
 def _official_descriptions(tool_names: list[str]) -> dict[str, str]:
@@ -836,6 +855,10 @@ def _skipped_plan(
         priority=priority,
         required_context=required_context,
         selected_by=selected_by,
+        tool_selection_source=(
+            "llm_stage1" if selected_by == "llm" else "deterministic_fallback"
+        ),
+        argument_construction_source="none",
         validation_status="skipped",
         validation_warnings=list(validation_warnings),
     )
@@ -871,7 +894,6 @@ def select_and_build_per_candidate_invocations(
     lanes: list[LaneSelectionRequest],
     deterministic_fallback: Callable[[str], list[ToolInvocationPlan]],
     deterministic_argument_mapping: Optional[Callable[[str, dict], dict[str, Any]]] = None,
-    max_tools_per_lane: int = MAX_LLM_SELECTED_TOOLS_PER_LANE,
 ) -> dict[str, list[ToolInvocationPlan]]:
     """One Stage 1 + one Stage 2 LLM call for a candidate, lane-aware.
 
@@ -896,6 +918,8 @@ def select_and_build_per_candidate_invocations(
     catalog = build_compact_catalog(
         mcp_client=mcp_client, agent_name=agent_name, step_id=step_id
     )
+    eligible_names = {name for lane in lanes for name in lane.allowed_tools}
+    catalog = [entry for entry in catalog if entry.tool_name in eligible_names]
     allowed_names = {e.tool_name for e in catalog}
     lane_map = {l.lane_type: l for l in lanes}
 
@@ -919,7 +943,6 @@ def select_and_build_per_candidate_invocations(
             }
             for l in lanes
         ],
-        "max_tools_per_lane": max_tools_per_lane,
     }
     try:
         stage1 = llm.generate_json(
@@ -953,11 +976,6 @@ def select_and_build_per_candidate_invocations(
             continue
         seen.add((lt, tn))
         by_lane_raw.setdefault(lt, []).append(entry)
-    # Hard cap per lane.
-    for lt in list(by_lane_raw):
-        if len(by_lane_raw[lt]) > max_tools_per_lane:
-            by_lane_raw[lt] = by_lane_raw[lt][:max_tools_per_lane]
-
     # Resolve schemas (drops tools with no callable signature into skipped).
     stage2_items: list[tuple[str, str, dict, dict]] = []  # (lane, tool, entry, schema)
     schema_skipped: list[tuple[str, ToolInvocationPlan]] = []
@@ -1012,7 +1030,10 @@ def select_and_build_per_candidate_invocations(
                     ),
                     priority=int(entry.get("priority") or 0),
                     required_context=list(entry.get("required_context") or []),
-                    selected_by="deterministic_fallback",
+                    selected_by="llm",
+                    tool_selection_source="llm_stage1",
+                    argument_construction_source="deterministic_mapping",
+                    stage2_skipped=True,
                     validation_status="ok",
                     validation_warnings=[
                         "stage-2 skipped: deterministic mapping satisfied required args"
@@ -1022,7 +1043,7 @@ def select_and_build_per_candidate_invocations(
                 plan = _skipped_plan(
                     tool_name=tn, reason="model_validation_failed",
                     priority=0, required_context=[],
-                    selected_by="deterministic_fallback", validation_warnings=[],
+                    selected_by="llm", validation_warnings=[],
                 )
             out.setdefault(lt, []).append(plan)
         for (lt, plan) in schema_skipped:
@@ -1085,6 +1106,7 @@ def select_and_build_per_candidate_invocations(
         construct_reason = stage2_reason.get((lt, tn), "")
         cleaned_args, arg_warnings = validate_arguments(proposed, schema)
         selected_by: Literal["llm", "deterministic_fallback"] = "llm"
+        argument_source: Literal["llm_stage2", "validated_fallback"] = "llm_stage2"
         if _missing_required(cleaned_args, schema) and deterministic_argument_mapping is not None:
             fb_args = deterministic_argument_mapping(tn, lane_map[lt].arg_hints) or {}
             fb_clean, fb_warn = validate_arguments(fb_args, schema)
@@ -1093,6 +1115,7 @@ def select_and_build_per_candidate_invocations(
                 arg_warnings = [*arg_warnings, *fb_warn,
                                 "stage-2 args fell back to deterministic mapping"]
                 selected_by = "deterministic_fallback"
+                argument_source = "validated_fallback"
         status: Literal["ok", "warning", "skipped"]
         if _missing_required(cleaned_args, schema):
             status = "skipped"
@@ -1109,6 +1132,8 @@ def select_and_build_per_candidate_invocations(
                 priority=int(entry.get("priority") or 0),
                 required_context=list(entry.get("required_context") or []),
                 selected_by=selected_by,
+                tool_selection_source="llm_stage1",
+                argument_construction_source=argument_source,
                 validation_status=status,
                 validation_warnings=arg_warnings,
             )

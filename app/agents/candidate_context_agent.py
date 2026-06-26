@@ -10,10 +10,20 @@ the run has available so far:
 - `raw_request_record.uploaded_files[]` (PDB/CIF → structure material,
   FASTA → sequence material)
 
-Per candidate, the agent calls at most one scoped MCP tool to enrich context.
-Raw payloads land in `tool_outputs/step_05/{tool_call_id}.json` and are
-referenced via `tool_call_records[].tool_output_ref`. Raw upstream payloads
-NEVER appear inside `candidate_records[]`.
+Per candidate, the agent may call zero or more scoped MCP tools to enrich
+context, chosen via the metadata-driven `step_05_enrichment_registry` plus
+the LLM Stage-1 relevance selector in `step_05_selection_policy`. The set
+of executed tools per candidate is bounded by registry eligibility and
+the LLM's relevance picks — never by a hand-coded per-candidate cap. Raw
+payloads land in `tool_outputs/step_05/{tool_call_id}.json` and are
+referenced via `tool_call_records[].tool_output_ref`. Raw upstream
+payloads NEVER appear inside `candidate_records[]`.
+
+Antibody full sequence → CDR3 → IEDB BCR lookup is wired via a synthetic
+plan path in `_build_iedb_cdr3_plans` + `_enrich_with_iedb_cdr3`: the raw
+CDR3 enters MCP arguments only and is never persisted on the candidate
+or forwarded to the LLM payload. See `antibody_cdr3_extraction` for the
+abnumber / anarci adapter contract.
 
 ZINC guard: ZINC ids land as `zinc_id` identifiers; no material is marked as
 `ZINC22` unless the source record explicitly says so. Step 5 doesn't emit
@@ -26,6 +36,7 @@ import re
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Optional
 
+from ..llm.provider import LLMProvider, MockLLMProvider
 from ..mcp.client import MCPClient
 from ..schemas.common import ToolCallRecord
 from ..schemas.step_05_candidate_context_table import (
@@ -40,10 +51,26 @@ from ..services.storage_service import Storage
 from ..services.workflow_state_service import WorkflowStateService
 from ..utils.ids import new_artifact_id, new_tool_call_id
 from ..utils.time import now_iso
+from .antibody_cdr3_extraction import (
+    CHAIN_TYPE_HEAVY,
+    CHAIN_TYPE_LIGHT,
+    Cdr3Result,
+    STATUS_DEPENDENCY_UNAVAILABLE as _CDR3_STATUS_DEPENDENCY_UNAVAILABLE,
+    STATUS_EXTRACTION_FAILED as _CDR3_STATUS_EXTRACTION_FAILED,
+    STATUS_NO_VARIABLE_DOMAIN as _CDR3_STATUS_NO_VARIABLE_DOMAIN,
+    STATUS_SUCCESS as _CDR3_STATUS_SUCCESS,
+    extract_cdr3,
+)
 from .step_05_enrichment_registry import (
     EnrichmentPlan,
     plan_enrichment_for_record,
     skipped_low_information_chembl_name_queries,
+)
+from .step_05_selection_policy import (
+    SELECTION_POLICY_VERSION as STEP5_SELECTION_POLICY_VERSION,
+    Step5ToolDecision,
+    select_step5_enrichment_plans,
+    selection_provenance_for_tool_input_summary,
 )
 
 
@@ -54,6 +81,50 @@ _ARTIFACT_KEY = "candidate_context_table.json"
 
 _PDB_EXTS = {".pdb", ".cif", ".mmcif", ".ent"}
 _FASTA_EXTS = {".fasta", ".fa", ".faa", ".seq"}
+
+# Step 5 CDR3 → IEDB extension.
+_IEDB_BCR_TOOL_NAME = "iedb_search_bcr_sequences"
+# Sentinel string written into the synthetic IEDB plan's ``query`` field
+# so the agent's executor can recognise it without ever seeing the raw
+# CDR3 string. The actual CDR3 lives in a transient stack-frame dict.
+_IEDB_TRANSIENT_TOKEN = "<cdr3-transient>"
+# Compact ``select`` columns the IEDB BCR endpoint returns. We do NOT
+# request anything else — this is the audited downstream-needed subset.
+_IEDB_SELECT_COLUMNS: tuple[str, ...] = (
+    "receptor_group_id",
+    "receptor_type",
+    "receptor_name",
+    "chain1_cdr3_seq",
+    "chain2_cdr3_seq",
+    "receptor_chain1_types",
+    "receptor_chain2_types",
+    "pdb_ids",
+    "curated_source_antigens",
+)
+# Material types the agent treats as candidate-attached antibody
+# sequences. ``Step 1 → Step 2`` populates these as paths; the sequence
+# string itself only enters memory transiently inside
+# ``_build_iedb_cdr3_plans``.
+_ANTIBODY_HEAVY_SEQ_MATERIAL_TYPES = (
+    "antibody_heavy_chain_sequence",
+)
+_ANTIBODY_LIGHT_SEQ_MATERIAL_TYPES = (
+    "antibody_light_chain_sequence",
+)
+_ANTIBODY_GENERIC_SEQ_MATERIAL_TYPES = (
+    "antibody_sequence_reference",
+)
+_ANTIBODY_SEQ_REFERENCE_ROLES = (
+    "antibody_sequence_reference",
+)
+
+_HEAVY_CHAIN_HINTS = {
+    "heavy", "heavychain", "heavy_chain", "vh", "hc", "igh", "ighv",
+}
+_LIGHT_CHAIN_HINTS = {
+    "light", "lightchain", "light_chain", "vl", "lc", "kappa", "lambda",
+    "igk", "igl", "igkv", "iglv",
+}
 
 
 # Structure-reference role inference. We never open the PDB; we look at
@@ -152,11 +223,19 @@ class CandidateContextAgent:
         registry: ArtifactRegistryService,
         workflow_state: WorkflowStateService,
         mcp_client: MCPClient,
+        llm: LLMProvider | None = None,
     ) -> None:
         self.storage = storage
         self.registry = registry
         self.workflow_state = workflow_state
         self.mcp_client = mcp_client
+        # LLM-assisted Stage 1 tool relevance selection (Step 5). Defaults
+        # to the deterministic MockLLMProvider so existing tests and
+        # offline runs keep producing the same eligible-set as before
+        # (the mock selects every tool whose coarse_input_requirements
+        # match the candidate's signals). Production wiring (graph / API)
+        # passes the configured provider from ``get_llm_provider()``.
+        self.llm = llm or MockLLMProvider()
 
     # ── public API ──────────────────────────────────────────────────────────
     def run(self, run_id: str) -> CandidateContextTable:
@@ -195,6 +274,7 @@ class CandidateContextAgent:
         tool_call_records: list[ToolCallRecord] = []
         candidate_records: list[CandidateRecord] = []
         missing_flags: list[str] = []
+        enrichment_selection_audit: dict[str, dict] = {}
         scoped_step5_tools = self.mcp_client.list_tools(
             agent_name=_AGENT_NAME, step_id=_STEP_ID
         )
@@ -246,6 +326,8 @@ class CandidateContextAgent:
                 record=target_cand,
                 scoped_tools=scoped_step5_tools,
                 label="target",
+                raw_user_query=raw_user_query,
+                selection_audit=enrichment_selection_audit,
             )
             tool_call_records.extend(tcs)
             if tcs:
@@ -269,6 +351,8 @@ class CandidateContextAgent:
                 record=ab_cand,
                 scoped_tools=scoped_step5_tools,
                 label="antibody",
+                raw_user_query=raw_user_query,
+                selection_audit=enrichment_selection_audit,
             )
             tool_call_records.extend(tcs)
             if tcs:
@@ -310,6 +394,8 @@ class CandidateContextAgent:
                 record=cc,
                 scoped_tools=scoped_step5_tools,
                 label="compound",
+                raw_user_query=raw_user_query,
+                selection_audit=enrichment_selection_audit,
             )
             tool_call_records.extend(tcs)
             if tcs:
@@ -333,6 +419,21 @@ class CandidateContextAgent:
             payload_text=payload_text,
             linker_text=linker_text,
         )
+        # Generalised per-candidate dedup. Different paths through
+        # the build / enrichment / normalization layers can converge on
+        # the same typed material or the same typed identifier for a
+        # candidate (e.g. HER2 / ERBB2 both resolve to UniProt P04626,
+        # uploaded heavy/light FASTA contributes a duplicate
+        # ``target_sequence`` entry, etc.). The dedup key is strict —
+        # different roles, different sources, or different stored
+        # values are never merged — so payload vs linker, heavy vs
+        # light, and structure files at different storage paths stay
+        # distinct. Identifier provenance is preserved by merging
+        # ``source_ids`` and keeping the higher ``confidence`` value.
+        for rec in candidate_records:
+            rec.materials = _dedupe_candidate_materials(rec.materials)
+            rec.identifiers = _dedupe_candidate_identifiers(rec.identifiers)
+
         downstream_hints = _build_downstream_query_hints(
             candidate_records=candidate_records,
             normalized_entities=normalized_entities,
@@ -351,6 +452,7 @@ class CandidateContextAgent:
             missing_context_flags=missing_flags,
             tool_call_records=tool_call_records,
             downstream_query_hints=downstream_hints,
+            enrichment_selection_audit=enrichment_selection_audit,
         )
 
         artifact_id = new_artifact_id("candidate_context_table")
@@ -469,9 +571,10 @@ class CandidateContextAgent:
                 )
             )
         for f in sequence_files:
+            material_type = _infer_antibody_sequence_material_type(f)
             materials.append(
                 self._material_with_role(
-                    "antibody_heavy_chain_sequence",
+                    material_type,
                     f.get("storage_path") or f.get("original_filename") or "",
                     "fasta",
                     role="antibody_sequence_reference", role_status="explicit",
@@ -885,8 +988,10 @@ class CandidateContextAgent:
         record: CandidateRecord,
         scoped_tools: Iterable[str],
         label: str,
+        raw_user_query: str = "",
+        selection_audit: dict[str, dict] | None = None,
     ) -> list[ToolCallRecord]:
-        plans = plan_enrichment_for_record(
+        eligible_plans = plan_enrichment_for_record(
             record,
             scoped_tools=scoped_tools,
             candidate_category=record.candidate_type,
@@ -897,10 +1002,76 @@ class CandidateContextAgent:
             record=record,
             scoped_tools=scoped_tools,
         )
+
+        # CDR3 → IEDB extension. Transient: ``raw_cdr3_by_tool`` lives in
+        # this stack frame ONLY and is keyed by the synthetic plan we
+        # append below. It carries the raw CDR3 string so the IEDB MCP
+        # call can build a real filter, but the raw CDR3 NEVER reaches
+        # the audit, the LLM payload, or the persisted artifact.
+        raw_cdr3_by_tool: dict[str, dict[str, Any]] = {}
+        cdr3_audit_by_tool: dict[str, dict[str, Any]] = {}
+        cdr3_plans = self._build_iedb_cdr3_plans(
+            record=record,
+            scoped_tools=scoped_tools,
+            raw_cdr3_by_tool=raw_cdr3_by_tool,
+            cdr3_audit_by_tool=cdr3_audit_by_tool,
+        )
+        eligible_plans = eligible_plans + cdr3_plans
+
+        decisions, audit = select_step5_enrichment_plans(
+            record=record,
+            eligible_plans=eligible_plans,
+            llm=self.llm,
+            raw_user_query=raw_user_query,
+        )
+        if selection_audit is not None and audit.candidate_id:
+            selection_audit[audit.candidate_id] = audit.to_compact()
+
+        eligible_count = len(eligible_plans)
+        # Real selected vs synthetic dependency-gap are reported as
+        # distinct counters so a reviewer can never confuse a synthetic
+        # ZINC dependency_unavailable record with an LLM-selected
+        # successful execution.
+        real_selected_count = sum(
+            1 for d in decisions
+            if d.selected and not d.plan.known_live_unavailable
+        )
+        known_unavailable_count = sum(
+            1 for d in decisions
+            if d.selected and d.plan.known_live_unavailable
+        )
+        skipped_count = sum(1 for d in decisions if not d.selected)
+        fallback_reason = audit.fallback_reason
+
         out: list[ToolCallRecord] = []
-        for plan in plans:
+        for decision in decisions:
+            if not decision.selected:
+                continue
+            plan = decision.plan
+            provenance = selection_provenance_for_tool_input_summary(
+                decision,
+                eligible_count=eligible_count,
+                real_selected_count=real_selected_count,
+                skipped_count=skipped_count,
+                known_unavailable_count=known_unavailable_count,
+                fallback_reason=fallback_reason,
+            )
             if plan.known_live_unavailable:
-                tc = _known_unavailable_tool_call(plan=plan, label=label)
+                tc = _known_unavailable_tool_call(
+                    plan=plan, label=label, provenance=provenance
+                )
+            elif plan.tool_name == _IEDB_BCR_TOOL_NAME and (
+                _IEDB_TRANSIENT_TOKEN in plan.query
+            ):
+                tc = self._enrich_with_iedb_cdr3(
+                    run_id=run_id,
+                    record=record,
+                    plan=plan,
+                    label=label,
+                    provenance=provenance,
+                    raw_cdr3_by_tool=raw_cdr3_by_tool,
+                    cdr3_audit_by_tool=cdr3_audit_by_tool,
+                )
             else:
                 summary = {
                     "query_kind": plan.query_kind,
@@ -910,6 +1081,7 @@ class CandidateContextAgent:
                     "output_extractor_type": plan.output_extractor_type,
                 }
                 summary.update(plan.extra_summary)
+                summary.update(provenance)
                 tc = self._enrich_with_tool(
                     run_id=run_id,
                     tool_name=plan.tool_name,
@@ -991,6 +1163,348 @@ class CandidateContextAgent:
             started_at=started,
             finished_at=finished,
             tool_input_summary=summary,
+            tool_output_artifact_id=output_artifact_id,
+            tool_output_ref=output_ref,
+            error_message=result.get("error_message"),
+        )
+
+    # ── CDR3 → IEDB extension ───────────────────────────────────────────
+    def _read_sequence_material_text(self, material_value: str) -> str:
+        """Read the antibody sequence string from a material `value`.
+
+        Sequence materials usually carry a storage path. We deliberately
+        treat the path as opaque: only the raw FASTA text is read from
+        storage, only the sequence characters (no headers) are returned,
+        and the full string is held in memory only long enough to build
+        an MCP filter. Never logged. Never persisted on the candidate.
+        """
+        text: str = ""
+        if not isinstance(material_value, str) or not material_value.strip():
+            return ""
+        # Path-shaped values get resolved through storage; literal sequences
+        # (already amino-acid characters) are used as-is.
+        if "/" in material_value or material_value.lower().endswith(
+            tuple(_FASTA_EXTS)
+        ):
+            try:
+                raw = self.storage.read_bytes(material_value) or b""
+                text = raw.decode("utf-8", errors="ignore")
+            except Exception:  # noqa: BLE001
+                text = ""
+        else:
+            text = material_value
+        # Strip FASTA headers / blank lines, keep AA chars only. We never
+        # log this text and we never return it from public methods.
+        lines = [
+            line.strip() for line in text.splitlines()
+            if line.strip() and not line.startswith(">")
+        ]
+        return "".join(lines).upper()
+
+    def _candidate_sequence_materials(
+        self, record: CandidateRecord
+    ) -> list[tuple[str, str, str]]:
+        """Return ``(material_id, chain_role, material_value)`` tuples
+        for every antibody sequence material attached to ``record``."""
+        out: list[tuple[str, str, str]] = []
+        for material in record.materials or []:
+            mt = material.material_type
+            role = (material.role or "").lower()
+            if mt in _ANTIBODY_HEAVY_SEQ_MATERIAL_TYPES:
+                chain_role = "antibody_heavy"
+            elif mt in _ANTIBODY_LIGHT_SEQ_MATERIAL_TYPES:
+                chain_role = "antibody_light"
+            elif mt in _ANTIBODY_GENERIC_SEQ_MATERIAL_TYPES:
+                chain_role = "unknown"
+            elif role in _ANTIBODY_SEQ_REFERENCE_ROLES:
+                # Generic reference; let the numbering backend decide.
+                chain_role = "unknown"
+            else:
+                continue
+            value = material.value or ""
+            if value:
+                out.append((material.material_id, chain_role, value))
+        return out
+
+    def _build_iedb_cdr3_plans(
+        self,
+        *,
+        record: CandidateRecord,
+        scoped_tools: Iterable[str],
+        raw_cdr3_by_tool: dict[str, dict[str, Any]],
+        cdr3_audit_by_tool: dict[str, dict[str, Any]],
+    ) -> list[EnrichmentPlan]:
+        if _IEDB_BCR_TOOL_NAME not in set(scoped_tools):
+            return []
+        if record.candidate_type != "antibody":
+            return []
+        seq_materials = self._candidate_sequence_materials(record)
+        if not seq_materials:
+            return []
+
+        plans: list[EnrichmentPlan] = []
+        for material_id, chain_role, material_value in seq_materials:
+            sequence = self._read_sequence_material_text(material_value)
+            if not sequence:
+                gap = (
+                    f"iedb_cdr3_extraction_failed:source_material={material_id}"
+                    ":empty_sequence"
+                )
+                if gap not in record.data_gaps:
+                    record.data_gaps.append(gap)
+                continue
+
+            cdr3: Cdr3Result = extract_cdr3(
+                sequence, expected_chain_role=chain_role  # type: ignore[arg-type]
+            )
+            if cdr3.status != _CDR3_STATUS_SUCCESS:
+                self._record_cdr3_failure_gap(
+                    record=record,
+                    material_id=material_id,
+                    cdr3=cdr3,
+                )
+                continue
+
+            # Decide which IEDB filter key applies to this chain. Heavy
+            # chains map to ``chain1_cdr3_seq``; light chains map to
+            # ``chain2_cdr3_seq``. Unknown extracted chain types are not
+            # queried — we do not invent a filter when the numbering
+            # backend is unsure.
+            if cdr3.chain_type == CHAIN_TYPE_HEAVY:
+                filter_key = "chain1_cdr3_seq"
+                derived_mat_type = "antibody_heavy_cdr3_sequence"
+            elif cdr3.chain_type == CHAIN_TYPE_LIGHT:
+                filter_key = "chain2_cdr3_seq"
+                derived_mat_type = "antibody_light_cdr3_sequence"
+            else:
+                gap = (
+                    f"iedb_cdr3_extraction_chain_type_unknown:"
+                    f"source_material={material_id}"
+                )
+                if gap not in record.data_gaps:
+                    record.data_gaps.append(gap)
+                continue
+
+            # Add a derived material whose `value` is a redacted marker —
+            # NOT the raw CDR3 string. The raw string stays in
+            # ``raw_cdr3_by_tool`` for the duration of this call only.
+            redacted_value = (
+                f"[redacted:cdr3 length={cdr3.cdr3_length} "
+                f"sha256={cdr3.cdr3_sha256_prefix} "
+                f"scheme={cdr3.numbering_scheme}]"
+            )
+            mat = Material(
+                material_id=new_artifact_id("material"),
+                material_type=derived_mat_type,
+                value=redacted_value,
+                value_format="redacted_marker",
+                extraction_status="extracted",
+                validation_status="valid",
+                role="antibody",
+                role_status="inferred",
+            )
+            _append_material_once(record, mat)
+            note = (
+                f"CDR3 extracted by antibody numbering backend "
+                f"'{cdr3.backend}' (scheme={cdr3.numbering_scheme}); "
+                f"length={cdr3.cdr3_length}; sha256_prefix="
+                f"{cdr3.cdr3_sha256_prefix}; source_material={material_id}; "
+                f"raw CDR3 used only for MCP arguments — not persisted."
+            )
+            if note not in record.context_notes:
+                record.context_notes.append(note)
+
+            # Build a synthetic plan. The ``query`` is a sentinel token,
+            # NOT the raw CDR3, so eligibility audit / catalog / LLM
+            # payload do not see the sequence.
+            unique_token = f"{_IEDB_TRANSIENT_TOKEN}:{material_id}:{filter_key}"
+            extra_summary = {
+                "fallback_group": "iedb_bcr_cdr3",
+                "provenance_policy": "cdr3_filtered_iedb_lookup",
+                "confidence_policy": "context_only",
+                "cdr3_chain_type": cdr3.chain_type,
+                "cdr3_length": cdr3.cdr3_length,
+                "cdr3_sha256_prefix": cdr3.cdr3_sha256_prefix,
+                "cdr3_numbering_scheme": cdr3.numbering_scheme,
+                "cdr3_backend": cdr3.backend,
+                "cdr3_source_material_id": material_id,
+                "iedb_filter_key": filter_key,
+            }
+            plan = EnrichmentPlan(
+                tool_name=_IEDB_BCR_TOOL_NAME,
+                query=unique_token,
+                query_kind="cdr3_filter",
+                query_role="antibody",
+                material_type=derived_mat_type,
+                schema_arg_name="filters",
+                capability_type="bcell_receptor_cdr3_lookup",
+                output_extractor_type="iedb_bcr_cdr3",
+                provenance_policy="cdr3_filtered_iedb_lookup",
+                confidence_policy="context_only",
+                known_live_unavailable=False,
+                known_unavailable_reason="",
+                extra_summary=extra_summary,
+            )
+            plans.append(plan)
+            raw_cdr3_by_tool[unique_token] = {
+                "cdr3_sequence": cdr3.cdr3_sequence,
+                "filter_key": filter_key,
+            }
+            cdr3_audit_by_tool[unique_token] = cdr3.to_compact_audit()
+        return plans
+
+    def _record_cdr3_failure_gap(
+        self,
+        *,
+        record: CandidateRecord,
+        material_id: str,
+        cdr3: Cdr3Result,
+    ) -> None:
+        if cdr3.status == _CDR3_STATUS_DEPENDENCY_UNAVAILABLE:
+            gap = (
+                "iedb_cdr3_extraction_dependency_unavailable:"
+                f"source_material={material_id}"
+            )
+            note = (
+                "Step 5 did not query IEDB BCR by CDR3 because antibody "
+                "numbering dependency (abnumber / anarci) is not "
+                "installed. Full VH/VL sequence preserved for Step 6 "
+                "PROSITE / Step 7 structure preparation."
+            )
+        elif cdr3.status == _CDR3_STATUS_NO_VARIABLE_DOMAIN:
+            gap = (
+                "iedb_cdr3_extraction_no_variable_domain:"
+                f"source_material={material_id}"
+            )
+            note = (
+                "Numbering backend reported no antibody variable domain; "
+                "Step 5 did not query IEDB with the full sequence."
+            )
+        else:
+            gap = (
+                "iedb_cdr3_extraction_failed:"
+                f"source_material={material_id}"
+            )
+            note = (
+                "Numbering backend failed to extract CDR3; Step 5 did "
+                "not query IEDB."
+            )
+        if gap not in record.data_gaps:
+            record.data_gaps.append(gap)
+        if note not in record.context_notes:
+            record.context_notes.append(note)
+
+    def _enrich_with_iedb_cdr3(
+        self,
+        *,
+        run_id: str,
+        record: CandidateRecord,
+        plan: EnrichmentPlan,
+        label: str,
+        provenance: dict[str, Any],
+        raw_cdr3_by_tool: dict[str, dict[str, Any]],
+        cdr3_audit_by_tool: dict[str, dict[str, Any]],
+    ) -> ToolCallRecord:
+        """Execute the synthetic IEDB plan with raw CDR3 in MCP args
+        ONLY. Audit and persisted summary keep only redacted metadata."""
+        transient = raw_cdr3_by_tool.get(plan.query) or {}
+        cdr3_sequence: str = transient.get("cdr3_sequence") or ""
+        filter_key: str = transient.get("filter_key") or "chain1_cdr3_seq"
+        cdr3_audit = cdr3_audit_by_tool.get(plan.query) or {}
+
+        # Compact audit summary — never the raw CDR3 string.
+        redacted_summary: dict[str, Any] = {
+            "query_kind": plan.query_kind,
+            "query_role": plan.query_role,
+            "material_type": plan.material_type,
+            "capability_type": plan.capability_type,
+            "output_extractor_type": plan.output_extractor_type,
+            "iedb_filter_key": filter_key,
+            "cdr3_chain_type": plan.extra_summary.get("cdr3_chain_type"),
+            "cdr3_length": plan.extra_summary.get("cdr3_length"),
+            "cdr3_sha256_prefix": plan.extra_summary.get("cdr3_sha256_prefix"),
+            "cdr3_numbering_scheme": plan.extra_summary.get("cdr3_numbering_scheme"),
+            "cdr3_backend": plan.extra_summary.get("cdr3_backend"),
+            "cdr3_source_material_id": plan.extra_summary.get(
+                "cdr3_source_material_id"
+            ),
+            "select_columns_count": len(_IEDB_SELECT_COLUMNS),
+            "cdr3_audit": cdr3_audit,
+        }
+        redacted_summary.update(plan.extra_summary)
+        redacted_summary.update(provenance)
+        # Defensive sweep: ensure no raw CDR3 leaks into the summary.
+        if cdr3_sequence:
+            for key, value in list(redacted_summary.items()):
+                if isinstance(value, str) and cdr3_sequence in value:
+                    redacted_summary[key] = "[redacted]"
+
+        tc_id = new_tool_call_id()
+        started = now_iso()
+        # ``filters`` is a real MCP argument; ``select`` is a compact
+        # column projection. Both contain operational values, NOT the
+        # full antibody sequence and NOT placed on the candidate.
+        mcp_args = {
+            "filters": {filter_key: f"eq.{cdr3_sequence}"},
+            "select": list(_IEDB_SELECT_COLUMNS),
+        }
+        result = self.mcp_client.call_tool(
+            agent_name=_AGENT_NAME,
+            step_id=_STEP_ID,
+            tool_name=_IEDB_BCR_TOOL_NAME,
+            **mcp_args,
+        )
+        finished = now_iso()
+
+        output_ref = None
+        output_artifact_id = None
+        if "payload" in result:
+            output_artifact_id = new_artifact_id("tool_output")
+            output_key = self.storage.run_key(
+                run_id, "tool_outputs", "step_05", f"{tc_id}.json"
+            )
+            self.storage.write_json(
+                output_key,
+                {
+                    "tool_call_id": tc_id,
+                    "tool_name": _IEDB_BCR_TOOL_NAME,
+                    # Persisted ``input`` is the REDACTED summary — never
+                    # the raw CDR3 string and never the operational MCP
+                    # arg dict. We accept the loss of a fully reproducible
+                    # input echo in exchange for the privacy guarantee.
+                    "input": redacted_summary,
+                    "output": result["payload"],
+                },
+            )
+            output_ref = output_key
+
+        # Surface a compact context_note + non-leaking summary for the
+        # candidate. Raw CDR3 still never reaches the record.
+        if result.get("run_status") in (None, "success") and output_ref:
+            record.candidate_notes = _notes_for(
+                ToolCallRecord(
+                    tool_call_id=tc_id,
+                    tool_name=_IEDB_BCR_TOOL_NAME,
+                    agent_name=_AGENT_NAME,
+                    step_id=_STEP_ID,
+                    run_status=result.get("run_status", "pending"),
+                    started_at=started,
+                    finished_at=finished,
+                    tool_input_summary=redacted_summary,
+                    tool_output_ref=output_ref,
+                ),
+                "iedb cdr3 context enrichment",
+            ) or record.candidate_notes
+
+        return ToolCallRecord(
+            tool_call_id=tc_id,
+            tool_name=_IEDB_BCR_TOOL_NAME,
+            agent_name=_AGENT_NAME,
+            step_id=_STEP_ID,
+            run_status=result.get("run_status", "pending"),
+            started_at=started,
+            finished_at=finished,
+            tool_input_summary=redacted_summary,
             tool_output_artifact_id=output_artifact_id,
             tool_output_ref=output_ref,
             error_message=result.get("error_message"),
@@ -1141,8 +1655,27 @@ def _looks_like_smiles_query(value: str) -> bool:
     return bool(re.search(r"[A-Za-z]", query))
 
 
-def _known_unavailable_tool_call(*, plan: EnrichmentPlan, label: str) -> ToolCallRecord:
+def _known_unavailable_tool_call(
+    *,
+    plan: EnrichmentPlan,
+    label: str,
+    provenance: dict[str, Any] | None = None,
+) -> ToolCallRecord:
     now = now_iso()
+    summary: dict[str, Any] = {
+        "query": plan.query,
+        "label": label,
+        "query_kind": plan.query_kind,
+        "query_role": plan.query_role,
+        "material_type": plan.material_type,
+        "capability_type": plan.capability_type,
+        "output_extractor_type": plan.output_extractor_type,
+        "provenance_policy": plan.provenance_policy,
+        "confidence_policy": plan.confidence_policy,
+        **plan.extra_summary,
+    }
+    if provenance:
+        summary.update(provenance)
     return ToolCallRecord(
         tool_call_id=new_tool_call_id(),
         tool_name=plan.tool_name,
@@ -1151,18 +1684,7 @@ def _known_unavailable_tool_call(*, plan: EnrichmentPlan, label: str) -> ToolCal
         run_status="dependency_unavailable",
         started_at=now,
         finished_at=now,
-        tool_input_summary={
-            "query": plan.query,
-            "label": label,
-            "query_kind": plan.query_kind,
-            "query_role": plan.query_role,
-            "material_type": plan.material_type,
-            "capability_type": plan.capability_type,
-            "output_extractor_type": plan.output_extractor_type,
-            "provenance_policy": plan.provenance_policy,
-            "confidence_policy": plan.confidence_policy,
-            **plan.extra_summary,
-        },
+        tool_input_summary=summary,
         error_message=plan.known_unavailable_reason or "known_unavailable",
     )
 
@@ -1343,6 +1865,35 @@ def _format_for_file(f: dict) -> str:
     if ext in {".cif", ".mmcif"}:
         return "cif"
     return "pdb"
+
+
+def _infer_antibody_sequence_material_type(f: dict) -> str:
+    """Infer heavy/light antibody sequence role from explicit file metadata.
+
+    This is deliberately conservative: unknown FASTA files stay generic
+    ``antibody_sequence_reference`` so Step 5 does not silently treat every
+    antibody sequence upload as a heavy chain.
+    """
+    parts: list[str] = []
+    for key in (
+        "original_filename", "file_id", "role", "chain_role",
+        "material_role", "description",
+    ):
+        value = f.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.lower())
+    haystack = " ".join(parts)
+    tokens = set(re.split(r"[^a-z0-9]+", haystack))
+    collapsed = re.sub(r"[^a-z0-9]+", "", haystack)
+    if tokens.intersection(_HEAVY_CHAIN_HINTS) or any(
+        hint in collapsed for hint in ("heavychain", "ighv")
+    ):
+        return "antibody_heavy_chain_sequence"
+    if tokens.intersection(_LIGHT_CHAIN_HINTS) or any(
+        hint in collapsed for hint in ("lightchain", "igkv", "iglv")
+    ):
+        return "antibody_light_chain_sequence"
+    return "antibody_sequence_reference"
 
 
 def _identifiers_for(
@@ -1768,6 +2319,88 @@ def _append_material_once(record: CandidateRecord, material: Material) -> None:
     ):
         return
     record.materials.append(material)
+
+
+def _material_dedup_key(m: Material) -> tuple:
+    """Strict per-material dedup key for one candidate.
+
+    Two materials are considered duplicates only when ALL of the
+    distinguishing axes match: ``material_type`` (so payload vs linker,
+    heavy vs light stay distinct), normalized ``value`` (storage path
+    / sequence string / identifier value, lowercased + stripped),
+    ``value_format`` (e.g. ``text`` vs ``smiles`` vs ``fasta``), ``role``,
+    and ``role_status``. Different roles or different sources never
+    collapse together; only true byte-for-byte duplicates do.
+    """
+    return (
+        (m.material_type or "").lower(),
+        (m.value or "").strip().lower(),
+        (m.value_format or "").lower(),
+        (m.role or "").lower(),
+        (m.role_status or "").lower(),
+    )
+
+
+def _dedupe_candidate_materials(materials: list[Material]) -> list[Material]:
+    """Drop duplicate materials within ONE candidate.
+
+    Order is preserved; the first occurrence wins so later identical
+    additions (e.g. a UniProt-derived path that converges on the same
+    canonical sequence reference) silently no-op. Materials with any
+    distinguishing field different — material_type, normalized value,
+    value_format, role, role_status — are NEVER merged.
+    """
+    seen: set[tuple] = set()
+    out: list[Material] = []
+    for m in materials:
+        key = _material_dedup_key(m)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(m)
+    return out
+
+
+def _dedupe_candidate_identifiers(
+    identifiers: list[Identifier],
+) -> list[Identifier]:
+    """Drop duplicate identifiers within ONE candidate AND merge
+    provenance.
+
+    Dedup key is ``(id_type.lower(), id_value.strip().upper())``. When
+    a duplicate is encountered, we merge its ``source_ids`` into the
+    first occurrence (set-union preserving order) and lift the
+    surviving ``confidence`` to the higher of the two values. Different
+    ``id_type`` or different ``id_value`` are never merged — e.g. two
+    distinct UniProt accessions stay distinct.
+    """
+    first_at: dict[tuple[str, str], int] = {}
+    out: list[Identifier] = []
+    for ident in identifiers:
+        key = (
+            (ident.id_type or "").lower(),
+            (ident.id_value or "").strip().upper(),
+        )
+        if key in first_at:
+            existing = out[first_at[key]]
+            existing_sources = list(existing.source_ids or [])
+            seen_set = set(existing_sources)
+            for s in ident.source_ids or []:
+                if s and s not in seen_set:
+                    existing_sources.append(s)
+                    seen_set.add(s)
+            existing.source_ids = existing_sources
+            try:
+                new_conf = float(ident.confidence or 0)
+                cur_conf = float(existing.confidence or 0)
+            except (TypeError, ValueError):
+                new_conf, cur_conf = 0.0, 0.0
+            if new_conf > cur_conf:
+                existing.confidence = ident.confidence
+            continue
+        first_at[key] = len(out)
+        out.append(ident)
+    return out
 
 
 def _compound_enrichment_smiles_role(record: CandidateRecord) -> tuple[str, str]:

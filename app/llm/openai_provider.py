@@ -54,6 +54,12 @@ class OpenAIProvider:
         self.max_retries = max(0, max_retries)
         self.timeout = float(timeout)
         self._client: Any | None = None
+        # Compact per-attempt usage log. Each entry holds only
+        # provider / model / task / attempt + token counts — never
+        # prompt, system, schema, response content, or API key.
+        # Callers (e.g. live smoke scripts) may read or reset this
+        # list to attribute token spend to a workflow phase.
+        self.usage_events: list[dict[str, Any]] = []
 
     def generate(self, prompt: str, *, system: str | None = None, **kwargs: Any) -> str:
         raise NotImplementedError("OpenAIProvider.generate not wired yet")
@@ -70,7 +76,17 @@ class OpenAIProvider:
         - SupervisorAgent structured-query parsing
         """
         task = (schema or {}).get("task") or "structured_query"
-        base_prompt = _build_json_prompt(prompt=prompt, schema=schema or {}, system=system)
+        # Build the user-message body WITHOUT embedding the system block.
+        # Chat Completions takes ``system`` as a dedicated role="system"
+        # message via ``_generate_content``; ``_build_json_prompt`` would
+        # otherwise prepend the same text into the user message, sending
+        # the system prompt twice on every call (a measurable Step 2 /
+        # Step 5 prompt-token waste). Gemini still passes ``system`` into
+        # ``_build_json_prompt`` because that path has no separate
+        # system role today.
+        base_prompt = _build_json_prompt(
+            prompt=prompt, schema=schema or {}, system=None,
+        )
         errors: list[str] = []
 
         for attempt in range(self.max_retries + 1):
@@ -81,6 +97,15 @@ class OpenAIProvider:
                     f"required JSON object. Error: {errors[-1]}. Return corrected JSON only."
                 )
             response = self._generate_content(base_prompt + retry_note, system=system)
+            # Record per-attempt token usage as soon as a response object
+            # exists, regardless of whether parsing later succeeds — a
+            # retry on a malformed response still cost real tokens.
+            self.usage_events.append(
+                _build_usage_event(
+                    provider=self.name, model=self.model,
+                    task=task, attempt=attempt, response=response,
+                )
+            )
             try:
                 parsed = _response_to_dict(response)
                 validated = _validate_task_shape(parsed, task)
@@ -164,3 +189,65 @@ def _response_to_dict(response: Any) -> dict:
                 joined, error_factory=OpenAIProviderError, provider_label="OpenAI"
             )
     raise OpenAIProviderError("OpenAI response did not include JSON content")
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _build_usage_event(
+    *, provider: str, model: str, task: str, attempt: int, response: Any,
+) -> dict[str, Any]:
+    """Compact usage event built from a Chat Completions response.
+
+    Reads ``response.usage`` ({prompt_tokens, completion_tokens,
+    total_tokens}). Missing fields degrade to ``None`` so the event
+    is always present even when the SDK version drifts. NEVER reads
+    or stores prompt / system / schema / response content / API key.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("usage")
+
+    def _get(key: str) -> Any:
+        if usage is None:
+            return None
+        return getattr(usage, key, None) if not isinstance(usage, dict) else usage.get(key)
+
+    # OpenAI Chat Completions exposes the cached-prompt token count
+    # under ``usage.prompt_tokens_details.cached_tokens`` (auto prompt
+    # caching). Degrades to ``None`` when the SDK / proxy / older
+    # backend does not surface that block.
+    details = _get("prompt_tokens_details")
+
+    def _detail(key: str) -> Any:
+        if details is None:
+            return None
+        if isinstance(details, dict):
+            return details.get(key)
+        return getattr(details, key, None)
+
+    return {
+        "provider": provider,
+        "model": model,
+        "task": task,
+        "attempt": attempt,
+        "prompt_tokens": _coerce_int(_get("prompt_tokens")),
+        "completion_tokens": _coerce_int(_get("completion_tokens")),
+        "total_tokens": _coerce_int(_get("total_tokens")),
+        "cached_prompt_tokens": _coerce_int(_detail("cached_tokens")),
+    }

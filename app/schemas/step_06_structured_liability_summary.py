@@ -51,4 +51,5 @@ class StructuredLiabilitySummary(BaseModel):
     candidate_liability_results: list[CandidateLiability] = Field(default_factory=list)
     missing_input_flags: list[str] = Field(default_factory=list)
     tool_output_artifacts: list[str] = Field(default_factory=list)
+    selection_audit: dict = Field(default_factory=dict)
     notes: Optional[str] = None

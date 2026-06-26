@@ -13,10 +13,16 @@ from typing import Any, Iterable, Optional
 
 from ..agents.tool_selection_policy import (
     LaneSelectionRequest,
-    MAX_LLM_SELECTED_TOOLS_PER_LANE,
     SelectionContext,
     ToolInvocationPlan,
     select_and_build_per_candidate_invocations,
+)
+from ..agents.step_06_capability_registry import (
+    STEP_06_CAPABILITY_BY_TOOL,
+    STEP_06_CAPABILITY_REGISTRY,
+    capabilities_for_lane,
+    deterministic_arguments,
+    eligible_capabilities,
 )
 from ..agents.step_06_interpretation import (
     aggregate_lane_risk,
@@ -45,65 +51,13 @@ _STEP_ID = "step_06"
 _ARTIFACT_KEY = "structured_liability_summary.json"
 
 
-# Lane → (representative fallback tool, material_type predicates that activate it).
-_LANE_TOOLS: tuple[tuple[LaneType, str, tuple[str, ...]], ...] = (
-    (
-        "payload_linker_compound_liability",
-        "DrugProps_pains_filter",
-        ("payload_smiles", "linker_smiles", "compound_smiles"),
-    ),
-    (
-        "antibody_protein_sequence_liability",
-        "PROSITE_scan_sequence",
-        ("antibody_heavy_chain_sequence", "antibody_light_chain_sequence", "target_sequence"),
-    ),
-    (
-        "antigen_protein_feature_context",
-        "EBIProteins_get_features",
-        ("target_antigen_name", "target_sequence"),
-    ),
-    (
-        "structure_interface_quality",
-        "ProteinsPlus_profile_structure_quality",
-        ("structure_file", "structure_ref"),
-    ),
-    (
-        "compound_bioactivity_prior_context",
-        "ChEMBL_search_activities",
-        ("compound_smiles",),
-    ),
+_LANE_TYPES: tuple[LaneType, ...] = (
+    "payload_linker_compound_liability",
+    "antibody_protein_sequence_liability",
+    "antigen_protein_feature_context",
+    "structure_interface_quality",
+    "compound_bioactivity_prior_context",
 )
-
-
-# Per-lane closed set of tool names the per-candidate LLM selector may pick.
-# Narrower than the agent's full Step 6 catalog so cross-lane spillover is
-# impossible. Order matters only for the deterministic mock selector's
-# preference; the agent treats this as an unordered allowed set.
-_LANE_ALLOWED_TOOLS: dict[str, tuple[str, ...]] = {
-    "payload_linker_compound_liability": (
-        "DrugProps_pains_filter",
-        "DrugProps_lipinski_filter",
-        "DrugProps_calculate_qed",
-        "SwissADME_calculate_adme",
-        "SwissADME_check_druglikeness",
-        "ADMETAI_predict_toxicity",
-        "ADMETAI_predict_physicochemical_properties",
-    ),
-    "antibody_protein_sequence_liability": (
-        "PROSITE_scan_sequence",
-        "IEDB_predict_mhci_binding",
-    ),
-    "antigen_protein_feature_context": (
-        "EBIProteins_get_features",
-        "EBIProteins_get_epitopes",
-    ),
-    "structure_interface_quality": (
-        "ProteinsPlus_profile_structure_quality",
-    ),
-    "compound_bioactivity_prior_context": (
-        "ChEMBL_search_activities",
-    ),
-}
 
 
 def _material_types(candidate: dict) -> set[str]:
@@ -156,6 +110,26 @@ class DevelopabilityAgent:
             self.storage.run_key(run_id, "candidate_context_table.json")
         )
         candidates = cct.get("candidate_records") or []
+        scoped_tools = set(self.mcp_client.list_tools(agent_name=_AGENT_NAME, step_id=_STEP_ID))
+        selection_audit: dict[str, Any] = {
+            "step_06_mcp_scoped_tool_count": len(scoped_tools),
+            "step_06_registry_inventory_tool_count": len(STEP_06_CAPABILITY_REGISTRY),
+            "step_06_registry_supported_tool_count": sum(
+                1 for c in STEP_06_CAPABILITY_REGISTRY if c.lane_type is not None
+            ),
+            "step_06_runtime_eligible_tools_by_candidate_lane": {},
+            "step_06_stage1_catalog_tool_names": [],
+            "step_06_stage1_allowed_tools_by_lane": {},
+            "step_06_stage1_selected_tools": [],
+            "step_06_stage2_schema_survivors": [],
+            "step_06_executed_tools": [],
+            "step_06_suppressed_tools_with_reason": [],
+            "step_06_dependency_unavailable_tools": [],
+            "step_06_upstream_error_tools": [],
+            "step_06_mocked_tools": [],
+            "tool_selection_source_distribution": {},
+            "argument_construction_source_distribution": {},
+        }
 
         missing_input_flags: list[str] = []
         candidate_liabilities: list[CandidateLiability] = []
@@ -167,8 +141,8 @@ class DevelopabilityAgent:
             candidate_id = candidate.get("candidate_id", "unknown")
 
             # ── 1. Partition lanes into "skipped (missing input)" and "active". ──
-            active_specs: list[tuple[LaneType, str, tuple[str, ...], str]] = []
-            for lane_type, fallback_tool, activator_types in _LANE_TOOLS:
+            active_specs: list[tuple[LaneType, str, SelectionContext, list[Any]]] = []
+            for lane_type in _LANE_TYPES:
                 lane_input = _lane_input(candidate, lane_type)
                 if lane_input is None:
                     lane_results.append(
@@ -180,36 +154,63 @@ class DevelopabilityAgent:
                             tool_call_records=[],
                             liability_flags=[],
                             lane_risk_category="unknown",
-                            lane_summary=_lane_missing_summary(lane_type, activator_types),
+                            lane_summary=_lane_missing_summary(lane_type),
                         )
                     )
                     continue
-                arg_value = lane_input
-                active_specs.append((lane_type, fallback_tool, activator_types, arg_value))
+                ctx = _selection_context(candidate, lane_type, lane_input)
+                eligible, excluded = eligible_capabilities(
+                    lane_type, signals=ctx.signals, scoped_tools=scoped_tools
+                )
+                audit_key = f"{candidate_id}:{lane_type}"
+                selection_audit["step_06_runtime_eligible_tools_by_candidate_lane"][audit_key] = [
+                    c.tool_name for c in eligible
+                ]
+                for item in excluded:
+                    if item.get("reason") == "dependency_unavailable":
+                        selection_audit["step_06_dependency_unavailable_tools"].append({
+                            "candidate_id": candidate_id, "lane_type": lane_type, **item,
+                        })
+                if not eligible:
+                    lane_results.append(LaneResult(
+                        lane_type=lane_type,
+                        run_status="skipped",
+                        input_status="insufficient",
+                        lane_summary="typed input present but no runtime-eligible Step 6 capability",
+                    ))
+                    continue
+                active_specs.append((lane_type, lane_input, ctx, eligible))
 
             # ── 2. One Stage 1 + one Stage 2 LLM call across all active lanes. ──
             plans_by_lane: dict[str, list[ToolInvocationPlan]] = {}
             if active_specs:
                 requests: list[LaneSelectionRequest] = []
-                for (lane_type, _fb_tool, _act_types, arg_value) in active_specs:
-                    ctx = _selection_context(candidate, lane_type, arg_value)
+                for (lane_type, _arg_value, ctx, eligible) in active_specs:
+                    names = [c.tool_name for c in eligible]
+                    selection_audit["step_06_stage1_catalog_tool_names"].extend(names)
+                    selection_audit["step_06_stage1_allowed_tools_by_lane"][
+                        f"{candidate_id}:{lane_type}"
+                    ] = names
                     requests.append(
                         LaneSelectionRequest(
                             lane_type=lane_type,
-                            allowed_tools=list(_allowed_tools_for_lane(lane_type, ctx)),
+                            allowed_tools=names,
                             signals=dict(ctx.signals),
                             arg_hints=dict(ctx.arg_hints),
                         )
                     )
 
-                fb_by_lane = {
-                    lane_type: (fb_tool, arg_value)
-                    for (lane_type, fb_tool, _act, arg_value) in active_specs
-                }
+                eligible_by_lane = {lane_type: eligible for lane_type, _v, _c, eligible in active_specs}
+                ctx_by_lane = {lane_type: ctx for lane_type, _v, ctx, _e in active_specs}
 
                 def _deterministic_for_lane(lt: str) -> list[ToolInvocationPlan]:
-                    fb_tool, arg_value = fb_by_lane[lt]
-                    return [_fallback_plan(fb_tool, arg_value)]
+                    return [
+                        _coverage_plan(
+                            cap.tool_name, ctx_by_lane[lt].arg_hints,
+                            selection_source="deterministic_fallback",
+                        )
+                        for cap in eligible_by_lane[lt]
+                    ]
 
                 plans_by_lane = select_and_build_per_candidate_invocations(
                     agent_name=_AGENT_NAME,
@@ -219,24 +220,45 @@ class DevelopabilityAgent:
                     candidate_id=candidate_id,
                     lanes=requests,
                     deterministic_fallback=_deterministic_for_lane,
-                    deterministic_argument_mapping=_deterministic_argument_mapping,
-                    max_tools_per_lane=MAX_LLM_SELECTED_TOOLS_PER_LANE,
+                    deterministic_argument_mapping=deterministic_arguments,
                 )
+                for lane_type, _v, ctx, eligible in active_specs:
+                    plans, suppressed = _apply_coverage_policy(
+                        plans_by_lane.get(lane_type) or [], eligible, ctx.arg_hints
+                    )
+                    plans_by_lane[lane_type] = plans
+                    selection_audit["step_06_suppressed_tools_with_reason"].extend(
+                        {"candidate_id": candidate_id, "lane_type": lane_type, **s}
+                        for s in suppressed
+                    )
 
             # ── 3. Execute the plans lane by lane and assemble lane results. ────
-            for (lane_type, fallback_tool, _act_types, arg_value) in active_specs:
-                plans = plans_by_lane.get(lane_type) or [_fallback_plan(fallback_tool, arg_value)]
+            for (lane_type, _arg_value, _ctx, eligible) in active_specs:
+                plans = plans_by_lane.get(lane_type) or [
+                    _coverage_plan(cap.tool_name, _ctx.arg_hints) for cap in eligible
+                ]
 
                 tool_records: list[ToolCallRecord] = []
                 lane_flags: list[dict] = []
                 lane_input_status = "insufficient"
                 for plan in plans:
+                    if plan.tool_selection_source == "llm_stage1":
+                        selection_audit["step_06_stage1_selected_tools"].append(plan.tool_name)
+                        if plan.validation_status != "skipped":
+                            selection_audit["step_06_stage2_schema_survivors"].append(plan.tool_name)
                     tc, one_input_status, payload = self._call_lane_plan(
                         run_id=run_id,
                         candidate_id=candidate_id,
                         plan=plan,
                     )
                     tool_records.append(tc)
+                    selection_audit["step_06_executed_tools"].append(plan.tool_name)
+                    _increment(selection_audit["tool_selection_source_distribution"], plan.tool_selection_source)
+                    _increment(selection_audit["argument_construction_source_distribution"], plan.argument_construction_source)
+                    if isinstance(payload, dict) and payload.get("status") == "upstream_error":
+                        selection_audit["step_06_upstream_error_tools"].append(plan.tool_name)
+                    if isinstance(payload, dict) and payload.get("status") == "mocked":
+                        selection_audit["step_06_mocked_tools"].append(plan.tool_name)
                     if one_input_status == "sufficient":
                         lane_input_status = "sufficient"
                     if tc.run_status not in {"skipped", "not_run"}:
@@ -317,6 +339,7 @@ class DevelopabilityAgent:
             candidate_liability_results=candidate_liabilities,
             missing_input_flags=missing_input_flags,
             tool_output_artifacts=_collect_output_artifacts(candidate_liabilities),
+            selection_audit=_finalize_selection_audit(selection_audit),
             notes=notes,
         )
 
@@ -430,6 +453,7 @@ def _selection_context(candidate: dict, lane_type: LaneType, arg_value: str) -> 
         "smiles": smiles,
         "sequence": sequence or arg_value,
         "protein_sequence": sequence or arg_value,
+        "structure_file": pdb_like,
         "pdb_id_or_path": pdb_like or arg_value,
         "pdb_id": _first_identifier_value(identifiers, {"pdb_id"}) or arg_value,
         "uniprot_id": uniprot or arg_value,
@@ -477,7 +501,7 @@ def _compose_lane_summary(
     )
 
 
-def _lane_missing_summary(lane_type: LaneType, activator_types: tuple[str, ...]) -> str:
+def _lane_missing_summary(lane_type: LaneType) -> str:
     """Human-readable skipped-lane summary that matches the lane's real input.
 
     Most lanes activate off candidate ``materials`` of a specific family; the
@@ -489,7 +513,12 @@ def _lane_missing_summary(lane_type: LaneType, activator_types: tuple[str, ...])
         return "no candidate identifiers matched chembl_id family"
     if lane_type == "antigen_protein_feature_context":
         return "no candidate identifiers matched uniprot_id family"
-    return f"no candidate materials matched {sorted(activator_types)[0]} family"
+    requirements = {
+        "payload_linker_compound_liability": "SMILES",
+        "antibody_protein_sequence_liability": "protein sequence",
+        "structure_interface_quality": "structure file or canonical PDB ID",
+    }
+    return f"no candidate inputs matched {requirements.get(lane_type, 'typed input')} family"
 
 
 def _lane_input(candidate: dict, lane_type: LaneType) -> Optional[str]:
@@ -523,51 +552,89 @@ def _lane_input(candidate: dict, lane_type: LaneType) -> Optional[str]:
             or _first_identifier_value(identifiers, {"pdb_id"})
         )
     if lane_type == "compound_bioactivity_prior_context":
-        return _first_identifier_value(identifiers, {"chembl_id"})
+        return (
+            _first_identifier_value(identifiers, {"chembl_id"})
+            or _first_material_value(materials, {"payload_smiles", "linker_smiles", "compound_smiles"})
+        )
     return None
 
 
-def _allowed_tools_for_lane(lane_type: LaneType, ctx: SelectionContext) -> tuple[str, ...]:
-    """Narrow static lane tools using available typed inputs."""
-    tools = list(_LANE_ALLOWED_TOOLS.get(lane_type, ()))
-    if lane_type == "compound_bioactivity_prior_context" and not ctx.signals.get("chembl_id"):
-        # Activities lookup needs ChEMBL-style identifiers. Name-only or
-        # SMILES-only context must not be routed into this tool.
-        tools = [t for t in tools if t != "ChEMBL_search_activities"]
-    return tuple(tools)
-
-
-def _fallback_plan(tool_name: str, arg_value: str) -> ToolInvocationPlan:
+def _coverage_plan(
+    tool_name: str,
+    arg_hints: dict[str, Any],
+    *,
+    selection_source: str = "coverage_policy",
+) -> ToolInvocationPlan:
+    args = deterministic_arguments(tool_name, arg_hints)
     return ToolInvocationPlan(
         tool_name=tool_name,
-        selection_reason="deterministic Step 6 lane fallback",
-        arguments=_deterministic_argument_mapping(tool_name, {"query": arg_value}),
-        argument_construction_reason="deterministic lane argument mapping",
+        selection_reason=(
+            "coverage category required by Step 6 production policy"
+            if selection_source == "coverage_policy"
+            else "deterministic fallback after Stage 1 failure or empty selection"
+        ),
+        arguments=args,
+        argument_construction_reason="registry deterministic argument mapping",
         selected_by="deterministic_fallback",
+        tool_selection_source=selection_source,  # type: ignore[arg-type]
+        argument_construction_source="deterministic_mapping",
+        stage2_skipped=True,
+        validation_status="ok" if args else "skipped",
     )
 
 
-def _deterministic_argument_mapping(tool_name: str, arg_hints: dict) -> dict[str, Any]:
-    if tool_name == "ProteinsPlus_profile_structure_quality":
-        return {"pdb_id_or_path": arg_hints.get("pdb_id_or_path") or arg_hints.get("pdb_id") or arg_hints.get("query") or ""}
-    if tool_name in {"ZINC_search_by_smiles", "DrugProps_pains_filter", "DrugProps_lipinski_filter", "DrugProps_calculate_qed", "SwissADME_calculate_adme", "SwissADME_check_druglikeness", "ADMETAI_predict_toxicity", "ADMETAI_predict_physicochemical_properties"}:
-        return {"smiles": arg_hints.get("smiles") or ""}
-    if tool_name == "PROSITE_scan_sequence":
-        return {"sequence": arg_hints.get("sequence") or arg_hints.get("protein_sequence") or ""}
-    if tool_name in {"EBIProteins_get_features", "EBIProteins_get_epitopes"}:
-        # TU official schema for both EBI tools requires `accession`.
-        return {
-            "accession": (
-                arg_hints.get("accession")
-                or arg_hints.get("uniprot_id")
-                or arg_hints.get("query")
-                or ""
-            )
-        }
-    if tool_name == "ChEMBL_search_activities":
-        chembl = arg_hints.get("chembl_id")
-        return {"molecule_chembl_id": chembl} if chembl else {}
-    return {"query": arg_hints.get("query") or arg_hints.get("compound_name") or arg_hints.get("smiles") or ""}
+def _apply_coverage_policy(
+    plans: list[ToolInvocationPlan], eligible: list[Any], arg_hints: dict[str, Any],
+) -> tuple[list[ToolInvocationPlan], list[dict]]:
+    kept: list[ToolInvocationPlan] = []
+    suppressed: list[dict] = []
+    seen_tools: set[str] = set()
+    seen_redundancy: set[str] = set()
+    for plan in sorted(plans, key=lambda p: (STEP_06_CAPABILITY_BY_TOOL.get(p.tool_name).priority if STEP_06_CAPABILITY_BY_TOOL.get(p.tool_name) else 999, p.tool_name)):
+        cap = STEP_06_CAPABILITY_BY_TOOL.get(plan.tool_name)
+        if cap is None or plan.tool_name in seen_tools:
+            continue
+        if cap.redundancy_group and cap.redundancy_group in seen_redundancy:
+            suppressed.append({
+                "tool_name": plan.tool_name,
+                "reason": f"semantic_redundancy_group:{cap.redundancy_group}",
+            })
+            continue
+        kept.append(plan)
+        seen_tools.add(plan.tool_name)
+        if cap.redundancy_group:
+            seen_redundancy.add(cap.redundancy_group)
+    covered = {
+        STEP_06_CAPABILITY_BY_TOOL[p.tool_name].coverage_category
+        for p in kept if p.validation_status != "skipped" and p.tool_name in STEP_06_CAPABILITY_BY_TOOL
+    }
+    for cap in eligible:
+        if cap.coverage_category in covered or cap.tool_name in seen_tools:
+            continue
+        plan = _coverage_plan(cap.tool_name, arg_hints)
+        kept.append(plan)
+        seen_tools.add(cap.tool_name)
+        covered.add(cap.coverage_category)
+    return kept, suppressed
+
+
+def _increment(counts: dict[str, int], key: str) -> None:
+    counts[key] = counts.get(key, 0) + 1
+
+
+def _finalize_selection_audit(audit: dict[str, Any]) -> dict[str, Any]:
+    for key in (
+        "step_06_stage1_catalog_tool_names", "step_06_stage1_selected_tools",
+        "step_06_stage2_schema_survivors", "step_06_executed_tools",
+        "step_06_upstream_error_tools", "step_06_mocked_tools",
+    ):
+        audit[key] = sorted(set(audit.get(key) or []))
+    dependency = audit.get("step_06_dependency_unavailable_tools") or []
+    audit["step_06_dependency_unavailable_tools"] = list({
+        (d.get("candidate_id"), d.get("lane_type"), d.get("tool_name")): d
+        for d in dependency
+    }.values())
+    return audit
 
 
 def _tool_input_summary(plan: ToolInvocationPlan, candidate_id: str) -> dict[str, Any]:
@@ -575,6 +642,9 @@ def _tool_input_summary(plan: ToolInvocationPlan, candidate_id: str) -> dict[str
         **{k: _short(v) for k, v in plan.arguments.items()},
         "candidate_id": candidate_id,
         "selected_by": plan.selected_by,
+        "tool_selection_source": plan.tool_selection_source,
+        "argument_construction_source": plan.argument_construction_source,
+        "stage2_skipped": plan.stage2_skipped,
         "selection_reason": plan.selection_reason,
         "selection_policy_version": plan.selection_policy_version,
         "argument_construction_reason": plan.argument_construction_reason,

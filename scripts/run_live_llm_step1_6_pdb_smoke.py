@@ -1,8 +1,9 @@
 """Live-ToolUniverse Step 1→6 smoke with a real uploaded PDB.
 
 Same shape as ``run_llm_step1_6_pdb_smoke.py`` but ALSO flips
-``MCP_LIVE_TOOLS=true`` and supplies a narrow ``MCP_LIVE_TOOL_ALLOWLIST``
-so the Step 5 / Step 6 wrappers actually route through
+``MCP_LIVE_TOOLS=true`` and supplies ``MCP_LIVE_TOOL_ALLOWLIST`` only as
+the runtime `_live=True` injection policy. The production MCP catalog is
+not filtered by this script. Eligible Step 5 / Step 6 wrappers route through
 ``ToolUniverseAdapter`` live instead of returning the deterministic mock
 envelope.
 
@@ -39,7 +40,20 @@ LIVE_ALLOWLIST = (
     "ProteinsPlus_profile_structure_quality",
     "DrugProps_pains_filter",
     "DrugProps_lipinski_filter",
+    "DrugProps_calculate_qed",
     "SwissADME_calculate_adme",
+    "SwissADME_check_druglikeness",
+    "BindingDB_get_targets_by_compound",
+    "PROSITE_scan_sequence",
+    "IEDB_predict_mhci_binding",
+    "EBIProteins_get_antigen",
+    "GlyGen_get_glycoprotein",
+    "iPTMnet_get_ptm_sites",
+    "PDBe_KB_get_interface_residues",
+    "PDBePISA_get_interfaces",
+    "PDBePISA_get_monomer_analysis",
+    "ChEMBL_search_compound_structural_alerts",
+    "ChEMBL_get_molecule_targets",
 )
 os.environ["MCP_LIVE_TOOLS"] = "true"
 os.environ["MCP_LIVE_TOOL_ALLOWLIST"] = ",".join(LIVE_ALLOWLIST)
@@ -63,40 +77,15 @@ _UNAVAILABLE_TOKENS = (
 # their `dependency_unavailable` poison the rollup.
 KNOWN_LIVE_DEPENDENCY_GAPS = (
     "ProteinsPlus_profile_structure_quality",
+    "ADMETAI_predict_toxicity",
+    "ADMETAI_predict_physicochemical_properties",
+    "ADMETAI_predict_solubility_lipophilicity_hydration",
+    "ADMETAI_predict_CYP_interactions",
+    "ADMETAI_predict_bioavailability",
+    "ADMETAI_predict_clearance_distribution",
+    "ADMETAI_predict_stress_response",
+    "ADMETAI_predict_nuclear_receptor_activity",
 )
-
-
-class _AllowlistMCPClient:
-    """Smoke-local MCP wrapper that filters ``list_tools`` to the live
-    allowlist before the Step 6 LLM ever sees the catalog.
-
-    Only ``list_tools`` is narrowed; ``call_tool`` still delegates to the
-    real inventory-backed client. This guarantees:
-
-    1. Stage 1 catalog presented to OpenAI contains ONLY the live
-       allowlist, so the LLM cannot pick a Step 6 tool that would later
-       fail `attempted_live=true` (per request item 1).
-    2. Production agents that build their own client via
-       ``deps.get_mcp_client()`` are untouched (per request item 2).
-
-    Scope, registry, inventory, and bindings are all reused — we add no
-    MCP tools and do not widen any agent/step's scope.
-    """
-
-    def __init__(self, inner, allowlist):
-        self._inner = inner
-        self._allowlist = set(allowlist)
-
-    def list_tools(self, *, agent_name, step_id):
-        return [
-            t for t in self._inner.list_tools(agent_name=agent_name, step_id=step_id)
-            if t in self._allowlist
-        ]
-
-    def call_tool(self, *, agent_name, step_id, tool_name, **kwargs):
-        return self._inner.call_tool(
-            agent_name=agent_name, step_id=step_id, tool_name=tool_name, **kwargs
-        )
 
 
 def _is_unavailable_error(exc: Exception) -> bool:
@@ -195,6 +184,7 @@ def _envelope_meta(raw_record: dict) -> dict:
 
 
 def main() -> int:
+    print('{"smoke_phase":"main_start"}', flush=True)
     from app.settings import get_settings  # noqa: PLC0415
     # Settings caches via lru_cache; we just set env vars so first call
     # already reads them. Defensive cache clear in case anything imported
@@ -205,6 +195,7 @@ def main() -> int:
         pass
 
     settings = get_settings()
+    print('{"smoke_phase":"settings_loaded"}', flush=True)
     provider_name = settings.llm_provider
     if provider_name == "gemini":
         if not settings.gemini_api_key:
@@ -236,6 +227,7 @@ def main() -> int:
     )
     from app.graph.adc_graph import build_minimal_graph  # noqa: PLC0415
     from app.utils.ids import new_artifact_id, new_run_id  # noqa: PLC0415
+    print('{"smoke_phase":"pipeline_imports_loaded"}', flush=True)
 
     # Clear dep caches too so our live env vars are honored by every getter.
     for fn in (get_storage, get_registry_service, get_workflow_state_service,
@@ -248,13 +240,13 @@ def main() -> int:
     storage = get_storage()
     registry = get_registry_service()
     workflow_state = get_workflow_state_service()
+    print('{"smoke_phase":"core_dependencies_loaded"}', flush=True)
     try:
         llm = get_llm_provider()
     except Exception as exc:  # noqa: BLE001
         _summary({"status": "SKIP", "reason": f"get_llm_provider failed: {type(exc).__name__}"})
         return 0
 
-    candidate_limit = int(os.environ.get("ADC_SMOKE_CANDIDATE_LIMIT", "5") or "5")
     run_id = new_run_id()
     file_id = new_artifact_id("uploaded_file")
     storage_path = storage.run_key(run_id, "inputs", "files", pdb_path.name)
@@ -273,7 +265,6 @@ def main() -> int:
         "run_id": run_id,
         "pdb_filename": pdb_path.name,
         "pdb_sha256_prefix": pdb_sha256[:12],
-        "candidate_limit": candidate_limit,
         "mcp_live_config": {
             "mcp_live_tools": settings.mcp_live_tools,
             "mcp_live_tool_allowlist_count": len(settings.live_tool_allowlist_set()),
@@ -414,31 +405,6 @@ def main() -> int:
     original_candidate_count = len(cct.get("candidate_records") or [])
     findings["step_05_candidate_count"] = original_candidate_count
 
-    # Trim cct to candidate_limit using the structure-then-compound preference.
-    if candidate_limit > 0 and original_candidate_count > candidate_limit:
-        candidates = cct["candidate_records"]
-        STRUCTURE_TYPES = {"target_antigen", "adc_construct"}
-        COMPOUND_TYPES = {"compound_component"}
-
-        def _pick(types: set[str]) -> dict | None:
-            for c in candidates:
-                if c.get("candidate_type") in types:
-                    return c
-            return None
-
-        selected: list[dict] = []
-        for picker in (_pick(STRUCTURE_TYPES), _pick(COMPOUND_TYPES)):
-            if picker is not None and picker not in selected:
-                selected.append(picker)
-            if len(selected) >= candidate_limit:
-                break
-        for c in candidates:
-            if len(selected) >= candidate_limit:
-                break
-            if c not in selected:
-                selected.append(c)
-        cct["candidate_records"] = selected[:candidate_limit]
-        storage.write_json(cct_key, cct)
     findings["step_06_input_candidate_count"] = len(cct["candidate_records"])
 
     # ── Step 6 ────────────────────────────────────────────────────────────
@@ -446,7 +412,7 @@ def main() -> int:
         DevelopabilityAgent(
             storage=storage, registry=registry,
             workflow_state=workflow_state,
-            mcp_client=_AllowlistMCPClient(get_mcp_client(), LIVE_ALLOWLIST),
+            mcp_client=get_mcp_client(),
             llm=llm,
         ).run(run_id)
     except Exception as exc:  # noqa: BLE001
@@ -464,6 +430,7 @@ def main() -> int:
     findings["step_06_artifact"] = registry.get(run_id).active_artifacts.structured_liability_summary_id
 
     step6 = storage.read_json(storage.run_key(run_id, "structured_liability_summary.json"))
+    findings.update(step6.get("selection_audit") or {})
 
     step6_audit: list[dict] = []
     tool_names_seen: set[str] = set()
@@ -505,6 +472,9 @@ def main() -> int:
                     "lane_type": lane_type,
                     "tool_name": tn,
                     "selected_by": input_summary.get("selected_by"),
+                    "tool_selection_source": input_summary.get("tool_selection_source"),
+                    "argument_construction_source": input_summary.get("argument_construction_source"),
+                    "stage2_skipped": input_summary.get("stage2_skipped"),
                     "run_status": tc.get("run_status"),
                     "attempted_live": attempted_live,
                     "executor": meta["executor"],
@@ -516,6 +486,8 @@ def main() -> int:
                     "liability_flags_count": len(lane.get("liability_flags") or []),
                 })
     findings["step_06_audit"] = step6_audit
+    findings["step_06_total_tool_calls"] = len(step6_audit)
+    findings["step_06_unique_tool_count"] = len(tool_names_seen)
     live_success_tools = {a["tool_name"] for a in step6_audit if a.get("live_success")}
     findings["step_06_selected_proteins_plus"] = (
         "ProteinsPlus_profile_structure_quality" in tool_names_seen
@@ -549,6 +521,11 @@ def main() -> int:
     for entry in step5_audit:
         if entry.get("envelope_status") == "upstream_error":
             upstream_error_tools.add(entry["tool_name"])
+    for entry in (step6.get("selection_audit") or {}).get(
+        "step_06_dependency_unavailable_tools", []
+    ):
+        if entry.get("tool_name"):
+            dep_unavail_tools.add(entry["tool_name"])
 
     # ── final conclusion fields ──────────────────────────────────────────
     all_in_scope_tools = set(LIVE_ALLOWLIST)
@@ -604,8 +581,8 @@ def main() -> int:
     #   is set so reviewers see the known-not-wired wrappers are not silent
     #   failures.
     # - "mocked_or_not_live": any mocked output or any in-scope tool whose
-    #   invocation did NOT carry `_live=True` (which the smoke's
-    #   ``_AllowlistMCPClient`` should prevent for Step 6 in this script).
+    #   invocation did NOT carry `_live=True` (the runtime allowlist controls
+    #   live dispatch only; it does not narrow the production tool catalog).
     # - "failed": the pipeline itself failed (set earlier in error paths).
     any_attempt_not_live = any(
         not a.get("attempted_live") for a in (step5_audit + step6_audit)

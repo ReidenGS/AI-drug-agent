@@ -50,6 +50,10 @@ class GeminiProvider:
         self.model = model
         self.max_retries = max(0, max_retries)
         self._client: Any | None = None
+        # Compact per-attempt usage log; same shape as OpenAIProvider.
+        # Holds only provider / model / task / attempt + token counts —
+        # never prompt, system, schema, response body, or API key.
+        self.usage_events: list[dict[str, Any]] = []
 
     def generate(self, prompt: str, *, system: str | None = None, **kwargs: Any) -> str:
         raise NotImplementedError("GeminiProvider.generate not wired yet")
@@ -77,6 +81,12 @@ class GeminiProvider:
                     f"required JSON object. Error: {errors[-1]}. Return corrected JSON only."
                 )
             response = self._generate_content(base_prompt + retry_note)
+            self.usage_events.append(
+                _build_usage_event(
+                    provider=self.name, model=self.model,
+                    task=task, attempt=attempt, response=response,
+                )
+            )
             try:
                 parsed = _response_to_dict(response)
                 validated = _validate_task_shape(parsed, task)
@@ -164,3 +174,58 @@ def _response_text(response: Any) -> str:
     if joined:
         return joined
     raise GeminiProviderError("Gemini response did not include text or parsed JSON")
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _build_usage_event(
+    *, provider: str, model: str, task: str, attempt: int, response: Any,
+) -> dict[str, Any]:
+    """Compact usage event built from a Gemini response.
+
+    Reads ``response.usage_metadata`` ({prompt_token_count,
+    candidates_token_count, total_token_count}) and projects to the
+    same shape OpenAI uses (prompt / completion / total). Missing
+    fields degrade to ``None``. NEVER reads or stores prompt,
+    response body, schema payload, or API key.
+    """
+    meta = getattr(response, "usage_metadata", None)
+    if meta is None and isinstance(response, dict):
+        meta = response.get("usage_metadata")
+
+    def _get(key: str) -> Any:
+        if meta is None:
+            return None
+        return getattr(meta, key, None) if not isinstance(meta, dict) else meta.get(key)
+
+    return {
+        "provider": provider,
+        "model": model,
+        "task": task,
+        "attempt": attempt,
+        "prompt_tokens": _coerce_int(_get("prompt_token_count")),
+        "completion_tokens": _coerce_int(_get("candidates_token_count")),
+        "total_tokens": _coerce_int(_get("total_token_count")),
+        # google-genai exposes context-cached prompt tokens on
+        # ``usage_metadata.cached_content_token_count`` when the
+        # caller wires up explicit context caching. We read it
+        # defensively so the field is always present even on SDK /
+        # backend versions that do not surface it.
+        "cached_prompt_tokens": _coerce_int(_get("cached_content_token_count")),
+    }

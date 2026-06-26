@@ -92,3 +92,9 @@ class CandidateContextTable(BaseModel):
     # provided one. Each entry: {"entity": str, "role": str,
     # "explicit_or_inferred": "explicit"|"inferred", "source": str}.
     downstream_query_hints: list[dict] = Field(default_factory=list)
+    # Step 5 LLM-assisted selection audit (additive). Keyed by
+    # ``candidate_id``; each value holds compact eligible_tools /
+    # selected_tools / skipped_eligible_tools / tool_selection_source /
+    # llm_call_status / llm_dropped_out_of_scope strings. Never holds
+    # raw LLM responses, raw tool payloads, full prompts, or API keys.
+    enrichment_selection_audit: dict = Field(default_factory=dict)

@@ -797,3 +797,300 @@ def test_step5_promotes_composite_linker_payload_smiles_as_compound_smiles(
         m.material_type == "compound_smiles" and m.value == "NCCO"
         for c in compound_records for m in c.materials
     )
+
+
+# ── per-candidate material + identifier dedup ───────────────────────────
+
+
+def test_step5_dedupes_target_uniprot_identifier_from_multipath_normalization(
+    local_storage, registry_service, workflow_state_service,
+):
+    """HER2 and ERBB2 both resolve to UniProt P04626 via normalized
+    entities, AND P04626 also appears as an explicit referenced_input.
+    The final target candidate must carry exactly ONE P04626 identifier
+    with merged provenance from every contributing path."""
+    sq_path_id = "structured_query_multipath_sentinel"
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        target="HER2",
+        referenced_inputs=[
+            {"id_type": "uniprot_id", "value": "P04626",
+             "source": "raw_request_text"},
+        ],
+        normalized_entities=[
+            {"original_text": "HER2", "canonical_name": "ERBB2",
+             "canonical_id": "P04626", "canonical_id_source": "UniProt",
+             "entity_type": "target_or_antigen",
+             "explicit_or_inferred": "explicit"},
+            {"original_text": "ERBB2", "canonical_name": "ERBB2",
+             "canonical_id": "P04626", "canonical_id_source": "UniProt",
+             "entity_type": "target_or_antigen",
+             "explicit_or_inferred": "explicit"},
+        ],
+    )
+    table = _run_step5(
+        local_storage, registry_service, workflow_state_service, run_id,
+    )
+    target = next(
+        c for c in table.candidate_records if c.candidate_type == "target_antigen"
+    )
+    uniprot_ids = [i for i in target.identifiers if i.id_type == "uniprot_id"]
+    assert [i.id_value for i in uniprot_ids] == ["P04626"]
+    # Provenance is preserved: source_ids contains at least the
+    # structured_query artifact id that fed each path.
+    assert uniprot_ids[0].source_ids, uniprot_ids[0].source_ids
+
+
+def test_step5_does_not_merge_distinct_uniprot_identifiers(
+    local_storage, registry_service, workflow_state_service,
+):
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        target="HER2",
+        referenced_inputs=[
+            {"id_type": "uniprot_id", "value": "P04626",
+             "source": "raw_request_text"},
+            {"id_type": "uniprot_id", "value": "Q9NQB7",
+             "source": "raw_request_text"},
+        ],
+    )
+    table = _run_step5(
+        local_storage, registry_service, workflow_state_service, run_id,
+    )
+    target = next(
+        c for c in table.candidate_records if c.candidate_type == "target_antigen"
+    )
+    ids = sorted(i.id_value for i in target.identifiers if i.id_type == "uniprot_id")
+    assert ids == ["P04626", "Q9NQB7"]
+
+
+def test_step5_dedupes_identical_target_sequence_material_per_candidate(
+    local_storage, registry_service, workflow_state_service,
+):
+    """Two paths that converge on the same FASTA reference for one
+    target produce a single ``target_sequence`` material."""
+    fasta = {
+        "file_id": new_file_id(),
+        "original_filename": "her2_extracellular.fasta",
+        "storage_path": "/runs/abc/inputs/files/her2_extracellular.fasta",
+        "content_type": "text/x-fasta",
+        "size_bytes": 12,
+    }
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        target="HER2",
+        # The same uploaded FASTA listed twice — simulates the
+        # multipath case where intake / Step 2 contributed the same
+        # reference under two different drift paths.
+        uploaded_files=[fasta, dict(fasta)],
+    )
+    table = _run_step5(
+        local_storage, registry_service, workflow_state_service, run_id,
+    )
+    target = next(
+        c for c in table.candidate_records if c.candidate_type == "target_antigen"
+    )
+    seq_materials = [m for m in target.materials
+                     if m.material_type == "target_sequence"]
+    assert len(seq_materials) == 1, [m.value for m in seq_materials]
+
+
+def test_step5_keeps_distinct_target_sequence_materials_at_different_paths(
+    local_storage, registry_service, workflow_state_service,
+):
+    """If the user uploads two genuinely different FASTAs that both
+    fall into the target-sequence channel, dedup does NOT merge them —
+    different ``value`` means different references."""
+    f1 = {
+        "file_id": new_file_id(),
+        "original_filename": "her2_a.fasta",
+        "storage_path": "/runs/abc/inputs/files/her2_a.fasta",
+        "content_type": "text/x-fasta", "size_bytes": 12,
+    }
+    f2 = {
+        "file_id": new_file_id(),
+        "original_filename": "her2_b.fasta",
+        "storage_path": "/runs/abc/inputs/files/her2_b.fasta",
+        "content_type": "text/x-fasta", "size_bytes": 12,
+    }
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        target="HER2", uploaded_files=[f1, f2],
+    )
+    table = _run_step5(
+        local_storage, registry_service, workflow_state_service, run_id,
+    )
+    target = next(
+        c for c in table.candidate_records if c.candidate_type == "target_antigen"
+    )
+    seq_materials = [m for m in target.materials
+                     if m.material_type == "target_sequence"]
+    assert len(seq_materials) == 2
+    assert {m.value for m in seq_materials} == {
+        f1["storage_path"], f2["storage_path"],
+    }
+
+
+def test_step5_does_not_merge_structure_files_with_different_paths(
+    local_storage, registry_service, workflow_state_service,
+):
+    f1 = {
+        "file_id": new_file_id(),
+        "original_filename": "antigen.pdb",
+        "storage_path": "/runs/abc/inputs/files/antigen.pdb",
+        "content_type": "chemical/x-pdb", "size_bytes": 12,
+    }
+    f2 = {
+        "file_id": new_file_id(),
+        "original_filename": "antigen.pdb",  # same name, different path
+        "storage_path": "/runs/xyz/inputs/files/antigen.pdb",
+        "content_type": "chemical/x-pdb", "size_bytes": 12,
+    }
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        target="HER2", uploaded_files=[f1, f2],
+    )
+    table = _run_step5(
+        local_storage, registry_service, workflow_state_service, run_id,
+    )
+    target = next(
+        c for c in table.candidate_records if c.candidate_type == "target_antigen"
+    )
+    structure_mats = [m for m in target.materials
+                      if m.material_type == "structure_file"]
+    assert len(structure_mats) == 2, [m.value for m in structure_mats]
+    assert {m.value for m in structure_mats} == {
+        f1["storage_path"], f2["storage_path"],
+    }
+
+
+def test_step5_does_not_merge_payload_and_linker_name_with_same_value(
+    local_storage, registry_service, workflow_state_service,
+):
+    """payload_name and linker_name with the same string value answer
+    different downstream questions; dedup must keep them separate."""
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        target="HER2",
+        payload="duplicate-name",
+        linker="duplicate-name",
+    )
+    table = _run_step5(
+        local_storage, registry_service, workflow_state_service, run_id,
+    )
+    name_types = sorted({
+        m.material_type
+        for c in table.candidate_records
+        for m in c.materials
+        if m.material_type in {"payload_name", "linker_name"}
+    })
+    assert name_types == ["linker_name", "payload_name"]
+
+
+def test_step5_does_not_merge_heavy_and_light_chain_sequence_materials(
+    local_storage, registry_service, workflow_state_service,
+):
+    """Heavy and light chain materials may carry an identical value in
+    pathological drift cases (e.g. a normalizer collapsing both paths
+    onto a single redacted marker). They must stay distinct because
+    Step 5's CDR3 path branches on the chain ``material_type``."""
+    from app.agents.candidate_context_agent import _dedupe_candidate_materials
+    from app.schemas.step_05_candidate_context_table import Material
+    heavy = Material(
+        material_id="m_heavy",
+        material_type="antibody_heavy_chain_sequence",
+        value="/runs/abc/heavy.fasta",
+        value_format="fasta",
+        role="antibody_sequence_reference",
+        role_status="explicit",
+    )
+    light = Material(
+        material_id="m_light",
+        material_type="antibody_light_chain_sequence",
+        value="/runs/abc/heavy.fasta",  # same value, different role/type
+        value_format="fasta",
+        role="antibody_sequence_reference",
+        role_status="explicit",
+    )
+    deduped = _dedupe_candidate_materials([heavy, light])
+    assert [m.material_type for m in deduped] == [
+        "antibody_heavy_chain_sequence",
+        "antibody_light_chain_sequence",
+    ]
+
+
+def test_step5_dedupes_exact_duplicate_material_for_one_candidate():
+    """The unit-level path: a fully equivalent material on the same
+    candidate collapses to one. All distinguishing axes must match."""
+    from app.agents.candidate_context_agent import _dedupe_candidate_materials
+    from app.schemas.step_05_candidate_context_table import Material
+    a = Material(
+        material_id="m_a",
+        material_type="target_sequence",
+        value="/runs/x/inputs/files/her2.fasta",
+        value_format="fasta",
+        role="target_sequence_reference",
+        role_status="explicit",
+    )
+    b = Material(
+        material_id="m_b",  # different artifact id, otherwise identical
+        material_type="target_sequence",
+        value="/runs/x/inputs/files/her2.fasta",
+        value_format="fasta",
+        role="target_sequence_reference",
+        role_status="explicit",
+    )
+    deduped = _dedupe_candidate_materials([a, b])
+    assert len(deduped) == 1
+    # First occurrence wins; provenance is the surviving artifact.
+    assert deduped[0].material_id == "m_a"
+
+
+def test_step5_identifier_dedup_merges_source_ids_and_keeps_higher_confidence():
+    from app.agents.candidate_context_agent import _dedupe_candidate_identifiers
+    from app.schemas.step_05_candidate_context_table import Identifier
+    a = Identifier(
+        id_type="uniprot_id", id_value="P04626",
+        source_ids=["sq_artifact_1"], confidence=0.5,
+    )
+    b = Identifier(
+        id_type="uniprot_id", id_value="P04626",
+        source_ids=["sq_artifact_2"], confidence=0.9,
+    )
+    c = Identifier(
+        id_type="uniprot_id", id_value="P04626",
+        source_ids=["sq_artifact_1"], confidence=0.2,  # duplicate source
+    )
+    deduped = _dedupe_candidate_identifiers([a, b, c])
+    assert len(deduped) == 1
+    survivor = deduped[0]
+    assert survivor.id_value == "P04626"
+    assert survivor.source_ids == ["sq_artifact_1", "sq_artifact_2"]
+    assert survivor.confidence == 0.9
+
+
+def test_step5_raw_content_isolation_holds_after_dedup_pass(
+    local_storage, registry_service, workflow_state_service,
+):
+    """The dedup pass must not loosen the raw-payload isolation
+    guarantee on the persisted normalized artifact."""
+    fasta = {
+        "file_id": new_file_id(),
+        "original_filename": "antigen.fasta",
+        "storage_path": "/runs/abc/inputs/files/antigen.fasta",
+        "content_type": "text/x-fasta", "size_bytes": 12,
+    }
+    run_id = _bootstrap(
+        local_storage, registry_service, workflow_state_service,
+        target="HER2", uploaded_files=[fasta, dict(fasta)],
+    )
+    table = _run_step5(
+        local_storage, registry_service, workflow_state_service, run_id,
+    )
+    blob = json.dumps(table.model_dump(), default=str)
+    # No FASTA header, no PDB ATOM/HETATM line, no raw CDR3.
+    assert ">antigen" not in blob
+    assert "ATOM " not in blob
+    assert "HETATM" not in blob
+    # And no plausible raw heavy-chain stretch.
+    assert "EVQLVQSGAEVKKPGSSVKVSCKAS" not in blob

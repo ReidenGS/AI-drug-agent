@@ -26,6 +26,9 @@ Hard constraints (architecture v0.1):
 from __future__ import annotations
 
 import json
+import re
+from io import StringIO
+from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Optional
 
@@ -70,6 +73,10 @@ _STEP_09 = "step_09"
 
 _PDB_EXTS = {".pdb", ".cif", ".mmcif", ".ent"}
 _FASTA_EXTS = {".fasta", ".fa", ".faa", ".seq"}
+_RESIDUE_RANGE_RE = re.compile(
+    r"\bresidues?\s+(?P<start>\d{1,6})\s*[-–]\s*(?P<end>\d{1,6})\b",
+    re.IGNORECASE,
+)
 
 
 # ── shared utilities ────────────────────────────────────────────────────────
@@ -79,6 +86,16 @@ def _format_for_file(filename: str) -> str:
     if ext in {".cif", ".mmcif"}:
         return "cif"
     return "pdb"
+
+
+def _looks_like_pdb_id(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9][A-Za-z0-9]{3}", value.strip()))
+
+
+def _looks_like_file_backed_sequence(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    return PurePosixPath(value).suffix.lower() in _FASTA_EXTS
 
 
 def _materials_by_type(candidate: dict, types: Iterable[str]) -> list[dict]:
@@ -150,17 +167,24 @@ class StructureAndDesignAgent:
         tool_call_records: list[ToolCallRecord] = []
         prepared: list[StructureInputRecord] = []
         all_pdb_ids_seen: set[str] = set()
+        candidates = [
+            c for c in (cct.get("candidate_records") or [])
+            if c.get("candidate_type") in {"target_antigen", "antibody", "adc_construct"}
+        ]
+        bound_resources, unresolved_resource_refs = _bind_step7_resources(
+            candidates=candidates,
+            structure_files=structure_files,
+            sequence_files=sequence_files,
+            refs_by_type=refs_by_type,
+        )
 
-        for candidate in cct.get("candidate_records") or []:
-            ctype = candidate.get("candidate_type")
-            if ctype not in {"target_antigen", "antibody", "adc_construct"}:
-                # compound_component / unknown candidates are handled in Step 9.
-                continue
+        for candidate in candidates:
+            resources = bound_resources.get(candidate.get("candidate_id"), {})
             record = self._build_structure_input_record(
                 candidate=candidate,
-                structure_files=structure_files,
-                sequence_files=sequence_files,
-                refs_by_type=refs_by_type,
+                structure_files=resources.get("structure_files") or [],
+                sequence_files=resources.get("sequence_files") or [],
+                refs_by_type=resources.get("refs_by_type") or {},
             )
             if record is None:
                 continue
@@ -178,11 +202,12 @@ class StructureAndDesignAgent:
                     tool_call_records.append(tc)
                     all_pdb_ids_seen.add(sref.pdb_id)
             prepared.append(record)
+        _attach_antigen_antibody_mapping(prepared, candidates)
 
         prep_status: str
         if not prepared:
             prep_status = "failed"
-        elif any(r.missing_metadata_flags for r in prepared):
+        elif unresolved_resource_refs or any(r.missing_metadata_flags for r in prepared):
             prep_status = "partial"
         else:
             prep_status = "ok"
@@ -196,6 +221,7 @@ class StructureAndDesignAgent:
             structure_output_artifacts=[
                 tc.tool_output_artifact_id for tc in tool_call_records if tc.tool_output_artifact_id
             ],
+            unresolved_resource_refs=unresolved_resource_refs,
         )
 
         artifact_id = new_artifact_id("prepared_structure_input_package")
@@ -220,44 +246,89 @@ class StructureAndDesignAgent:
         materials = candidate.get("materials") or []
 
         # Structure signals on the candidate itself.
-        cand_structure_mats = _materials_by_type(candidate, {"structure_file", "structure_ref"})
+        cand_structure_mats = _materials_by_type(candidate, {"structure_file"})
+        cand_structure_ref_mats = _materials_by_type(candidate, {"structure_ref"})
+        cand_structure_file_refs = [
+            m for m in cand_structure_ref_mats
+            if not _looks_like_pdb_id(m.get("value"))
+        ]
+        cand_structure_mats.extend(cand_structure_file_refs)
+        cand_pdb_material_refs = [
+            m for m in cand_structure_ref_mats
+            if _looks_like_pdb_id(m.get("value"))
+        ]
         cand_pdb_ids = _identifiers_by_type(candidate, {"pdb_id"})
         cand_uniprot_ids = _identifiers_by_type(candidate, {"uniprot_id"})
         cand_sequence_mats = _materials_by_type(
             candidate,
             {"antibody_heavy_chain_sequence", "antibody_light_chain_sequence", "target_sequence"},
         )
+        bound_sequence_paths = {
+            f.get("storage_path") for f in sequence_files if f.get("storage_path")
+        }
+        cand_sequence_mats = [
+            m for m in cand_sequence_mats
+            if not _looks_like_file_backed_sequence(m.get("value"))
+            or m.get("value") in bound_sequence_paths
+        ]
 
         # Top-level uploads. For target/antibody we accept any uploaded structure
         # file as a candidate-attached structure ref; explicit pairing is the
         # Step 8 evaluator's concern.
         has_structure_file = bool(cand_structure_mats) or bool(structure_files)
-        has_pdb_id = bool(cand_pdb_ids) or bool(refs_by_type.get("pdb_id"))
+        has_pdb_id = bool(cand_pdb_material_refs) or bool(cand_pdb_ids) or bool(refs_by_type.get("pdb_id"))
         has_sequence = bool(cand_sequence_mats) or bool(sequence_files) or bool(
             cand_uniprot_ids or refs_by_type.get("uniprot_id")
         )
         if not (has_structure_file or has_pdb_id or has_sequence):
             return None
 
-        # Decide input_case in order of strongest signal.
-        if cand_structure_mats or structure_files:
+        # Decide input_case in deterministic source-priority order.
+        if structure_files:
             input_case = "uploaded_structure_file"
             structure_source = "user_uploaded"
-        elif cand_pdb_ids or refs_by_type.get("pdb_id"):
+            preferred_rank = 1
+            preferred_reason = "uploaded PDB/CIF structure file preferred over candidate/PDB ID/sequence inputs"
+        elif cand_structure_mats:
+            input_case = "uploaded_structure_file"
+            structure_source = "candidate_material"
+            preferred_rank = 2
+            preferred_reason = "candidate material structure_file/structure_ref preferred over PDB ID/sequence inputs"
+        elif cand_pdb_material_refs:
+            input_case = "known_pdb_id"
+            structure_source = "candidate_material"
+            preferred_rank = 2
+            preferred_reason = "candidate material structure_ref preferred over candidate/Step 2 PDB ID/sequence inputs"
+        elif cand_pdb_ids:
+            input_case = "known_pdb_id"
+            structure_source = "candidate_identifier"
+            preferred_rank = 3
+            preferred_reason = "candidate pdb_id preferred over Step 2 PDB ID/sequence inputs"
+        elif refs_by_type.get("pdb_id"):
             input_case = "known_pdb_id"
             structure_source = "structured_query.referenced_inputs"
+            preferred_rank = 4
+            preferred_reason = "Step 2 referenced pdb_id preferred over sequence-only inputs"
         else:
             input_case = "sequence_only_input"
             structure_source = "fasta_or_uniprot"
+            preferred_rank = 5
+            preferred_reason = "no structure file or PDB ID available; preparing sequence-only prediction input"
 
         structure_refs: list[StructureRef] = []
         for m in cand_structure_mats:
+            source_ref = m.get("material_id") or m.get("value")
             structure_refs.append(
                 StructureRef(
                     pdb_id=None,
                     file_id=None,
                     structure_format=_format_for_file(m.get("value_format") or ""),  # type: ignore[arg-type]
                     validation_status="unknown",
+                    source_kind="candidate_material",
+                    source_ref=source_ref,
+                    related_candidate_ids=[candidate_id],
+                    resource_binding_status="explicit",
+                    binding_confidence=1.0,
                 )
             )
         for f in structure_files:
@@ -267,6 +338,11 @@ class StructureAndDesignAgent:
                     file_id=f.get("file_id"),
                     structure_format=_format_for_file(f.get("original_filename", "")),  # type: ignore[arg-type]
                     validation_status="unknown",
+                    source_kind="uploaded_file",
+                    source_ref=f.get("storage_path") or f.get("file_id"),
+                    related_candidate_ids=[candidate_id],
+                    resource_binding_status=f.get("resource_binding_status", "inferred"),
+                    binding_confidence=float(f.get("binding_confidence", 0.6)),
                 )
             )
         for ident in cand_pdb_ids:
@@ -275,40 +351,115 @@ class StructureAndDesignAgent:
                     pdb_id=ident.get("id_value"),
                     structure_format="pdb",
                     validation_status="unknown",
+                    source_kind="pdb_id",
+                    source_ref=ident.get("id_value"),
+                    related_candidate_ids=[candidate_id],
+                    resource_binding_status="explicit",
+                    binding_confidence=1.0,
                 )
             )
+        for material in cand_pdb_material_refs:
+            value = material.get("value")
+            if value and not any(s.pdb_id == value for s in structure_refs):
+                structure_refs.append(StructureRef(
+                    pdb_id=value,
+                    structure_format="pdb",
+                    validation_status="unknown",
+                    source_kind="candidate_material",
+                    source_ref=material.get("material_id") or value,
+                    related_candidate_ids=[candidate_id],
+                    resource_binding_status="explicit",
+                    binding_confidence=1.0,
+                ))
         for ref in refs_by_type.get("pdb_id", []):
             value = ref.get("value")
             if value and not any(s.pdb_id == value for s in structure_refs):
                 structure_refs.append(
-                    StructureRef(pdb_id=value, structure_format="pdb", validation_status="unknown")
+                    StructureRef(
+                        pdb_id=value,
+                        structure_format="pdb",
+                        validation_status="unknown",
+                        source_kind="pdb_id",
+                        source_ref=value,
+                        related_candidate_ids=[candidate_id],
+                        resource_binding_status=ref.get("resource_binding_status", "inferred"),
+                        binding_confidence=float(ref.get("binding_confidence", 0.6)),
+                    )
                 )
 
         sequence_refs: list[SequenceRef] = []
+        prediction_required = input_case == "sequence_only_input"
         for m in cand_sequence_mats:
+            material_id = m.get("material_id", new_artifact_id("seq"))
             sequence_refs.append(
                 SequenceRef(
-                    sequence_id=m.get("material_id", new_artifact_id("seq")),
+                    sequence_id=material_id,
                     chain_role=_chain_role_from_material(m.get("material_type", "")),
-                    sequence=str(m.get("value") or ""),
+                    sequence=str(m.get("value") or "") or None,
+                    source_kind="material_sequence",
+                    source_ref=material_id,
+                    prediction_needed=prediction_required,
+                    sequence_value_status="inline",
+                    prediction_input_kind="amino_acid_sequence",
+                    related_candidate_ids=[candidate_id],
+                    resource_binding_status="explicit",
+                    binding_confidence=1.0,
                 )
             )
         for f in sequence_files:
+            sequence_id = f.get("file_id", new_artifact_id("seq"))
             sequence_refs.append(
                 SequenceRef(
-                    sequence_id=f.get("file_id", new_artifact_id("seq")),
-                    chain_role="antibody_heavy" if ctype == "antibody" else "antigen",
-                    sequence=f.get("storage_path") or f.get("original_filename") or "",
+                    sequence_id=sequence_id,
+                    chain_role=_chain_role_from_fasta_file(f, ctype),
+                    sequence=None,
+                    source_kind="uploaded_fasta",
+                    source_ref=f.get("storage_path") or sequence_id,
+                    prediction_needed=prediction_required,
+                    sequence_storage_ref=f.get("storage_path") or None,
+                    sequence_value_status="referenced",
+                    prediction_input_kind="fasta_ref",
+                    related_candidate_ids=[candidate_id],
+                    resource_binding_status=f.get("resource_binding_status", "inferred"),
+                    binding_confidence=float(f.get("binding_confidence", 0.6)),
                 )
             )
         for ident in cand_uniprot_ids:
+            uniprot = ident.get("id_value", "uniprot")
             sequence_refs.append(
                 SequenceRef(
-                    sequence_id=ident.get("id_value", "uniprot"),
+                    sequence_id=uniprot,
                     chain_role="antigen" if ctype == "target_antigen" else None,
-                    sequence=f"uniprot:{ident.get('id_value')}",
+                    sequence=None,
+                    source_kind="uniprot_id",
+                    source_ref=uniprot,
+                    prediction_needed=prediction_required,
+                    sequence_value_status="identifier_only",
+                    prediction_input_kind="uniprot_id",
+                    related_candidate_ids=[candidate_id],
+                    resource_binding_status="explicit",
+                    binding_confidence=1.0,
                 )
             )
+        if ctype == "target_antigen":
+            for ref in refs_by_type.get("uniprot_id", []):
+                uniprot = ref.get("value")
+                if uniprot and not any(s.sequence_id == uniprot for s in sequence_refs):
+                    sequence_refs.append(
+                        SequenceRef(
+                            sequence_id=uniprot,
+                            chain_role="antigen",
+                            sequence=None,
+                            source_kind="uniprot_id",
+                            source_ref=uniprot,
+                            prediction_needed=prediction_required,
+                            sequence_value_status="identifier_only",
+                            prediction_input_kind="uniprot_id",
+                            related_candidate_ids=[candidate_id],
+                            resource_binding_status=ref.get("resource_binding_status", "inferred"),
+                            binding_confidence=float(ref.get("binding_confidence", 0.6)),
+                        )
+                    )
 
         structure_role = (
             "complex" if ctype == "adc_construct"
@@ -323,12 +474,32 @@ class StructureAndDesignAgent:
         )
 
         missing_flags: list[str] = []
+        source_priority_notes = [preferred_reason]
         if input_case == "uploaded_structure_file" and not structure_refs:
             missing_flags.append("uploaded_structure_file_present_but_no_ref")
         if input_case == "known_pdb_id" and not any(s.pdb_id for s in structure_refs):
             missing_flags.append("pdb_id_referenced_but_no_structure_ref")
         if input_case == "sequence_only_input" and not sequence_refs:
             missing_flags.append("sequence_only_input_but_no_sequence_ref")
+        observed_chain_mapping, observed_ranges = _observed_structure_metadata(
+            storage=self.storage,
+            structure_files=structure_files,
+            candidate_structure_materials=cand_structure_mats,
+        )
+        chain_mapping = observed_chain_mapping or _chain_mapping_from_sequence_refs(sequence_refs)
+        if input_case in {"uploaded_structure_file", "known_pdb_id"} and not chain_mapping:
+            missing_flags.append("chain_ids_missing")
+        if observed_chain_mapping and all(cm.chain_role == "other" for cm in observed_chain_mapping):
+            missing_flags.append("chain_roles_unknown")
+        if input_case == "sequence_only_input" and sequence_refs and not chain_mapping:
+            missing_flags.append("chain_mapping_incomplete")
+
+        residue_ranges = _extract_residue_ranges(candidate, refs_by_type)
+        for observed_range in observed_ranges:
+            if observed_range not in residue_ranges:
+                residue_ranges.append(observed_range)
+        if _partial_input_hint_present(candidate, refs_by_type) and not residue_ranges:
+            missing_flags.append("residue_range_missing_for_partial_input")
 
         return StructureInputRecord(
             structure_input_id=new_artifact_id("structure_input"),
@@ -339,11 +510,15 @@ class StructureAndDesignAgent:
             structure_role=structure_role,  # type: ignore[arg-type]
             structure_refs=structure_refs,
             sequence_refs_for_prediction=sequence_refs,
-            chain_mapping=[],
+            chain_mapping=chain_mapping,
             chain_pair_candidates=[],
             antigen_antibody_mapping=None,
-            residue_ranges=[],
+            residue_ranges=residue_ranges,
             missing_metadata_flags=missing_flags,
+            preferred_input_rank=preferred_rank,
+            preferred_input_reason=preferred_reason,
+            prediction_required=prediction_required,
+            source_priority_notes=source_priority_notes,
         )
 
     # ── Step 8 ──────────────────────────────────────────────────────────────
@@ -511,11 +686,14 @@ class StructureAndDesignAgent:
                 None,
             )
             if seq_ref:
-                # alphafold_get_prediction expects a UniProt; we pass either an
-                # explicit uniprot identifier or a placeholder derived from the
-                # sequence_id so the wrapper records a deterministic call.
-                value = seq_ref.get("sequence") or ""
-                uniprot = value.replace("uniprot:", "") if value.startswith("uniprot:") else None
+                # AlphaFold wrapper accepts UniProt identifiers. Step 7 now
+                # represents identifiers explicitly instead of encoding them
+                # as pseudo-sequences.
+                uniprot = (
+                    seq_ref.get("source_ref")
+                    if seq_ref.get("prediction_input_kind") == "uniprot_id"
+                    else None
+                )
                 if uniprot:
                     out.append(
                         ("alphafold_get_prediction", {"uniprot": uniprot}, "prediction_confidence")
@@ -683,12 +861,374 @@ class StructureAndDesignAgent:
 
 # ── module-level helpers ────────────────────────────────────────────────────
 
+def _bind_step7_resources(
+    *, candidates: list[dict], structure_files: list[dict],
+    sequence_files: list[dict], refs_by_type: dict[str, list[dict]],
+) -> tuple[dict[str, dict[str, Any]], list[dict]]:
+    bound = {
+        c["candidate_id"]: {"structure_files": [], "sequence_files": [], "refs_by_type": {}}
+        for c in candidates if c.get("candidate_id")
+    }
+    by_type: dict[str, list[str]] = {}
+    for candidate in candidates:
+        if candidate.get("candidate_id"):
+            by_type.setdefault(candidate.get("candidate_type", ""), []).append(candidate["candidate_id"])
+    unresolved: list[dict] = []
+
+    def compatible_ids(resource: dict, resource_kind: str) -> tuple[list[str], str, float]:
+        explicit_ids = _explicit_resource_candidate_ids(resource, set(bound))
+        if explicit_ids:
+            return explicit_ids, "explicit", 1.0
+        role = _resource_role(resource, resource_kind)
+        if role in {"target", "antigen"}:
+            ids = by_type.get("target_antigen", [])
+            return (ids, "inferred", 0.8) if len(ids) == 1 else ([], "ambiguous", 0.0)
+        if role in {"antibody", "antibody_heavy", "antibody_light"}:
+            ids = by_type.get("antibody", [])
+            return (ids, "inferred", 0.8) if len(ids) == 1 else ([], "ambiguous", 0.0)
+        if role == "complex":
+            ids = by_type.get("adc_construct", [])
+            if len(ids) == 1:
+                return ids, "inferred", 0.7
+            target_ids = by_type.get("target_antigen", [])
+            return (target_ids, "inferred", 0.5) if len(target_ids) == 1 else ([], "ambiguous", 0.0)
+        if resource_kind in {"structure", "pdb_id", "uniprot_id"}:
+            ids = by_type.get("target_antigen", [])
+            return (ids, "inferred", 0.5) if len(ids) == 1 else ([], "ambiguous", 0.0)
+        return [], "unassigned", 0.0
+
+    def bind_file(resource: dict, kind: str) -> None:
+        ids, status, confidence = compatible_ids(resource, kind)
+        if not ids:
+            unresolved.append(_unresolved_resource_summary(resource, kind, status))
+            return
+        for candidate_id in ids:
+            item = dict(resource)
+            item.update(resource_binding_status=status, binding_confidence=confidence, related_candidate_ids=ids)
+            bound[candidate_id]["structure_files" if kind == "structure" else "sequence_files"].append(item)
+
+    for resource in structure_files:
+        bind_file(resource, "structure")
+    for resource in sequence_files:
+        bind_file(resource, "sequence")
+    for id_type, refs in refs_by_type.items():
+        for ref in refs:
+            if id_type not in {"pdb_id", "uniprot_id"} and not _reference_has_range(ref):
+                continue
+            ids, status, confidence = compatible_ids(ref, id_type)
+            if not ids:
+                unresolved.append(_unresolved_resource_summary(ref, id_type, status))
+                continue
+            for candidate_id in ids:
+                item = dict(ref)
+                item.update(resource_binding_status=status, binding_confidence=confidence, related_candidate_ids=ids)
+                bound[candidate_id]["refs_by_type"].setdefault(id_type, []).append(item)
+    return bound, unresolved
+
+
+def _explicit_resource_candidate_ids(resource: dict, valid_ids: set[str]) -> list[str]:
+    values = [resource.get("candidate_id"), resource.get("related_candidate_id")]
+    if isinstance(resource.get("related_candidate_ids"), list):
+        values.extend(resource["related_candidate_ids"])
+    return list(dict.fromkeys(str(v) for v in values if v and str(v) in valid_ids))
+
+
+def _resource_role(resource: dict, resource_kind: str) -> str | None:
+    for key in ("chain_role", "role", "source_role"):
+        if isinstance(resource.get(key), str) and resource[key].strip():
+            return resource[key].strip().lower()
+    filename = (resource.get("original_filename") or "").lower()
+    if any(marker in filename for marker in ("heavy", "_vh", "-vh", "_hc", "-hc")):
+        return "antibody_heavy"
+    if any(marker in filename for marker in ("light", "_vl", "-vl", "_lc", "-lc")):
+        return "antibody_light"
+    if any(marker in filename for marker in ("antigen", "target", "her2", "erbb2")):
+        return "antigen"
+    if "antibody" in filename or "trastuzumab" in filename:
+        return "antibody"
+    if "complex" in filename and resource_kind == "structure":
+        return "complex"
+    return None
+
+
+def _unresolved_resource_summary(resource: dict, kind: str, status: str) -> dict:
+    return {
+        "resource_type": kind,
+        "source_ref": resource.get("file_id") or resource.get("value") or resource.get("original_filename") or "unknown",
+        "resource_binding_status": status,
+        "reason": "no unique compatible candidate binding",
+    }
+
+
+def _reference_has_range(ref: dict) -> bool:
+    return any(key in ref for key in ("residue_range", "start", "end", "residue_start", "residue_end", "range")) or bool(
+        _RESIDUE_RANGE_RE.search(str(ref.get("value") or ""))
+    )
+
+
+def _observed_structure_metadata(
+    *, storage: Storage, structure_files: list[dict],
+    candidate_structure_materials: list[dict],
+) -> tuple[list[ChainMapping], list[dict]]:
+    mappings: list[ChainMapping] = []
+    ranges: list[dict] = []
+    resources = list(structure_files)
+    resources.extend({
+        "storage_path": material.get("value"),
+        "chain_id": material.get("chain_id"),
+        "chain_role": material.get("chain_role") or material.get("role"),
+        "chain_roles": material.get("chain_roles") or {},
+    } for material in candidate_structure_materials)
+    seen: set[tuple[str, str]] = set()
+    for resource in resources:
+        source_ref = resource.get("storage_path")
+        if not source_ref:
+            continue
+        explicit_roles = resource.get("chain_roles") or {}
+        for chain_id, start, end in _parse_structure_chain_summary(storage, source_ref):
+            key = (str(source_ref), chain_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            explicit_role = explicit_roles.get(chain_id)
+            if not explicit_role and resource.get("chain_id") == chain_id:
+                explicit_role = resource.get("chain_role")
+            role = explicit_role if explicit_role in {"antigen", "antibody_heavy", "antibody_light"} else "other"
+            mappings.append(ChainMapping(
+                chain_id=chain_id,
+                chain_role=role,  # type: ignore[arg-type]
+                mapping_confidence=1.0 if explicit_role else 0.0,
+                source="explicit" if explicit_role else "unknown",
+                source_ref=str(source_ref),
+                chain_id_kind="observed",
+            ))
+            if start is not None and end is not None:
+                ranges.append({
+                    "chain_id": chain_id, "start": start, "end": end,
+                    "source": "observed_structure", "source_ref": str(source_ref),
+                })
+    return mappings, ranges
+
+
+def _parse_structure_chain_summary(
+    storage: Storage, source_ref: str,
+) -> list[tuple[str, int | None, int | None]]:
+    try:
+        path = Path(source_ref)
+        if path.is_file():
+            data = path.read_bytes()
+        elif storage.exists(source_ref):
+            data = storage.read_bytes(source_ref)
+        else:
+            return []
+        from Bio.PDB import MMCIFParser, PDBParser
+
+        text = data.decode("utf-8", errors="replace")
+        suffix = PurePosixPath(source_ref).suffix.lower()
+        parser = MMCIFParser(QUIET=True) if suffix in {".cif", ".mmcif"} else PDBParser(QUIET=True)
+        structure = parser.get_structure("step7_input", StringIO(text))
+        model = next(structure.get_models(), None)
+        if model is None:
+            return []
+        out: list[tuple[str, int | None, int | None]] = []
+        for chain in model:
+            residue_numbers = [
+                residue.id[1] for residue in chain
+                if isinstance(residue.id[1], int) and residue.id[0] == " "
+            ]
+            out.append((
+                str(chain.id),
+                min(residue_numbers) if residue_numbers else None,
+                max(residue_numbers) if residue_numbers else None,
+            ))
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _chain_role_from_material(material_type: str) -> Optional[str]:
     return {
         "antibody_heavy_chain_sequence": "antibody_heavy",
         "antibody_light_chain_sequence": "antibody_light",
         "target_sequence": "antigen",
     }.get(material_type)
+
+
+def _chain_role_from_fasta_file(file_record: dict, candidate_type: str | None) -> str:
+    name = (file_record.get("original_filename") or "").lower()
+    if any(marker in name for marker in ("light", "_l", "-l", "vl", "lc")):
+        return "antibody_light"
+    if any(marker in name for marker in ("heavy", "_h", "-h", "vh", "hc")):
+        return "antibody_heavy"
+    if candidate_type == "target_antigen":
+        return "antigen"
+    if candidate_type == "antibody":
+        return "antibody_heavy"
+    return "antigen"
+
+
+def _chain_mapping_from_sequence_refs(sequence_refs: list[SequenceRef]) -> list[ChainMapping]:
+    out: list[ChainMapping] = []
+    placeholders = {
+        "antigen": "predicted_antigen",
+        "antibody_heavy": "predicted_antibody_heavy",
+        "antibody_light": "predicted_antibody_light",
+    }
+    seen: set[str] = set()
+    for ref in sequence_refs:
+        role = ref.chain_role
+        if role not in placeholders or role in seen:
+            continue
+        seen.add(role)
+        out.append(
+            ChainMapping(
+                chain_id=placeholders[role],
+                chain_role=role,  # type: ignore[arg-type]
+                mapping_confidence=0.5,
+                source="inferred",
+                source_ref=ref.sequence_id,
+                chain_id_kind="prediction_placeholder",
+            )
+        )
+    return out
+
+
+def _attach_antigen_antibody_mapping(
+    prepared: list[StructureInputRecord],
+    candidates: list[dict],
+) -> None:
+    records = {r.candidate_id: r for r in prepared}
+    targets = [c for c in candidates if c.get("candidate_type") == "target_antigen" and c.get("candidate_id") in records]
+    antibodies = [c for c in candidates if c.get("candidate_type") == "antibody" and c.get("candidate_id") in records]
+    if not targets or not antibodies:
+        return
+
+    explicit_pairs: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        candidate_id = candidate.get("candidate_id")
+        related = candidate.get("related_candidate_ids") or []
+        if candidate.get("related_candidate_id"):
+            related = [*related, candidate.get("related_candidate_id")]
+        for related_id in related:
+            if candidate_id in records and related_id in records:
+                types = {next((c.get("candidate_type") for c in candidates if c.get("candidate_id") == x), None) for x in (candidate_id, related_id)}
+                if types == {"target_antigen", "antibody"}:
+                    target_id = candidate_id if next(c for c in candidates if c.get("candidate_id") == candidate_id).get("candidate_type") == "target_antigen" else related_id
+                    antibody_id = related_id if target_id == candidate_id else candidate_id
+                    explicit_pairs.add((target_id, antibody_id))
+
+    pairs: list[tuple[str, str, bool]] = [(t, a, True) for t, a in sorted(explicit_pairs)]
+    if not pairs and len(targets) == 1 and len(antibodies) == 1:
+        pairs = [(targets[0]["candidate_id"], antibodies[0]["candidate_id"], False)]
+    elif not pairs:
+        # Multiple candidates with no typed relationship: expose only pair
+        # candidates involving each record, never a shared first-pair mapping.
+        for target in targets:
+            for antibody in antibodies:
+                pair = {
+                    "target_candidate_id": target["candidate_id"],
+                    "antibody_candidate_id": antibody["candidate_id"],
+                    "mapping_status": "ambiguous",
+                }
+                records[target["candidate_id"]].chain_pair_candidates.append(pair)
+                records[antibody["candidate_id"]].chain_pair_candidates.append(pair)
+        return
+
+    for target_id, antibody_id, explicit in pairs:
+        target_record = records[target_id]
+        antibody_record = records[antibody_id]
+        antigen_refs = [s.sequence_id for s in target_record.sequence_refs_for_prediction if s.chain_role == "antigen"]
+        heavy_refs = [s.sequence_id for s in antibody_record.sequence_refs_for_prediction if s.chain_role == "antibody_heavy"]
+        light_refs = [s.sequence_id for s in antibody_record.sequence_refs_for_prediction if s.chain_role == "antibody_light"]
+        if target_record.prediction_required or antibody_record.prediction_required:
+            status = "sequence_only_prediction_needed"
+        elif not explicit:
+            status = "ambiguous"
+        elif antigen_refs and heavy_refs and light_refs:
+            status = "complete"
+        elif not (target_record.chain_mapping and antibody_record.chain_mapping):
+            status = "missing_chain_ids"
+        else:
+            status = "partial"
+        mapping = {
+            "target_candidate_id": target_id,
+            "antibody_candidate_id": antibody_id,
+            "antigen_sequence_ids": antigen_refs,
+            "antibody_heavy_sequence_ids": heavy_refs,
+            "antibody_light_sequence_ids": light_refs,
+            "mapping_status": status,
+            "relationship_source": "explicit" if explicit else "ambiguous",
+        }
+        pair = {"target_candidate_id": target_id, "antibody_candidate_id": antibody_id, "mapping_status": status}
+        for record in (target_record, antibody_record):
+            record.antigen_antibody_mapping = mapping
+            record.chain_pair_candidates.append(pair)
+
+
+def _extract_residue_ranges(candidate: dict, refs_by_type: dict[str, list[dict]]) -> list[dict]:
+    ranges: list[dict] = []
+
+    def add_range(start: Any, end: Any, source: str, source_ref: str | None = None) -> None:
+        try:
+            s = int(start)
+            e = int(end)
+        except (TypeError, ValueError):
+            return
+        if s <= 0 or e < s:
+            return
+        item = {
+            "start": s,
+            "end": e,
+            "source": source,
+        }
+        if source_ref:
+            item["source_ref"] = source_ref
+        if item not in ranges:
+            ranges.append(item)
+
+    def scan_obj(obj: dict, source: str) -> None:
+        source_ref = obj.get("material_id") or obj.get("source") or obj.get("id_type")
+        if isinstance(obj.get("residue_range"), dict):
+            rr = obj["residue_range"]
+            add_range(rr.get("start") or rr.get("residue_start"), rr.get("end") or rr.get("residue_end"), source, source_ref)
+        if obj.get("start") is not None or obj.get("end") is not None:
+            add_range(obj.get("start"), obj.get("end"), source, source_ref)
+        if obj.get("residue_start") is not None or obj.get("residue_end") is not None:
+            add_range(obj.get("residue_start"), obj.get("residue_end"), source, source_ref)
+        text_values = []
+        for key in ("range", "residue_range", "value", "notes", "context"):
+            value = obj.get(key)
+            if isinstance(value, str):
+                text_values.append(value)
+        for text in text_values:
+            match = _RESIDUE_RANGE_RE.search(text)
+            if match:
+                add_range(match.group("start"), match.group("end"), source, source_ref)
+
+    for material in candidate.get("materials") or []:
+        if isinstance(material, dict):
+            scan_obj(material, "candidate_material")
+    for ref_list in refs_by_type.values():
+        for ref in ref_list:
+            if isinstance(ref, dict):
+                scan_obj(ref, "referenced_input")
+    return ranges
+
+
+def _partial_input_hint_present(candidate: dict, refs_by_type: dict[str, list[dict]]) -> bool:
+    text_parts: list[str] = []
+    for material in candidate.get("materials") or []:
+        if isinstance(material, dict):
+            text_parts.extend(
+                str(material.get(k) or "")
+                for k in ("value", "notes", "context")
+            )
+    for ref_list in refs_by_type.values():
+        for ref in ref_list:
+            if isinstance(ref, dict):
+                text_parts.extend(str(ref.get(k) or "") for k in ("value", "source", "notes", "context"))
+    text = " ".join(text_parts).lower()
+    return any(marker in text for marker in ("partial", "fragment", "domain", "residues"))
 
 
 def _run_case_from_input_case(input_case: str | None) -> str:
