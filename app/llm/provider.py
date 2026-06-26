@@ -58,10 +58,10 @@ def _mock_stage1_selection(schema: dict) -> dict:
 def _mock_stage1_multi_lane(schema: dict) -> dict:
     """Deterministic per-candidate multi-lane Stage 1 selector mock.
 
-    For each lane in `schema["lanes"]`, picks at most `max_tools_per_lane`
-    tools from the intersection of the catalog and the lane's
-    `allowed_tools` whose `coarse_input_requirements` intersect the lane's
-    `signals`. Returns a flat `selections` list tagged with `lane_type`.
+    For each lane in `schema["lanes"]`, picks every complementary tool from
+    the intersection of the catalog and the lane's `allowed_tools` whose
+    `coarse_input_requirements` intersect the lane's `signals`. Returns a
+    flat `selections` list tagged with `lane_type`.
     """
     catalog = schema.get("compact_catalog") or []
     name_to_entry = {
@@ -69,7 +69,6 @@ def _mock_stage1_multi_lane(schema: dict) -> dict:
         if isinstance(e, dict) and e.get("tool_name")
     }
     lanes = schema.get("lanes") or []
-    cap = int(schema.get("max_tools_per_lane") or 2)
     selections: list[dict] = []
     for lane in lanes:
         lane_type = lane.get("lane_type")
@@ -94,8 +93,6 @@ def _mock_stage1_multi_lane(schema: dict) -> dict:
                 "priority": 1,
                 "required_context": sorted(set(reqs) & available),
             })
-            if len(picks) >= cap:
-                break
         selections.extend(picks)
     return {
         "selections": selections,

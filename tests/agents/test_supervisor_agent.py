@@ -298,14 +298,25 @@ def test_supervisor_normalizes_entity_type_aliases_before_pydantic():
                 "entity_type": "small molecule",
                 "explicit_or_inferred": "explicit",
             },
+            {
+                "original_text": "trastuzumab analog",
+                "canonical_name": "trastuzumab analog",
+                "entity_type": "antibody_candidate",
+                "explicit_or_inferred": "explicit",
+            },
         ]
     )
     agent = SupervisorAgent(llm=_DriftedLLM(drift))
     sq = agent.parse_raw_to_structured_query(_raw())
-    assert [e.entity_type for e in sq.normalized_entities] == ["linker_payload", "compound"]
+    assert [e.entity_type for e in sq.normalized_entities] == [
+        "linker_payload",
+        "compound",
+        "antibody",
+    ]
     warnings = " | ".join(sq.parse_warnings)
     assert "payload-linker" in warnings
     assert "linker_payload" in warnings
+    assert "antibody_candidate" in warnings
 
 
 def test_supervisor_repairs_explicit_payload_smiles_in_payload_text():

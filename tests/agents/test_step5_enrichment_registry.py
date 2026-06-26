@@ -201,6 +201,143 @@ def test_sabdab_target_and_antibody_name_planning():
     ]
 
 
+def test_pdb_id_plans_sabdab_get_structure_for_antibody_or_target():
+    """SAbDab_get_structure should plan for antibody / target_antigen /
+    adc_construct candidates when a pdb_id identifier is present."""
+    for category in ("antibody", "target_antigen", "adc_construct"):
+        plans = plan_enrichment_for_record(
+            _record(
+                candidate_type=category,
+                identifiers=[_ident("pdb_id", "1N8Z")],
+            ),
+            scoped_tools=["SAbDab_get_structure"],
+            candidate_category=category,
+            registry=STEP_05_CAPABILITY_REGISTRY,
+        )
+        assert [(p.tool_name, p.schema_arg_name, p.query_kind, p.query)
+                for p in plans] == [
+            ("SAbDab_get_structure", "pdb_id", "pdb_id", "1N8Z")
+        ], category
+
+
+def test_target_antigen_name_plans_therasabdab_search_by_target():
+    plans = plan_enrichment_for_record(
+        _record(
+            candidate_type="target_antigen",
+            materials=[_mat("target_antigen_name", "HER2", "target")],
+        ),
+        scoped_tools=["TheraSAbDab_search_by_target"],
+        candidate_category="target_antigen",
+        registry=STEP_05_CAPABILITY_REGISTRY,
+    )
+    assert [(p.tool_name, p.schema_arg_name, p.query, p.query_role)
+            for p in plans] == [
+        ("TheraSAbDab_search_by_target", "target", "HER2", "target")
+    ]
+
+
+def test_antibody_name_plans_therasabdab_search_therapeutics():
+    plans = plan_enrichment_for_record(
+        _record(
+            candidate_type="antibody",
+            materials=[_mat("antibody_name", "trastuzumab", "antibody")],
+        ),
+        scoped_tools=["TheraSAbDab_search_therapeutics"],
+        candidate_category="antibody",
+        registry=STEP_05_CAPABILITY_REGISTRY,
+    )
+    assert [(p.tool_name, p.schema_arg_name, p.query, p.query_role)
+            for p in plans] == [
+        ("TheraSAbDab_search_therapeutics", "query", "trastuzumab", "antibody")
+    ]
+
+
+def test_new_therasabdab_tools_only_route_in_their_candidate_category():
+    """Symmetric guard: target_antigen_name should NOT plan
+    TheraSAbDab_search_therapeutics, and antibody_name should NOT plan
+    TheraSAbDab_search_by_target — they answer different questions and
+    each is keyed to its own candidate category."""
+    target_plans = plan_enrichment_for_record(
+        _record(
+            candidate_type="target_antigen",
+            materials=[_mat("target_antigen_name", "HER2", "target")],
+        ),
+        scoped_tools=["TheraSAbDab_search_therapeutics"],
+        candidate_category="target_antigen",
+        registry=STEP_05_CAPABILITY_REGISTRY,
+    )
+    antibody_plans = plan_enrichment_for_record(
+        _record(
+            candidate_type="antibody",
+            materials=[_mat("antibody_name", "trastuzumab", "antibody")],
+        ),
+        scoped_tools=["TheraSAbDab_search_by_target"],
+        candidate_category="antibody",
+        registry=STEP_05_CAPABILITY_REGISTRY,
+    )
+    assert target_plans == []
+    assert antibody_plans == []
+
+
+def test_iedb_search_bcr_sequences_is_not_routed_by_step5_registry():
+    """Audit note (documented in the final report, not just a test
+    silently passing): iedb_search_bcr_sequences has only optional
+    ``limit`` / ``offset`` / ``select`` / ``filters`` parameters.
+    ``filters`` is a free-form object whose schema is not knowable from
+    Step 5 typed inputs, so a deterministic argument mapping cannot be
+    constructed safely. The registry therefore does NOT route to this
+    tool; the agent's eligibility planner returns no plan for it even
+    when it is in the scoped catalog. The audit / handoff explicitly
+    records this as an intentional skip (NOT a silent fallback)."""
+    for materials in (
+        [_mat("antibody_name", "trastuzumab", "antibody")],
+        [_mat("target_antigen_name", "HER2", "target")],
+        [_mat("antibody_heavy_chain_sequence",
+              "/runs/x/trastuzumab.fasta", "antibody_sequence_reference")],
+    ):
+        for category in ("antibody", "target_antigen", "adc_construct"):
+            plans = plan_enrichment_for_record(
+                _record(candidate_type=category, materials=materials),
+                scoped_tools=["iedb_search_bcr_sequences"],
+                candidate_category=category,
+                registry=STEP_05_CAPABILITY_REGISTRY,
+            )
+            assert plans == [], (category, materials)
+
+
+def test_sequence_only_candidate_does_not_fabricate_tool_calls():
+    """When a candidate only carries a FASTA material reference (no
+    name, no UniProt accession, no PDB ID), the registry must NOT
+    invent a tool call. Step 5 does not have a sequence-based UniProt
+    or sequence-search wrapper in scope, and we do not synthesise one."""
+    record = _record(
+        candidate_type="antibody",
+        materials=[
+            _mat(
+                "antibody_heavy_chain_sequence",
+                "/runs/x/trastuzumab.fasta",
+                "antibody_sequence_reference",
+            )
+        ],
+    )
+    full_scope = [
+        "SAbDab_search_structures",
+        "SAbDab_get_structure",
+        "TheraSAbDab_search_by_target",
+        "TheraSAbDab_search_therapeutics",
+        "ChEMBL_get_molecule",
+        "ChEMBL_search_molecules",
+        "ChEMBL_search_substructure",
+    ]
+    plans = plan_enrichment_for_record(
+        record,
+        scoped_tools=full_scope,
+        candidate_category="antibody",
+        registry=STEP_05_CAPABILITY_REGISTRY,
+    )
+    assert plans == []
+
+
 def test_zinc_known_unavailable_policy_is_explicit_when_included():
     plans = plan_enrichment_for_record(
         _record(identifiers=[_ident("zinc_id", "ZINC0000001")]),

@@ -34,6 +34,8 @@ from typing import Any
 import pytest
 
 from app.agents.tool_selection_policy import (
+    SELECTION_STAGE1_MULTI_LANE_SYSTEM_PROMPT,
+    SELECTION_STAGE1_MULTI_LANE_USER_PROMPT,
     SELECTION_STAGE1_SYSTEM_PROMPT,
     SELECTION_STAGE1_USER_PROMPT,
     SELECTION_STAGE2_SYSTEM_PROMPT,
@@ -80,6 +82,18 @@ def test_stage1_system_prompt_marks_catalog_as_scope_filtered():
     assert "agent_name" in s and "step_id" in s
     # Catalog-only is explicit.
     assert "use only the `compact_catalog` provided" in s
+
+
+def test_multilane_stage1_prompt_has_no_tool_count_cap_language():
+    prompt = (
+        SELECTION_STAGE1_MULTI_LANE_SYSTEM_PROMPT + "\n" +
+        SELECTION_STAGE1_MULTI_LANE_USER_PROMPT
+    ).lower()
+    assert "allowed_tools" in prompt
+    assert "tool cap" not in prompt
+    assert "per-lane tool cap" not in prompt
+    assert "max_tools_per_lane" not in prompt
+    assert "at most 2" not in prompt
 
 
 def test_stage1_system_prompt_blocks_full_tooluniverse_knowledge():

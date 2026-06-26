@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Literal, Optional
 
+from .step_06_capability_registry import STEP_06_CAPABILITY_BY_TOOL
+
 Severity = Literal["low", "medium", "high"]
 LaneRisk = Literal["low", "medium", "high", "unknown"]
 
@@ -251,34 +253,16 @@ _ANTIBODY_LANE = "antibody_protein_sequence_liability"
 _ANTIGEN_LANE = "antigen_protein_feature_context"
 _STRUCTURE_LANE = "structure_interface_quality"
 
-_INTERPRETERS: dict[str, tuple[Any, frozenset[str]]] = {
-    "DrugProps_pains_filter": (_interpret_pains, frozenset({_SMALL_MOLECULE_LANE})),
-    "DrugProps_lipinski_filter": (_interpret_lipinski, frozenset({_SMALL_MOLECULE_LANE})),
-    "DrugProps_calculate_qed": (_interpret_qed, frozenset({_SMALL_MOLECULE_LANE})),
-    "SwissADME_calculate_adme": (_interpret_adme, frozenset({_SMALL_MOLECULE_LANE})),
-    "SwissADME_check_druglikeness": (_interpret_adme, frozenset({_SMALL_MOLECULE_LANE})),
-    "ADMETAI_predict_toxicity": (_interpret_toxicity, frozenset({_SMALL_MOLECULE_LANE})),
-    "ADMETAI_predict_physicochemical_properties": (
-        _interpret_adme,
-        frozenset({_SMALL_MOLECULE_LANE}),
-    ),
-    "PROSITE_scan_sequence": (
-        _interpret_motifs,
-        frozenset({_ANTIBODY_LANE, _ANTIGEN_LANE}),
-    ),
-    "EBIProteins_get_features": (
-        _interpret_protein_features,
-        frozenset({_ANTIBODY_LANE, _ANTIGEN_LANE}),
-    ),
-    "EBIProteins_get_epitopes": (_interpret_epitopes, frozenset({_ANTIGEN_LANE})),
-    "EBIProteins_get_antigen": (
-        _interpret_protein_features,
-        frozenset({_ANTIGEN_LANE}),
-    ),
-    "ProteinsPlus_profile_structure_quality": (
-        _interpret_structure_quality,
-        frozenset({_STRUCTURE_LANE}),
-    ),
+_INTERPRETER_BY_TYPE: dict[str, Any] = {
+    "pains": _interpret_pains,
+    "lipinski": _interpret_lipinski,
+    "qed": _interpret_qed,
+    "adme": _interpret_adme,
+    "toxicity": _interpret_toxicity,
+    "motifs": _interpret_motifs,
+    "protein_features": _interpret_protein_features,
+    "epitopes": _interpret_epitopes,
+    "structure_quality": _interpret_structure_quality,
 }
 
 
@@ -299,11 +283,13 @@ def interpret_tool_payload(
     """
     if not isinstance(payload, dict):
         return []
-    entry = _INTERPRETERS.get(tool_name)
-    if entry is None:
+    capability = STEP_06_CAPABILITY_BY_TOOL.get(tool_name)
+    if capability is None:
         return []
-    fn, allowed_lanes = entry
-    if lane_type is not None and lane_type not in allowed_lanes:
+    if lane_type is not None and capability.lane_type != lane_type:
+        return []
+    fn = _INTERPRETER_BY_TYPE.get(capability.output_interpreter_type)
+    if fn is None:
         return []
     try:
         return fn(payload, tool_name, source_ref)

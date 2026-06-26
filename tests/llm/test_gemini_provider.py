@@ -267,3 +267,170 @@ def test_stage2_multi_tool_rejects_entry_missing_lane_type_or_tool_name():
         provider.generate_json(
             "args", schema={"task": "tool_selection_stage_2_multi_tool"}
         )
+
+
+# ── usage event recording ──────────────────────────────────────────────────
+
+
+def _response_with_usage(
+    text: str, *, prompt: int | None = None,
+    completion: int | None = None, total: int | None = None,
+) -> SimpleNamespace:
+    usage = SimpleNamespace(
+        prompt_token_count=prompt,
+        candidates_token_count=completion,
+        total_token_count=total,
+    )
+    return SimpleNamespace(text=text, usage_metadata=usage)
+
+
+def test_gemini_usage_events_record_token_counts_from_usage_metadata():
+    provider = _provider_with_responses([
+        _response_with_usage(
+            '{"task_intent":{"task_type":"adc_design"},'
+            '"mentioned_entities":{}}',
+            prompt=200, completion=80, total=280,
+        )
+    ])
+    provider.generate_json("parse", schema={"raw_request_record": {}})
+    assert len(provider.usage_events) == 1
+    evt = provider.usage_events[0]
+    assert evt["provider"] == "gemini"
+    assert evt["model"] == provider.model
+    assert evt["task"] == "structured_query"
+    assert evt["attempt"] == 0
+    # Gemini exposes prompt_token_count / candidates_token_count /
+    # total_token_count; we project to the OpenAI-shaped names.
+    assert evt["prompt_tokens"] == 200
+    assert evt["completion_tokens"] == 80
+    assert evt["total_tokens"] == 280
+
+
+def test_gemini_usage_events_recorded_for_each_retry_attempt():
+    provider = _provider_with_responses([
+        _response_with_usage(
+            "not json", prompt=11, completion=2, total=13,
+        ),
+        _response_with_usage(
+            '{"task_intent":{"task_type":"adc_design"},"mentioned_entities":{}}',
+            prompt=33, completion=4, total=37,
+        ),
+    ])
+    provider.generate_json("parse", schema={"raw_request_record": {}})
+    assert [e["attempt"] for e in provider.usage_events] == [0, 1]
+    assert provider.usage_events[0]["total_tokens"] == 13
+    assert provider.usage_events[1]["total_tokens"] == 37
+
+
+def test_gemini_usage_event_degrades_to_null_when_no_usage_metadata():
+    provider = _provider_with_responses([
+        SimpleNamespace(text='{"task_intent":{"task_type":"adc_design"},"mentioned_entities":{}}')
+        # no usage_metadata at all
+    ])
+    provider.generate_json("parse", schema={"raw_request_record": {}})
+    assert len(provider.usage_events) == 1
+    evt = provider.usage_events[0]
+    assert evt["prompt_tokens"] is None
+    assert evt["completion_tokens"] is None
+    assert evt["total_tokens"] is None
+
+
+def test_gemini_usage_event_reads_cached_content_token_count_when_present():
+    usage = SimpleNamespace(
+        prompt_token_count=900,
+        candidates_token_count=80,
+        total_token_count=980,
+        cached_content_token_count=300,
+    )
+    response = SimpleNamespace(
+        text='{"task_intent":{"task_type":"adc_design"},"mentioned_entities":{}}',
+        usage_metadata=usage,
+    )
+    provider = _provider_with_responses([response])
+    provider.generate_json("parse", schema={"raw_request_record": {}})
+    evt = provider.usage_events[0]
+    assert evt["cached_prompt_tokens"] == 300
+    assert evt["prompt_tokens"] == 900
+
+
+def test_gemini_usage_event_cached_prompt_tokens_none_when_missing():
+    """Older google-genai SDK versions don't expose
+    ``cached_content_token_count``. The field must degrade to None,
+    not raise."""
+    usage = SimpleNamespace(
+        prompt_token_count=400,
+        candidates_token_count=20,
+        total_token_count=420,
+    )
+    response = SimpleNamespace(
+        text='{"task_intent":{"task_type":"adc_design"},"mentioned_entities":{}}',
+        usage_metadata=usage,
+    )
+    provider = _provider_with_responses([response])
+    provider.generate_json("parse", schema={"raw_request_record": {}})
+    evt = provider.usage_events[0]
+    assert evt["cached_prompt_tokens"] is None
+    # Shape parity with OpenAI: same 8 keys must be present.
+    assert set(evt.keys()) == {
+        "provider", "model", "task", "attempt",
+        "prompt_tokens", "completion_tokens", "total_tokens",
+        "cached_prompt_tokens",
+    }
+
+
+def test_gemini_usage_events_carry_no_prompt_response_or_api_key():
+    secret_prompt = "Gemini PROMPT body with HER2 SECRET payload"
+    secret_response = (
+        '{"task_intent":{"task_type":"adc_design"},'
+        '"mentioned_entities":{"target_or_antigen_text":"HER2_SECRET"}}'
+    )
+    provider = GeminiProvider(api_key="gemini-very-secret-key", max_retries=0)
+
+    def _fake_generate_content(prompt: str) -> object:
+        return _response_with_usage(secret_response, prompt=10, completion=5, total=15)
+
+    provider._generate_content = _fake_generate_content  # type: ignore[method-assign]
+    provider.generate_json(secret_prompt, schema={"raw_request_record": {}})
+    assert len(provider.usage_events) == 1
+    import json as _json
+    blob = _json.dumps(provider.usage_events[0])
+    assert "gemini-very-secret-key" not in blob
+    assert "PROMPT body" not in blob
+    assert "HER2_SECRET" not in blob
+
+
+# ── Gemini path STILL embeds system block into the user prompt body ──────
+
+
+def test_gemini_user_prompt_body_still_includes_system_block():
+    """The Gemini provider's ``_generate_content`` signature takes only
+    a prompt today — there is no separate role=system message. The
+    user message body therefore MUST still include the system block,
+    otherwise the model loses the system instructions entirely.
+
+    If Gemini ever gains a real system-role channel, this test will
+    intentionally need to be updated alongside that change."""
+    sentinel_system = "SENTINEL_SYSTEM_BLOCK_GEMINI_only"
+    user_prompt_body = "USER_PROMPT_SENTINEL_for_gemini"
+    captured: dict = {}
+
+    provider = GeminiProvider(api_key="gemini-fake-dedup", max_retries=0)
+
+    def _fake_generate_content(prompt: str) -> object:
+        captured["prompt"] = prompt
+        return SimpleNamespace(
+            text=('{"task_intent":{"task_type":"adc_design"},'
+                  '"mentioned_entities":{}}'),
+        )
+
+    provider._generate_content = _fake_generate_content  # type: ignore[method-assign]
+    provider.generate_json(
+        user_prompt_body,
+        schema={"raw_request_record": {"raw_user_query": "HER2"}},
+        system=sentinel_system,
+    )
+    # System sentinel MUST appear in the user prompt body — Gemini has
+    # no separate system-role channel here.
+    assert sentinel_system in captured["prompt"]
+    # And the user task body is still present too.
+    assert user_prompt_body in captured["prompt"]

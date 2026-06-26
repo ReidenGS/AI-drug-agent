@@ -69,6 +69,69 @@ STEP_05_CAPABILITY_REGISTRY: tuple[Step5EnrichmentCapability, ...] = (
             "agent's SAbDab outcome annotator."
         ),
     ),
+    # ── PDB id → SAbDab antibody structure detail lookup ─────────────
+    Step5EnrichmentCapability(
+        tool_name="SAbDab_get_structure",
+        # Distinct from name-keyed "antibody_structure_lookup": planner
+        # falls through to the slot-kind query path so query_kind ends
+        # up as "pdb_id" rather than "name".
+        capability_type="antibody_structure_id_lookup",
+        required_input_slots=("pdb_id",),
+        accepted_input_slots=("pdb_id",),
+        schema_arg_mapping={"pdb_id": "pdb_id"},
+        priority=55,
+        fallback_group="sabdab_structure_by_pdb",
+        max_calls_per_candidate=2,
+        candidate_categories=("antibody", "target_antigen", "adc_construct"),
+        output_extractor_type="sabdab_structure",
+        provenance_policy="structure_context_lookup",
+        confidence_policy="context_only",
+        notes=(
+            "Fetch SAbDab antibody structure details (CDR annotations, "
+            "chain info, antigen-binding metadata) by PDB ID. Candidate "
+            "context only — does not generate ADC candidates."
+        ),
+    ),
+    # ── Target / antigen name → TheraSAbDab landscape ────────────────
+    Step5EnrichmentCapability(
+        tool_name="TheraSAbDab_search_by_target",
+        capability_type="therapeutic_antibody_landscape_lookup",
+        required_input_slots=("target_antigen_name",),
+        accepted_input_slots=("target_antigen_name",),
+        schema_arg_mapping={"*": "target"},
+        priority=65,
+        fallback_group="therasabdab_target",
+        max_calls_per_candidate=1,
+        candidate_categories=("target_antigen",),
+        output_extractor_type="therasabdab_landscape",
+        provenance_policy="therapeutic_landscape_context",
+        confidence_policy="context_only",
+        notes=(
+            "Therapeutic antibody landscape against a target antigen. "
+            "Response is stored via tool_output_ref; Step 5 records the "
+            "context only and never emits ADC candidates or rankings."
+        ),
+    ),
+    # ── Antibody name → TheraSAbDab therapeutic metadata ─────────────
+    Step5EnrichmentCapability(
+        tool_name="TheraSAbDab_search_therapeutics",
+        capability_type="therapeutic_antibody_lookup",
+        required_input_slots=("antibody_name",),
+        accepted_input_slots=("antibody_name",),
+        schema_arg_mapping={"*": "query"},
+        priority=65,
+        fallback_group="therasabdab_therapeutics",
+        max_calls_per_candidate=1,
+        candidate_categories=("antibody",),
+        output_extractor_type="therasabdab_therapeutic",
+        provenance_policy="therapeutic_antibody_context",
+        confidence_policy="context_only",
+        notes=(
+            "Therapeutic antibody metadata lookup (INN, target antigen, "
+            "format, clinical phase, PDB references) by antibody name. "
+            "Step 5 records context only; never generates candidates."
+        ),
+    ),
     # ── ChEMBL id → exact molecule lookup ─────────────────────────────
     Step5EnrichmentCapability(
         tool_name="ChEMBL_get_molecule",

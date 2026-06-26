@@ -13,6 +13,7 @@ from fastapi import APIRouter
 
 from ..agents.candidate_context_agent import CandidateContextAgent
 from ..deps import (
+    get_llm_provider,
     get_mcp_client,
     get_registry_service,
     get_storage,
@@ -48,5 +49,6 @@ def execute_step_05(run_id: str) -> dict:
         registry=get_registry_service(),
         workflow_state=get_workflow_state_service(),
         mcp_client=get_mcp_client(),
+        llm=get_llm_provider(),
     )
     return agent.run(run_id).model_dump()

@@ -79,3 +79,41 @@ def test_mock_parser_emits_warnings_for_missing_target():
     out = _parse("Just build an ADC.")
     assert out["mentioned_entities"]["target_or_antigen_text"] is None
     assert any("target" in w for w in out["parse_warnings"])
+
+
+# ── tool-selection mocks ───────────────────────────────────────────────────
+
+def test_mock_multilane_stage1_selects_all_matching_allowed_tools():
+    allowed_tools = [
+        "DrugProps_pains_filter",
+        "DrugProps_lipinski_filter",
+        "DrugProps_calculate_qed",
+        "SwissADME_calculate_adme",
+        "SwissADME_check_druglikeness",
+    ]
+    catalog = [
+        {
+            "tool_name": tool_name,
+            "coarse_input_requirements": ["smiles"],
+        }
+        for tool_name in allowed_tools
+    ]
+
+    out = MockLLMProvider().generate_json(
+        "pick",
+        schema={
+            "task": "tool_selection_stage_1_multi_lane",
+            "compact_catalog": catalog,
+            "lanes": [
+                {
+                    "lane_type": "payload_linker_compound_liability",
+                    "allowed_tools": allowed_tools,
+                    "signals": {"smiles": True},
+                }
+            ],
+        },
+    )
+
+    selections = out["selections"]
+    assert [entry["tool_name"] for entry in selections] == allowed_tools
+    assert len(selections) == 5

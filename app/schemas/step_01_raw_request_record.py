@@ -25,6 +25,12 @@ class UploadedFile(BaseModel):
     content_type: Optional[str] = None
     sha256: Optional[str] = None
     size_bytes: Optional[int] = None
+    related_candidate_id: Optional[str] = None
+    related_candidate_ids: list[str] = Field(default_factory=list)
+    role: Optional[str] = None
+    chain_role: Optional[str] = None
+    chain_id: Optional[str] = None
+    chain_roles: dict[str, str] = Field(default_factory=dict)
 
 
 class RawRequestRecord(BaseModel):
