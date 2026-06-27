@@ -13,7 +13,10 @@ from __future__ import annotations
 from typing import Any
 
 from ..agents.tool_selection_policy import ToolInvocationPlan
-from ..agents.step_06_available_fields import project_candidate_available_fields
+from ..agents.step_06_available_fields import (
+    AvailableField,
+    project_candidate_available_fields,
+)
 from ..agents.step_06_capability_registry import (
     STEP_06_CAPABILITY_BY_TOOL,
     STEP_06_CAPABILITY_REGISTRY,
@@ -107,6 +110,8 @@ class DevelopabilityAgent:
             "step_06_stage2_uninvokable_tool_details": [],
             "step_06_selection_progress": [],
             "step_06_resolver_failed_tools": [],
+            "step_06_runtime_chain_expanded_tools": [],
+            "step_06_runtime_chain_expansion_details": [],
             "step_06_runtime_resolved_tools": [],
             "step_06_executed_tools": [],
             "step_06_recorded_tool_call_tools": [],
@@ -216,48 +221,62 @@ class DevelopabilityAgent:
                 lane_input_status = "insufficient"
                 argument_mapping_audit: list[dict] = []
                 for plan in plans:
-                    argument_mapping_audit.extend(plan.argument_mapping_audit)
-                    tc, one_input_status, payload = self._call_lane_plan(
-                        run_id=run_id,
-                        candidate_id=candidate_id,
+                    for plan_to_run, chain_expansion in _expand_chain_sequences_for_runtime(
                         candidate=candidate,
+                        candidate_id=candidate_id,
+                        lane_type=lane_type,
                         plan=plan,
-                    )
-                    tool_records.append(tc)
-                    selection_audit["step_06_recorded_tool_call_tools"].append(plan.tool_name)
-                    if tc.run_status not in {"skipped", "not_run"}:
-                        selection_audit["step_06_executed_tools"].append(plan.tool_name)
-                    if plan.argument_field_refs and tc.run_status not in {"skipped", "not_run"}:
-                        selection_audit["step_06_runtime_resolved_tools"].append(plan.tool_name)
-                    if (
-                        isinstance(tc.tool_input_summary, dict)
-                        and any(
-                            entry.get("resolve_status") in {"missing", "unresolved"}
-                            for entry in tc.tool_input_summary.get("runtime_resolver_audit", [])
-                        )
                     ):
-                        selection_audit["step_06_resolver_failed_tools"].append(plan.tool_name)
-                    _increment(selection_audit["tool_selection_source_distribution"], plan.tool_selection_source)
-                    _increment(selection_audit["argument_mapping_source_distribution"], plan.argument_construction_source)
-                    if isinstance(payload, dict) and payload.get("status") == "upstream_error":
-                        selection_audit["step_06_upstream_error_tools"].append(plan.tool_name)
-                    if isinstance(payload, dict) and payload.get("status") == "mocked":
-                        selection_audit["step_06_mocked_tools"].append(plan.tool_name)
-                    if one_input_status == "sufficient":
-                        lane_input_status = "sufficient"
-                    if tc.run_status not in {"skipped", "not_run"}:
-                        any_lane_ran = True
-                    if tc.run_status in {"failed", "dependency_unavailable"}:
-                        any_lane_failed_or_dep = True
-                    if tc.run_status == "success" and payload is not None:
-                        lane_flags.extend(
-                            interpret_tool_payload(
-                                tc.tool_name,
-                                payload,
-                                source_ref=tc.tool_output_ref,
-                                lane_type=lane_type,
+                        if chain_expansion:
+                            selection_audit["step_06_runtime_chain_expanded_tools"].append(
+                                plan_to_run.tool_name
                             )
+                            selection_audit["step_06_runtime_chain_expansion_details"].append(
+                                chain_expansion
+                            )
+                        argument_mapping_audit.extend(plan_to_run.argument_mapping_audit)
+                        tc, one_input_status, payload = self._call_lane_plan(
+                            run_id=run_id,
+                            candidate_id=candidate_id,
+                            candidate=candidate,
+                            plan=plan_to_run,
+                            chain_expansion=chain_expansion,
                         )
+                        tool_records.append(tc)
+                        selection_audit["step_06_recorded_tool_call_tools"].append(plan_to_run.tool_name)
+                        if tc.run_status not in {"skipped", "not_run"}:
+                            selection_audit["step_06_executed_tools"].append(plan_to_run.tool_name)
+                        if plan_to_run.argument_field_refs and tc.run_status not in {"skipped", "not_run"}:
+                            selection_audit["step_06_runtime_resolved_tools"].append(plan_to_run.tool_name)
+                        if (
+                            isinstance(tc.tool_input_summary, dict)
+                            and any(
+                                entry.get("resolve_status") in {"missing", "unresolved"}
+                                for entry in tc.tool_input_summary.get("runtime_resolver_audit", [])
+                            )
+                        ):
+                            selection_audit["step_06_resolver_failed_tools"].append(plan_to_run.tool_name)
+                        _increment(selection_audit["tool_selection_source_distribution"], plan_to_run.tool_selection_source)
+                        _increment(selection_audit["argument_mapping_source_distribution"], plan_to_run.argument_construction_source)
+                        if isinstance(payload, dict) and payload.get("status") == "upstream_error":
+                            selection_audit["step_06_upstream_error_tools"].append(plan_to_run.tool_name)
+                        if isinstance(payload, dict) and payload.get("status") == "mocked":
+                            selection_audit["step_06_mocked_tools"].append(plan_to_run.tool_name)
+                        if one_input_status == "sufficient":
+                            lane_input_status = "sufficient"
+                        if tc.run_status not in {"skipped", "not_run"}:
+                            any_lane_ran = True
+                        if tc.run_status in {"failed", "dependency_unavailable"}:
+                            any_lane_failed_or_dep = True
+                        if tc.run_status == "success" and payload is not None:
+                            lane_flags.extend(
+                                interpret_tool_payload(
+                                    tc.tool_name,
+                                    payload,
+                                    source_ref=tc.tool_output_ref,
+                                    lane_type=lane_type,
+                                )
+                            )
 
                 any_success = any(r.run_status == "success" for r in tool_records)
                 all_dep_unavail = bool(tool_records) and all(
@@ -362,6 +381,7 @@ class DevelopabilityAgent:
         candidate_id: str,
         candidate: dict,
         plan: ToolInvocationPlan,
+        chain_expansion: dict[str, Any] | None = None,
     ) -> tuple[ToolCallRecord, str, Any]:
         tc_id = new_tool_call_id()
         started = now_iso()
@@ -400,7 +420,10 @@ class DevelopabilityAgent:
                 started_at=started,
                 finished_at=finished,
                 tool_input_summary=_tool_input_summary(
-                    plan, candidate_id, resolver_audit=resolver_audit
+                    plan,
+                    candidate_id,
+                    resolver_audit=resolver_audit,
+                    chain_expansion=chain_expansion,
                 ),
                 error_message=(
                     "tool invocation plan validation_status=skipped"
@@ -431,7 +454,10 @@ class DevelopabilityAgent:
                     "candidate_id": candidate_id,
                     "tool_name": plan.tool_name,
                     "input": _tool_input_summary(
-                        plan, candidate_id, resolver_audit=resolver_audit
+                        plan,
+                        candidate_id,
+                        resolver_audit=resolver_audit,
+                        chain_expansion=chain_expansion,
                     ),
                     "output": result["payload"],
                 },
@@ -447,7 +473,10 @@ class DevelopabilityAgent:
             started_at=started,
             finished_at=finished,
             tool_input_summary=_tool_input_summary(
-                plan, candidate_id, resolver_audit=resolver_audit
+                plan,
+                candidate_id,
+                resolver_audit=resolver_audit,
+                chain_expansion=chain_expansion,
             ),
             tool_output_artifact_id=output_artifact_id,
             tool_output_ref=output_ref,
@@ -539,6 +568,8 @@ def _finalize_selection_audit(audit: dict[str, Any]) -> dict[str, Any]:
         "step_06_stage1_scope_tool_names", "step_06_stage1_disclosed_tool_names",
         "step_06_stage2_mapped_tools", "step_06_runtime_resolved_tools",
         "step_06_recorded_tool_call_tools", "step_06_resolver_failed_tools",
+        "step_06_runtime_chain_expanded_tools",
+        "step_06_stage2_uninvokable_tools",
     ):
         audit[key] = sorted(set(audit.get(key) or []))
     uninv_details = audit.get("step_06_stage2_uninvokable_tool_details")
@@ -556,6 +587,21 @@ def _finalize_selection_audit(audit: dict[str, Any]) -> dict[str, Any]:
         audit["step_06_stage2_uninvokable_tool_details"] = deduped_details
     else:
         audit["step_06_stage2_uninvokable_tool_details"] = []
+    chain_expansion_details = audit.get("step_06_runtime_chain_expansion_details")
+    if isinstance(chain_expansion_details, list):
+        deduped_chain_expansions: list[dict[str, Any]] = []
+        seen = set[str]()
+        for entry in chain_expansion_details:
+            if not isinstance(entry, dict):
+                continue
+            key = str(sorted(entry.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped_chain_expansions.append(entry)
+        audit["step_06_runtime_chain_expansion_details"] = deduped_chain_expansions
+    else:
+        audit["step_06_runtime_chain_expansion_details"] = []
     dependency = audit.get("step_06_dependency_unavailable_tools") or []
     audit["step_06_dependency_unavailable_tools"] = list({
         (d.get("candidate_id"), d.get("lane_type"), d.get("tool_name")): d
@@ -569,8 +615,9 @@ def _tool_input_summary(
     candidate_id: str,
     *,
     resolver_audit: list[dict] | None = None,
+    chain_expansion: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    summary = {
         **{k: _short(v) for k, v in plan.arguments.items()},
         "candidate_id": candidate_id,
         "selected_by": plan.selected_by,
@@ -587,6 +634,15 @@ def _tool_input_summary(
         "missing_required_fields": list(plan.missing_required_fields),
         "runtime_resolver_audit": resolver_audit or [],
     }
+    if chain_expansion:
+        summary.update({
+            "runtime_chain_expansion": True,
+            "original_field_ref": chain_expansion.get("original_field_ref"),
+            "expanded_field_ref": chain_expansion.get("expanded_field_ref"),
+            "chain_role": chain_expansion.get("chain_role"),
+            "expansion_reason": chain_expansion.get("expansion_reason"),
+        })
+    return summary
 
 
 def _lane_active_from_modality(lane_type: LaneType, modality_summary: Any) -> bool:
@@ -621,6 +677,86 @@ def _lane_active_from_modality(lane_type: LaneType, modality_summary: Any) -> bo
             or modality_summary.has_uploaded_structure_ref
         )
     return False
+
+
+def _expand_chain_sequences_for_runtime(
+    *,
+    candidate: dict,
+    candidate_id: str,
+    lane_type: LaneType,
+    plan: ToolInvocationPlan,
+) -> list[tuple[ToolInvocationPlan, dict[str, Any] | None]]:
+    if not plan.argument_field_refs:
+        return [(plan, None)]
+
+    projection = project_candidate_available_fields(candidate)
+    fields_by_ref = {field.field_ref: field for field in projection.available_fields}
+    chain_ref_by_role: dict[str, str] = {}
+    for field in projection.available_fields:
+        if not _is_antibody_chain_sequence_field(field):
+            continue
+        role = _normalize_antibody_chain_role(field=field)
+        if role in {"heavy", "light"}:
+            chain_ref_by_role[role] = field.field_ref
+    if len(chain_ref_by_role) < 2:
+        return [(plan, None)]
+
+    chainable_args: dict[str, str] = {}
+    for arg, field_ref in plan.argument_field_refs.items():
+        if str(arg).lower() not in {"sequence", "protein_sequence"}:
+            continue
+        field = fields_by_ref.get(field_ref)
+        if not _is_antibody_chain_sequence_field(field):
+            continue
+        chain_role = _normalize_antibody_chain_role(field=field)
+        if chain_role not in chain_ref_by_role:
+            continue
+        chainable_args[arg] = field_ref
+
+    if not chainable_args:
+        return [(plan, None)]
+
+    expanded: list[tuple[ToolInvocationPlan, dict[str, Any]]] = []
+    for chain_role, expanded_ref in chain_ref_by_role.items():
+        updated_mapping = dict(plan.argument_field_refs)
+        for arg in chainable_args:
+            updated_mapping[arg] = expanded_ref
+        reason = "single-sequence antibody tool expanded across available heavy/light chain sequence fields"
+        original_ref = chainable_args[next(iter(chainable_args))]
+        updated_plan = plan.model_copy(update={"argument_field_refs": updated_mapping})
+        expanded.append((
+            updated_plan,
+            {
+                "candidate_id": candidate_id,
+                "lane_type": lane_type,
+                "tool_name": plan.tool_name,
+                "original_field_ref": original_ref,
+                "expanded_field_ref": expanded_ref,
+                "chain_role": chain_role,
+                "expansion_reason": reason,
+            },
+        ))
+    return expanded
+
+
+def _is_antibody_chain_sequence_field(field: AvailableField | None) -> bool:
+    if field is None:
+        return False
+    return (
+        field.field_type == "protein_sequence"
+        and field.value_kind in {"protein_sequence", "uploaded_fasta_ref"}
+        and _normalize_antibody_chain_role(field=field) in {"heavy", "light"}
+    )
+
+
+def _normalize_antibody_chain_role(field: AvailableField) -> str | None:
+    if field.material_type in {"antibody_heavy_chain_sequence", "antibody_heavy_cdr3_sequence"}:
+        return "heavy"
+    if field.material_type in {"antibody_light_chain_sequence", "antibody_light_cdr3_sequence"}:
+        return "light"
+    if field.chain_role in {"heavy", "light"}:
+        return field.chain_role
+    return None
 
 
 def _user_query_summary(cct: dict, candidate: dict) -> str:

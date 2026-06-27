@@ -195,6 +195,8 @@ def test_step6_selection_audit_uses_schema_mapping_fields(
         "step_06_executed_tools",
         "step_06_recorded_tool_call_tools",
         "step_06_stage2_uninvokable_tool_details",
+        "step_06_runtime_chain_expanded_tools",
+        "step_06_runtime_chain_expansion_details",
         "step_06_selection_progress",
         "argument_mapping_source_distribution",
     ):
@@ -218,6 +220,7 @@ def test_step6_selection_audit_uses_schema_mapping_fields(
     assert resolved <= mapped
     assert executed <= resolved
     assert executed <= recorded
+    assert isinstance(audit["step_06_runtime_chain_expansion_details"], list)
 
     assert isinstance(audit["step_06_selection_progress"], list)
     assert isinstance(audit["step_06_stage2_uninvokable_tool_details"], list)

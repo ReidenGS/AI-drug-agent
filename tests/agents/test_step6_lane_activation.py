@@ -21,7 +21,10 @@ Also pins:
 
 from __future__ import annotations
 
+import json
 from typing import Any
+
+import pytest
 
 from app.agents.developability_agent import DevelopabilityAgent
 from app.agents.step_06_capability_registry import STEP_06_CAPABILITY_REGISTRY
@@ -999,6 +1002,208 @@ def test_step6_stage2_maps_required_args_to_field_refs(
     }
     assert ("llm_stage1", "llm_stage2") in provenance
 
+
+def _single_sequence_tool_llm(tool_name: str):
+    class _LLM:
+        name = "single_seq"
+        model = "test"
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def generate(self, prompt: str, *, system: str | None = None, **kw: Any) -> str:
+            raise NotImplementedError
+
+        def generate_json(self, prompt: str, *, schema: dict, system: str | None = None) -> dict:
+            self.calls.append((schema or {}).get("task", ""))
+            task = (schema or {}).get("task")
+            if task == "step6_schema_mapping_stage_1":
+                return {"selections": [{"tool_name": tool_name, "selection_reason": "sequence lane"}]}
+            if task == "step6_schema_mapping_stage_2":
+                field_ref = next(
+                    f["field_ref"] for f in schema.get("candidate_available_fields", [])
+                    if f.get("material_type") == "antibody_heavy_chain_sequence"
+                )
+                return {
+                    "tools": [{
+                        "tool_name": tool_name,
+                        "can_invoke": True,
+                        "argument_mapping": {"sequence": field_ref},
+                        "missing_required_fields": [],
+                        "argument_mapping_reason": "force heavy sequence mapping",
+                    }]
+                }
+            return {}
+
+    return _LLM()
+
+
+def _mock_sequence_tool(tool_name: str, calls: list[dict[str, Any]]):
+    def _tool(**kw: Any) -> dict[str, Any]:
+        calls.append(dict(kw))
+        if tool_name == "PROSITE_scan_sequence":
+            return {"status": "mocked", "motifs": []}
+        return {"status": "mocked", "predictions": []}
+    return _tool
+
+
+@pytest.mark.parametrize("tool_name", ["PROSITE_scan_sequence", "IEDB_predict_mhci_binding"])
+def test_step6_single_sequence_tool_expands_to_both_antibody_chains(
+    local_storage, registry_service, workflow_state_service, tool_name: str
+):
+    heavy_seq = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
+    light_seq = "DIQMTQSPSSLSASVGDRVTITCQASQDIQLLNGRT"
+    calls: list[dict[str, Any]] = []
+    llm = _single_sequence_tool_llm(tool_name)
+    run_id = _seed_synthetic_cct(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        materials=[
+            _material("antibody_heavy_chain_sequence", heavy_seq),
+            _material("antibody_light_chain_sequence", light_seq),
+        ],
+        candidate_type="antibody",
+    )
+    DevelopabilityAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={tool_name: _mock_sequence_tool(tool_name, calls)}),
+        llm=llm,
+    ).run(run_id)
+
+    persisted = local_storage.read_json(local_storage.run_key(run_id, "structured_liability_summary.json"))
+    lane = _lane_results(persisted)["antibody_protein_sequence_liability"]
+    tool_calls = [
+        tc for tc in lane["tool_call_records"] if tc["tool_name"] == tool_name
+    ]
+    assert len(tool_calls) == 2
+    assert all(tc["run_status"] == "success" for tc in tool_calls)
+    assert {tc["tool_input_summary"].get("chain_role") for tc in tool_calls} == {"heavy", "light"}
+    expanded_refs = [
+        tc["tool_input_summary"].get("expanded_field_ref")
+        for tc in tool_calls
+        if tc["tool_input_summary"].get("runtime_chain_expansion")
+    ]
+    assert len(expanded_refs) == 2
+    assert len(set(expanded_refs)) == 2
+    assert all(tc["tool_input_summary"].get("runtime_chain_expansion") is True for tc in tool_calls)
+    for tc in tool_calls:
+        assert heavy_seq not in json.dumps(tc["tool_input_summary"])
+        assert light_seq not in json.dumps(tc["tool_input_summary"])
+        assert tc["tool_input_summary"].get("expansion_reason") is not None
+        if tc["tool_output_ref"]:
+            out = local_storage.read_json(tc["tool_output_ref"])
+            assert heavy_seq not in json.dumps(out)
+            assert light_seq not in json.dumps(out)
+
+    summary = persisted["selection_audit"]
+    assert summary["step_06_runtime_chain_expanded_tools"].count(tool_name) >= 1
+    assert any(
+        entry.get("tool_name") == tool_name
+        for entry in summary.get("step_06_runtime_chain_expansion_details", [])
+    )
+
+
+def test_step6_single_sequence_tool_runs_once_when_only_one_chain(
+    local_storage, registry_service, workflow_state_service
+):
+    heavy_seq = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
+    calls: list[dict[str, Any]] = []
+    tool_name = "PROSITE_scan_sequence"
+    llm = _single_sequence_tool_llm(tool_name)
+    run_id = _seed_synthetic_cct(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        materials=[_material("antibody_heavy_chain_sequence", heavy_seq)],
+        candidate_type="antibody",
+    )
+    DevelopabilityAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={tool_name: _mock_sequence_tool(tool_name, calls)}),
+        llm=llm,
+    ).run(run_id)
+
+    persisted = local_storage.read_json(local_storage.run_key(run_id, "structured_liability_summary.json"))
+    lane = _lane_results(persisted)["antibody_protein_sequence_liability"]
+    tool_calls = [tc for tc in lane["tool_call_records"] if tc["tool_name"] == tool_name]
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["tool_input_summary"].get("runtime_chain_expansion") is not True
+    summary = persisted["selection_audit"]
+    assert summary["step_06_runtime_chain_expansion_details"] == []
+
+
+def test_step6_non_antibody_sequence_ref_does_not_expand(
+    local_storage, registry_service, workflow_state_service
+):
+    heavy_seq = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
+    light_seq = "DIQMTQSPSSLSASVGDRVTITCQASQDIQLLNGRT"
+    target_seq = "MKTAYIAKQRQISFVKSHFSRQDILDLWIY"
+
+    class _LLM:
+        name = "target_sequence_mapping"
+        model = "test"
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def generate(self, prompt, *, system=None, **kw):
+            raise NotImplementedError
+
+        def generate_json(self, prompt, *, schema, system=None):
+            task = (schema or {}).get("task")
+            if task == "step6_schema_mapping_stage_1":
+                return {"selections": [{"tool_name": "IEDB_predict_mhci_binding"}]}
+            if task == "step6_schema_mapping_stage_2":
+                field_ref = next(
+                    f["field_ref"] for f in schema.get("candidate_available_fields", [])
+                    if f.get("material_type") == "target_sequence"
+                )
+                return {
+                    "tools": [{
+                        "tool_name": "IEDB_predict_mhci_binding",
+                        "can_invoke": True,
+                        "argument_mapping": {"sequence": field_ref},
+                        "missing_required_fields": [],
+                        "argument_mapping_reason": "non-antibody sequence",
+                    }]
+                }
+            return {}
+
+    llm = _LLM()
+    calls: list[dict[str, Any]] = []
+    run_id = _seed_synthetic_cct(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        materials=[
+            _material("antibody_heavy_chain_sequence", heavy_seq),
+            _material("antibody_light_chain_sequence", light_seq),
+            _material("target_sequence", target_seq),
+        ],
+        candidate_type="antibody",
+    )
+    DevelopabilityAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={"IEDB_predict_mhci_binding": _mock_sequence_tool("IEDB_predict_mhci_binding", calls)}),
+        llm=llm,
+    ).run(run_id)
+
+    persisted = local_storage.read_json(
+        local_storage.run_key(run_id, "structured_liability_summary.json")
+    )
+    lane = _lane_results(persisted)["antibody_protein_sequence_liability"]
+    tool_calls = [tc for tc in lane["tool_call_records"] if tc["tool_name"] == "IEDB_predict_mhci_binding"]
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["tool_input_summary"].get("runtime_chain_expansion") is not True
+    assert "chain_role" not in (tool_calls[0]["tool_input_summary"] or {})
+    assert calls and calls[0].get("sequence") == target_seq
 
 # ── LLM call-count budget (per-candidate Stage1 + Stage2) ───────────────────
 
