@@ -27,6 +27,17 @@ dev = [
     "moto[s3,dynamodb,sqs]>=5.0",
     "ruff>=0.5",
 ]
+# Step 6 ADMETAI live wrappers route through ToolUniverseAdapter ->
+# ToolUniverse `ADMETAITool` which in turn loads ADMET-AI's local
+# PyTorch model ensemble. Install with `pip install -e '.[admet]'` to
+# enable live ADMETAI predictions; without the `admet` extra each
+# ADMETAI call returns an envelope carrying
+# ``status="upstream_error"`` (the project never silently degrades
+# the result). We pin the transitive resolution to admet-ai because
+# torch / chemprop / scikit-learn / lightning are pulled in by it.
+admet = [
+    "admet-ai>=2.0.1",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
