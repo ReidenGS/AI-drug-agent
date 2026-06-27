@@ -104,6 +104,8 @@ class DevelopabilityAgent:
             "step_06_stage2_schema_survivors": [],
             "step_06_stage2_mapped_tools": [],
             "step_06_stage2_uninvokable_tools": [],
+            "step_06_stage2_uninvokable_tool_details": [],
+            "step_06_selection_progress": [],
             "step_06_resolver_failed_tools": [],
             "step_06_runtime_resolved_tools": [],
             "step_06_executed_tools": [],
@@ -191,10 +193,23 @@ class DevelopabilityAgent:
                 selection_audit["step_06_stage2_uninvokable_tools"].extend(
                     selector_audit.get("stage2_uninvokable_tools") or []
                 )
+                selection_audit["step_06_stage2_uninvokable_tool_details"].extend(
+                    selector_audit.get("stage2_uninvokable_tool_details") or []
+                )
+                selection_audit["step_06_selection_progress"].extend(
+                    selector_audit.get("selection_progress") or []
+                )
 
             # ── 3. Execute the plans lane by lane and assemble lane results. ────
             for lane_type in active_lanes:
                 plans = plans_by_lane.get(lane_type) or []
+                selection_audit["step_06_selection_progress"].append({
+                    "candidate_id": candidate_id,
+                    "lane_type": lane_type,
+                    "stage": "runtime",
+                    "status": "started",
+                    "selected_tool_names": [plan.tool_name for plan in plans],
+                })
 
                 tool_records: list[ToolCallRecord] = []
                 lane_flags: list[dict] = []
@@ -248,6 +263,24 @@ class DevelopabilityAgent:
                 all_dep_unavail = bool(tool_records) and all(
                     r.run_status == "dependency_unavailable" for r in tool_records
                 )
+                any_timeout = any(
+                    r.run_status in {"failed", "error"} and
+                    "timeout" in str(r.error_message or "").lower()
+                    for r in tool_records
+                )
+                runtime_status = (
+                    "skipped" if not plans
+                    else "timeout" if any_timeout
+                    else "error" if any(r.run_status in {"failed", "dependency_unavailable"} for r in tool_records)
+                    else "ok"
+                )
+                selection_audit["step_06_selection_progress"].append({
+                    "candidate_id": candidate_id,
+                    "lane_type": lane_type,
+                    "stage": "runtime",
+                    "status": runtime_status,
+                    "selected_tool_names": [plan.tool_name for plan in plans],
+                })
                 lane_results.append(
                     LaneResult(
                         lane_type=lane_type,
@@ -477,6 +510,28 @@ def _increment(counts: dict[str, int], key: str) -> None:
 
 
 def _finalize_selection_audit(audit: dict[str, Any]) -> dict[str, Any]:
+    uninv = audit.get("step_06_stage2_uninvokable_tools") or []
+    if uninv and isinstance(uninv[0], dict):
+        deduped = []
+        seen: set[tuple[Any, ...]] = set()
+        for item in uninv:
+            if not isinstance(item, dict):
+                continue
+            key = (
+                item.get("candidate_id"),
+                item.get("lane_type"),
+                item.get("tool_name"),
+            )
+            if key not in seen:
+                seen.add(key)
+                deduped.append(item)
+        audit["step_06_stage2_uninvokable_tools"] = deduped
+    elif isinstance(uninv, list):
+        audit["step_06_stage2_uninvokable_tools"] = sorted(set(uninv))
+
+    if "step_06_stage2_uninvokable_tools" in audit and not isinstance(audit["step_06_stage2_uninvokable_tools"], list):
+        audit["step_06_stage2_uninvokable_tools"] = []
+
     for key in (
         "step_06_stage1_catalog_tool_names", "step_06_stage1_selected_tools",
         "step_06_stage2_schema_survivors", "step_06_executed_tools",
@@ -484,9 +539,23 @@ def _finalize_selection_audit(audit: dict[str, Any]) -> dict[str, Any]:
         "step_06_stage1_scope_tool_names", "step_06_stage1_disclosed_tool_names",
         "step_06_stage2_mapped_tools", "step_06_runtime_resolved_tools",
         "step_06_recorded_tool_call_tools", "step_06_resolver_failed_tools",
-        "step_06_stage2_uninvokable_tools",
     ):
         audit[key] = sorted(set(audit.get(key) or []))
+    uninv_details = audit.get("step_06_stage2_uninvokable_tool_details")
+    if isinstance(uninv_details, list):
+        deduped_details: list[dict[str, Any]] = []
+        seen = set[str]()
+        for entry in uninv_details:
+            if not isinstance(entry, dict):
+                continue
+            key = str(sorted(entry.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped_details.append(entry)
+        audit["step_06_stage2_uninvokable_tool_details"] = deduped_details
+    else:
+        audit["step_06_stage2_uninvokable_tool_details"] = []
     dependency = audit.get("step_06_dependency_unavailable_tools") or []
     audit["step_06_dependency_unavailable_tools"] = list({
         (d.get("candidate_id"), d.get("lane_type"), d.get("tool_name")): d

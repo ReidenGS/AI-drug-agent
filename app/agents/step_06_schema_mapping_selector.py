@@ -34,13 +34,20 @@ STEP6_STAGE1_SCHEMA_MAPPING_SYSTEM_PROMPT = """You are selecting relevant Step 6
 Rules:
 1. Use ONLY the disclosed compact_catalog. It is already Step 6 scoped and
    modality-filtered. Do not name tools outside it.
-2. Prefer `live_wired` tools when equivalent live-wired tools exist for the
+2. Select the smallest non-redundant set of tools that covers the candidate's
+   relevant Step 6 risk categories. If tools are likely to return overlapping
+   or duplicate evidence for the same lane, same input, and same risk category,
+   select only the best one.
+3. Select multiple tools only when they cover meaningfully different risk
+   categories or output fields; explain the difference in selection_reason.
+   Do not select every eligible tool.
+4. Prefer `live_wired` tools when equivalent live-wired tools exist for the
    same lane/input requirement. Dependency-unavailable tools may be selected only
    when no live equivalent is present.
-3. Select zero or more relevant tool_name values. A valid empty selection is allowed.
-4. Do NOT construct arguments. Do NOT infer raw values. Candidate fields are
+5. Select zero or more relevant tool_name values. A valid empty selection is allowed.
+6. Do NOT construct arguments. Do NOT infer raw values. Candidate fields are
    digests and field refs only.
-5. Return exactly JSON: {"selections":[{"tool_name":"...","selection_reason":"..."}]}.
+7. Return exactly JSON: {"selections":[{"tool_name":"...","selection_reason":"..."}]}.
 No prose, no markdown, no tool calls.
 """.strip()
 
@@ -202,9 +209,25 @@ def select_step6_schema_mapped_invocations(
         "stage2_schema_survivors": [],
         "stage2_mapped_tools": [],
         "stage2_uninvokable_tools": [],
+        "stage2_uninvokable_tool_details": [],
+        "selection_progress": [],
         "fallback_reason": None,
     }
     if not disclosure.disclosed_tool_names:
+        audit["selection_progress"].append({
+            "candidate_id": candidate_id,
+            "lane_type": None,
+            "stage": "stage1",
+            "status": "skipped",
+            "selected_tool_names": [],
+        })
+        audit["selection_progress"].append({
+            "candidate_id": candidate_id,
+            "lane_type": None,
+            "stage": "stage2",
+            "status": "skipped",
+            "selected_tool_names": [],
+        })
         return {}, disclosure, audit
 
     runtime_policy_for_tool = {
@@ -238,26 +261,57 @@ def select_step6_schema_mapped_invocations(
         "user_query_summary": user_query_summary,
         "disclosure_tags": disclosure.disclosure_tags,
     }
+    audit["selection_progress"].append({
+        "candidate_id": candidate_id,
+        "lane_type": None,
+        "stage": "stage1",
+        "status": "started",
+        "selected_tool_names": [],
+    })
     try:
         stage1 = llm.generate_json(
             STEP6_STAGE1_SCHEMA_MAPPING_USER_PROMPT,
             schema=stage1_payload,
             system=STEP6_STAGE1_SCHEMA_MAPPING_SYSTEM_PROMPT,
         )
-        audit["stage1_call_status"] = "ok"
         raw_selections = (stage1 or {}).get("selections")
         if not isinstance(raw_selections, list):
             raise ValueError("stage1 selections missing or not list")
     except Exception as exc:  # noqa: BLE001
         audit["stage1_call_status"] = "fallback"
         audit["fallback_reason"] = f"stage1_provider_or_parse_error:{exc}"
+        reason = str(exc).lower()
+        stage1_status = "timeout" if "timeout" in reason else "error"
+        audit["selection_progress"].append({
+            "candidate_id": candidate_id,
+            "lane_type": None,
+            "stage": "stage1",
+            "status": stage1_status,
+            "selected_tool_names": [],
+        })
         plans = deterministic_fallback(disclosure.disclosed_tool_names) if deterministic_fallback else []
         return _group_by_lane(plans), disclosure, audit
 
+    audit["stage1_call_status"] = "ok"
     selected_entries = _clean_stage1(raw_selections, set(disclosure.disclosed_tool_names))
     if not selected_entries:
+        audit["selection_progress"].append({
+            "candidate_id": candidate_id,
+            "lane_type": None,
+            "stage": "stage1",
+            "status": "ok",
+            "selected_tool_names": [],
+        })
         return {}, disclosure, audit
+
     audit["stage1_selected_tools"] = [entry["tool_name"] for entry in selected_entries]
+    audit["selection_progress"].append({
+        "candidate_id": candidate_id,
+        "lane_type": None,
+        "stage": "stage1",
+        "status": "ok",
+        "selected_tool_names": audit["stage1_selected_tools"],
+    })
 
     stage2_items: list[tuple[dict, dict]] = []
     schema_skipped: list[ToolInvocationPlan] = []
@@ -272,12 +326,19 @@ def select_step6_schema_mapped_invocations(
                 source="llm_stage1",
                 missing=[],
             ))
-        else:
-            stage2_items.append((entry, schema))
-    audit["stage2_schema_survivors"] = [entry["tool_name"] for entry, _schema in stage2_items]
+            continue
+        stage2_items.append((entry, schema))
 
-    stage2_response_tools: dict[str, dict] = {}
+    audit["stage2_schema_survivors"] = [entry["tool_name"] for entry, _schema in stage2_items]
     if stage2_items:
+        selected_tool_names = [entry["tool_name"] for entry, _schema in stage2_items]
+        audit["selection_progress"].append({
+            "candidate_id": candidate_id,
+            "lane_type": None,
+            "stage": "stage2",
+            "status": "started",
+            "selected_tool_names": selected_tool_names,
+        })
         stage2_payload = {
             "task": "step6_schema_mapping_stage_2",
             "agent_name": agent_name,
@@ -303,17 +364,44 @@ def select_step6_schema_mapped_invocations(
             tools = (stage2 or {}).get("tools")
             if not isinstance(tools, list):
                 raise ValueError("stage2 tools missing or not list")
-            stage2_response_tools = {
+            stage2_response_tools: dict[str, dict] = {
                 item.get("tool_name"): item for item in tools
                 if isinstance(item, dict) and isinstance(item.get("tool_name"), str)
             }
+            audit["selection_progress"].append({
+                "candidate_id": candidate_id,
+                "lane_type": None,
+                "stage": "stage2",
+                "status": "ok",
+                "selected_tool_names": selected_tool_names,
+            })
         except Exception as exc:  # noqa: BLE001
             audit["stage2_call_status"] = "fallback"
             audit["fallback_reason"] = f"stage2_provider_or_parse_error:{exc}"
+            reason = str(exc).lower()
+            stage2_status = "timeout" if "timeout" in reason else "error"
+            audit["selection_progress"].append({
+                "candidate_id": candidate_id,
+                "lane_type": None,
+                "stage": "stage2",
+                "status": stage2_status,
+                "selected_tool_names": selected_tool_names,
+            })
             stage2_response_tools = {
-                entry["tool_name"]: _deterministic_mapping_response(entry["tool_name"], schema, available_fields)
+                entry["tool_name"]: _deterministic_mapping_response(
+                    entry["tool_name"], schema, available_fields
+                )
                 for entry, schema in stage2_items
             }
+    else:
+        stage2_response_tools = {}
+        audit["selection_progress"].append({
+            "candidate_id": candidate_id,
+            "lane_type": None,
+            "stage": "stage2",
+            "status": "skipped",
+            "selected_tool_names": [],
+        })
 
     plans = list(schema_skipped)
     for entry, schema in stage2_items:
@@ -335,7 +423,16 @@ def select_step6_schema_mapped_invocations(
             source="llm_stage2" if audit["stage2_call_status"] == "ok" else "deterministic_mapping",
         )
         if plan.validation_status == "skipped":
+            cap = STEP_06_CAPABILITY_BY_TOOL.get(tool_name)
             audit["stage2_uninvokable_tools"].append(tool_name)
+            audit["stage2_uninvokable_tool_details"].append({
+                "candidate_id": candidate_id,
+                "lane_type": cap.lane_type if cap else None,
+                "tool_name": tool_name,
+                "missing_required_fields": list(plan.missing_required_fields),
+                "skip_reason": response.get("argument_mapping_reason")
+                or "missing required field coverage",
+            })
         else:
             audit["stage2_mapped_tools"].append(tool_name)
         plans.append(plan)

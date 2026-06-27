@@ -5,6 +5,7 @@ from typing import Any
 from app.agents.step_06_available_fields import project_candidate_available_fields
 from app.agents.step_06_capability_registry import STEP_06_CAPABILITY_REGISTRY
 from app.agents.step_06_schema_mapping_selector import (
+    STEP6_STAGE1_SCHEMA_MAPPING_SYSTEM_PROMPT,
     disclose_step6_tools,
     select_step6_schema_mapped_invocations,
 )
@@ -43,6 +44,16 @@ def _identifier(id_type: str, value: str):
 
 def _projection(candidate: dict):
     return project_candidate_available_fields(candidate)
+
+
+def test_stage1_prompt_requires_non_redundant_tool_selection():
+    prompt = STEP6_STAGE1_SCHEMA_MAPPING_SYSTEM_PROMPT.lower()
+    assert "smallest non-redundant" in prompt
+    assert "overlapping" in prompt
+    assert "duplicate evidence" in prompt
+    assert "same risk category" in prompt
+    assert "do not select every eligible tool" in prompt
+    assert "meaningfully different risk" in prompt
 
 
 def test_disclosure_smiles_only_shows_compound_and_hides_sequence_structure():
@@ -243,6 +254,13 @@ def test_stage2_cannot_map_structure_ref_to_pdb_id_required_schema(monkeypatch):
     assert plan.validation_status == "skipped"
     assert "pdb_id" in plan.missing_required_fields
     assert audit["stage2_uninvokable_tools"] == ["PDBePISA_get_interfaces"]
+    assert any(
+        entry.get("tool_name") == "PDBePISA_get_interfaces"
+        and entry.get("lane_type") == "structure_interface_quality"
+        and "pdb_id" in entry.get("missing_required_fields", [])
+        for entry in audit.get("stage2_uninvokable_tool_details", [])
+        if isinstance(entry, dict)
+    )
 
 
 def test_stage2_cannot_use_uploaded_structure_ref_for_pdb_id_schema(monkeypatch):
@@ -284,6 +302,13 @@ def test_stage2_cannot_use_uploaded_structure_ref_for_pdb_id_schema(monkeypatch)
     assert plan.validation_status == "skipped"
     assert "pdb_id" in plan.missing_required_fields
     assert audit["stage2_uninvokable_tools"] == ["PDBePISA_get_interfaces"]
+    assert any(
+        entry.get("tool_name") == "PDBePISA_get_interfaces"
+        and entry.get("lane_type") == "structure_interface_quality"
+        and "pdb_id" in entry.get("missing_required_fields", [])
+        for entry in audit.get("stage2_uninvokable_tool_details", [])
+        if isinstance(entry, dict)
+    )
 
 
 def test_stage2_maps_pdb_id_or_path_compatible_structure_schema(monkeypatch):

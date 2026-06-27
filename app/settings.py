@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     qwen_api_key: str = ""
     qwen_model: str = "qwen-plus"
     qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    # Timeout (seconds) for synchronous Qwen API calls (read + JSON parse +
+    # validation envelope). Finite timeout keeps smoke/interactive runs
+    # bounded when Step 6 Stage 2 schema mapping stalls.
+    qwen_timeout: float = 90.0
 
     api_key: str = "dev-key"
 

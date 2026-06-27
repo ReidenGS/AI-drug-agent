@@ -642,6 +642,14 @@ def test_step6_structure_ref_maps_pdb_id_only_as_skipped_and_structure_file_as_e
     assert captured["proteinsplus"]["structure_file"] == _S1_PDB_PATH
     summary = persisted["selection_audit"]
     assert "PDBePISA_get_interfaces" in summary["step_06_stage2_uninvokable_tools"]
+    assert any(
+        entry.get("tool_name") == "PDBePISA_get_interfaces"
+        and entry.get("candidate_id") == "cand_synthetic_1"
+        and entry.get("lane_type") == "structure_interface_quality"
+        and "pdb_id" in entry.get("missing_required_fields", [])
+        for entry in summary.get("step_06_stage2_uninvokable_tool_details", [])
+        if isinstance(entry, dict)
+    )
     assert "PDBePISA_get_interfaces" in summary["step_06_stage1_selected_tools"]
     assert "ProteinsPlus_profile_structure_quality" in summary["step_06_stage2_mapped_tools"]
     assert "ProteinsPlus_profile_structure_quality" in summary["step_06_runtime_resolved_tools"]

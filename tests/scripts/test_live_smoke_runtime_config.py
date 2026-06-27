@@ -117,6 +117,31 @@ def test_resolve_qwen_provider_model_and_base_url(smoke_module):
     assert base_url == "https://example.test/compatible/v1"
 
 
+def test_qwen_base_url_is_redacted_in_smoke_output_helper(smoke_module):
+    assert (
+        smoke_module._redact_base_url("https://dashscope.aliyuncs.com/compatible-mode/v1")
+        == "https://dashscope.aliyuncs.com"
+    )
+    assert (
+        smoke_module._redact_base_url("https://dashscope.aliyuncs.com:8443/compatible-mode/v1")
+        == "https://dashscope.aliyuncs.com:8443"
+    )
+    assert smoke_module._redact_base_url(None) == ""
+
+    settings = SimpleNamespace(
+        llm_provider="qwen",
+        qwen_api_key="qwen-key",
+        qwen_model="qwen-plus",
+        qwen_base_url="https://region.example.com/compatible-mode/v1",
+        gemini_api_key="",
+        gemini_model="gemini-3.5-flash",
+        openai_api_key="",
+        openai_model="gpt-4.1-mini",
+    )
+    _provider, _model, base_url = smoke_module._resolve_provider_model(settings)
+    assert smoke_module._redact_base_url(base_url) == "https://region.example.com"
+
+
 def test_collect_llm_usage_summary_is_compact(smoke_module):
     class _FakeProvider:
         usage_events = [
@@ -158,6 +183,8 @@ def test_collect_llm_usage_summary_is_compact(smoke_module):
     by_task = out["llm_usage_by_task"]
     assert by_task["structured_query"]["calls"] == 1
     assert by_task["tool_selection_stage_1"]["calls"] == 2
+    models = {ev["model"] for ev in out["llm_usage_events"]}
+    assert "qwen-plus" in models
     assert out["llm_usage_total_tokens"] == 280
     assert out["llm_usage_prompt_tokens_total"] == 220
     # One stage-1 event missing cached_prompt_tokens should set estimate=true.

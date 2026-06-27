@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import io
 import os
 import sys
 from pathlib import Path
+from contextlib import redirect_stderr, redirect_stdout
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -206,6 +209,26 @@ def _short(value, limit: int = 120):
     return value
 
 
+def _redact_base_url(base_url: str | None) -> str:
+    if not base_url:
+        return ""
+    try:
+        parsed = urlparse(base_url)
+        host = parsed.hostname or ""
+        scheme = parsed.scheme or "https"
+        if parsed.port:
+            return f"{scheme}://{host}:{parsed.port}"
+        return f"{scheme}://{host}" if host else "redacted"
+    except Exception:  # noqa: BLE001
+        return "redacted"
+
+
+def _suppress_stdout_stderr(fn, *args, **kwargs):
+    sink = io.StringIO()
+    with redirect_stdout(sink), redirect_stderr(sink):
+        return fn(*args, **kwargs)
+
+
 def _hit_count(payload: dict) -> int:
     """Best-effort count of result rows from common TU/live envelopes."""
     if not isinstance(payload, dict):
@@ -312,7 +335,7 @@ def main() -> int:
         "mcp_live_config": {},
     }
     if base_url:
-        findings["llm_base_url"] = base_url
+        findings["qwen_base_url_redacted"] = _redact_base_url(base_url)
 
     pdb_path = Path(os.environ.get("ADC_SMOKE_PDB", str(DEFAULT_PDB)))
     if not pdb_path.exists():
@@ -395,7 +418,7 @@ def main() -> int:
         workflow_state=workflow_state, llm=llm,
     )
     try:
-        final = graph.invoke({"intake_request": intake_request})
+        final = _suppress_stdout_stderr(graph.invoke, {"intake_request": intake_request})
     except Exception as exc:  # noqa: BLE001
         if _is_unavailable_error(exc):
             _summary({**findings, "pipeline_status": "LLM_UNAVAILABLE",
@@ -414,11 +437,22 @@ def main() -> int:
 
     # ── Step 5 ────────────────────────────────────────────────────────────
     try:
-        CandidateContextAgent(
-            storage=storage, registry=registry,
-            workflow_state=workflow_state, mcp_client=get_mcp_client(),
-        ).run(run_id)
+        _suppress_stdout_stderr(
+            CandidateContextAgent(
+                storage=storage,
+                registry=registry,
+                workflow_state=workflow_state,
+                mcp_client=get_mcp_client(),
+            ).run,
+            run_id,
+        )
     except Exception as exc:  # noqa: BLE001
+        if _is_unavailable_error(exc):
+            _summary({**findings, "pipeline_status": "LLM_UNAVAILABLE",
+                      "live_tool_status": "failed",
+                      "reason": f"{provider_name} quota/timeout/disconnect",
+                      "stage": "step_05"})
+            return 0
         _summary({**findings, "pipeline_status": "FAIL",
                   "live_tool_status": "failed",
                   "stage": "step_05",
@@ -503,12 +537,15 @@ def main() -> int:
 
     # ── Step 6 ────────────────────────────────────────────────────────────
     try:
-        DevelopabilityAgent(
-            storage=storage, registry=registry,
-            workflow_state=workflow_state,
-            mcp_client=get_mcp_client(),
-            llm=llm,
-        ).run(run_id)
+        _suppress_stdout_stderr(
+            DevelopabilityAgent(
+                storage=storage, registry=registry,
+                workflow_state=workflow_state,
+                mcp_client=get_mcp_client(),
+                llm=llm,
+            ).run,
+            run_id,
+        )
     except Exception as exc:  # noqa: BLE001
         if _is_unavailable_error(exc):
             _summary({**findings, "pipeline_status": "LLM_UNAVAILABLE",
@@ -666,7 +703,9 @@ def main() -> int:
     findings["live_success_tool_names"] = live_success_tool_names
     findings.update(_collect_llm_usage_summary(llm))
     if base_url:
-        findings["llm_base_url"] = base_url
+        findings["qwen_base_url_redacted"] = findings.get(
+            "qwen_base_url_redacted", _redact_base_url(base_url)
+        )
 
     # ── live_tool_status taxonomy ─────────────────────────────────────────
     # - "all_live_success": no mocked outputs, no upstream_error, no

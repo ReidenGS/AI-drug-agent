@@ -85,5 +85,6 @@ def get_llm_provider() -> LLMProvider:
             api_key=settings.qwen_api_key,
             model=settings.qwen_model,
             base_url=settings.qwen_base_url,
+            timeout=settings.qwen_timeout,
         )
     return MockLLMProvider()

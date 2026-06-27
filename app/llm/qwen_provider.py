@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from requests import Timeout as RequestsTimeout
 
 from .json_task_validation import (
     build_json_prompt as _build_json_prompt,
@@ -44,7 +45,7 @@ class QwenProvider:
         *,
         base_url: str = DEFAULT_QWEN_BASE_URL,
         max_retries: int = 2,
-        timeout: float = 60.0,
+        timeout: float = 90.0,
     ) -> None:
         if not api_key:
             raise ValueError("QwenProvider requires a non-empty api_key")
@@ -75,7 +76,21 @@ class QwenProvider:
                     "\n\nYour previous response could not be parsed or validated as the "
                     f"required JSON object. Error: {errors[-1]}. Return corrected JSON only."
                 )
-            response = self._generate_content(base_prompt + retry_note, system=system)
+            try:
+                response = self._generate_content(base_prompt + retry_note, system=system)
+            except Exception as exc:  # noqa: BLE001
+                # Keep timeout explicit and retriable; do not swallow other
+                # provider/transport exceptions into synthetic fallbacks.
+                timeout_msg = _normalize_timeout_error(exc)
+                errors.append(timeout_msg)
+                logger.warning(
+                    "Qwen JSON generation failed for task=%s attempt=%s/%s: %s",
+                    task,
+                    attempt + 1,
+                    self.max_retries + 1,
+                    timeout_msg,
+                )
+                continue
             self.usage_events.append(
                 _build_usage_event(
                     provider=self.name,
@@ -131,6 +146,28 @@ class QwenProvider:
                 ) from exc
             self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         return self._client
+
+
+def _normalize_timeout_error(exc: BaseException) -> str:
+    if _is_timeout_error(exc):
+        timeout = getattr(exc, "timeout", None)
+        if timeout is None:
+            return "request timed out"
+        return f"request timed out after {timeout}s"
+    msg = str(exc)
+    if "timeout" in msg.lower() or "timed out" in msg.lower():
+        return "request timed out"
+    return msg
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, RequestsTimeout)):
+        return True
+    name = exc.__class__.__name__.lower()
+    if "timeout" in name:
+        return True
+    mod = str(getattr(exc, "__module__", "")).lower()
+    return "timeout" in mod
 
 
 def _response_to_dict(response: Any) -> dict:

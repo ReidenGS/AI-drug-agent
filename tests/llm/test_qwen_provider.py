@@ -176,3 +176,49 @@ def test_error_message_does_not_contain_api_key_prompt_or_raw_response():
 def test_no_api_key_raises_value_error():
     with pytest.raises(ValueError, match="non-empty api_key"):
         QwenProvider(api_key="")
+
+
+def test_generate_json_retries_on_timeout_and_returns_response():
+    class _Timeout(Exception):
+        """Stub exception that looks like a transport timeout."""
+
+    provider = QwenProvider(api_key="qwen-fake-key", max_retries=1, timeout=1.0)
+    calls = iter([
+        _Timeout("connection timed out"),
+        _chat_response('{"selections":[{"tool_name":"DrugProps_calculate_qed"}]}'),
+    ])
+
+    def _fake_generate_content(prompt: str, *, system: str | None = None) -> Any:
+        value = next(calls)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    provider._generate_content = _fake_generate_content  # type: ignore[method-assign]
+    out = provider.generate_json(
+        "pick", schema={"task": "step6_schema_mapping_stage_1"}
+    )
+
+    assert out["selections"][0]["tool_name"] == "DrugProps_calculate_qed"
+    # usage is recorded only after the successful retry attempt.
+    assert len(provider.usage_events) == 1
+    assert provider.usage_events[0]["attempt"] == 1
+
+
+def test_generate_json_reports_timeout_without_task_intent_leakage():
+    class _Timeout(Exception):
+        """Timeout stub to exercise timeout normalization branch."""
+
+    provider = QwenProvider(api_key="qwen-fake-key", max_retries=0, timeout=1.0)
+
+    def _fake_generate_content(prompt: str, *, system: str | None = None) -> Any:
+        raise _Timeout("timed out while waiting")
+
+    provider._generate_content = _fake_generate_content  # type: ignore[method-assign]
+    with pytest.raises(QwenProviderError) as excinfo:
+        provider.generate_json(
+            "pick", schema={"task": "step6_schema_mapping_stage_1"}
+        )
+    msg = str(excinfo.value)
+    assert "timed out" in msg.lower()
+    assert "non-empty" not in msg

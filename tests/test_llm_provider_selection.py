@@ -228,6 +228,15 @@ def test_qwen_base_url_env_value_is_passed_to_provider(monkeypatch):
     assert provider.base_url == "https://example.test/compatible/v1"
 
 
+def test_qwen_timeout_env_value_is_passed_to_provider(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "qwen")
+    monkeypatch.setenv("QWEN_API_KEY", "qwen-fake-key")
+    monkeypatch.setenv("QWEN_TIMEOUT", "12.5")
+    provider = deps.get_llm_provider()
+    assert isinstance(provider, QwenProvider)
+    assert provider.timeout == 12.5
+
+
 def test_default_qwen_model_pinned():
     from app.settings import Settings
 
