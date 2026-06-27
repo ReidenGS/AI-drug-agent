@@ -252,6 +252,15 @@ def test_step6_payload_smiles_only_runs_compound_lane_and_marks_others_missing(
 
     # Summary status stays in the "completed-ish" band, not failed.
     assert persisted["prefilter_status"] in {"completed", "partial"}
+    audit = persisted["selection_audit"]
+    assert set(audit["step_06_stage1_catalog_tool_names"]) == set(
+        audit["step_06_stage1_disclosed_tool_names"]
+    )
+    assert set(audit["step_06_stage1_catalog_tool_names"]) < set(
+        audit["step_06_stage1_scope_tool_names"]
+    )
+    assert "PROSITE_scan_sequence" in audit["step_06_stage1_scope_tool_names"]
+    assert "PROSITE_scan_sequence" not in audit["step_06_stage1_catalog_tool_names"]
 
 
 def test_step6_payload_name_does_not_run_smiles_liability_tools(
@@ -274,14 +283,15 @@ def test_step6_payload_name_does_not_run_smiles_liability_tools(
     lanes = _lane_results(persisted)
 
     assert lanes["payload_linker_compound_liability"]["run_status"] == "skipped"
-    assert lanes["payload_linker_compound_liability"]["input_status"] == "missing"
-    called = {
+    assert lanes["payload_linker_compound_liability"]["input_status"] == "insufficient"
+    successful = {
         tc["tool_name"]
         for cand in persisted["candidate_liability_results"]
         for lane in cand["lane_results"]
         for tc in lane["tool_call_records"]
+        if tc["run_status"] == "success"
     }
-    assert not (called & {
+    assert not (successful & {
         "DrugProps_pains_filter",
         "DrugProps_lipinski_filter",
         "DrugProps_calculate_qed",
@@ -290,7 +300,11 @@ def test_step6_payload_name_does_not_run_smiles_liability_tools(
         "ADMETAI_predict_toxicity",
         "ADMETAI_predict_physicochemical_properties",
     })
-    assert "ChEMBL_search_activities" not in called
+    assert "ChEMBL_search_activities" not in successful
+    audit = persisted["selection_audit"]
+    assert "ambiguous_modality_fail_open" in (
+        audit["step_06_stage1_disclosure_summary"]["cand_synthetic_1"]["disclosure_tags"]
+    )
 
 
 def test_step6_antibody_name_does_not_run_sequence_tools(
@@ -313,14 +327,15 @@ def test_step6_antibody_name_does_not_run_sequence_tools(
     lanes = _lane_results(persisted)
 
     assert lanes["antibody_protein_sequence_liability"]["run_status"] == "skipped"
-    assert lanes["antibody_protein_sequence_liability"]["input_status"] == "missing"
-    called = {
+    assert lanes["antibody_protein_sequence_liability"]["input_status"] == "insufficient"
+    successful = {
         tc["tool_name"]
         for cand in persisted["candidate_liability_results"]
         for lane in cand["lane_results"]
         for tc in lane["tool_call_records"]
+        if tc["run_status"] == "success"
     }
-    assert "PROSITE_scan_sequence" not in called
+    assert "PROSITE_scan_sequence" not in successful
 
 
 def test_step6_target_name_without_accession_does_not_run_accession_tools(
@@ -344,15 +359,16 @@ def test_step6_target_name_without_accession_does_not_run_accession_tools(
     lanes = _lane_results(persisted)
 
     assert lanes["antigen_protein_feature_context"]["run_status"] == "skipped"
-    assert lanes["antigen_protein_feature_context"]["input_status"] == "missing"
-    called = {
+    assert lanes["antigen_protein_feature_context"]["input_status"] == "insufficient"
+    successful = {
         tc["tool_name"]
         for cand in persisted["candidate_liability_results"]
         for lane in cand["lane_results"]
         for tc in lane["tool_call_records"]
+        if tc["run_status"] == "success"
     }
-    assert "EBIProteins_get_features" not in called
-    assert "EBIProteins_get_epitopes" not in called
+    assert "EBIProteins_get_features" not in successful
+    assert "EBIProteins_get_epitopes" not in successful
 
 
 # ── 2. antibody sequence only → sequence lane only ──────────────────────────

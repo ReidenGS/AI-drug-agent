@@ -148,11 +148,15 @@ class DevelopabilityAgent:
             projection = project_candidate_available_fields(candidate)
             available_fields = projection.available_fields
             modality_summary = projection.modality_summary
+            force_fail_open = (
+                modality_summary.ambiguous_or_unknown
+                or not modality_summary.modality_tags
+            )
 
             # ── 1. Partition lanes into "skipped (missing input)" and "active". ──
             active_lanes: list[LaneType] = []
             for lane_type in _LANE_TYPES:
-                if not _lane_active_from_modality(lane_type, modality_summary):
+                if not force_fail_open and not _lane_active_from_modality(lane_type, modality_summary):
                     lane_results.append(
                         LaneResult(
                             lane_type=lane_type,
@@ -183,6 +187,10 @@ class DevelopabilityAgent:
                     deterministic_fallback=step6_live_capability_fallback,
                 )
                 selection_audit["step_06_stage1_scope_tool_names"].extend(disclosure.scoped_tool_names)
+                # `step_06_stage1_catalog_tool_names` is the LLM-visible
+                # compact catalog AFTER progressive disclosure. The full
+                # scoped Step 6 surface remains in
+                # `step_06_stage1_scope_tool_names`.
                 selection_audit["step_06_stage1_catalog_tool_names"].extend(disclosure.disclosed_tool_names)
                 selection_audit["step_06_stage1_disclosed_tool_names"].extend(disclosure.disclosed_tool_names)
                 selection_audit["step_06_stage1_hidden_tools_with_reason"].extend(
