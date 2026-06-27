@@ -23,6 +23,7 @@ class LaneResult(BaseModel):
     input_status: Literal["sufficient", "insufficient", "missing"]
     selected_tools: list[str] = Field(default_factory=list)
     tool_call_records: list[ToolCallRecord] = Field(default_factory=list)
+    argument_mapping_audit: list[dict] = Field(default_factory=list)
     liability_flags: list[dict] = Field(default_factory=list)
     lane_risk_category: Literal["low", "medium", "high", "unknown"] = "unknown"
     lane_summary: Optional[str] = None
