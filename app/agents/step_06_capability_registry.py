@@ -65,14 +65,21 @@ STEP_06_CAPABILITY_REGISTRY: tuple[Step6Capability, ...] = (
     _cap("DrugProps_calculate_qed", _SMILES, ("smiles",), "smiles", "qed", 30, interpreter="qed"),
     _cap("SwissADME_calculate_adme", _SMILES, ("smiles",), "smiles", "adme", 40, interpreter="adme"),
     _cap("SwissADME_check_druglikeness", _SMILES, ("smiles",), "smiles", "extended_drug_likeness", 50, interpreter="adme"),
-    _cap("ADMETAI_predict_toxicity", _SMILES, ("smiles",), "smiles", "toxicity", 60, runtime="dependency_unavailable", interpreter="toxicity", reason="ADMET-AI local model dependency deferred"),
-    _cap("ADMETAI_predict_physicochemical_properties", _SMILES, ("smiles",), "smiles", "physchem", 61, runtime="dependency_unavailable", interpreter="adme", reason="ADMET-AI local model dependency deferred"),
-    _cap("ADMETAI_predict_solubility_lipophilicity_hydration", _SMILES, ("smiles",), "smiles", "solubility", 62, runtime="dependency_unavailable", reason="ADMET-AI local model dependency deferred"),
-    _cap("ADMETAI_predict_CYP_interactions", _SMILES, ("smiles",), "smiles", "cyp", 63, runtime="dependency_unavailable", reason="ADMET-AI local model dependency deferred"),
-    _cap("ADMETAI_predict_bioavailability", _SMILES, ("smiles",), "smiles", "bioavailability", 64, runtime="dependency_unavailable", reason="ADMET-AI local model dependency deferred"),
-    _cap("ADMETAI_predict_clearance_distribution", _SMILES, ("smiles",), "smiles", "clearance", 65, runtime="dependency_unavailable", reason="ADMET-AI local model dependency deferred"),
-    _cap("ADMETAI_predict_stress_response", _SMILES, ("smiles",), "smiles", "stress_response", 66, runtime="dependency_unavailable", reason="ADMET-AI local model dependency deferred"),
-    _cap("ADMETAI_predict_nuclear_receptor_activity", _SMILES, ("smiles",), "smiles", "nuclear_receptor", 67, runtime="dependency_unavailable", reason="ADMET-AI local model dependency deferred"),
+    # ADMETAI runtime status: wired through ``ToolUniverseAdapter`` ->
+    # ToolUniverse ``ADMETAITool`` -> local ``admet_ai`` model
+    # ensemble. The Step 6 wrapper layer is thin (validates smiles +
+    # delegates), so live readiness depends on the ``admet_ai`` package
+    # being installed in the runtime venv. When ``admet_ai`` is missing
+    # the adapter returns ``status="upstream_error"`` rather than a
+    # silent success — the dependency story is honest either way.
+    _cap("ADMETAI_predict_toxicity", _SMILES, ("smiles",), "smiles", "toxicity", 60, interpreter="toxicity"),
+    _cap("ADMETAI_predict_physicochemical_properties", _SMILES, ("smiles",), "smiles", "physchem", 61, interpreter="adme"),
+    _cap("ADMETAI_predict_solubility_lipophilicity_hydration", _SMILES, ("smiles",), "smiles", "solubility", 62),
+    _cap("ADMETAI_predict_CYP_interactions", _SMILES, ("smiles",), "smiles", "cyp", 63),
+    _cap("ADMETAI_predict_bioavailability", _SMILES, ("smiles",), "smiles", "bioavailability", 64),
+    _cap("ADMETAI_predict_clearance_distribution", _SMILES, ("smiles",), "smiles", "clearance", 65),
+    _cap("ADMETAI_predict_stress_response", _SMILES, ("smiles",), "smiles", "stress_response", 66),
+    _cap("ADMETAI_predict_nuclear_receptor_activity", _SMILES, ("smiles",), "smiles", "nuclear_receptor", 67),
     _cap("PROSITE_scan_sequence", _SEQUENCE, ("protein_sequence",), "sequence", "sequence_motif", 10, interpreter="motifs"),
     _cap("IEDB_predict_mhci_binding", _SEQUENCE, ("protein_sequence",), "sequence", "immunogenicity", 20),
     _cap("EBIProteins_get_features", _ANTIGEN, ("uniprot_id",), "accession", "protein_features", 10, interpreter="protein_features"),

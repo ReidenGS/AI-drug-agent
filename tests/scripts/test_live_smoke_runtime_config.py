@@ -66,8 +66,12 @@ def test_live_allowlist_does_not_narrow_step6_catalog(smoke_module):
         "ADMETAI_predict_toxicity",
         "ProteinsPlus_profile_structure_quality",
     } <= catalog_names
-    assert "ADMETAI_predict_toxicity" not in smoke_module.LIVE_ALLOWLIST
+    # ADMETAI was migrated to a live wrapper; it now belongs to the
+    # live allowlist and is NOT a known dependency gap. ProteinsPlus
+    # remains deferred.
+    assert "ADMETAI_predict_toxicity" in smoke_module.LIVE_ALLOWLIST
     assert "ProteinsPlus_profile_structure_quality" in smoke_module.KNOWN_LIVE_DEPENDENCY_GAPS
+    assert "ADMETAI_predict_toxicity" not in smoke_module.KNOWN_LIVE_DEPENDENCY_GAPS
 
 
 def test_chembl_id_counting_distinguishes_occurrence_and_unique(smoke_module):
@@ -86,5 +90,8 @@ def test_chembl_id_counting_distinguishes_occurrence_and_unique(smoke_module):
 
 
 def test_known_dependency_gap_constants_are_explicit(smoke_module):
+    """ProteinsPlus_profile_structure_quality is the only Step 6 tool
+    still classified as a known live dependency gap after the ADMETAI
+    live-wiring migration."""
     assert "ProteinsPlus_profile_structure_quality" in smoke_module.KNOWN_LIVE_DEPENDENCY_GAPS
-    assert "ADMETAI_predict_toxicity" in smoke_module.KNOWN_LIVE_DEPENDENCY_GAPS
+    assert "ADMETAI_predict_toxicity" not in smoke_module.KNOWN_LIVE_DEPENDENCY_GAPS

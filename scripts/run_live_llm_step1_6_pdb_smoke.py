@@ -54,6 +54,14 @@ LIVE_ALLOWLIST = (
     "PDBePISA_get_monomer_analysis",
     "ChEMBL_search_compound_structural_alerts",
     "ChEMBL_get_molecule_targets",
+    "ADMETAI_predict_toxicity",
+    "ADMETAI_predict_physicochemical_properties",
+    "ADMETAI_predict_solubility_lipophilicity_hydration",
+    "ADMETAI_predict_CYP_interactions",
+    "ADMETAI_predict_bioavailability",
+    "ADMETAI_predict_clearance_distribution",
+    "ADMETAI_predict_stress_response",
+    "ADMETAI_predict_nuclear_receptor_activity",
 )
 os.environ["MCP_LIVE_TOOLS"] = "true"
 os.environ["MCP_LIVE_TOOL_ALLOWLIST"] = ",".join(LIVE_ALLOWLIST)
@@ -75,16 +83,15 @@ _UNAVAILABLE_TOKENS = (
 # Tools whose live wrapper is intentionally not wired yet. Surfacing them
 # under a named field keeps `live_tool_status` honest without letting
 # their `dependency_unavailable` poison the rollup.
+#
+# ADMETAI_* tools were migrated to live wrappers (ToolUniverseAdapter ->
+# ToolUniverse ADMETAITool) and are no longer dependency gaps for the
+# rollup. When the runtime ``admet_ai`` package is missing the call
+# still completes with ``executor=tooluniverse`` and the envelope
+# carries ``status="upstream_error"`` — the envelope-status rollup
+# surfaces that case via ``step_06_tool_output_envelope_status_counts``.
 KNOWN_LIVE_DEPENDENCY_GAPS = (
     "ProteinsPlus_profile_structure_quality",
-    "ADMETAI_predict_toxicity",
-    "ADMETAI_predict_physicochemical_properties",
-    "ADMETAI_predict_solubility_lipophilicity_hydration",
-    "ADMETAI_predict_CYP_interactions",
-    "ADMETAI_predict_bioavailability",
-    "ADMETAI_predict_clearance_distribution",
-    "ADMETAI_predict_stress_response",
-    "ADMETAI_predict_nuclear_receptor_activity",
 )
 
 
