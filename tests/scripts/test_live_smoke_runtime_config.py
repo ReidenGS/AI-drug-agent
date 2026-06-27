@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -95,3 +96,69 @@ def test_known_dependency_gap_constants_are_explicit(smoke_module):
     live-wiring migration."""
     assert "ProteinsPlus_profile_structure_quality" in smoke_module.KNOWN_LIVE_DEPENDENCY_GAPS
     assert "ADMETAI_predict_toxicity" not in smoke_module.KNOWN_LIVE_DEPENDENCY_GAPS
+
+
+def test_resolve_qwen_provider_model_and_base_url(smoke_module):
+    """The smoke runtime helper should resolve qwen settings without touching
+    MCP catalog logic."""
+    settings = SimpleNamespace(
+        llm_provider="qwen",
+        qwen_api_key="qwen-key",
+        qwen_model="qwen-max",
+        qwen_base_url="https://example.test/compatible/v1",
+        gemini_api_key="",
+        gemini_model="gemini-3.5-flash",
+        openai_api_key="",
+        openai_model="gpt-4.1-mini",
+    )
+    provider, model, base_url = smoke_module._resolve_provider_model(settings)
+    assert provider == "qwen"
+    assert model == "qwen-max"
+    assert base_url == "https://example.test/compatible/v1"
+
+
+def test_collect_llm_usage_summary_is_compact(smoke_module):
+    class _FakeProvider:
+        usage_events = [
+            {
+                "provider": "qwen",
+                "model": "qwen-plus",
+                "task": "structured_query",
+                "attempt": 0,
+                "prompt_tokens": 120,
+                "completion_tokens": 40,
+                "total_tokens": 160,
+                "cached_prompt_tokens": 30,
+            },
+            {
+                "provider": "qwen",
+                "model": "qwen-plus",
+                "task": "tool_selection_stage_1",
+                "attempt": 0,
+                "prompt_tokens": 80,
+                "completion_tokens": 15,
+                "total_tokens": 95,
+                "cached_prompt_tokens": None,
+            },
+            {
+                "provider": "qwen",
+                "model": "qwen-plus",
+                "task": "tool_selection_stage_1",
+                "attempt": 1,
+                "prompt_tokens": 20,
+                "completion_tokens": 5,
+                "total_tokens": 25,
+                "cached_prompt_tokens": 5,
+            },
+        ]
+
+    out = smoke_module._collect_llm_usage_summary(_FakeProvider())
+    assert out["llm_usage_event_count"] == 3
+    assert "qwen" in {ev["provider"] for ev in out["llm_usage_events"]}
+    by_task = out["llm_usage_by_task"]
+    assert by_task["structured_query"]["calls"] == 1
+    assert by_task["tool_selection_stage_1"]["calls"] == 2
+    assert out["llm_usage_total_tokens"] == 280
+    assert out["llm_usage_prompt_tokens_total"] == 220
+    # One stage-1 event missing cached_prompt_tokens should set estimate=true.
+    assert out["llm_usage_uncached_prompt_tokens_total_is_estimate"] is True

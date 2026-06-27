@@ -94,6 +94,13 @@ KNOWN_LIVE_DEPENDENCY_GAPS = (
     "ProteinsPlus_profile_structure_quality",
 )
 
+_USAGE_COUNTER_KEYS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "cached_prompt_tokens",
+)
+
 
 def _is_unavailable_error(exc: Exception) -> bool:
     msg = str(exc).lower()
@@ -101,6 +108,90 @@ def _is_unavailable_error(exc: Exception) -> bool:
         return True
     cls = type(exc).__name__.lower()
     return any(tok in cls for tok in ("ratelimit", "timeout", "apiconnection", "apierror"))
+
+
+def _aggregate_usage_by_task(events: list[dict]) -> dict:
+    by_task: dict[str, dict[str, int]] = {}
+    for evt in events:
+        if not isinstance(evt, dict):
+            continue
+        task = str(evt.get("task") or "")
+        bucket = by_task.setdefault(task, {
+            "calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cached_prompt_tokens": 0,
+        })
+        bucket["calls"] += 1
+        for key in _USAGE_COUNTER_KEYS:
+            value = evt.get(key)
+            if isinstance(value, int):
+                bucket[key] += value
+    return by_task
+
+
+def _aggregate_usage_totals(events: list[dict]) -> dict:
+    total_tokens = 0
+    prompt_total = 0
+    cached_total = 0
+    uncached_total = 0
+    is_estimate = False
+    saw_event = False
+    for evt in events:
+        if not isinstance(evt, dict):
+            continue
+        saw_event = True
+        total = evt.get("total_tokens")
+        if isinstance(total, int):
+            total_tokens += total
+        prompt = evt.get("prompt_tokens")
+        cached = evt.get("cached_prompt_tokens")
+        if isinstance(prompt, int):
+            prompt_total += prompt
+        if isinstance(cached, int):
+            cached_total += cached
+        if isinstance(prompt, int) and isinstance(cached, int):
+            uncached_total += max(0, prompt - cached)
+        elif isinstance(prompt, int):
+            uncached_total += prompt
+            is_estimate = True
+    return {
+        "llm_usage_total_tokens": total_tokens,
+        "llm_usage_prompt_tokens_total": prompt_total,
+        "llm_usage_cached_prompt_tokens_total": cached_total,
+        "llm_usage_uncached_prompt_tokens_total": uncached_total,
+        "llm_usage_uncached_prompt_tokens_total_is_estimate": is_estimate if saw_event else False,
+    }
+
+
+def _resolve_provider_model(settings) -> tuple[str, str, str]:
+    provider_name = settings.llm_provider
+    if provider_name == "gemini":
+        if not settings.gemini_api_key:
+            raise ValueError("GEMINI_API_KEY is required for provider=gemini")
+        return provider_name, settings.gemini_model, ""
+    if provider_name == "openai":
+        if not settings.openai_api_key:
+            raise ValueError("OPENAI_API_KEY is required for provider=openai")
+        return provider_name, settings.openai_model, ""
+    if provider_name == "qwen":
+        if not settings.qwen_api_key:
+            raise ValueError("QWEN_API_KEY is required for provider=qwen")
+        return provider_name, settings.qwen_model, settings.qwen_base_url
+    raise ValueError(f"unsupported LLM_PROVIDER={provider_name!r}")
+
+
+def _collect_llm_usage_summary(llm) -> dict:
+    usage_events = getattr(llm, "usage_events", [])
+    if not isinstance(usage_events, list):
+        usage_events = []
+    return {
+        "llm_usage_events": usage_events,
+        "llm_usage_event_count": len(usage_events),
+        "llm_usage_by_task": _aggregate_usage_by_task(usage_events),
+        **_aggregate_usage_totals(usage_events),
+    }
 
 
 def _summary(d: dict) -> None:
@@ -203,21 +294,25 @@ def main() -> int:
 
     settings = get_settings()
     print('{"smoke_phase":"settings_loaded"}', flush=True)
-    provider_name = settings.llm_provider
-    if provider_name == "gemini":
-        if not settings.gemini_api_key:
-            _summary({"status": "SKIP", "reason": "GEMINI_API_KEY unset"})
-            return 0
-        model_name = settings.gemini_model
-    elif provider_name == "openai":
-        if not settings.openai_api_key:
-            _summary({"status": "SKIP", "reason": "OPENAI_API_KEY unset"})
-            return 0
-        model_name = settings.openai_model
-    else:
-        _summary({"status": "SKIP",
-                  "reason": f"unsupported LLM_PROVIDER={provider_name!r}"})
+    try:
+        provider_name, model_name, base_url = _resolve_provider_model(settings)
+    except ValueError as exc:
+        _summary({"status": "SKIP", "reason": str(exc)})
         return 0
+    findings: dict = {
+        # `pipeline_status` is whether Step 1-6 ran end-to-end. It does NOT
+        # mean every live tool succeeded — see `live_tool_status` below.
+        "pipeline_status": "PASS",
+        "live_tool_status": "unknown",  # filled in at the end
+        "provider": provider_name,
+        "model": model_name,
+        "run_id": None,
+        "pdb_filename": None,
+        "pdb_sha256_prefix": None,
+        "mcp_live_config": {},
+    }
+    if base_url:
+        findings["llm_base_url"] = base_url
 
     pdb_path = Path(os.environ.get("ADC_SMOKE_PDB", str(DEFAULT_PDB)))
     if not pdb_path.exists():
@@ -262,21 +357,13 @@ def main() -> int:
     elif hasattr(storage, "write"):
         storage.write(storage_path, pdb_bytes)
 
-    findings: dict = {
-        # `pipeline_status` is whether Step 1-6 ran end-to-end. It does NOT
-        # mean every live tool succeeded — see `live_tool_status` below.
-        "pipeline_status": "PASS",
-        "live_tool_status": "unknown",  # filled in at the end
-        "provider": provider_name,
-        "model": model_name,
-        "run_id": run_id,
-        "pdb_filename": pdb_path.name,
-        "pdb_sha256_prefix": pdb_sha256[:12],
-        "mcp_live_config": {
-            "mcp_live_tools": settings.mcp_live_tools,
-            "mcp_live_tool_allowlist_count": len(settings.live_tool_allowlist_set()),
-            "mcp_live_tool_allowlist": sorted(settings.live_tool_allowlist_set()),
-        },
+    findings["run_id"] = run_id
+    findings["pdb_filename"] = pdb_path.name
+    findings["pdb_sha256_prefix"] = pdb_sha256[:12]
+    findings["mcp_live_config"] = {
+        "mcp_live_tools": settings.mcp_live_tools,
+        "mcp_live_tool_allowlist_count": len(settings.live_tool_allowlist_set()),
+        "mcp_live_tool_allowlist": sorted(settings.live_tool_allowlist_set()),
     }
 
     intake_request = {
@@ -577,6 +664,9 @@ def main() -> int:
         {a["tool_name"] for a in (step5_audit + step6_audit) if a.get("live_success")}
     )
     findings["live_success_tool_names"] = live_success_tool_names
+    findings.update(_collect_llm_usage_summary(llm))
+    if base_url:
+        findings["llm_base_url"] = base_url
 
     # ── live_tool_status taxonomy ─────────────────────────────────────────
     # - "all_live_success": no mocked outputs, no upstream_error, no
