@@ -11,6 +11,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from ..services.storage_service import Storage
 from .step_06_available_fields import AvailableField, project_candidate_available_fields
 
 
@@ -29,6 +30,7 @@ def resolve_runtime_value(
     *,
     candidate: dict[str, Any],
     field_ref: str,
+    storage: Storage | None = None,
 ) -> ResolvedRuntimeValue:
     """Resolve a candidate-local field_ref to the raw candidate value.
 
@@ -49,7 +51,15 @@ def resolve_runtime_value(
     if field is None:
         return _unresolved(field_ref, "field_ref is not present in candidate available fields")
 
-    raw_value = _raw_value_for_ref(candidate, parsed)
+    try:
+        raw_value = _raw_value_for_ref(candidate, parsed, storage=storage)
+    except Exception as exc:  # noqa: BLE001
+        return ResolvedRuntimeValue(
+            status="unresolved",
+            field_ref=field_ref,
+            audit_metadata=_audit_metadata(field),
+            error_message=f"unable to resolve runtime value: {exc}",
+        )
     if raw_value in (None, ""):
         return ResolvedRuntimeValue(
             status="missing",
@@ -66,13 +76,25 @@ def resolve_runtime_value(
     )
 
 
-def _raw_value_for_ref(candidate: dict[str, Any], parsed: dict[str, str]) -> str | None:
+def _raw_value_for_ref(
+    candidate: dict[str, Any],
+    parsed: dict[str, str],
+    *,
+    storage: Storage | None = None,
+) -> str | None:
     if parsed["source_kind"] == "material":
         for material in candidate.get("materials") or []:
             if not isinstance(material, dict):
                 continue
             if str(material.get("material_id") or "") == parsed["source_id"]:
                 value = material.get("value")
+                value_kind = _material_value_kind(material)
+                if value_kind == "uploaded_fasta_ref":
+                    if value in (None, ""):
+                        return None
+                    if storage is None:
+                        return None
+                    return _read_uploaded_fasta_sequence(storage, str(value))
                 return str(value) if value not in (None, "") else None
         return None
     if parsed["source_kind"] == "identifier":
@@ -137,6 +159,62 @@ def _parse_field_ref(field_ref: str) -> dict[str, str] | None:
         "source_id": source_id,
         "field_name": field_name,
     }
+
+
+def _material_value_kind(material: dict[str, Any]) -> str:
+    mt = str(material.get("material_type") or "")
+    value_kind = str(material.get("value_kind") or "").lower()
+    if value_kind:
+        return value_kind
+
+    if mt in {"antibody_heavy_chain_sequence", "antibody_light_chain_sequence"}:
+        return "uploaded_fasta_ref" if _material_value_looks_like_ref(material) else "protein_sequence"
+    return ""
+
+
+def _material_value_looks_like_ref(material: dict[str, Any]) -> bool:
+    from .step_06_available_fields import _is_ref_shaped_material
+
+    return _is_ref_shaped_material(material)
+
+
+def _read_uploaded_fasta_sequence(storage: Storage, path: str) -> str:
+    try:
+        data = storage.read_bytes(path)
+    except Exception as exc:
+        raise ValueError("uploaded FASTA content could not be read from storage") from exc
+    try:
+        content = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("uploaded FASTA content is not utf-8 text") from exc
+    sequences = _extract_fasta_sequences(content)
+    if not sequences:
+        raise ValueError("uploaded FASTA content has no sequences")
+
+    # Do not concatenate multi-record FASTA bodies; emit first chain only and
+    # keep resolver logic deterministic. Selection strategy is visible via the
+    # compact resolver output path in tests and auditing.
+    return sequences[0]
+
+
+def _extract_fasta_sequences(content: str) -> list[str]:
+    out: list[str] = []
+    current: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(">"):
+            if current:
+                out.append("".join(current))
+                current = []
+            continue
+        letters = "".join(ch for ch in stripped if ch.isalpha())
+        if letters:
+            current.append(letters)
+    if current:
+        out.append("".join(current))
+    return out
 
 
 def _unresolved(field_ref: str, reason: str) -> ResolvedRuntimeValue:

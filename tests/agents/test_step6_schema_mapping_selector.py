@@ -111,6 +111,19 @@ def test_disclosure_pdb_id_and_structure_ref_show_structure_category():
     assert "PDBePISA_get_interfaces" in set(ref_result.disclosed_tool_names)
 
 
+def test_disclosure_uploaded_pdb_path_ref_shows_structure_tools():
+    uploaded = _projection(
+        _candidate(materials=[_material("m_struct", "structure_ref", "/upload/complex.pdb", value_format="pdb")])
+    )
+    disclosed = set(disclose_step6_tools(
+        scoped_tool_names=SCOPED,
+        modality_summary=uploaded.modality_summary,
+        available_fields=uploaded.available_fields,
+    ).disclosed_tool_names)
+    assert "PDBePISA_get_interfaces" in disclosed
+    assert "ProteinsPlus_profile_structure_quality" in disclosed
+
+
 def test_disclosure_mixed_inputs_is_union():
     proj = _projection(
         _candidate(
@@ -230,6 +243,89 @@ def test_stage2_cannot_map_structure_ref_to_pdb_id_required_schema(monkeypatch):
     assert plan.validation_status == "skipped"
     assert "pdb_id" in plan.missing_required_fields
     assert audit["stage2_uninvokable_tools"] == ["PDBePISA_get_interfaces"]
+
+
+def test_stage2_cannot_use_uploaded_structure_ref_for_pdb_id_schema(monkeypatch):
+    proj = _projection(
+        _candidate(materials=[_material("m_struct", "structure_ref", "adc_pilot/runs/run_x/inputs/complex.pdb", value_format="pdb")])
+    )
+    import app.agents.step_06_schema_mapping_selector as selector
+
+    monkeypatch.setattr(
+        selector,
+        "signature_schema_for",
+        lambda _name: {
+            "type": "object",
+            "properties": {"pdb_id": {"type": "string"}},
+            "required": ["pdb_id"],
+        },
+    )
+    ref = next(f.field_ref for f in proj.available_fields if f.value_kind == "structure_ref")
+    llm = _RecordingLLM(
+        stage1={"selections": [{"tool_name": "PDBePISA_get_interfaces", "selection_reason": "structure"}]},
+        stage2={"tools": [{
+            "tool_name": "PDBePISA_get_interfaces",
+            "can_invoke": True,
+            "argument_mapping": {"pdb_id": ref},
+            "missing_required_fields": [],
+            "argument_mapping_reason": "bad map",
+        }]},
+    )
+    plans, _disclosure, audit = select_step6_schema_mapped_invocations(
+        agent_name="developability_agent",
+        step_id="step_06",
+        mcp_client=_MCP(["PDBePISA_get_interfaces"]),
+        llm=llm,
+        candidate_id="cand_schema_map",
+        available_fields=proj.available_fields,
+        modality_summary=proj.modality_summary,
+    )
+    plan = plans["structure_interface_quality"][0]
+    assert plan.validation_status == "skipped"
+    assert "pdb_id" in plan.missing_required_fields
+    assert audit["stage2_uninvokable_tools"] == ["PDBePISA_get_interfaces"]
+
+
+def test_stage2_maps_pdb_id_or_path_compatible_structure_schema(monkeypatch):
+    proj = _projection(
+        _candidate(materials=[_material("m_struct", "structure_ref", "adc_pilot/runs/run_x/inputs/complex.pdb", value_format="pdb")])
+    )
+    import app.agents.step_06_schema_mapping_selector as selector
+
+    monkeypatch.setattr(
+        selector,
+        "signature_schema_for",
+        lambda _name: {
+            "type": "object",
+            "properties": {
+                "structure_file": {"type": "string"},
+            },
+            "required": ["structure_file"],
+        },
+    )
+    ref = next(f.field_ref for f in proj.available_fields if f.value_kind == "structure_ref")
+    llm = _RecordingLLM(
+        stage1={"selections": [{"tool_name": "ProteinsPlus_profile_structure_quality", "selection_reason": "structure"}]},
+        stage2={"tools": [{
+            "tool_name": "ProteinsPlus_profile_structure_quality",
+            "can_invoke": True,
+            "argument_mapping": {"structure_file": ref},
+            "missing_required_fields": [],
+            "argument_mapping_reason": "ok",
+        }]},
+    )
+    plans, _disclosure, _audit = select_step6_schema_mapped_invocations(
+        agent_name="developability_agent",
+        step_id="step_06",
+        mcp_client=_MCP(["ProteinsPlus_profile_structure_quality"]),
+        llm=llm,
+        candidate_id="cand_schema_map",
+        available_fields=proj.available_fields,
+        modality_summary=proj.modality_summary,
+    )
+    plan = plans["structure_interface_quality"][0]
+    assert plan.validation_status in {"ok", "warning"}
+    assert plan.argument_field_refs["structure_file"] == ref
 
 
 def test_stage2_maps_pdb_id_identifier_to_pdb_id_schema(monkeypatch):

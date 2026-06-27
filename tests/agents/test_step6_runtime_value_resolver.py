@@ -11,6 +11,10 @@ SMILES = "CC(=O)NCCO"
 UNIPROT = "P04626"
 CHEMBL = "CHEMBL2107839"
 FASTA_PATH = "adc_pilot/runs/run_x/inputs/heavy_chain.fasta"
+FASTA_CONTENT = ">chainA\nEVQLVESGG\n"
+FASTA_MULTI_CHAIN_CONTENT = (
+    ">chainA\nEVQLVESGG\n>chainB\nDIQMTQSP\n"
+)
 PDB_PATH = "adc_pilot/runs/run_x/inputs/her2_complex.pdb"
 RAW_CDR3 = "ARDRGGYFDY"
 
@@ -121,19 +125,19 @@ def test_resolver_recovers_smiles_uniprot_and_chembl_raw_values():
         _assert_audit_clean(result)
 
 
-def test_resolver_recovers_uploaded_refs_runtime_only_without_audit_path():
+def test_resolver_uploaded_ref_materials_use_ref_or_runtime_resolution():
     candidate = _candidate()
-    for material_type, expected in (
-        ("antibody_light_chain_sequence", FASTA_PATH),
-        ("structure_ref", PDB_PATH),
-    ):
-        ref = _field_ref(candidate, material_type=material_type)
-        result = resolve_runtime_value(candidate=candidate, field_ref=ref)
-        assert result.status == "resolved"
-        assert result.raw_value == expected
-        assert "ref_length" in result.audit_metadata
-        assert "ref_sha256_prefix" in result.audit_metadata
-        _assert_audit_clean(result)
+    fasta_ref = _field_ref(candidate, material_type="antibody_light_chain_sequence")
+    fasta_result = resolve_runtime_value(candidate=candidate, field_ref=fasta_ref)
+    assert fasta_result.status in {"missing", "unresolved"}
+
+    structure_ref = _field_ref(candidate, material_type="structure_ref")
+    structure_result = resolve_runtime_value(candidate=candidate, field_ref=structure_ref)
+    assert structure_result.status == "resolved"
+    assert structure_result.raw_value == PDB_PATH
+    assert "ref_length" in structure_result.audit_metadata
+    assert "ref_sha256_prefix" in structure_result.audit_metadata
+    _assert_audit_clean(structure_result)
 
 
 def test_unresolved_and_missing_refs_return_explicit_status():
@@ -153,6 +157,47 @@ def test_unresolved_and_missing_refs_return_explicit_status():
     assert missing.status in {"missing", "unresolved"}
     assert missing.raw_value is None
     assert missing.error_message
+
+
+def test_resolver_resolves_uploaded_fasta_at_runtime(local_storage):
+    candidate = _candidate()
+    local_storage.write_bytes(FASTA_PATH, FASTA_CONTENT.encode("utf-8"))
+    ref = _field_ref(candidate, material_type="antibody_light_chain_sequence")
+    result = resolve_runtime_value(candidate=candidate, field_ref=ref, storage=local_storage)
+
+    assert result.status == "resolved"
+    assert result.raw_value == "EVQLVESGG"
+    assert result.audit_metadata["field_type"] == "protein_sequence"
+    assert result.audit_metadata["value_kind"] == "uploaded_fasta_ref"
+    assert result.audit_metadata["chain_role"] == "light"
+    _assert_audit_clean(result)
+
+
+def test_resolver_rejects_missing_uploaded_fasta(local_storage):
+    candidate = _candidate()
+    ref = _field_ref(candidate, material_type="antibody_light_chain_sequence")
+    result = resolve_runtime_value(
+        candidate=candidate,
+        field_ref=ref,
+        storage=local_storage,
+    )
+
+    assert result.status in {"missing", "unresolved"}
+    assert result.error_message
+    _assert_audit_clean(result)
+
+
+def test_resolver_picks_first_fasta_chain_only(local_storage):
+    candidate = _candidate()
+    local_storage.write_bytes(FASTA_PATH, FASTA_MULTI_CHAIN_CONTENT.encode("utf-8"))
+    ref = _field_ref(candidate, material_type="antibody_light_chain_sequence")
+    result = resolve_runtime_value(candidate=candidate, field_ref=ref, storage=local_storage)
+
+    assert result.status == "resolved"
+    assert result.raw_value == "EVQLVESGG"
+    assert result.raw_value != "DIQMTQSP"
+    assert result.raw_value == result.raw_value.strip()
+    _assert_audit_clean(result)
 
 
 def test_resolver_audit_does_not_leak_raw_cdr3():

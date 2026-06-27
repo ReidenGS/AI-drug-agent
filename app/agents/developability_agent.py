@@ -103,6 +103,8 @@ class DevelopabilityAgent:
             "step_06_stage1_selected_tools": [],
             "step_06_stage2_schema_survivors": [],
             "step_06_stage2_mapped_tools": [],
+            "step_06_stage2_uninvokable_tools": [],
+            "step_06_resolver_failed_tools": [],
             "step_06_runtime_resolved_tools": [],
             "step_06_executed_tools": [],
             "step_06_recorded_tool_call_tools": [],
@@ -186,6 +188,9 @@ class DevelopabilityAgent:
                 selection_audit["step_06_stage2_mapped_tools"].extend(
                     selector_audit.get("stage2_mapped_tools") or []
                 )
+                selection_audit["step_06_stage2_uninvokable_tools"].extend(
+                    selector_audit.get("stage2_uninvokable_tools") or []
+                )
 
             # ── 3. Execute the plans lane by lane and assemble lane results. ────
             for lane_type in active_lanes:
@@ -209,6 +214,14 @@ class DevelopabilityAgent:
                         selection_audit["step_06_executed_tools"].append(plan.tool_name)
                     if plan.argument_field_refs and tc.run_status not in {"skipped", "not_run"}:
                         selection_audit["step_06_runtime_resolved_tools"].append(plan.tool_name)
+                    if (
+                        isinstance(tc.tool_input_summary, dict)
+                        and any(
+                            entry.get("resolve_status") in {"missing", "unresolved"}
+                            for entry in tc.tool_input_summary.get("runtime_resolver_audit", [])
+                        )
+                    ):
+                        selection_audit["step_06_resolver_failed_tools"].append(plan.tool_name)
                     _increment(selection_audit["tool_selection_source_distribution"], plan.tool_selection_source)
                     _increment(selection_audit["argument_mapping_source_distribution"], plan.argument_construction_source)
                     if isinstance(payload, dict) and payload.get("status") == "upstream_error":
@@ -323,7 +336,11 @@ class DevelopabilityAgent:
         resolver_audit: list[dict] = []
         unresolved: list[str] = []
         for arg_name, field_ref in sorted((plan.argument_field_refs or {}).items()):
-            resolved = resolve_runtime_value(candidate=candidate, field_ref=field_ref)
+            resolved = resolve_runtime_value(
+                candidate=candidate,
+                field_ref=field_ref,
+                storage=self.storage,
+            )
             resolver_audit.append({
                 "schema_arg": arg_name,
                 "field_ref": field_ref,
@@ -466,7 +483,8 @@ def _finalize_selection_audit(audit: dict[str, Any]) -> dict[str, Any]:
         "step_06_upstream_error_tools", "step_06_mocked_tools",
         "step_06_stage1_scope_tool_names", "step_06_stage1_disclosed_tool_names",
         "step_06_stage2_mapped_tools", "step_06_runtime_resolved_tools",
-        "step_06_recorded_tool_call_tools",
+        "step_06_recorded_tool_call_tools", "step_06_resolver_failed_tools",
+        "step_06_stage2_uninvokable_tools",
     ):
         audit[key] = sorted(set(audit.get(key) or []))
     dependency = audit.get("step_06_dependency_unavailable_tools") or []
