@@ -13,7 +13,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # set of accepted provider names. The settings layer is the single place that
 # turns user-facing forms (Gemini / GEMINI / Mock) into the lowercase
 # canonical value the rest of the codebase consumes.
-SUPPORTED_LLM_PROVIDERS: tuple[str, ...] = ("mock", "gemini", "openai")
+SUPPORTED_LLM_PROVIDERS: tuple[str, ...] = ("mock", "gemini", "openai", "qwen")
 
 
 class Settings(BaseSettings):
@@ -32,7 +32,7 @@ class Settings(BaseSettings):
 
     sqs_queue_url: str = ""
 
-    llm_provider: Literal["mock", "gemini", "openai"] = "mock"
+    llm_provider: Literal["mock", "gemini", "openai", "qwen"] = "mock"
     gemini_api_key: str = ""
     # Default updated 2026-06: Google's `gemini-1.5-pro` returns 404 unavailable
     # on the v1beta endpoint for many new keys. `gemini-3.5-flash` is the
@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     # `gpt-4.1-mini` is a small JSON-capable model. Override via env for
     # heavier benchmark runs.
     openai_model: str = "gpt-4.1-mini"
+
+    # Qwen provider — DashScope OpenAI-compatible JSON-only LLM channel.
+    qwen_api_key: str = ""
+    qwen_model: str = "qwen-plus"
+    qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
     api_key: str = "dev-key"
 
