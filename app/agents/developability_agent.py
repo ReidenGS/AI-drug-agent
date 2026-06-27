@@ -1,15 +1,16 @@
-"""DevelopabilityAgent — Step 6 with LLM-assisted progressive tool selection.
+"""DevelopabilityAgent — Step 6 schema-field mapped tool selection.
 
-The agent still owns Step 6 logic: it builds lane contexts from Step 5
-candidate records, asks the selector to choose tools from the current
-Agent/Step MCP allowed list, then calls tools only through the MCP client.
-Raw outputs are stored under `tool_outputs/step_06/{tool_call_id}.json` and
-referenced by `tool_call_records[].tool_output_ref`.
+Step 6 projects Step 5 candidate records into LLM-safe available fields and
+candidate modality summaries, discloses a modality-relevant Step 6 catalog,
+asks Stage 1 to choose relevant tools, asks Stage 2 to map tool schemas to
+field refs, then resolves raw values only at MCP-call runtime. Raw outputs
+are stored under `tool_outputs/step_06/{tool_call_id}.json` and referenced
+by `tool_call_records[].tool_output_ref`.
 """
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+from typing import Any
 
 from ..agents.tool_selection_policy import ToolInvocationPlan
 from ..agents.step_06_available_fields import project_candidate_available_fields
@@ -58,27 +59,6 @@ _LANE_TYPES: tuple[LaneType, ...] = (
 )
 
 
-def _material_types(candidate: dict) -> set[str]:
-    return {m.get("material_type") for m in (candidate.get("materials") or [])}
-
-
-def _material_value(candidate: dict, types: Iterable[str]) -> Optional[str]:
-    for m in candidate.get("materials") or []:
-        if m.get("material_type") in types:
-            value = m.get("value")
-            if value:
-                return str(value)
-    return None
-
-
-def _materials(candidate: dict) -> list[dict]:
-    return list(candidate.get("materials") or [])
-
-
-def _identifiers(candidate: dict) -> list[dict]:
-    return list(candidate.get("identifiers") or [])
-
-
 class DevelopabilityAgent:
     name = _AGENT_NAME
 
@@ -115,9 +95,7 @@ class DevelopabilityAgent:
             "step_06_registry_supported_tool_count": sum(
                 1 for c in STEP_06_CAPABILITY_REGISTRY if c.lane_type is not None
             ),
-            "step_06_runtime_eligible_tools_by_candidate_lane": {},
             "step_06_stage1_catalog_tool_names": [],
-            "step_06_stage1_allowed_tools_by_lane": {},
             "step_06_stage1_scope_tool_names": [],
             "step_06_stage1_disclosed_tool_names": [],
             "step_06_stage1_hidden_tools_with_reason": [],
@@ -128,12 +106,10 @@ class DevelopabilityAgent:
             "step_06_runtime_resolved_tools": [],
             "step_06_executed_tools": [],
             "step_06_recorded_tool_call_tools": [],
-            "step_06_suppressed_tools_with_reason": [],
             "step_06_dependency_unavailable_tools": [],
             "step_06_upstream_error_tools": [],
             "step_06_mocked_tools": [],
             "tool_selection_source_distribution": {},
-            "argument_construction_source_distribution": {},
             "argument_mapping_source_distribution": {},
         }
 
@@ -234,7 +210,6 @@ class DevelopabilityAgent:
                     if plan.argument_field_refs and tc.run_status not in {"skipped", "not_run"}:
                         selection_audit["step_06_runtime_resolved_tools"].append(plan.tool_name)
                     _increment(selection_audit["tool_selection_source_distribution"], plan.tool_selection_source)
-                    _increment(selection_audit["argument_construction_source_distribution"], plan.argument_construction_source)
                     _increment(selection_audit["argument_mapping_source_distribution"], plan.argument_construction_source)
                     if isinstance(payload, dict) and payload.get("status") == "upstream_error":
                         selection_audit["step_06_upstream_error_tools"].append(plan.tool_name)
@@ -430,58 +405,6 @@ class DevelopabilityAgent:
         ), input_status, result.get("payload")
 
 
-def _selection_context(candidate: dict, lane_type: LaneType, arg_value: str) -> SelectionContext:
-    materials = _materials(candidate)
-    identifiers = _identifiers(candidate)
-    mat_types = {m.get("material_type") for m in materials}
-    id_types = {i.get("id_type") for i in identifiers}
-
-    smiles = _first_material_value(materials, {"payload_smiles", "linker_smiles", "compound_smiles"})
-    compound_name = _first_material_value(materials, {"payload_name", "linker_name", "compound_name"})
-    sequence = _first_material_value(
-        materials,
-        {"antibody_heavy_chain_sequence", "antibody_light_chain_sequence", "target_sequence"},
-    )
-    pdb_like = _first_material_value(materials, {"structure_file", "structure_ref"})
-    uniprot = _first_identifier_value(identifiers, {"uniprot_id"})
-    chembl = _first_identifier_value(identifiers, {"chembl_id"})
-
-    signals = {
-        "smiles": bool(smiles),
-        "compound_name": bool(compound_name),
-        "protein_sequence": bool(sequence),
-        "antibody_sequence": bool(
-            mat_types.intersection({"antibody_heavy_chain_sequence", "antibody_light_chain_sequence"})
-        ),
-        "target_name": "target_antigen_name" in mat_types,
-        "uniprot_id": bool(uniprot),
-        "pdb_id": "pdb_id" in id_types,
-        "structure_file": bool(pdb_like),
-        "chembl_id": bool(chembl),
-    }
-    arg_hints: dict[str, Any] = {
-        "query": arg_value,
-        "smiles": smiles,
-        "sequence": sequence or arg_value,
-        "protein_sequence": sequence or arg_value,
-        "structure_file": pdb_like,
-        "pdb_id_or_path": pdb_like or arg_value,
-        "pdb_id": _first_identifier_value(identifiers, {"pdb_id"}) or arg_value,
-        "uniprot_id": uniprot or arg_value,
-        # `accession` mirrors uniprot_id so Stage 2 / deterministic
-        # mapping can satisfy EBIProteins_get_features / _get_epitopes,
-        # whose official TU schemas require `accession`, not `query`.
-        "accession": uniprot or arg_value,
-        "compound_name": compound_name or arg_value,
-        "chembl_id": chembl or arg_value,
-    }
-    return SelectionContext(
-        signals=signals,
-        arg_hints={k: v for k, v in arg_hints.items() if v},
-        note=f"lane_type={lane_type}; candidate_id={candidate.get('candidate_id', '')}",
-    )
-
-
 def _compose_lane_summary(
     *,
     lane_type: LaneType,
@@ -530,103 +453,6 @@ def _lane_missing_summary(lane_type: LaneType) -> str:
         "structure_interface_quality": "structure file or canonical PDB ID",
     }
     return f"no candidate inputs matched {requirements.get(lane_type, 'typed input')} family"
-
-
-def _lane_input(candidate: dict, lane_type: LaneType) -> Optional[str]:
-    """Return the typed input that can safely drive a Step 6 lane.
-
-    This intentionally does not treat display names as typed scientific
-    inputs. A payload/linker name is not a SMILES string, an antibody name
-    is not a sequence, and a target name is not a UniProt accession.
-    """
-    materials = _materials(candidate)
-    identifiers = _identifiers(candidate)
-
-    if lane_type == "payload_linker_compound_liability":
-        return _first_material_value(
-            materials, {"payload_smiles", "linker_smiles", "compound_smiles"}
-        )
-    if lane_type == "antibody_protein_sequence_liability":
-        return _first_material_value(
-            materials,
-            {
-                "antibody_heavy_chain_sequence",
-                "antibody_light_chain_sequence",
-                "target_sequence",
-            },
-        )
-    if lane_type == "antigen_protein_feature_context":
-        return _first_identifier_value(identifiers, {"uniprot_id", "accession"})
-    if lane_type == "structure_interface_quality":
-        return (
-            _first_material_value(materials, {"structure_file", "structure_ref"})
-            or _first_identifier_value(identifiers, {"pdb_id"})
-        )
-    if lane_type == "compound_bioactivity_prior_context":
-        return (
-            _first_identifier_value(identifiers, {"chembl_id"})
-            or _first_material_value(materials, {"payload_smiles", "linker_smiles", "compound_smiles"})
-        )
-    return None
-
-
-def _coverage_plan(
-    tool_name: str,
-    arg_hints: dict[str, Any],
-    *,
-    selection_source: str = "coverage_policy",
-) -> ToolInvocationPlan:
-    args = deterministic_arguments(tool_name, arg_hints)
-    return ToolInvocationPlan(
-        tool_name=tool_name,
-        selection_reason=(
-            "coverage category required by Step 6 production policy"
-            if selection_source == "coverage_policy"
-            else "deterministic fallback after Stage 1 failure or empty selection"
-        ),
-        arguments=args,
-        argument_construction_reason="registry deterministic argument mapping",
-        selected_by="deterministic_fallback",
-        tool_selection_source=selection_source,  # type: ignore[arg-type]
-        argument_construction_source="deterministic_mapping",
-        stage2_skipped=True,
-        validation_status="ok" if args else "skipped",
-    )
-
-
-def _apply_coverage_policy(
-    plans: list[ToolInvocationPlan], eligible: list[Any], arg_hints: dict[str, Any],
-) -> tuple[list[ToolInvocationPlan], list[dict]]:
-    kept: list[ToolInvocationPlan] = []
-    suppressed: list[dict] = []
-    seen_tools: set[str] = set()
-    seen_redundancy: set[str] = set()
-    for plan in sorted(plans, key=lambda p: (STEP_06_CAPABILITY_BY_TOOL.get(p.tool_name).priority if STEP_06_CAPABILITY_BY_TOOL.get(p.tool_name) else 999, p.tool_name)):
-        cap = STEP_06_CAPABILITY_BY_TOOL.get(plan.tool_name)
-        if cap is None or plan.tool_name in seen_tools:
-            continue
-        if cap.redundancy_group and cap.redundancy_group in seen_redundancy:
-            suppressed.append({
-                "tool_name": plan.tool_name,
-                "reason": f"semantic_redundancy_group:{cap.redundancy_group}",
-            })
-            continue
-        kept.append(plan)
-        seen_tools.add(plan.tool_name)
-        if cap.redundancy_group:
-            seen_redundancy.add(cap.redundancy_group)
-    covered = {
-        STEP_06_CAPABILITY_BY_TOOL[p.tool_name].coverage_category
-        for p in kept if p.validation_status != "skipped" and p.tool_name in STEP_06_CAPABILITY_BY_TOOL
-    }
-    for cap in eligible:
-        if cap.coverage_category in covered or cap.tool_name in seen_tools:
-            continue
-        plan = _coverage_plan(cap.tool_name, arg_hints)
-        kept.append(plan)
-        seen_tools.add(cap.tool_name)
-        covered.add(cap.coverage_category)
-    return kept, suppressed
 
 
 def _increment(counts: dict[str, int], key: str) -> None:
@@ -725,20 +551,6 @@ def _user_query_summary(cct: dict, candidate: dict) -> str:
         if isinstance(n, str) and len(n) <= 160
     ]
     return "; ".join([*compact_hints[:8], *notes[:4]])
-
-
-def _first_material_value(materials: list[dict], types: set[str]) -> Optional[str]:
-    for m in materials:
-        if m.get("material_type") in types and m.get("value"):
-            return str(m.get("value"))
-    return None
-
-
-def _first_identifier_value(identifiers: list[dict], types: set[str]) -> Optional[str]:
-    for i in identifiers:
-        if i.get("id_type") in types and i.get("id_value"):
-            return str(i.get("id_value"))
-    return None
 
 
 def _aggregate_lane_run_status(records: list[ToolCallRecord]) -> str:
