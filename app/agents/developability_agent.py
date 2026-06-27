@@ -723,7 +723,45 @@ def _expand_chain_sequences_for_runtime(
             updated_mapping[arg] = expanded_ref
         reason = "single-sequence antibody tool expanded across available heavy/light chain sequence fields"
         original_ref = chainable_args[next(iter(chainable_args))]
+        updated_mapping_audit: list[dict[str, Any]] = []
+        chainable_arg_set = set(chainable_args)
+        for entry in plan.argument_mapping_audit or []:
+            if not isinstance(entry, dict):
+                continue
+            updated_entry = dict(entry)
+            schema_arg = str(updated_entry.get("schema_arg") or "")
+            if schema_arg in chainable_arg_set:
+                updated_entry["field_ref"] = expanded_ref
+                updated_entry["runtime_chain_expansion"] = True
+                updated_entry["original_field_ref"] = chainable_args[schema_arg]
+                updated_entry["expanded_field_ref"] = expanded_ref
+                updated_entry["chain_role"] = chain_role
+                updated_entry["expansion_reason"] = reason
+            updated_mapping_audit.append(updated_entry)
+
+        for arg in chainable_args:
+            if not any(
+                isinstance(entry, dict) and str(entry.get("schema_arg") or "") == arg
+                for entry in updated_mapping_audit
+            ):
+                updated_mapping_audit.append({
+                    "tool_name": plan.tool_name,
+                    "schema_arg": arg,
+                    "field_ref": expanded_ref,
+                    "mapping_source": plan.argument_construction_source,
+                    "argument_mapping_reason": "",
+                    "runtime_chain_expansion": True,
+                    "original_field_ref": chainable_args[arg],
+                    "expanded_field_ref": expanded_ref,
+                    "chain_role": chain_role,
+                    "expansion_reason": reason,
+                })
+
         updated_plan = plan.model_copy(update={"argument_field_refs": updated_mapping})
+        if updated_mapping_audit:
+            updated_plan = updated_plan.model_copy(
+                update={"argument_mapping_audit": updated_mapping_audit}
+            )
         expanded.append((
             updated_plan,
             {

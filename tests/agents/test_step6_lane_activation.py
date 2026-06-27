@@ -1090,6 +1090,21 @@ def test_step6_single_sequence_tool_expands_to_both_antibody_chains(
     assert len(set(expanded_refs)) == 2
     assert all(tc["tool_input_summary"].get("runtime_chain_expansion") is True for tc in tool_calls)
     for tc in tool_calls:
+        summary = tc["tool_input_summary"]
+        expanded_ref = summary.get("expanded_field_ref")
+        assert summary["argument_field_refs"].get("sequence") == expanded_ref
+        mapping_entries = [
+            e for e in summary.get("argument_mapping_audit", [])
+            if isinstance(e, dict) and e.get("schema_arg") == "sequence"
+        ]
+        assert mapping_entries
+        assert all(e.get("field_ref") == expanded_ref for e in mapping_entries)
+        resolver_entries = [
+            e for e in summary.get("runtime_resolver_audit", [])
+            if isinstance(e, dict) and e.get("schema_arg") == "sequence"
+        ]
+        assert resolver_entries
+        assert all(e.get("field_ref") == expanded_ref for e in resolver_entries)
         assert heavy_seq not in json.dumps(tc["tool_input_summary"])
         assert light_seq not in json.dumps(tc["tool_input_summary"])
         assert tc["tool_input_summary"].get("expansion_reason") is not None
