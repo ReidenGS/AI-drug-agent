@@ -200,9 +200,10 @@ def test_step6_only_calls_step6_inventory_tools(
                 assert tc["tool_name"] in step6_tool_names, (
                     f"Step 6 agent called non-Step-6 tool: {tc['tool_name']}"
                 )
-                # Nothing the agent calls should be rejected by scope — if it
-                # were, the lane routing has a bug.
-                assert tc["run_status"] != "skipped" or lane["input_status"] == "missing"
+                # Turn B may record skipped tools when Stage 2 cannot map
+                # required args to field refs. It must still never be a
+                # Step-scope rejection.
+                assert tc.get("error_message") != "tool_not_in_agent_scope"
 
 
 # ── 4. unwired wrappers → dependency_unavailable, status partial ─────────────

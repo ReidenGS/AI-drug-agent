@@ -11,23 +11,21 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Optional
 
-from ..agents.tool_selection_policy import (
-    LaneSelectionRequest,
-    SelectionContext,
-    ToolInvocationPlan,
-    select_and_build_per_candidate_invocations,
-)
+from ..agents.tool_selection_policy import ToolInvocationPlan
+from ..agents.step_06_available_fields import project_candidate_available_fields
 from ..agents.step_06_capability_registry import (
     STEP_06_CAPABILITY_BY_TOOL,
     STEP_06_CAPABILITY_REGISTRY,
-    capabilities_for_lane,
-    deterministic_arguments,
-    eligible_capabilities,
 )
 from ..agents.step_06_interpretation import (
     aggregate_lane_risk,
     interpret_tool_payload,
     lane_summary as build_lane_summary,
+)
+from ..agents.step_06_runtime_value_resolver import resolve_runtime_value
+from ..agents.step_06_schema_mapping_selector import (
+    select_step6_schema_mapped_invocations,
+    step6_live_capability_fallback,
 )
 from ..llm.provider import LLMProvider, MockLLMProvider
 from ..mcp.client import MCPClient
@@ -120,15 +118,23 @@ class DevelopabilityAgent:
             "step_06_runtime_eligible_tools_by_candidate_lane": {},
             "step_06_stage1_catalog_tool_names": [],
             "step_06_stage1_allowed_tools_by_lane": {},
+            "step_06_stage1_scope_tool_names": [],
+            "step_06_stage1_disclosed_tool_names": [],
+            "step_06_stage1_hidden_tools_with_reason": [],
+            "step_06_stage1_disclosure_summary": {},
             "step_06_stage1_selected_tools": [],
             "step_06_stage2_schema_survivors": [],
+            "step_06_stage2_mapped_tools": [],
+            "step_06_runtime_resolved_tools": [],
             "step_06_executed_tools": [],
+            "step_06_recorded_tool_call_tools": [],
             "step_06_suppressed_tools_with_reason": [],
             "step_06_dependency_unavailable_tools": [],
             "step_06_upstream_error_tools": [],
             "step_06_mocked_tools": [],
             "tool_selection_source_distribution": {},
             "argument_construction_source_distribution": {},
+            "argument_mapping_source_distribution": {},
         }
 
         missing_input_flags: list[str] = []
@@ -139,12 +145,14 @@ class DevelopabilityAgent:
         for candidate in candidates:
             lane_results: list[LaneResult] = []
             candidate_id = candidate.get("candidate_id", "unknown")
+            projection = project_candidate_available_fields(candidate)
+            available_fields = projection.available_fields
+            modality_summary = projection.modality_summary
 
             # ── 1. Partition lanes into "skipped (missing input)" and "active". ──
-            active_specs: list[tuple[LaneType, str, SelectionContext, list[Any]]] = []
+            active_lanes: list[LaneType] = []
             for lane_type in _LANE_TYPES:
-                lane_input = _lane_input(candidate, lane_type)
-                if lane_input is None:
+                if not _lane_active_from_modality(lane_type, modality_summary):
                     lane_results.append(
                         LaneResult(
                             lane_type=lane_type,
@@ -158,103 +166,68 @@ class DevelopabilityAgent:
                         )
                     )
                     continue
-                ctx = _selection_context(candidate, lane_type, lane_input)
-                eligible, excluded = eligible_capabilities(
-                    lane_type, signals=ctx.signals, scoped_tools=scoped_tools
-                )
-                audit_key = f"{candidate_id}:{lane_type}"
-                selection_audit["step_06_runtime_eligible_tools_by_candidate_lane"][audit_key] = [
-                    c.tool_name for c in eligible
-                ]
-                for item in excluded:
-                    if item.get("reason") == "dependency_unavailable":
-                        selection_audit["step_06_dependency_unavailable_tools"].append({
-                            "candidate_id": candidate_id, "lane_type": lane_type, **item,
-                        })
-                if not eligible:
-                    lane_results.append(LaneResult(
-                        lane_type=lane_type,
-                        run_status="skipped",
-                        input_status="insufficient",
-                        lane_summary="typed input present but no runtime-eligible Step 6 capability",
-                    ))
-                    continue
-                active_specs.append((lane_type, lane_input, ctx, eligible))
+                active_lanes.append(lane_type)
 
             # ── 2. One Stage 1 + one Stage 2 LLM call across all active lanes. ──
             plans_by_lane: dict[str, list[ToolInvocationPlan]] = {}
-            if active_specs:
-                requests: list[LaneSelectionRequest] = []
-                for (lane_type, _arg_value, ctx, eligible) in active_specs:
-                    names = [c.tool_name for c in eligible]
-                    selection_audit["step_06_stage1_catalog_tool_names"].extend(names)
-                    selection_audit["step_06_stage1_allowed_tools_by_lane"][
-                        f"{candidate_id}:{lane_type}"
-                    ] = names
-                    requests.append(
-                        LaneSelectionRequest(
-                            lane_type=lane_type,
-                            allowed_tools=names,
-                            signals=dict(ctx.signals),
-                            arg_hints=dict(ctx.arg_hints),
-                        )
-                    )
-
-                eligible_by_lane = {lane_type: eligible for lane_type, _v, _c, eligible in active_specs}
-                ctx_by_lane = {lane_type: ctx for lane_type, _v, ctx, _e in active_specs}
-
-                def _deterministic_for_lane(lt: str) -> list[ToolInvocationPlan]:
-                    return [
-                        _coverage_plan(
-                            cap.tool_name, ctx_by_lane[lt].arg_hints,
-                            selection_source="deterministic_fallback",
-                        )
-                        for cap in eligible_by_lane[lt]
-                    ]
-
-                plans_by_lane = select_and_build_per_candidate_invocations(
+            if active_lanes:
+                plans_by_lane, disclosure, selector_audit = select_step6_schema_mapped_invocations(
                     agent_name=_AGENT_NAME,
                     step_id=_STEP_ID,
                     mcp_client=self.mcp_client,
                     llm=self.llm,
                     candidate_id=candidate_id,
-                    lanes=requests,
-                    deterministic_fallback=_deterministic_for_lane,
-                    deterministic_argument_mapping=deterministic_arguments,
+                    available_fields=available_fields,
+                    modality_summary=modality_summary,
+                    user_query_summary=_user_query_summary(cct, candidate),
+                    deterministic_fallback=step6_live_capability_fallback,
                 )
-                for lane_type, _v, ctx, eligible in active_specs:
-                    plans, suppressed = _apply_coverage_policy(
-                        plans_by_lane.get(lane_type) or [], eligible, ctx.arg_hints
-                    )
-                    plans_by_lane[lane_type] = plans
-                    selection_audit["step_06_suppressed_tools_with_reason"].extend(
-                        {"candidate_id": candidate_id, "lane_type": lane_type, **s}
-                        for s in suppressed
-                    )
+                selection_audit["step_06_stage1_scope_tool_names"].extend(disclosure.scoped_tool_names)
+                selection_audit["step_06_stage1_catalog_tool_names"].extend(disclosure.disclosed_tool_names)
+                selection_audit["step_06_stage1_disclosed_tool_names"].extend(disclosure.disclosed_tool_names)
+                selection_audit["step_06_stage1_hidden_tools_with_reason"].extend(
+                    {"candidate_id": candidate_id, **item}
+                    for item in disclosure.hidden_tools_with_reason
+                )
+                selection_audit["step_06_stage1_disclosure_summary"][candidate_id] = {
+                    **disclosure.disclosure_summary,
+                    "disclosure_tags": disclosure.disclosure_tags,
+                }
+                selection_audit["step_06_stage1_selected_tools"].extend(
+                    selector_audit.get("stage1_selected_tools") or []
+                )
+                selection_audit["step_06_stage2_schema_survivors"].extend(
+                    selector_audit.get("stage2_schema_survivors") or []
+                )
+                selection_audit["step_06_stage2_mapped_tools"].extend(
+                    selector_audit.get("stage2_mapped_tools") or []
+                )
 
             # ── 3. Execute the plans lane by lane and assemble lane results. ────
-            for (lane_type, _arg_value, _ctx, eligible) in active_specs:
-                plans = plans_by_lane.get(lane_type) or [
-                    _coverage_plan(cap.tool_name, _ctx.arg_hints) for cap in eligible
-                ]
+            for lane_type in active_lanes:
+                plans = plans_by_lane.get(lane_type) or []
 
                 tool_records: list[ToolCallRecord] = []
                 lane_flags: list[dict] = []
                 lane_input_status = "insufficient"
+                argument_mapping_audit: list[dict] = []
                 for plan in plans:
-                    if plan.tool_selection_source == "llm_stage1":
-                        selection_audit["step_06_stage1_selected_tools"].append(plan.tool_name)
-                        if plan.validation_status != "skipped":
-                            selection_audit["step_06_stage2_schema_survivors"].append(plan.tool_name)
+                    argument_mapping_audit.extend(plan.argument_mapping_audit)
                     tc, one_input_status, payload = self._call_lane_plan(
                         run_id=run_id,
                         candidate_id=candidate_id,
+                        candidate=candidate,
                         plan=plan,
                     )
                     tool_records.append(tc)
-                    selection_audit["step_06_executed_tools"].append(plan.tool_name)
+                    selection_audit["step_06_recorded_tool_call_tools"].append(plan.tool_name)
+                    if tc.run_status not in {"skipped", "not_run"}:
+                        selection_audit["step_06_executed_tools"].append(plan.tool_name)
+                    if plan.argument_field_refs and tc.run_status not in {"skipped", "not_run"}:
+                        selection_audit["step_06_runtime_resolved_tools"].append(plan.tool_name)
                     _increment(selection_audit["tool_selection_source_distribution"], plan.tool_selection_source)
                     _increment(selection_audit["argument_construction_source_distribution"], plan.argument_construction_source)
+                    _increment(selection_audit["argument_mapping_source_distribution"], plan.argument_construction_source)
                     if isinstance(payload, dict) and payload.get("status") == "upstream_error":
                         selection_audit["step_06_upstream_error_tools"].append(plan.tool_name)
                     if isinstance(payload, dict) and payload.get("status") == "mocked":
@@ -286,6 +259,7 @@ class DevelopabilityAgent:
                         input_status=lane_input_status,
                         selected_tools=[p.tool_name for p in plans],
                         tool_call_records=tool_records,
+                        argument_mapping_audit=argument_mapping_audit,
                         liability_flags=lane_flags,
                         lane_risk_category=aggregate_lane_risk(
                             lane_flags,
@@ -357,13 +331,32 @@ class DevelopabilityAgent:
         *,
         run_id: str,
         candidate_id: str,
+        candidate: dict,
         plan: ToolInvocationPlan,
     ) -> tuple[ToolCallRecord, str, Any]:
         tc_id = new_tool_call_id()
         started = now_iso()
-        input_status = "sufficient" if plan.arguments else "insufficient"
+        runtime_arguments: dict[str, Any] = {}
+        resolver_audit: list[dict] = []
+        unresolved: list[str] = []
+        for arg_name, field_ref in sorted((plan.argument_field_refs or {}).items()):
+            resolved = resolve_runtime_value(candidate=candidate, field_ref=field_ref)
+            resolver_audit.append({
+                "schema_arg": arg_name,
+                "field_ref": field_ref,
+                "resolve_status": resolved.status,
+                "audit_metadata": resolved.audit_metadata,
+                "error_message": resolved.error_message,
+            })
+            if resolved.status == "resolved" and resolved.raw_value not in (None, ""):
+                runtime_arguments[arg_name] = resolved.raw_value
+            else:
+                unresolved.append(arg_name)
+        if not plan.argument_field_refs:
+            runtime_arguments = dict(plan.arguments)
+        input_status = "sufficient" if runtime_arguments else "insufficient"
 
-        if plan.validation_status == "skipped":
+        if plan.validation_status == "skipped" or unresolved:
             finished = now_iso()
             return ToolCallRecord(
                 tool_call_id=tc_id,
@@ -373,15 +366,21 @@ class DevelopabilityAgent:
                 run_status="skipped",
                 started_at=started,
                 finished_at=finished,
-                tool_input_summary=_tool_input_summary(plan, candidate_id),
-                error_message="tool invocation plan validation_status=skipped",
+                tool_input_summary=_tool_input_summary(
+                    plan, candidate_id, resolver_audit=resolver_audit
+                ),
+                error_message=(
+                    "tool invocation plan validation_status=skipped"
+                    if plan.validation_status == "skipped"
+                    else f"runtime field_ref unresolved for args: {sorted(unresolved)}"
+                ),
             ), input_status, None
 
         result = self.mcp_client.call_tool(
             agent_name=_AGENT_NAME,
             step_id=_STEP_ID,
             tool_name=plan.tool_name,
-            **plan.arguments,
+            **runtime_arguments,
         )
         finished = now_iso()
 
@@ -398,7 +397,9 @@ class DevelopabilityAgent:
                     "tool_call_id": tc_id,
                     "candidate_id": candidate_id,
                     "tool_name": plan.tool_name,
-                    "input": plan.arguments,
+                    "input": _tool_input_summary(
+                        plan, candidate_id, resolver_audit=resolver_audit
+                    ),
                     "output": result["payload"],
                 },
             )
@@ -412,7 +413,9 @@ class DevelopabilityAgent:
             run_status=result.get("run_status", "pending"),
             started_at=started,
             finished_at=finished,
-            tool_input_summary=_tool_input_summary(plan, candidate_id),
+            tool_input_summary=_tool_input_summary(
+                plan, candidate_id, resolver_audit=resolver_audit
+            ),
             tool_output_artifact_id=output_artifact_id,
             tool_output_ref=output_ref,
             error_message=result.get("error_message"),
@@ -627,6 +630,9 @@ def _finalize_selection_audit(audit: dict[str, Any]) -> dict[str, Any]:
         "step_06_stage1_catalog_tool_names", "step_06_stage1_selected_tools",
         "step_06_stage2_schema_survivors", "step_06_executed_tools",
         "step_06_upstream_error_tools", "step_06_mocked_tools",
+        "step_06_stage1_scope_tool_names", "step_06_stage1_disclosed_tool_names",
+        "step_06_stage2_mapped_tools", "step_06_runtime_resolved_tools",
+        "step_06_recorded_tool_call_tools",
     ):
         audit[key] = sorted(set(audit.get(key) or []))
     dependency = audit.get("step_06_dependency_unavailable_tools") or []
@@ -637,7 +643,12 @@ def _finalize_selection_audit(audit: dict[str, Any]) -> dict[str, Any]:
     return audit
 
 
-def _tool_input_summary(plan: ToolInvocationPlan, candidate_id: str) -> dict[str, Any]:
+def _tool_input_summary(
+    plan: ToolInvocationPlan,
+    candidate_id: str,
+    *,
+    resolver_audit: list[dict] | None = None,
+) -> dict[str, Any]:
     return {
         **{k: _short(v) for k, v in plan.arguments.items()},
         "candidate_id": candidate_id,
@@ -650,7 +661,62 @@ def _tool_input_summary(plan: ToolInvocationPlan, candidate_id: str) -> dict[str
         "argument_construction_reason": plan.argument_construction_reason,
         "validation_status": plan.validation_status,
         "validation_warnings": plan.validation_warnings,
+        "argument_field_refs": dict(plan.argument_field_refs),
+        "argument_mapping_audit": list(plan.argument_mapping_audit),
+        "missing_required_fields": list(plan.missing_required_fields),
+        "runtime_resolver_audit": resolver_audit or [],
     }
+
+
+def _lane_active_from_modality(lane_type: LaneType, modality_summary: Any) -> bool:
+    if lane_type == "payload_linker_compound_liability":
+        return bool(
+            modality_summary.has_payload_smiles
+            or modality_summary.has_linker_smiles
+            or modality_summary.has_compound_smiles
+        )
+    if lane_type == "compound_bioactivity_prior_context":
+        return bool(
+            modality_summary.has_payload_smiles
+            or modality_summary.has_linker_smiles
+            or modality_summary.has_compound_smiles
+            or modality_summary.has_compound_identifier
+        )
+    if lane_type == "antibody_protein_sequence_liability":
+        return bool(
+            modality_summary.has_antibody_heavy_sequence
+            or modality_summary.has_antibody_light_sequence
+            or modality_summary.has_antibody_sequence
+            or modality_summary.has_antigen_sequence
+            or modality_summary.has_protein_sequence
+            or modality_summary.has_uploaded_fasta_ref
+            or modality_summary.has_cdr3_ref_or_marker
+        )
+    if lane_type == "antigen_protein_feature_context":
+        return bool(modality_summary.has_uniprot_id)
+    if lane_type == "structure_interface_quality":
+        return bool(
+            modality_summary.has_pdb_id
+            or modality_summary.has_uploaded_structure_ref
+        )
+    return False
+
+
+def _user_query_summary(cct: dict, candidate: dict) -> str:
+    hints = cct.get("downstream_query_hints") or []
+    compact_hints = []
+    for item in hints:
+        if not isinstance(item, dict):
+            continue
+        entity = item.get("entity")
+        role = item.get("role")
+        if entity and role:
+            compact_hints.append(f"{role}:{entity}")
+    notes = [
+        n for n in (candidate.get("context_notes") or [])
+        if isinstance(n, str) and len(n) <= 160
+    ]
+    return "; ".join([*compact_hints[:8], *notes[:4]])
 
 
 def _first_material_value(materials: list[dict], types: set[str]) -> Optional[str]:

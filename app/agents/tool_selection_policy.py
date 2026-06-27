@@ -225,6 +225,9 @@ class ToolInvocationPlan(BaseModel):
     selection_policy_version: str = SELECTION_POLICY_VERSION
     validation_status: Literal["ok", "warning", "skipped"] = "ok"
     validation_warnings: list[str] = Field(default_factory=list)
+    argument_field_refs: dict[str, str] = Field(default_factory=dict)
+    argument_mapping_audit: list[dict] = Field(default_factory=list)
+    missing_required_fields: list[str] = Field(default_factory=list)
 
 
 @dataclass(slots=True)

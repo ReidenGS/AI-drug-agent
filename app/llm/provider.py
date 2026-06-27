@@ -157,6 +157,82 @@ def _mock_stage2_arguments(schema: dict) -> dict:
     }
 
 
+def _mock_step6_schema_mapping_stage1(schema: dict) -> dict:
+    catalog = schema.get("compact_catalog") or []
+    return {
+        "selections": [
+            {
+                "tool_name": entry.get("tool_name"),
+                "selection_reason": "mock selected disclosed Step 6 tool",
+                "priority": 1,
+            }
+            for entry in catalog
+            if isinstance(entry, dict) and entry.get("tool_name")
+        ],
+        "selection_metadata": {"strategy": "mock_select_disclosed_catalog"},
+    }
+
+
+def _mock_step6_schema_mapping_stage2(schema: dict) -> dict:
+    fields = schema.get("candidate_available_fields") or []
+    tools = schema.get("tools") or []
+
+    def match_field(arg_name: str) -> dict | None:
+        lowered = arg_name.lower()
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            value_kind = field.get("value_kind")
+            id_type = field.get("id_type")
+            field_type = field.get("field_type")
+            if lowered in {"smiles", "canonical_smiles"} and value_kind == "smiles":
+                return field
+            if lowered in {"pdb_id", "pdb"} and id_type == "pdb_id":
+                return field
+            if lowered in {"pdb_id_or_path", "structure_file", "structure_ref"} and (
+                id_type == "pdb_id" or value_kind == "structure_ref"
+            ):
+                return field
+            if lowered in {"sequence", "protein_sequence"} and (
+                field_type == "protein_sequence" and value_kind == "protein_sequence"
+            ):
+                return field
+            if lowered in {"accession", "uniprot_id", "uniprot_accession"} and id_type == "uniprot_id":
+                return field
+            if lowered in {"molecule_chembl_id", "chembl_id"} and id_type == "chembl_id":
+                return field
+        return None
+
+    out: list[dict] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        schema_obj = tool.get("full_schema") or {}
+        required = list(schema_obj.get("required") or [])
+        properties = schema_obj.get("properties") or {}
+        mapping: dict[str, str] = {}
+        missing: list[str] = []
+        for arg_name in required:
+            field = match_field(str(arg_name))
+            if field is None:
+                missing.append(str(arg_name))
+            else:
+                mapping[str(arg_name)] = field["field_ref"]
+        if not required:
+            for arg_name in properties:
+                field = match_field(str(arg_name))
+                if field is not None:
+                    mapping[str(arg_name)] = field["field_ref"]
+        out.append({
+            "tool_name": tool.get("tool_name"),
+            "can_invoke": not missing and bool(mapping),
+            "argument_mapping": mapping,
+            "missing_required_fields": missing,
+            "argument_mapping_reason": "mock mapped schema args to available field refs",
+        })
+    return {"tools": out}
+
+
 _TARGET_HINTS = (
     "HER2", "EGFR", "TROP2", "BCMA", "CD19", "CD20", "CD22", "CD33", "CD30", "CD79",
     "Nectin-4", "B7-H3", "FOLR1", "MET", "MUC1", "ROR1", "PSMA", "Claudin18.2",
@@ -267,6 +343,10 @@ class MockLLMProvider:
             return _mock_stage1_multi_lane(schema)
         if task == "tool_selection_stage_2_multi_tool":
             return _mock_stage2_multi_tool(schema)
+        if task == "step6_schema_mapping_stage_1":
+            return _mock_step6_schema_mapping_stage1(schema)
+        if task == "step6_schema_mapping_stage_2":
+            return _mock_step6_schema_mapping_stage2(schema)
 
         raw = (schema or {}).get("raw_request_record") or {}
         ctx = raw.get("user_provided_context") or {}

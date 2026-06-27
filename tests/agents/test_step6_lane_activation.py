@@ -205,7 +205,11 @@ def test_step6_smiles_runs_bindingdb_prior_without_chembl_id(
     assert bio["input_status"] == "sufficient"
     names = {tc["tool_name"] for tc in bio["tool_call_records"]}
     assert "BindingDB_get_targets_by_compound" in names
-    assert "ChEMBL_search_activities" not in names
+    successful_names = {
+        tc["tool_name"] for tc in bio["tool_call_records"]
+        if tc["run_status"] == "success"
+    }
+    assert "ChEMBL_search_activities" not in successful_names
 
 
 # ── 1. payload SMILES only → compound liability + bioactivity lanes only ────
@@ -488,20 +492,18 @@ class _OutOfScopeLLM:
 
     def generate_json(self, prompt: str, *, schema: dict, system: str | None = None) -> dict:
         task = (schema or {}).get("task")
-        if task in {"tool_selection_stage_1", "tool_selection_stage_1_multi_lane"}:
+        if task in {"tool_selection_stage_1", "tool_selection_stage_1_multi_lane", "step6_schema_mapping_stage_1"}:
             # Try to pick clearly out-of-scope Step 13 / Step 14 tool names
             # plus a hallucinated one. None is in the Step 6 catalog, so the
             # per-candidate selector must drop all and fall back deterministically.
-            lanes = (schema or {}).get("lanes") or [{"lane_type": "payload_linker_compound_liability"}]
-            lt = lanes[0].get("lane_type") if lanes else "payload_linker_compound_liability"
             return {
                 "selections": [
-                    {"lane_type": lt, "tool_name": "MultiAgentLiteratureSearch", "selection_reason": "step13"},
-                    {"lane_type": lt, "tool_name": "FDA_OrangeBook_get_patent_info", "selection_reason": "step14"},
-                    {"lane_type": lt, "tool_name": "TotallyHallucinatedTool", "selection_reason": "halluc"},
+                    {"tool_name": "MultiAgentLiteratureSearch", "selection_reason": "step13"},
+                    {"tool_name": "FDA_OrangeBook_get_patent_info", "selection_reason": "step14"},
+                    {"tool_name": "TotallyHallucinatedTool", "selection_reason": "halluc"},
                 ]
             }
-        if task in {"tool_selection_stage_2", "tool_selection_stage_2_multi_tool"}:
+        if task in {"tool_selection_stage_2", "tool_selection_stage_2_multi_tool", "step6_schema_mapping_stage_2"}:
             return {"arguments": {}, "argument_construction_reason": "", "tools": []}
         return {}
 
@@ -551,8 +553,9 @@ def test_step6_fake_llm_out_of_scope_tool_is_not_executed(
         assert forbidden not in called, (
             f"Step 6 must never call {forbidden}; got tool call set {called}"
         )
-    # And the deterministic fallback DID run.
-    assert "DrugProps_pains_filter" in called
+    # Turn B respects cleaned-empty selections instead of silently falling
+    # back to a deterministic tool execution.
+    assert "DrugProps_pains_filter" not in called
 
 
 # ── 7. Stage 1 / Stage 2 LLM payload boundary (catalog only, no _live) ──────
@@ -576,24 +579,27 @@ class _RecordingLLM:
     def generate_json(self, prompt: str, *, schema: dict, system: str | None = None) -> dict:
         self.calls.append({"system": system, "schema": schema})
         task = (schema or {}).get("task")
-        if task == "tool_selection_stage_1_multi_lane":
-            lanes = (schema or {}).get("lanes") or []
-            lt = lanes[0].get("lane_type") if lanes else "payload_linker_compound_liability"
+        if task == "step6_schema_mapping_stage_1":
             return {
                 "selections": [
-                    {"lane_type": lt, "tool_name": "DrugProps_pains_filter",
+                    {"tool_name": "DrugProps_pains_filter",
                      "selection_reason": "test"}
                 ]
             }
-        if task == "tool_selection_stage_2_multi_tool":
+        if task == "step6_schema_mapping_stage_2":
             tools = (schema or {}).get("tools") or []
+            field_ref = next(
+                f["field_ref"] for f in schema.get("candidate_available_fields", [])
+                if f.get("value_kind") == "smiles"
+            )
             out = []
             for t in tools:
                 out.append({
-                    "lane_type": t.get("lane_type"),
                     "tool_name": t.get("tool_name"),
-                    "arguments": {"smiles": "CCO"},
-                    "argument_construction_reason": "ok",
+                    "can_invoke": True,
+                    "argument_mapping": {"smiles": field_ref},
+                    "missing_required_fields": [],
+                    "argument_mapping_reason": "ok",
                 })
             return {"tools": out}
         return {}
@@ -607,16 +613,31 @@ class _SelectAllEligibleLLM:
         raise NotImplementedError
 
     def generate_json(self, prompt: str, *, schema: dict, system: str | None = None) -> dict:
-        if schema.get("task") == "tool_selection_stage_1_multi_lane":
+        if schema.get("task") == "step6_schema_mapping_stage_1":
             return {
                 "selections": [
                     {
-                        "lane_type": lane["lane_type"],
-                        "tool_name": tool_name,
+                        "tool_name": entry["tool_name"],
                         "selection_reason": "complementary production coverage",
                     }
-                    for lane in schema.get("lanes") or []
-                    for tool_name in lane.get("allowed_tools") or []
+                    for entry in schema.get("compact_catalog") or []
+                ]
+            }
+        if schema.get("task") == "step6_schema_mapping_stage_2":
+            field_ref = next(
+                f["field_ref"] for f in schema.get("candidate_available_fields", [])
+                if f.get("value_kind") == "smiles"
+            )
+            return {
+                "tools": [
+                    {
+                        "tool_name": tool["tool_name"],
+                        "can_invoke": True,
+                        "argument_mapping": {"smiles": field_ref},
+                        "missing_required_fields": [],
+                        "argument_mapping_reason": "test",
+                    }
+                    for tool in schema.get("tools") or []
                 ]
             }
         return {"tools": []}
@@ -639,13 +660,15 @@ def test_step6_five_complementary_smiles_tools_are_not_truncated(
         local_storage.run_key(run_id, "structured_liability_summary.json")
     )
     lane = _lane_results(persisted)["payload_linker_compound_liability"]
-    assert set(lane["selected_tools"]) == {
+    selected = set(lane["selected_tools"])
+    assert {
         "DrugProps_pains_filter",
         "DrugProps_lipinski_filter",
         "DrugProps_calculate_qed",
         "SwissADME_calculate_adme",
         "SwissADME_check_druglikeness",
-    }
+    } <= selected
+    assert "ADMETAI_predict_toxicity" in selected
 
 
 def test_step6_tool_selection_prompt_hides_live_and_uses_progressive_disclosure(
@@ -663,16 +686,16 @@ def test_step6_tool_selection_prompt_hides_live_and_uses_progressive_disclosure(
         llm=llm,
     ).run(run_id)
 
-    stage1 = [c for c in llm.calls if c["schema"].get("task") == "tool_selection_stage_1_multi_lane"]
-    stage2 = [c for c in llm.calls if c["schema"].get("task") == "tool_selection_stage_2_multi_tool"]
-    # Stage 1 must fire exactly once per candidate. Stage 2 may be skipped
-    # when deterministic argument mapping already satisfies required args.
+    stage1 = [c for c in llm.calls if c["schema"].get("task") == "step6_schema_mapping_stage_1"]
+    stage2 = [c for c in llm.calls if c["schema"].get("task") == "step6_schema_mapping_stage_2"]
+    # Stage 1 must fire exactly once per candidate. Stage 2 maps selected
+    # tool schemas to candidate_available_fields refs.
     assert stage1
 
-    # Stage 1 payload: compact catalog + per-lane signals; no full_schema, no `_live`.
+    # Stage 1 payload: disclosed compact catalog + safe candidate fields; no full_schema, no `_live`.
     for c in stage1:
         sc = c["schema"]
-        assert "compact_catalog" in sc and "lanes" in sc
+        assert "compact_catalog" in sc and "candidate_available_fields" in sc
         assert "full_schema" not in sc
         blob = str(sc)
         assert "_live" not in blob
@@ -680,11 +703,9 @@ def test_step6_tool_selection_prompt_hides_live_and_uses_progressive_disclosure(
             assert set(entry) == {
                 "tool_name", "short_description", "capability_tags",
                 "coarse_input_requirements", "step_id", "agent_name",
-            }
-        # Per-lane allowed_tools must stay inside the Step 6 catalog.
-        for lane in sc["lanes"]:
-            for t in lane.get("allowed_tools") or []:
-                assert t in _STEP6_VALID_TOOLS
+        }
+        for entry in sc["compact_catalog"]:
+            assert entry["tool_name"] in _STEP6_VALID_TOOLS
 
     # Stage 2 payload (if fired): per-tool schema; `_live` never exposed.
     for c in stage2:
@@ -697,11 +718,11 @@ def test_step6_tool_selection_prompt_hides_live_and_uses_progressive_disclosure(
             assert "_live" not in (full_schema.get("properties") or {})
 
 
-# ── Stage 2 is SKIPPED when deterministic mapping satisfies required args ──
+# ── Stage 2 maps schema args to field refs ─────────────────────────────────
 
 
 class _DeterministicProbeLLM:
-    """Stage 1 picks one tool; Stage 2 is never expected to be called."""
+    """Stage 1 picks one tool; Stage 2 maps its arg to a field_ref."""
     name = "det_probe"
     model = "test"
 
@@ -714,30 +735,33 @@ class _DeterministicProbeLLM:
     def generate_json(self, prompt, *, schema, system=None):
         task = (schema or {}).get("task") or ""
         self.tasks.append(task)
-        if task == "tool_selection_stage_1_multi_lane":
-            lanes = (schema or {}).get("lanes") or []
-            lt = lanes[0].get("lane_type") if lanes else "payload_linker_compound_liability"
+        if task == "step6_schema_mapping_stage_1":
             return {
                 "selections": [
-                    {"lane_type": lt, "tool_name": "DrugProps_pains_filter",
+                    {"tool_name": "DrugProps_pains_filter",
                      "selection_reason": "smiles available"}
                 ]
             }
-        if task == "tool_selection_stage_2_multi_tool":
-            # If Stage 2 fires we want to spot it; return empty so the
-            # agent surface still falls through to deterministic for
-            # safety, but the test asserts this branch never executes.
-            return {"tools": []}
+        if task == "step6_schema_mapping_stage_2":
+            field_ref = next(
+                f["field_ref"] for f in schema.get("candidate_available_fields", [])
+                if f.get("value_kind") == "smiles"
+            )
+            return {"tools": [{
+                "tool_name": "DrugProps_pains_filter",
+                "can_invoke": True,
+                "argument_mapping": {"smiles": field_ref},
+                "missing_required_fields": [],
+                "argument_mapping_reason": "test mapping",
+            }]}
         return {}
 
 
-def test_step6_skips_stage2_when_deterministic_satisfies_required_args(
+def test_step6_stage2_maps_required_args_to_field_refs(
     local_storage, registry_service, workflow_state_service
 ):
-    """For DrugProps_pains_filter the deterministic mapping already
-    returns ``{"smiles": <value>}`` which satisfies the schema's single
-    required field. The per-candidate selector must therefore SKIP the
-    Stage 2 LLM round-trip entirely."""
+    """Stage 2 now emits schema-arg → field_ref mapping; raw values are
+    resolved only at runtime."""
     llm = _DeterministicProbeLLM()
     run_id = _seed_synthetic_cct(
         local_storage, registry_service, workflow_state_service,
@@ -749,10 +773,8 @@ def test_step6_skips_stage2_when_deterministic_satisfies_required_args(
         mcp_client=LocalMCPClient(bindings=_bindings(_DEFAULT_OK_BINDINGS)),
         llm=llm,
     ).run(run_id)
-    assert llm.tasks.count("tool_selection_stage_1_multi_lane") == 1
-    assert llm.tasks.count("tool_selection_stage_2_multi_tool") == 0, (
-        f"Stage 2 should have been skipped; tasks={llm.tasks}"
-    )
+    assert llm.tasks.count("step6_schema_mapping_stage_1") == 1
+    assert llm.tasks.count("step6_schema_mapping_stage_2") == 1
 
     # And the plan still ran via deterministic args, not skipped.
     persisted = local_storage.read_json(
@@ -768,7 +790,7 @@ def test_step6_skips_stage2_when_deterministic_satisfies_required_args(
         for tc in lane["tool_call_records"]
         if tc.get("tool_name") == "DrugProps_pains_filter"
     }
-    assert ("llm_stage1", "deterministic_mapping") in provenance
+    assert ("llm_stage1", "llm_stage2") in provenance
 
 
 # ── LLM call-count budget (per-candidate Stage1 + Stage2) ───────────────────
@@ -782,12 +804,16 @@ class _CountingLLM:
     def __init__(self) -> None:
         self.tasks: list[str] = []
         from app.llm.provider import (  # noqa: PLC0415
+            _mock_step6_schema_mapping_stage1,
+            _mock_step6_schema_mapping_stage2,
             _mock_stage1_multi_lane,
             _mock_stage2_multi_tool,
             _mock_stage1_selection,
             _mock_stage2_arguments,
         )
         self._dispatch = {
+            "step6_schema_mapping_stage_1": _mock_step6_schema_mapping_stage1,
+            "step6_schema_mapping_stage_2": _mock_step6_schema_mapping_stage2,
             "tool_selection_stage_1_multi_lane": _mock_stage1_multi_lane,
             "tool_selection_stage_2_multi_tool": _mock_stage2_multi_tool,
             "tool_selection_stage_1": _mock_stage1_selection,
@@ -834,14 +860,16 @@ def test_step6_one_candidate_multi_lane_makes_at_most_one_stage1_and_one_stage2(
         llm=llm,
     ).run(run_id)
 
-    stage1 = sum(1 for t in llm.tasks if t == "tool_selection_stage_1_multi_lane")
-    stage2 = sum(1 for t in llm.tasks if t == "tool_selection_stage_2_multi_tool")
+    stage1 = sum(1 for t in llm.tasks if t == "step6_schema_mapping_stage_1")
+    stage2 = sum(1 for t in llm.tasks if t == "step6_schema_mapping_stage_2")
     # Single candidate ⇒ exactly one Stage 1, at most one Stage 2.
     assert stage1 == 1, f"expected 1 Stage 1 call, got {stage1} (tasks={llm.tasks})"
     assert stage2 <= 1, f"expected ≤1 Stage 2 call, got {stage2} (tasks={llm.tasks})"
     # And no legacy per-lane / per-tool task names.
     assert "tool_selection_stage_1" not in llm.tasks
     assert "tool_selection_stage_2" not in llm.tasks
+    assert "tool_selection_stage_1_multi_lane" not in llm.tasks
+    assert "tool_selection_stage_2_multi_tool" not in llm.tasks
 
 
 def _seed_n_candidates(
@@ -909,8 +937,8 @@ def test_step6_five_candidates_stay_under_ten_llm_calls(
         mcp_client=LocalMCPClient(bindings=_bindings(_DEFAULT_OK_BINDINGS)),
         llm=llm,
     ).run(run_id)
-    stage1 = sum(1 for t in llm.tasks if t == "tool_selection_stage_1_multi_lane")
-    stage2 = sum(1 for t in llm.tasks if t == "tool_selection_stage_2_multi_tool")
+    stage1 = sum(1 for t in llm.tasks if t == "step6_schema_mapping_stage_1")
+    stage2 = sum(1 for t in llm.tasks if t == "step6_schema_mapping_stage_2")
     assert stage1 == 5
     assert stage2 <= 5
     assert stage1 + stage2 <= 10
@@ -1036,16 +1064,14 @@ def test_step6_stage2_missing_required_args_does_not_crash(
 
         def generate_json(self, prompt, *, schema, system=None):
             task = (schema or {}).get("task")
-            if task == "tool_selection_stage_1_multi_lane":
-                lanes = (schema or {}).get("lanes") or []
-                lt = lanes[0].get("lane_type") if lanes else "payload_linker_compound_liability"
+            if task == "step6_schema_mapping_stage_1":
                 return {
                     "selections": [
-                        {"lane_type": lt, "tool_name": "DrugProps_pains_filter",
+                        {"tool_name": "DrugProps_pains_filter",
                          "selection_reason": "ok"}
                     ]
                 }
-            if task == "tool_selection_stage_2_multi_tool":
+            if task == "step6_schema_mapping_stage_2":
                 # Refuse to provide any arguments.
                 return {"tools": []}
             return {}
@@ -1060,9 +1086,9 @@ def test_step6_stage2_missing_required_args_does_not_crash(
         mcp_client=LocalMCPClient(bindings=_bindings(_DEFAULT_OK_BINDINGS)),
         llm=_EmptyStage2LLM(),
     ).run(run_id)
-    # No crash — agent should have completed Step 6 successfully via the
-    # deterministic argument mapping for DrugProps_pains_filter.
+    # No crash — valid Stage 2 can_invoke=false / omitted mapping is
+    # respected, so the step may finish with only missing lanes.
     persisted = local_storage.read_json(
         local_storage.run_key(run_id, "structured_liability_summary.json")
     )
-    assert persisted["prefilter_status"] in {"completed", "partial"}
+    assert persisted["prefilter_status"] in {"completed", "partial", "completed_with_missing_lanes"}
