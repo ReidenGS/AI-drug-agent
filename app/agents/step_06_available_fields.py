@@ -381,6 +381,8 @@ def _is_ref_shaped_material(material: dict[str, Any]) -> bool:
     value = str(material.get("value") or "")
     value_format = str(material.get("value_format") or "").lower()
     mt = str(material.get("material_type") or "")
+    if mt in {"payload_smiles", "linker_smiles", "compound_smiles"}:
+        return False
     if mt in {"structure_file", "structure_ref"}:
         return True
     if value_format in {"fasta", "pdb", "cif", "mmcif", "file", "path", "storage_ref"}:

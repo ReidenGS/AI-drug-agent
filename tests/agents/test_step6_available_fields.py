@@ -183,6 +183,38 @@ def test_identifiers_and_smiles_have_typed_transforms_without_value_leakage():
     assert projection.modality_summary.has_pdb_id is True
 
 
+def test_slash_stereochemistry_smiles_are_inline_not_refs():
+    stereo_smiles = "C/C=C\\C"
+    candidate = _candidate(
+        materials=[
+            _material("mat_payload_stereo", "payload_smiles", stereo_smiles, role="payload"),
+            _material("mat_linker_stereo", "linker_smiles", stereo_smiles, role="linker"),
+            _material("mat_compound_stereo", "compound_smiles", stereo_smiles, role="compound"),
+            _material("mat_pdb_ref", "structure_ref", PDB_PATH, value_format="pdb"),
+            _material("mat_fasta_ref", "antibody_heavy_chain_sequence", FASTA_PATH, value_format="fasta"),
+        ]
+    )
+    projection = project_candidate_available_fields(candidate)
+    for material_type in ("payload_smiles", "linker_smiles", "compound_smiles"):
+        field = _field(projection.available_fields, material_type=material_type)
+        assert field.value_kind == "smiles"
+        assert field.length == len(stereo_smiles)
+        assert field.sha256_prefix == _sha(stereo_smiles)
+        assert field.ref_length is None
+        assert field.ref_sha256_prefix is None
+        assert "use_smiles" in field.allowed_transforms
+
+    structure = _field(projection.available_fields, material_type="structure_ref")
+    assert structure.length is None and structure.sha256_prefix is None
+    assert structure.ref_length == len(PDB_PATH)
+    assert structure.ref_sha256_prefix == _sha(PDB_PATH)
+
+    fasta = _field(projection.available_fields, material_type="antibody_heavy_chain_sequence")
+    assert fasta.length is None and fasta.sha256_prefix is None
+    assert fasta.ref_length == len(FASTA_PATH)
+    assert fasta.ref_sha256_prefix == _sha(FASTA_PATH)
+
+
 def test_every_available_field_uses_value_or_ref_metadata_xor_and_stable_refs():
     candidate = _candidate(
         materials=[
