@@ -34,10 +34,13 @@ STEP6_STAGE1_SCHEMA_MAPPING_SYSTEM_PROMPT = """You are selecting relevant Step 6
 Rules:
 1. Use ONLY the disclosed compact_catalog. It is already Step 6 scoped and
    modality-filtered. Do not name tools outside it.
-2. Select zero or more relevant tool_name values. A valid empty selection is allowed.
-3. Do NOT construct arguments. Do NOT infer raw values. Candidate fields are
+2. Prefer `live_wired` tools when equivalent live-wired tools exist for the
+   same lane/input requirement. Dependency-unavailable tools may be selected only
+   when no live equivalent is present.
+3. Select zero or more relevant tool_name values. A valid empty selection is allowed.
+4. Do NOT construct arguments. Do NOT infer raw values. Candidate fields are
    digests and field refs only.
-4. Return exactly JSON: {"selections":[{"tool_name":"...","selection_reason":"..."}]}.
+5. Return exactly JSON: {"selections":[{"tool_name":"...","selection_reason":"..."}]}.
 No prose, no markdown, no tool calls.
 """.strip()
 
@@ -71,6 +74,7 @@ class DisclosureResult(BaseModel):
     disclosed_tool_names: list[str] = Field(default_factory=list)
     hidden_tools_with_reason: list[dict] = Field(default_factory=list)
     disclosure_tags: list[str] = Field(default_factory=list)
+    disclosed_tool_runtime_policy: dict[str, str] = Field(default_factory=dict)
     disclosure_summary: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -149,10 +153,17 @@ def disclose_step6_tools(
         else:
             hidden.append({"tool_name": tool_name, "reason": "modality_not_present"})
 
+    runtime_by_tool: dict[str, str] = {}
+    for name in disclosed:
+        cap = STEP_06_CAPABILITY_BY_TOOL.get(name)
+        if cap is not None:
+            runtime_by_tool[name] = cap.runtime_policy
+
     return DisclosureResult(
         scoped_tool_names=scoped,
         disclosed_tool_names=sorted(disclosed),
         hidden_tools_with_reason=hidden,
+        disclosed_tool_runtime_policy=runtime_by_tool,
         disclosure_tags=sorted(disclose_tags),
         disclosure_summary={
             "small_molecule": small,
@@ -196,18 +207,32 @@ def select_step6_schema_mapped_invocations(
     if not disclosure.disclosed_tool_names:
         return {}, disclosure, audit
 
+    runtime_policy_for_tool = {
+        name: cap.runtime_policy for name, cap in STEP_06_CAPABILITY_BY_TOOL.items()
+    }
     catalog = [
-        entry for entry in build_compact_catalog(
+        {
+            **entry.model_dump(),
+            "runtime_policy": runtime_policy_for_tool.get(entry.tool_name, "unknown"),
+            "runtime_status": runtime_policy_for_tool.get(entry.tool_name, "unknown"),
+        }
+        for entry in build_compact_catalog(
             mcp_client=mcp_client, agent_name=agent_name, step_id=step_id
         )
         if entry.tool_name in set(disclosure.disclosed_tool_names)
     ]
+    catalog.sort(
+        key=lambda item: (
+            _runtime_sort_key(item.get("runtime_policy", "unknown")),
+            item["tool_name"],
+        )
+    )
     stage1_payload = {
         "task": "step6_schema_mapping_stage_1",
         "agent_name": agent_name,
         "step_id": step_id,
         "candidate_id": candidate_id,
-        "compact_catalog": [entry.model_dump() for entry in catalog],
+        "compact_catalog": list(catalog),
         "candidate_modality_summary": modality_summary.model_dump(),
         "candidate_available_fields": [field.model_dump() for field in available_fields],
         "user_query_summary": user_query_summary,
@@ -331,6 +356,14 @@ def _cap_matches_modalities(cap: Any, *, small: bool, protein: bool, uniprot: bo
         return True
     return False
 
+def _runtime_sort_key(policy: str) -> int:
+    return {
+        "live_wired": 0,
+        "dependency_unavailable": 1,
+        "future": 2,
+        "unsupported_for_adc_step6": 3,
+    }.get(policy, 4)
+
 
 def _clean_stage1(raw: list[dict], allowed: set[str]) -> list[dict]:
     out: list[dict] = []
@@ -441,7 +474,10 @@ def _field_can_satisfy_arg(arg: str, field: AvailableField) -> bool:
     if lowered in {"smiles", "canonical_smiles"}:
         return field.value_kind == "smiles"
     if lowered in {"sequence", "protein_sequence"}:
-        return field.field_type == "protein_sequence" and field.value_kind == "protein_sequence"
+        return (
+            field.field_type == "protein_sequence"
+            and field.value_kind in {"protein_sequence", "uploaded_fasta_ref"}
+        )
     if lowered in {"accession", "uniprot_id", "uniprot_accession", "uniprot_ac"}:
         return field.id_type == "uniprot_id"
     if lowered in {"molecule_chembl_id", "chembl_id"}:

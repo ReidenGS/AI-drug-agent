@@ -716,10 +716,15 @@ def test_step6_tool_selection_prompt_hides_live_and_uses_progressive_disclosure(
         blob = str(sc)
         assert "_live" not in blob
         for entry in sc["compact_catalog"]:
-            assert set(entry) == {
+            assert set(entry).issuperset({
                 "tool_name", "short_description", "capability_tags",
                 "coarse_input_requirements", "step_id", "agent_name",
-        }
+            })
+            assert set(entry).issubset({
+                "tool_name", "short_description", "capability_tags",
+                "coarse_input_requirements", "step_id", "agent_name",
+                "runtime_policy", "runtime_status",
+            })
         for entry in sc["compact_catalog"]:
             assert entry["tool_name"] in _STEP6_VALID_TOOLS
 
