@@ -484,6 +484,20 @@ def test_step7_unscoped_pdb_id_is_unresolved_when_target_and_antibody_conflict(
         local_storage, registry_service, workflow_state_service,
         referenced_inputs=[{"id_type": "pdb_id", "value": "1N8Z", "source": "raw_request_text"}],
     )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for cand in cct["candidate_records"]:
+        if cand.get("candidate_type") in {"target_antigen", "antibody"}:
+            cand["identifiers"] = [
+                i for i in (cand.get("identifiers") or [])
+                if i.get("id_type") != "pdb_id"
+            ]
+            cand["materials"] = [
+                m for m in (cand.get("materials") or [])
+                if m.get("material_type") != "structure_ref"
+            ]
+    local_storage.write_json(cct_path, cct)
+
     pkg = StructureAndDesignAgent(
         storage=local_storage, registry=registry_service,
         workflow_state=workflow_state_service, mcp_client=_mcp(),
@@ -562,9 +576,109 @@ def test_step7_structure_file_material_is_consumable_by_step8_without_fake_place
     tool_calls = [tc for tc in results.tool_call_records if tc.tool_name in {"CrystalStructure_validate", "ProteinsPlus_profile_structure_quality"}]
     assert tool_calls, "expected structure validation calls"
     for tc in tool_calls:
+        assert tc.tool_input_summary["pdb_id_or_path"] == str(
+            PROJECT_ROOT / "data" / "pdb" / "S1.pdb"
+        )
         assert "uploaded" not in json.dumps(tc.tool_input_summary or {})
         assert tc.tool_input_summary and ("pdb_id_or_path" in tc.tool_input_summary)
         assert tc.tool_input_summary["pdb_id_or_path"].endswith("S1.pdb")
+
+
+def test_step7_name_only_routes_to_database_search_tools(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[],
+    )
+    # Build with candidate names only; no structure files, no PDB IDs, no sequences.
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    ).run_step_7(run_id)
+
+    db_results = [tc for tc in pkg.structure_tool_call_records if tc.tool_name in {"RCSBAdvSearch_search_structures", "PDBeSearch_search_structures"}]
+    assert db_results, "name-only input should route to search wrappers"
+    assert all(tc.run_status in {"success", "dependency_unavailable", "failed"} for tc in db_results)
+
+    assert all(
+        tc.tool_input_summary
+        and tc.tool_input_summary.get("routing_decision") == "selected"
+        for tc in db_results
+    )
+    skipped = [
+        tc for tc in pkg.structure_tool_call_records
+        if tc.tool_name in {"RCSBData_get_entry", "RCSBData_get_assembly", "SAbDab_get_structure", "alphafold_get_prediction"}
+    ]
+    assert skipped and all(tc.run_status == "skipped" for tc in skipped)
+    assert all(tc.tool_input_summary.get("routing_decision") == "not_applicable" for tc in skipped)
+
+
+def test_step7_candidate_pdb_id_routes_to_rcsb_and_sabdab_step7_tools(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service)
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    antibody.setdefault("identifiers", []).append(
+        {"id_type": "pdb_id", "id_value": "1N8Z", "source": "candidate_profile"}
+    )
+    local_storage.write_json(cct_path, cct)
+
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    ).run_step_7(run_id)
+    tc_by_name = {
+        tc.tool_name: tc for tc in pkg.structure_tool_call_records if tc.tool_name in {
+            "RCSBData_get_entry", "RCSBData_get_assembly", "SAbDab_get_structure"
+        }
+    }
+    assert "RCSBData_get_entry" in tc_by_name
+    assert tc_by_name["RCSBData_get_entry"].tool_input_summary.get("routing_decision") == "selected"
+    assert "RCSBData_get_assembly" in tc_by_name
+    assert tc_by_name["RCSBData_get_assembly"].tool_input_summary.get("arguments", {}).get("assembly_id") == "1"
+    assert "SAbDab_get_structure" in tc_by_name
+    assert tc_by_name["SAbDab_get_structure"].tool_input_summary.get("routing_decision") == "selected"
+
+
+def test_step7_sequence_only_uniprot_routes_to_alphafold_not_structure_search(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "uniprot_id", "value": "P04626", "source": "raw"}],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for cand in cct["candidate_records"]:
+        cand["materials"] = [
+            m for m in cand.get("materials", [])
+            if not (isinstance(m, dict) and str(m.get("material_type", "")).endswith("_name"))
+        ]
+    local_storage.write_json(cct_path, cct)
+
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    ).run_step_7(run_id)
+    tc_names = {tc.tool_name for tc in pkg.structure_tool_call_records}
+    assert "alphafold_get_prediction" in tc_names
+    for name in {"RCSBData_get_entry", "RCSBData_get_assembly", "RCSBAdvSearch_search_structures", "PDBeSearch_search_structures"}:
+        callset = [tc for tc in pkg.structure_tool_call_records if tc.tool_name == name]
+        assert callset
+        assert all(call.tool_input_summary.get("routing_decision") == "not_applicable" for call in callset)
+        assert all(call.run_status == "skipped" for call in callset)
+    af_calls = [tc for tc in pkg.structure_tool_call_records if tc.tool_name == "alphafold_get_prediction"]
+    assert af_calls
+    assert all(tc.run_status in {"success", "skipped", "dependency_unavailable"} for tc in af_calls)
 
 
 def test_step8_skips_when_no_usable_structure_ref(
@@ -893,6 +1007,11 @@ def test_step8_uploaded_structure_file_path_calls_validation_tools(
             },
         ],
     )
+    raw_path = local_storage.run_key(run_id, "inputs/raw_request_record.json")
+    raw = local_storage.read_json(raw_path)
+    raw["uploaded_files"][0]["storage_path"] = local_storage.run_key(run_id, "inputs/files/file_pdb.pdb")
+    local_storage.write_json(raw_path, raw)
+    local_storage.write_bytes(raw["uploaded_files"][0]["storage_path"], b"HEADER    DUMMY\nEND\n")
     agent = StructureAndDesignAgent(
         storage=local_storage, registry=registry_service,
         workflow_state=workflow_state_service, mcp_client=_mcp(),

@@ -77,6 +77,24 @@ _RESIDUE_RANGE_RE = re.compile(
     r"\bresidues?\s+(?P<start>\d{1,6})\s*[-–]\s*(?P<end>\d{1,6})\b",
     re.IGNORECASE,
 )
+_STEP7_SCOPED_TOOLS = (
+    "PDBeSearch_search_structures",
+    "RCSBAdvSearch_search_structures",
+    "RCSBData_get_assembly",
+    "RCSBData_get_entry",
+    "SAbDab_get_structure",
+    "alphafold_get_prediction",
+)
+_NAME_LIKE_MATERIAL_TYPES = {
+    "target_antigen_name",
+    "antibody_name",
+    "complete_adc_name",
+    "antigen_name",
+    "candidate_name",
+    "antibody_candidate_name",
+    "target_name",
+    "antigen_candidate_name",
+}
 
 
 # ── shared utilities ────────────────────────────────────────────────────────
@@ -126,6 +144,17 @@ def _pdb_path_like(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     return PurePosixPath(value.strip()).suffix.lower() in _PDB_EXTS
+
+
+def _is_concrete_pdb_path(storage: Storage, value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    if not _pdb_path_like(value):
+        return False
+    try:
+        return Path(value).is_file() or storage.exists(value)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ── agent ───────────────────────────────────────────────────────────────────
@@ -183,7 +212,6 @@ class StructureAndDesignAgent:
 
         tool_call_records: list[ToolCallRecord] = []
         prepared: list[StructureInputRecord] = []
-        all_pdb_ids_seen: set[str] = set()
         candidates = [
             c for c in (cct.get("candidate_records") or [])
             if c.get("candidate_type") in {"target_antigen", "antibody", "adc_construct"}
@@ -205,21 +233,17 @@ class StructureAndDesignAgent:
             )
             if record is None:
                 continue
-            # Enrich PDB references once via RCSBData_get_entry (mockable wrapper).
-            for sref in record.structure_refs:
-                if sref.pdb_id and sref.pdb_id not in all_pdb_ids_seen:
-                    tc = self._call_tool(
-                        run_id=run_id,
-                        step_id=_STEP_07,
-                        tool_name="RCSBData_get_entry",
-                        kwargs={"pdb_id": sref.pdb_id},
-                        output_dir="step_07",
-                        label=f"enrich:{sref.pdb_id}",
-                    )
-                    tool_call_records.append(tc)
-                    all_pdb_ids_seen.add(sref.pdb_id)
+            calls = self._route_step7_scoped_tools(
+                run_id=run_id,
+                candidate=candidate,
+                record=record,
+            )
+            tool_call_records.extend(calls)
             prepared.append(record)
-        _attach_antigen_antibody_mapping(prepared, candidates)
+        _attach_antigen_antibody_mapping(
+            [r for r in prepared if r.input_case != "database_search_result"],
+            candidates,
+        )
 
         prep_status: str
         if not prepared:
@@ -297,11 +321,24 @@ class StructureAndDesignAgent:
         has_sequence = bool(cand_sequence_mats) or bool(sequence_files) or bool(
             cand_uniprot_ids or refs_by_type.get("uniprot_id")
         )
+        has_name_input = bool(_names_from_materials(materials))
+        input_case = None
+        structure_source = None
+        preferred_rank = 0
+        preferred_reason = "no structure signals available"
         if not (has_structure_file or has_pdb_id or has_sequence):
-            return None
+            if has_name_input:
+                input_case = "database_search_result"
+                structure_source = "name_only"
+                preferred_rank = 5
+                preferred_reason = "name-based structure search fallback when no structure/PDB/sequence is available"
+            else:
+                return None
 
         # Decide input_case in deterministic source-priority order.
-        if structure_files:
+        if input_case == "database_search_result":
+            pass
+        elif structure_files:
             input_case = "uploaded_structure_file"
             structure_source = "user_uploaded"
             preferred_rank = 1
@@ -691,7 +728,7 @@ class StructureAndDesignAgent:
         out: list[tuple[str, dict, str]] = []
 
         if input_case == "uploaded_structure_file":
-            structure_ref = _step8_structure_ref(sin.get("structure_refs") or [])
+            structure_ref = _step8_structure_ref(self.storage, sin.get("structure_refs") or [])
             if not structure_ref:
                 return out
             ref_value = structure_ref["value"]
@@ -742,6 +779,141 @@ class StructureAndDesignAgent:
                     pass
 
         return out
+
+    # ── Step 7 scoped tool routing ───────────────────────────────────────
+    def _route_step7_scoped_tools(
+        self, run_id: str, candidate: dict, record: StructureInputRecord
+    ) -> list[ToolCallRecord]:
+        calls: list[ToolCallRecord] = []
+        input_case = record.input_case
+        candidate_id = record.candidate_id
+        structure_input_id = record.structure_input_id
+
+        def _summary_base() -> dict[str, Any]:
+            return {
+                "label": f"step07:{structure_input_id}",
+                "candidate_id": candidate_id,
+                "candidate_type": candidate.get("candidate_type"),
+                "input_case": input_case,
+            }
+
+        def _skip(tool_name: str, reason: str) -> None:
+            calls.append(
+                _skipped_tool_record(
+                    tool_name=tool_name,
+                    agent_name=_AGENT_NAME,
+                    step_id=_STEP_07,
+                    summary={
+                        **_summary_base(),
+                        "routing_decision": "not_applicable",
+                        "reason": reason,
+                    },
+                )
+            )
+
+        def _run(tool_name: str, kwargs: dict[str, Any], decision: str) -> None:
+            calls.append(
+                self._call_tool(
+                    run_id=run_id,
+                    step_id=_STEP_07,
+                    tool_name=tool_name,
+                    kwargs=kwargs,
+                    output_dir="step_07",
+                    label=f"{input_case}:{structure_input_id}:{tool_name}",
+                    extra_input_summary={
+                        **_summary_base(),
+                        "routing_decision": decision,
+                        "arguments": {k: _short(v) for k, v in kwargs.items()},
+                    },
+                )
+            )
+
+        if input_case == "uploaded_structure_file":
+            for name in _STEP7_SCOPED_TOOLS:
+                if name in {"RCSBData_get_entry", "RCSBData_get_assembly"}:
+                    _skip(name, "uploaded structure inputs use local parser and optional file-scoped metadata only")
+                elif name in {"RCSBAdvSearch_search_structures", "PDBeSearch_search_structures"}:
+                    _skip(name, "no local/known-PDB fallback path for fully uploaded structure input")
+                elif name == "SAbDab_get_structure":
+                    _skip(name, "SAbDab routing requires explicit antibody PDB-id path")
+                else:
+                    _skip(name, "sequence-only prediction route not used for uploaded structure input")
+            return calls
+
+        if input_case == "known_pdb_id":
+            pdb_ref = next((s for s in record.structure_refs if s.pdb_id), None)
+            if pdb_ref and pdb_ref.pdb_id:
+                _run("RCSBData_get_entry", {"pdb_id": pdb_ref.pdb_id}, "selected")
+                _run(
+                    "RCSBData_get_assembly",
+                    {"pdb_id": pdb_ref.pdb_id, "assembly_id": "1"},
+                    "selected",
+                )
+                if record.structure_role == "antibody_only":
+                    _run("SAbDab_get_structure", {"pdb_id": pdb_ref.pdb_id}, "selected")
+                else:
+                    _skip(
+                        "SAbDab_get_structure",
+                        "only applies to antibody role inputs",
+                    )
+            else:
+                _skip("RCSBData_get_entry", "known_pdb_id input case requires explicit PDB ID")
+                _skip("RCSBData_get_assembly", "known_pdb_id input case requires explicit PDB ID")
+                _skip("SAbDab_get_structure", "known_pdb_id input case requires explicit PDB ID")
+            _skip("RCSBAdvSearch_search_structures", "explicit PDB ID route has precedence over search")
+            _skip("PDBeSearch_search_structures", "explicit PDB ID route has precedence over search")
+            _skip("alphafold_get_prediction", "explicit PDB ID route does not need sequence-only prediction")
+            return calls
+
+        if input_case == "sequence_only_input":
+            for name in _STEP7_SCOPED_TOOLS:
+                if name == "alphafold_get_prediction":
+                    continue
+                if name in {"RCSBData_get_entry", "RCSBData_get_assembly", "SAbDab_get_structure"}:
+                    _skip(name, "sequence-only input uses UniProt prediction path, no PDB ID")
+                else:
+                    _skip(
+                        name,
+                        "sequence-only route uses local/sequence metadata unless explicit UniProt/ID is present",
+                    )
+
+            uniprot = next(
+                (
+                    s.source_ref
+                    for s in record.sequence_refs_for_prediction
+                    if s.prediction_input_kind == "uniprot_id"
+                ),
+                None,
+            )
+            if uniprot:
+                _run("alphafold_get_prediction", {"uniprot": uniprot}, "selected")
+            else:
+                _skip("alphafold_get_prediction", "sequence-only route has no usable UniProt identifier")
+            return calls
+
+        if input_case == "database_search_result":
+            query = _structure_query_from_candidate(candidate, record)
+            if query:
+                _run("RCSBAdvSearch_search_structures", {"query": query}, "selected")
+                _run("PDBeSearch_search_structures", {"query": query}, "selected")
+            else:
+                _skip(
+                    "RCSBAdvSearch_search_structures",
+                    "name-only input has no usable query material",
+                )
+                _skip(
+                    "PDBeSearch_search_structures",
+                    "name-only input has no usable query material",
+                )
+            _skip("RCSBData_get_entry", "database search handles identity inference, not exact PDB ID path")
+            _skip("RCSBData_get_assembly", "database search handles identity inference, not exact assembly path")
+            _skip("SAbDab_get_structure", "database search handles identity inference, not exact antibody-PDB path")
+            _skip("alphafold_get_prediction", "database search is name-based sequence-agnostic input")
+            return calls
+
+        for tool_name in _STEP7_SCOPED_TOOLS:
+            _skip(tool_name, f"unhandled Step 7 input_case={input_case}")
+        return calls
 
     # ── Step 9 ──────────────────────────────────────────────────────────────
     def run_step_9(self, run_id: str) -> CompoundScreeningArtifact:
@@ -973,6 +1145,29 @@ def _bind_step7_resources(
                 item.update(resource_binding_status=status, binding_confidence=confidence, related_candidate_ids=ids)
                 bound[candidate_id]["refs_by_type"].setdefault(id_type, []).append(item)
     return bound, unresolved
+
+
+def _names_from_materials(materials: list[dict]) -> list[str]:
+    names: list[str] = []
+    for material in materials:
+        if not isinstance(material, dict):
+            continue
+        if material.get("material_type") not in _NAME_LIKE_MATERIAL_TYPES:
+            continue
+        value = (material.get("value") or "").strip()
+        if value:
+            names.append(value)
+    return names
+
+
+def _structure_query_from_candidate(candidate: dict, record: StructureInputRecord) -> str:
+    names = _names_from_materials(candidate.get("materials") or [])
+    if names:
+        return names[0]
+    candidate_type = record.structure_role
+    if candidate_type == "complex":
+        return record.structure_input_id.replace("-", " ").replace("_", " ")
+    return record.candidate_id
 
 
 def _explicit_resource_candidate_ids(resource: dict, valid_ids: set[str]) -> list[str]:
@@ -1309,25 +1504,17 @@ def _artifact_type_for_tool(tool_name: str) -> str:
     return "other"
 
 
-def _step8_structure_ref(structure_refs: list[Any]) -> dict[str, Any] | None:
-    def _pathlike(value: Any) -> bool:
-        return _pdb_path_like(value)
-
-    for sref in structure_refs:
-        if isinstance(sref, dict) and sref.get("file_id"):
-            return {"value": sref["file_id"], "source": "file_id"}
-    for sref in structure_refs:
-        if isinstance(sref, dict) and sref.get("pdb_id"):
-            return {"value": sref["pdb_id"], "source": "pdb_id"}
+def _step8_structure_ref(storage: Storage, structure_refs: list[Any]) -> dict[str, Any] | None:
     for sref in structure_refs:
         if not isinstance(sref, dict):
             continue
-        for key in ("storage_ref", "source_ref", "original_storage_ref"):
-            if key == "original_storage_ref":
-                continue
+        for key in ("storage_ref", "source_ref"):
             value = sref.get(key)
-            if _pathlike(value):
+            if _is_concrete_pdb_path(storage, value):
                 return {"value": value, "source": key}
+    for sref in structure_refs:
+        if isinstance(sref, dict) and sref.get("pdb_id"):
+            return {"value": sref["pdb_id"], "source": "pdb_id"}
     return None
 
 
