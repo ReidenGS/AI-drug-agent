@@ -681,7 +681,7 @@ def test_step7_candidate_pdb_id_routes_to_rcsb_and_sabdab_step7_tools(
     assert rec.structure_refs and any(s.source_kind == "pdb_id" for s in rec.structure_refs)
 
 
-def test_step7_sequence_only_uniprot_routes_to_alphafold_not_structure_search(
+def test_step7_sequence_only_uniprot_triggers_alphafold_get_prediction_lookup(
     local_storage, registry_service, workflow_state_service
 ):
     run_id = _seed(
@@ -697,6 +697,78 @@ def test_step7_sequence_only_uniprot_routes_to_alphafold_not_structure_search(
         ]
     local_storage.write_json(cct_path, cct)
 
+    overrides = {
+        "alphafold_get_prediction": lambda **kw: {
+            "uniprot": kw.get("uniprot"),
+            "status": "success",
+            "model_path": "mock://alphafold/P04626.pdb",
+        },
+    }
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(
+            inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+            bindings=overrides,
+        ),
+    )
+    pkg = agent.run_step_7(run_id)
+    step8 = agent.run_step_8(run_id)
+    af_calls = [tc for tc in pkg.structure_tool_call_records if tc.tool_name == "alphafold_get_prediction"]
+    assert len(af_calls) == 1
+    af_call = af_calls[0]
+    assert af_call.run_status == "success"
+    assert af_call.tool_input_summary["routing_decision"] == "selected"
+    assert af_call.tool_input_summary["arguments"]["uniprot"] == "P04626"
+
+    rec = next(
+        r for r in pkg.prepared_structure_inputs if r.input_case == "sequence_only_input"
+    )
+    assert any(
+        ref.source_kind == "predicted_needed" and ref.source_ref == "P04626"
+        for ref in rec.structure_refs
+    )
+    compacted = {m["tool_name"]: m for m in rec.step7_tool_output_metadata}
+    assert compacted["alphafold_get_prediction"]["compact_output"]["compact_type"] == "alphafold_prediction"
+    assert compacted["alphafold_get_prediction"]["compact_output"]["model_ref"] == "mock://alphafold/P04626.pdb"
+
+    for name in {"RCSBData_get_entry", "RCSBData_get_assembly", "RCSBAdvSearch_search_structures", "PDBeSearch_search_structures"}:
+        callset = [tc for tc in pkg.structure_tool_call_records if tc.tool_name == name]
+        assert callset
+        assert all(
+            call.tool_input_summary.get("routing_decision") in {"not_applicable", "scope_unavailable"}
+            for call in callset
+        )
+        assert all(call.run_status == "skipped" for call in callset)
+    assert all(tc.tool_name != "alphafold_get_prediction" for tc in step8.tool_call_records)
+
+    pkg_blob = json.dumps(pkg.model_dump())
+    assert "raw_sequence" not in pkg_blob
+    assert "full_payload" not in pkg_blob
+
+
+def test_step7_sequence_only_without_uniprot_skips_alphafold_lookup(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service, referenced_inputs=[])
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for cand in cct["candidate_records"]:
+        if cand.get("candidate_type") == "target_antigen":
+            cand["materials"] = [
+                {
+                    "material_id": "manual_sequence_target",
+                    "material_type": "target_sequence",
+                    "value": "MKTAYIAKQNNVG..."
+                }
+            ]
+        else:
+            cand["materials"] = []
+            if isinstance(cand.get("materials"), list):
+                cand["materials"] = []
+    local_storage.write_json(cct_path, cct)
+
     agent = StructureAndDesignAgent(
         storage=local_storage,
         registry=registry_service,
@@ -704,15 +776,44 @@ def test_step7_sequence_only_uniprot_routes_to_alphafold_not_structure_search(
         mcp_client=_mcp(),
     )
     pkg = agent.run_step_7(run_id)
-    step8 = agent.run_step_8(run_id)
-    tc_names = {tc.tool_name for tc in pkg.structure_tool_call_records}
-    assert "alphafold_get_prediction" not in tc_names
-    for name in {"RCSBData_get_entry", "RCSBData_get_assembly", "RCSBAdvSearch_search_structures", "PDBeSearch_search_structures"}:
-        callset = [tc for tc in pkg.structure_tool_call_records if tc.tool_name == name]
-        assert callset
-        assert all(call.tool_input_summary.get("routing_decision") == "not_applicable" for call in callset)
-        assert all(call.run_status == "skipped" for call in callset)
-    assert all(tc.tool_name != "alphafold_get_prediction" for tc in step8.tool_call_records)
+
+    rec = next(r for r in pkg.prepared_structure_inputs if r.input_case == "sequence_only_input")
+    af_calls = [tc for tc in pkg.structure_tool_call_records if tc.tool_name == "alphafold_get_prediction"]
+    assert len(af_calls) == 1
+    af_call = af_calls[0]
+    assert af_call.run_status == "skipped"
+    assert af_call.tool_input_summary["routing_decision"] == "not_applicable"
+    assert af_call.tool_input_summary.get("reason") == "sequence-only input has no UniProt accession for AlphaFold prediction lookup"
+
+    assert not any(ref.source_kind == "predicted_needed" for ref in rec.structure_refs)
+
+
+def test_step7_scope_failure_records_scope_unavailable(
+    local_storage, registry_service, workflow_state_service
+):
+    class _FailingScopeClient(LocalMCPClient):
+        def list_tools(self, *args, **kwargs):  # type: ignore[override]
+            raise RuntimeError("scope backend unavailable")
+
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "uniprot_id", "value": "P04626", "source": "raw"}],
+    )
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_FailingScopeClient(),
+    ).run_step_7(run_id)
+
+    by_name = {tc.tool_name: tc for tc in pkg.structure_tool_call_records}
+    for tool in structure_and_design_module._STEP7_SCOPED_TOOLS:
+        assert tool in by_name
+        tc = by_name[tool]
+        assert tc.run_status == "skipped"
+        assert tc.tool_input_summary["routing_decision"] == "scope_unavailable"
+        assert "scope backend unavailable" in tc.tool_input_summary.get("reason", "")
+        assert tc.run_status == "skipped"
 
 
 def test_step7_database_search_results_become_ambiguous_candidates_only(

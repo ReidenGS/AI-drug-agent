@@ -785,20 +785,39 @@ class StructureAndDesignAgent:
         `_STEP7_SCOPED_TOOLS`; we intersect it with the MCP-scoped tool list so
         runtime drift is surfaced via drift-fence tests.
         """
-        try:
-            runtime_scoped = set(
-                self.mcp_client.list_tools(agent_name=_AGENT_NAME, step_id=_STEP_07)
-            )
-        except Exception:
-            runtime_scoped = set(_STEP7_SCOPED_TOOLS)
-        return tuple(sorted(set(_STEP7_SCOPED_TOOLS) & runtime_scoped))
+        runtime_scoped = self.mcp_client.list_tools(
+            agent_name=_AGENT_NAME, step_id=_STEP_07
+        )
+        return tuple(runtime_scoped)
 
     # ── Step 7 scoped tool routing ───────────────────────────────────────
     def _route_step7_scoped_tools(
         self, run_id: str, candidate: dict, record: StructureInputRecord
     ) -> list[ToolCallRecord]:
-        scoped_tools = set(self._step7_scoped_tools())
         calls: list[ToolCallRecord] = []
+        try:
+            scoped_tools = set(self._step7_scoped_tools())
+        except Exception as e:
+            summary_base = {
+                "label": f"step07:{record.structure_input_id}",
+                "candidate_id": record.candidate_id,
+                "candidate_type": candidate.get("candidate_type"),
+                "input_case": record.input_case,
+            }
+            for tool_name in _STEP7_SCOPED_TOOLS:
+                calls.append(
+                    _skipped_tool_record(
+                        tool_name=tool_name,
+                        agent_name=_AGENT_NAME,
+                        step_id=_STEP_07,
+                        summary={
+                            **summary_base,
+                            "routing_decision": "scope_unavailable",
+                            "reason": f"step_7 scope introspection failed: {str(e)}",
+                        },
+                    )
+                )
+            return calls
         input_case = record.input_case
         candidate_id = record.candidate_id
         structure_input_id = record.structure_input_id
@@ -822,7 +841,7 @@ class StructureAndDesignAgent:
                         step_id=_STEP_07,
                         summary={
                             **_summary_base(),
-                            "routing_decision": "not_in_runtime_scope",
+                            "routing_decision": "scope_unavailable",
                             "reason": "tool not available from MCP runtime scope",
                             "scope": {"step_7_scoped_tools": sorted(_STEP7_SCOPED_TOOLS)},
                         },
@@ -869,6 +888,8 @@ class StructureAndDesignAgent:
 
         if input_case == "uploaded_structure_file":
             for name in _STEP7_SCOPED_TOOLS:
+                if name not in scoped_tools:
+                    continue
                 if name in {"RCSBData_get_entry", "RCSBData_get_assembly"}:
                     _skip(name, "uploaded structure inputs use local parser and optional file-scoped metadata only")
                 elif name in {"RCSBAdvSearch_search_structures", "PDBeSearch_search_structures"}:
@@ -899,22 +920,43 @@ class StructureAndDesignAgent:
                 elif record.structure_role != "antibody_only":
                     _skip("SAbDab_get_structure", "only applies to antibody role inputs")
             else:
-                _skip("RCSBData_get_entry", "known_pdb_id input case requires explicit PDB ID")
-                _skip("RCSBData_get_assembly", "known_pdb_id input case requires explicit PDB ID")
-                _skip("SAbDab_get_structure", "known_pdb_id input case requires explicit PDB ID")
-            _skip("RCSBAdvSearch_search_structures", "explicit PDB ID route has precedence over search")
-            _skip("PDBeSearch_search_structures", "explicit PDB ID route has precedence over search")
+                if "RCSBData_get_entry" in scoped_tools:
+                    _skip("RCSBData_get_entry", "known_pdb_id input case requires explicit PDB ID")
+                if "RCSBData_get_assembly" in scoped_tools:
+                    _skip("RCSBData_get_assembly", "known_pdb_id input case requires explicit PDB ID")
+                if "SAbDab_get_structure" in scoped_tools:
+                    _skip("SAbDab_get_structure", "known_pdb_id input case requires explicit PDB ID")
+            if "RCSBAdvSearch_search_structures" in scoped_tools:
+                _skip("RCSBAdvSearch_search_structures", "explicit PDB ID route has precedence over search")
+            if "PDBeSearch_search_structures" in scoped_tools:
+                _skip("PDBeSearch_search_structures", "explicit PDB ID route has precedence over search")
             return calls
 
         if input_case == "sequence_only_input":
+            uniprot_sequence_ref = next(
+                (
+                    r for r in record.sequence_refs_for_prediction
+                    if r.prediction_input_kind == "uniprot_id" and r.source_ref
+                ),
+                None,
+            )
             for name in _STEP7_SCOPED_TOOLS:
+                if name not in scoped_tools:
+                    continue
                 if name in {"RCSBData_get_entry", "RCSBData_get_assembly", "SAbDab_get_structure"}:
                     _skip(name, "sequence-only input uses UniProt prediction path, no PDB ID")
                 elif name == "alphafold_get_prediction":
-                    # AlphaFold is intentionally deferred from Step 7 in this boundary.
-                    # Do not emit a Step 7 call record to keep Step 8/contract
-                    # handoff explicit and compact.
-                    continue
+                    if uniprot_sequence_ref:
+                        _run_and_record(
+                            "alphafold_get_prediction",
+                            {"uniprot": uniprot_sequence_ref.source_ref or uniprot_sequence_ref.sequence_id},
+                            "selected",
+                        )
+                    else:
+                        _skip(
+                            name,
+                            "sequence-only input has no UniProt accession for AlphaFold prediction lookup",
+                        )
                 else:
                     _skip(
                         name,
@@ -930,14 +972,36 @@ class StructureAndDesignAgent:
                 if "PDBeSearch_search_structures" in scoped_tools:
                     _run_and_record("PDBeSearch_search_structures", {"query": query}, "selected")
             else:
-                _skip("RCSBAdvSearch_search_structures", "name-only input has no usable query material")
-                _skip("PDBeSearch_search_structures", "name-only input has no usable query material")
-            _skip("RCSBData_get_entry", "database search handles identity inference, not exact PDB ID path")
-            _skip("RCSBData_get_assembly", "database search handles identity inference, not exact assembly path")
-            _skip("SAbDab_get_structure", "database search handles identity inference, not exact antibody-PDB path")
+                if "RCSBAdvSearch_search_structures" in scoped_tools:
+                    _skip(
+                        "RCSBAdvSearch_search_structures",
+                        "name-only input has no usable query material",
+                    )
+                if "PDBeSearch_search_structures" in scoped_tools:
+                    _skip(
+                        "PDBeSearch_search_structures",
+                        "name-only input has no usable query material",
+                    )
+            if "RCSBData_get_entry" in scoped_tools:
+                _skip(
+                    "RCSBData_get_entry",
+                    "database search handles identity inference, not exact PDB ID path",
+                )
+            if "RCSBData_get_assembly" in scoped_tools:
+                _skip(
+                    "RCSBData_get_assembly",
+                    "database search handles identity inference, not exact assembly path",
+                )
+            if "SAbDab_get_structure" in scoped_tools:
+                _skip(
+                    "SAbDab_get_structure",
+                    "database search handles identity inference, not exact antibody-PDB path",
+                )
             return calls
 
         for tool_name in _STEP7_SCOPED_TOOLS:
+            if tool_name not in scoped_tools:
+                continue
             _skip(tool_name, f"unhandled Step 7 input_case={input_case}")
         return calls
     # ── Step 9 ──────────────────────────────────────────────────────────────
@@ -1746,6 +1810,27 @@ def _apply_step7_tool_output_metadata(
             except Exception:  # noqa: BLE001
                 continue
 
+    if tool_name == "alphafold_get_prediction":
+        ref_source = compact_output.get("uniprot") or compact_output.get("uniprot_id")
+        model_ref = compact_output.get("model_ref")
+        if model_ref:
+            af_ref = _step7_normalized_struct_ref(
+                source_kind="predicted_needed",
+                pdb_id=None,
+                source_ref=ref_source,
+                storage_ref=model_ref,
+                validation_status="unknown",
+            )
+            if af_ref and not any(
+                (
+                    existing.source_kind == "predicted_needed"
+                    and existing.source_ref == af_ref.source_ref
+                    and existing.storage_ref == af_ref.storage_ref
+                )
+                for existing in record.structure_refs
+            ):
+                record.structure_refs.append(af_ref)
+
     if tool_name in {"RCSBAdvSearch_search_structures", "PDBeSearch_search_structures"}:
         for hit in compact_output.get("hits", []) if isinstance(compact_output, dict) else []:
             if not isinstance(hit, dict):
@@ -1973,21 +2058,27 @@ def _read_tool_output_payload(storage: Storage, tool_call: ToolCallRecord) -> di
 
 
 def _step7_normalized_struct_ref(
-    *, source_kind: str, pdb_id: Any, source_ref: Any,
-    validation_status: str
+    *,
+    source_kind: str,
+    pdb_id: Any,
+    source_ref: Any,
+    validation_status: str,
+    storage_ref: Any = None,
 ) -> StructureRef | None:
-    if not pdb_id:
+    if not pdb_id and not storage_ref:
         return None
-    return StructureRef(
+    result = StructureRef(
         pdb_id=str(pdb_id),
         source_kind=source_kind,  # type: ignore[arg-type]
         source_ref=(str(source_ref) if source_ref is not None else None),
+        storage_ref=str(storage_ref) if storage_ref else None,
         structure_format="pdb",
         validation_status=validation_status,  # type: ignore[arg-type]
         related_candidate_ids=[],
         resource_binding_status="inferred",
         binding_confidence=0.6,
     )
+    return result
 
 
 def _skipped_tool_record(*, tool_name: str, agent_name: str, step_id: str, summary: dict[str, Any]) -> ToolCallRecord:
