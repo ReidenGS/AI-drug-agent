@@ -83,7 +83,20 @@ def shape_instruction(task: str) -> str:
         '"requested_outputs":["ranked_candidates"],'
         '"user_constraints":[],"parse_warnings":[],'
         '"normalized_entities":[],"entity_decompositions":[],'
-        '"clarification_questions":[]}\n'
+        '"clarification_questions":[],'
+        '"missing_slots":[]}\n'
+        "`missing_slots` is a JSON array of required-slot gaps you judged "
+        "against the inferred task intent and the user's query / context / "
+        "uploaded-file metadata. Each item: `slot_name` "
+        '("target_or_antigen", "antibody", "payload", "linker", '
+        '"structure_or_sequence", "pdb_id", "uniprot_id", "smiles", '
+        '"task_intent", "constraint", "other"), `slot_category` ("target", '
+        '"antibody", "payload", "linker", "structure", "sequence", '
+        '"identifier", "task_intent", "constraint", "other"), `severity` '
+        '("blocking", "warning", "optional"), `required_for` (list of '
+        "intents), `reason`, and an optional one-line `suggested_question`. "
+        "Only list slots that are genuinely missing; omit a slot when an "
+        "equivalent typed input already satisfies it.\n"
         "`task_intent.primary_intent` MUST be one of "
         '"new_adc_design", "existing_adc_evaluation", '
         '"developability_assessment", "structure_analysis", '
@@ -331,6 +344,10 @@ def validate_task_shape(data: dict, task: str, *, error_factory: ErrorFactory) -
 def _validate_structured_query_rest(data: dict, *, error_factory: ErrorFactory) -> dict:
     if not isinstance(data.get("mentioned_entities"), dict):
         raise error_factory("structured_query response requires object `mentioned_entities`")
+    # `missing_slots` is drift-tolerant: a single malformed item must never
+    # fail the whole Step 2 parse, so we coerce it into a clean list BEFORE
+    # the strict list checks below rather than raising on shape drift.
+    normalize_missing_slots(data)
     for key in (
         "referenced_inputs",
         "requested_outputs",
@@ -339,6 +356,7 @@ def _validate_structured_query_rest(data: dict, *, error_factory: ErrorFactory) 
         "normalized_entities",
         "entity_decompositions",
         "clarification_questions",
+        "missing_slots",
     ):
         if key not in data:
             data[key] = []
@@ -407,6 +425,7 @@ _REQUESTED_OUTPUTS_ALIASES = {
 
 def normalize_structured_query(data: dict) -> dict:
     _normalize_entity_decomposition_components(data)
+    normalize_missing_slots(data)
 
     raw = data.get("requested_outputs")
     if not isinstance(raw, list):
@@ -518,3 +537,214 @@ def _candidate_label(item: Any) -> str | None:
             if isinstance(val, str) and val.strip():
                 return val.strip().lower()
     return None
+
+
+# ── Step 2 ``missing_slots`` normalization ─────────────────────────────────
+#
+# Single source of truth for missing_slot drift handling. Both the shared
+# provider normalizer (`normalize_structured_query`) and the SupervisorAgent
+# boundary coercer call `normalize_missing_slots(data)` so OpenAI / Gemini /
+# Qwen / Mock all agree on the cleaned shape. The rule: never crash on a
+# single malformed item — coerce what we can, drop the rest, and record a
+# compact parse_warning. Unknown enum values map to the safe `other` /
+# `warning` defaults rather than failing validation.
+
+_MISSING_SLOT_NAMES = frozenset(
+    {
+        "target_or_antigen",
+        "antibody",
+        "payload",
+        "linker",
+        "structure_or_sequence",
+        "pdb_id",
+        "uniprot_id",
+        "smiles",
+        "task_intent",
+        "constraint",
+        "other",
+    }
+)
+
+_MISSING_SLOT_CATEGORIES = frozenset(
+    {
+        "target",
+        "antibody",
+        "payload",
+        "linker",
+        "structure",
+        "sequence",
+        "identifier",
+        "task_intent",
+        "constraint",
+        "other",
+    }
+)
+
+_MISSING_SLOT_SEVERITIES = frozenset({"blocking", "warning", "optional"})
+
+# Best-effort slot_name → slot_category default when the LLM omitted or
+# drifted the category. Keeps the two fields internally consistent.
+_MISSING_SLOT_NAME_TO_CATEGORY = {
+    "target_or_antigen": "target",
+    "antibody": "antibody",
+    "payload": "payload",
+    "linker": "linker",
+    "structure_or_sequence": "structure",
+    "pdb_id": "identifier",
+    "uniprot_id": "identifier",
+    "smiles": "identifier",
+    "task_intent": "task_intent",
+    "constraint": "constraint",
+    "other": "other",
+}
+
+_MISSING_SLOT_NAME_ALIASES = {
+    "target": "target_or_antigen",
+    "antigen": "target_or_antigen",
+    "target_antigen": "target_or_antigen",
+    "antibody_candidate": "antibody",
+    "structure": "structure_or_sequence",
+    "sequence": "structure_or_sequence",
+    "structure_or_sequence_input": "structure_or_sequence",
+    "uniprot": "uniprot_id",
+    "pdb": "pdb_id",
+    "task": "task_intent",
+    "intent": "task_intent",
+    "constraints": "constraint",
+}
+
+
+def _coerce_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        s = value.strip()
+        return [s] if s else []
+    if isinstance(value, (list, tuple)):
+        out: list[str] = []
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                out.append(item.strip())
+            elif item is not None and not isinstance(item, (list, tuple, dict)):
+                out.append(str(item))
+        return out
+    return []
+
+
+def _coerce_missing_slot_item(item: Any) -> dict | None:
+    """Coerce one missing_slots entry into the canonical shape, or drop it.
+
+    Returns ``None`` for entries that carry no usable signal (so the caller
+    drops them). Unknown enum values degrade to the safe defaults; a bare
+    string becomes an ``other`` slot whose ``reason`` is the string.
+    """
+    if item is None:
+        return None
+    if isinstance(item, str):
+        s = item.strip()
+        if not s:
+            return None
+        return {
+            "slot_name": "other",
+            "slot_category": "other",
+            "severity": "warning",
+            "required_for": [],
+            "reason": s,
+            "suggested_question": None,
+            "evidence": None,
+        }
+    if not isinstance(item, dict):
+        return None
+
+    raw_name = item.get("slot_name")
+    name = raw_name.strip().lower() if isinstance(raw_name, str) else ""
+    name = _MISSING_SLOT_NAME_ALIASES.get(name, name)
+    if name not in _MISSING_SLOT_NAMES:
+        name = "other"
+
+    raw_category = item.get("slot_category")
+    category = raw_category.strip().lower() if isinstance(raw_category, str) else ""
+    if category not in _MISSING_SLOT_CATEGORIES:
+        category = _MISSING_SLOT_NAME_TO_CATEGORY.get(name, "other")
+
+    raw_sev = item.get("severity")
+    severity = raw_sev.strip().lower() if isinstance(raw_sev, str) else ""
+    if severity not in _MISSING_SLOT_SEVERITIES:
+        severity = "warning"
+
+    suggested = item.get("suggested_question")
+    if suggested is not None and not isinstance(suggested, str):
+        suggested = str(suggested)
+    if isinstance(suggested, str):
+        suggested = suggested.strip() or None
+
+    evidence = item.get("evidence")
+    if evidence is not None and not isinstance(evidence, str):
+        evidence = str(evidence)
+    if isinstance(evidence, str):
+        evidence = evidence.strip() or None
+
+    reason = item.get("reason")
+    reason = reason.strip() if isinstance(reason, str) else ("" if reason is None else str(reason))
+
+    return {
+        "slot_name": name,
+        "slot_category": category,
+        "severity": severity,
+        "required_for": _coerce_str_list(item.get("required_for")),
+        "reason": reason,
+        "suggested_question": suggested,
+        "evidence": evidence,
+    }
+
+
+def normalize_missing_slots(data: dict) -> dict:
+    """Coerce ``data['missing_slots']`` into a clean ``list[dict]`` in place.
+
+    Accepts absent / dict / string / list inputs (real LLM drift shapes),
+    drops unusable entries, and records a single compact parse_warning when
+    any entry was dropped or the container shape itself was coerced.
+    """
+    if not isinstance(data, dict):
+        return data
+    raw = data.get("missing_slots")
+    if raw is None or raw == "":
+        data["missing_slots"] = []
+        return data
+
+    warnings = data.get("parse_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    data["parse_warnings"] = warnings
+
+    container_coerced = False
+    if isinstance(raw, dict):
+        items: list[Any] = [raw]
+        container_coerced = True
+    elif isinstance(raw, str):
+        items = [raw]
+        container_coerced = True
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        data["missing_slots"] = []
+        warnings.append(
+            f"dropped malformed missing_slots: expected list, got {type(raw).__name__}"
+        )
+        return data
+
+    cleaned: list[dict] = []
+    dropped = 0
+    for entry in items:
+        coerced = _coerce_missing_slot_item(entry)
+        if coerced is None:
+            dropped += 1
+            continue
+        cleaned.append(coerced)
+
+    data["missing_slots"] = cleaned
+    if dropped:
+        warnings.append(f"dropped {dropped} malformed missing_slots entr{'y' if dropped == 1 else 'ies'}")
+    if container_coerced:
+        warnings.append("normalized missing_slots container to a list")
+    return data

@@ -30,10 +30,12 @@ from typing import Any, Optional
 
 from ..llm.provider import LLMProvider
 from ..schemas.step_01_raw_request_record import RawRequestRecord
+from ..llm.json_task_validation import normalize_missing_slots
 from ..schemas.step_02_structured_query import (
     EntityComponent,
     EntityDecomposition,
     MentionedEntities,
+    MissingSlot,
     NormalizedEntity,
     SourceRawRequestRef,
     StructuredQuery,
@@ -152,6 +154,44 @@ Output essentials:
      "source": "antibody_light_chain_sequence"}
   ]
 }
+
+Missing-slot reporting (`missing_slots`):
+After extracting the structured_query fields, judge which REQUIRED slots
+for the inferred `task_intent.primary_intent` are NOT satisfied by the
+user's query, user_provided_context, or uploaded-file metadata, and list
+only those in `missing_slots`. This is a structured gap channel for the
+downstream readiness check; `parse_warnings` stays for internal parse
+problems. Rules: do not mark a slot missing when an equivalent typed input
+already satisfies it; never make an optional slot `blocking`;
+`suggested_question` must be a single sentence the user can answer
+directly; one entry per missing slot.
+
+required_slot_schema (satisfied_by = any one is enough):
+- new_adc_design:
+  - blocking target_or_antigen <- mentioned_entities.target_or_antigen_text
+    OR normalized_entities[entity_type=target_or_antigen] OR
+    referenced_inputs[id_type=uniprot_id] OR an uploaded file whose
+    role/source indicates a target/antigen.
+    question: "What target or antigen should the ADC be designed against?"
+  - warning antibody <- antibody_candidate_text OR antibody entity OR an
+    antibody heavy/light/sequence reference.
+  - warning payload <- payload_text OR payload entity OR a payload SMILES.
+  - warning linker <- linker_text OR linker entity OR a linker SMILES OR a
+    linker_payload entity.
+- structure_analysis:
+  - blocking structure_or_sequence <- referenced_inputs[id_type=pdb_id] OR
+    an uploaded PDB/CIF file OR referenced_inputs[id_type=uniprot_id] OR a
+    heavy/light/protein sequence reference.
+    question: "Please provide a PDB/CIF file, PDB ID, UniProt ID, or protein sequence."
+- developability_assessment:
+  - blocking structure_or_sequence ONLY when no analyzable molecule/protein
+    input exists at all (no payload/linker name or SMILES, no antibody/
+    protein sequence, no UniProt/accession, no PDB/CIF/PDB ID).
+- literature_review / patent_ip_review:
+  - focus on a searchable entity (target/drug/compound) if none is present;
+    do NOT demand full ADC-design completeness. Use warning unless there is
+    no searchable entity at all (then blocking other/task_intent).
+You only REPORT missing_slots here; the readiness check decides the final stop.
 
 Return exactly one JSON object matching the schema. Keep `parse_warnings`
 as a string array and `user_constraints` as an object array with
@@ -780,6 +820,11 @@ def normalize_llm_payload_for_step2(
     _normalize_normalized_entity_types(out)
     _normalize_typed_smiles_fields(out, raw_request_record)
     _normalize_antibody_chain_references(out)
+    # missing_slots drift: absent -> [], dict -> [dict], string ->
+    # [{slot_name:"other", reason:string}], malformed list entries dropped /
+    # compacted with a parse_warning. Shares the provider validator's logic
+    # so OpenAI/Gemini/Qwen/Mock all agree on the cleaned shape.
+    normalize_missing_slots(out)
 
     return out
 
@@ -888,6 +933,11 @@ class SupervisorAgent:
             normalized_entities=normalized_entities,
             entity_decompositions=entity_decompositions,
             clarification_questions=llm_payload.get("clarification_questions") or [],
+            missing_slots=[
+                MissingSlot(**ms)
+                for ms in (llm_payload.get("missing_slots") or [])
+                if isinstance(ms, dict)
+            ],
         )
         return sq
 

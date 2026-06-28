@@ -451,6 +451,17 @@ class MockLLMProvider:
             haystack=haystack,
         )
 
+        missing_slots = _compute_missing_slots(
+            primary_intent=primary_intent,
+            target=target,
+            candidate=candidate,
+            payload=payload,
+            linker=linker,
+            referenced=referenced,
+            normalized_entities=normalized_entities,
+            mentioned_drugs=mentioned_drugs,
+        )
+
         return {
             "task_intent": {
                 "task_type": task_type,
@@ -476,6 +487,7 @@ class MockLLMProvider:
             "normalized_entities": normalized_entities,
             "entity_decompositions": decompositions,
             "clarification_questions": clarifications,
+            "missing_slots": missing_slots,
         }
 
 
@@ -944,8 +956,17 @@ def _classify_primary_intent(
         outputs.extend(["optimization_suggestions", "report"])
         confidence = 0.65
 
-    # New ADC design fallback (target + payload + linker / antibody all hint)
-    elif target and (payload or "design" in text or "build" in text) and not non_adc:
+    # New ADC design fallback. Fires when the user shows a target + design /
+    # payload signal, OR when there is an explicit design verb together with
+    # an ADC signal even though the target is still missing — that missing
+    # target is exactly the blocking gap Step 3 will surface.
+    elif (not non_adc) and (
+        (target and (payload or "design" in text or "build" in text))
+        or (
+            any(verb in text for verb in ("design", "build", "create", "develop"))
+            and any(sig in text for sig in ("adc", "antibody-drug", "antibody drug"))
+        )
+    ):
         primary = "new_adc_design"
         secondary.append("structure_analysis")
         secondary.append("developability_assessment")
@@ -1058,6 +1079,195 @@ def _clarification_questions(
             seen.add(q)
             out.append(q)
     return out
+
+
+_ANTIBODY_SEQUENCE_SOURCES = {
+    "antibody_heavy_chain_sequence",
+    "antibody_light_chain_sequence",
+    "antibody_sequence_reference",
+}
+_STRUCTURE_FILE_EXTS = (".pdb", ".cif", ".mmcif", ".ent")
+_SEQUENCE_FILE_EXTS = (".fasta", ".fa", ".faa", ".seq")
+
+
+def _missing_slot_signals(
+    *,
+    target: str | None,
+    candidate: str | None,
+    payload: str | None,
+    linker: str | None,
+    referenced: list[dict],
+    normalized_entities: list[dict],
+    mentioned_drugs: list[str],
+) -> dict[str, bool]:
+    """Deterministic satisfied/unsatisfied flags mirroring required_slot_schema.
+
+    A slot is satisfied when ANY equivalent typed input is present — a flat
+    mention string, a normalized entity of the right type, a typed
+    referenced_input, an antibody-chain / sequence reference, or an uploaded
+    file whose filename/source indicates structure or sequence. Only
+    metadata is inspected — never file bytes or sequence content.
+    """
+    ref_id_types = {
+        r.get("id_type") for r in referenced if isinstance(r, dict)
+    }
+    norm_types = {
+        ne.get("entity_type") for ne in normalized_entities if isinstance(ne, dict)
+    }
+
+    smiles_sources = {
+        (r.get("source") or "")
+        for r in referenced
+        if isinstance(r, dict) and r.get("id_type") == "smiles"
+    }
+    has_payload_smiles = bool(smiles_sources & {"payload_smiles", "compound_smiles"})
+    has_linker_smiles = bool(smiles_sources & {"linker_smiles", "compound_smiles"})
+
+    has_sequence_ref = False
+    has_structure_upload = False
+    has_sequence_upload = False
+    for r in referenced:
+        if not isinstance(r, dict):
+            continue
+        idt = (r.get("id_type") or "")
+        src = (r.get("source") or "").lower()
+        filename = (r.get("filename") or "").lower()
+        if idt in _ANTIBODY_SEQUENCE_SOURCES or src in _ANTIBODY_SEQUENCE_SOURCES:
+            has_sequence_ref = True
+        if filename.endswith(_STRUCTURE_FILE_EXTS):
+            has_structure_upload = True
+        if filename.endswith(_SEQUENCE_FILE_EXTS):
+            has_sequence_upload = True
+
+    target_satisfied = bool(target) or "uniprot_id" in ref_id_types or "target_or_antigen" in norm_types
+    antibody_satisfied = (
+        bool(candidate) or "antibody" in norm_types or has_sequence_ref
+    )
+    payload_satisfied = bool(payload) or "payload" in norm_types or has_payload_smiles
+    linker_satisfied = (
+        bool(linker)
+        or bool(norm_types & {"linker", "linker_payload"})
+        or has_linker_smiles
+    )
+    structure_or_sequence_satisfied = (
+        "pdb_id" in ref_id_types
+        or "uniprot_id" in ref_id_types
+        or has_structure_upload
+        or has_sequence_upload
+        or has_sequence_ref
+    )
+    return {
+        "target": target_satisfied,
+        "antibody": antibody_satisfied,
+        "payload": payload_satisfied,
+        "linker": linker_satisfied,
+        "structure_or_sequence": structure_or_sequence_satisfied,
+        "any_analyzable": (
+            payload_satisfied
+            or linker_satisfied
+            or antibody_satisfied
+            or structure_or_sequence_satisfied
+        ),
+        "searchable_entity": (
+            target_satisfied
+            or antibody_satisfied
+            or payload_satisfied
+            or bool(mentioned_drugs)
+        ),
+    }
+
+
+def _compute_missing_slots(
+    *,
+    primary_intent: str,
+    target: str | None,
+    candidate: str | None,
+    payload: str | None,
+    linker: str | None,
+    referenced: list[dict],
+    normalized_entities: list[dict],
+    mentioned_drugs: list[str],
+) -> list[dict]:
+    """Mock missing_slots that follow the prompt's required_slot_schema.
+
+    Deterministic and intentionally minimal: only the rules the Step 2 /
+    Step 3 tests exercise. Each entry already matches the cleaned schema
+    shape (so the supervisor normalizer is a no-op on this output).
+    """
+    sig = _missing_slot_signals(
+        target=target,
+        candidate=candidate,
+        payload=payload,
+        linker=linker,
+        referenced=referenced,
+        normalized_entities=normalized_entities,
+        mentioned_drugs=mentioned_drugs,
+    )
+    slots: list[dict] = []
+
+    def _add(slot_name, slot_category, severity, required_for, reason, question=None):
+        slots.append(
+            {
+                "slot_name": slot_name,
+                "slot_category": slot_category,
+                "severity": severity,
+                "required_for": list(required_for),
+                "reason": reason,
+                "suggested_question": question,
+                "evidence": None,
+            }
+        )
+
+    if primary_intent == "new_adc_design":
+        if not sig["target"]:
+            _add(
+                "target_or_antigen", "target", "blocking", ["new_adc_design"],
+                "No target/antigen provided for the new ADC design.",
+                "What target or antigen should the ADC be designed against?",
+            )
+        if not sig["antibody"]:
+            _add(
+                "antibody", "antibody", "warning", ["new_adc_design"],
+                "No antibody candidate provided; Step 5 will rely on discovery.",
+                "Which antibody candidate should we use, or should we run discovery?",
+            )
+        if not sig["payload"]:
+            _add(
+                "payload", "payload", "warning", ["new_adc_design"],
+                "No payload provided for the ADC.",
+                "Which payload should the ADC carry?",
+            )
+        if not sig["linker"]:
+            _add(
+                "linker", "linker", "warning", ["new_adc_design"],
+                "No linker chemistry specified.",
+                "Which linker chemistry should we assume?",
+            )
+    elif primary_intent == "structure_analysis":
+        if not sig["structure_or_sequence"]:
+            _add(
+                "structure_or_sequence", "structure", "blocking",
+                ["structure_analysis"],
+                "No structure or sequence input provided for structure analysis.",
+                "Please provide a PDB/CIF file, PDB ID, UniProt ID, or protein sequence.",
+            )
+    elif primary_intent == "developability_assessment":
+        if not sig["any_analyzable"]:
+            _add(
+                "structure_or_sequence", "structure", "blocking",
+                ["developability_assessment"],
+                "No analyzable molecule or protein input found.",
+                "Please provide a compound/SMILES, protein sequence, UniProt ID, or structure.",
+            )
+    elif primary_intent in {"literature_review", "patent_ip_review"}:
+        if not sig["searchable_entity"]:
+            _add(
+                "other", "other", "blocking", [primary_intent],
+                "No searchable entity (target, drug, or compound) was identified.",
+                "Which target, drug, or compound should we search for?",
+            )
+
+    return slots
 
 
 def _uploaded_file_refs(files: list) -> list[dict]:

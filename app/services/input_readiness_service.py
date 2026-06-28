@@ -58,6 +58,22 @@ from .workflow_state_service import WorkflowStateService
 _ARTIFACT_KEY = "inputs/input_readiness_status.json"
 
 
+# Step 2 `missing_slots` slot_category -> Step 3 `GapCategory`. Keeps the
+# structured Step 2 gap channel aligned with Step 3's checklist taxonomy.
+_MISSING_SLOT_CATEGORY_TO_GAP = {
+    "target": "target",
+    "antibody": "antibody",
+    "payload": "payload_or_linker",
+    "linker": "payload_or_linker",
+    "structure": "structure_or_sequence",
+    "sequence": "structure_or_sequence",
+    "identifier": "structure_or_sequence",
+    "task_intent": "task_intent",
+    "constraint": "constraints",
+    "other": "other",
+}
+
+
 _PDB_EXTS = {".pdb", ".cif", ".mmcif", ".ent"}
 _FASTA_EXTS = {".fasta", ".fa", ".faa", ".seq"}
 _CSV_EXTS = {".csv", ".tsv", ".xlsx", ".xls"}
@@ -492,6 +508,16 @@ class InputReadinessService:
                     )
                 )
 
+        # ── Step 2 structured missing_slots consumption (minimal) ───────────
+        # Step 3 reflects the LLM-judged required-slot gaps reported by
+        # Step 2: a `blocking` slot floors readiness to `blocked` and shows
+        # up in the checklist; `warning` / `optional` slots are informational
+        # gaps that never block on their own. We dedupe a slot against an
+        # existing deterministic item only when that item already covers the
+        # same category at the same-or-higher severity, so a genuinely new
+        # blocking slot is always surfaced.
+        self._consume_missing_slots(sq, missing)
+
         blocking = [m.message for m in missing if m.severity == "blocking"]
         if blocking:
             status_val: str = "blocked"
@@ -521,6 +547,61 @@ class InputReadinessService:
         self.registry.update_active(run_id, input_readiness_status_id=artifact_id)
         self.workflow_state.mark(run_id, "step_03", "completed")
         return status
+
+    @staticmethod
+    def _consume_missing_slots(
+        structured_query: dict, missing: list[MissingInputItem]
+    ) -> None:
+        """Append Step 2 `missing_slots` to the Step 3 checklist (in place).
+
+        Deterministic, additive, and backward compatible: when Step 2 did
+        not populate `missing_slots` (old artifacts) this is a no-op. A slot
+        is skipped only when an existing deterministic item already covers
+        the same category at the same-or-higher severity, avoiding duplicate
+        lines while always surfacing a new/stronger gap.
+        """
+        slots = structured_query.get("missing_slots") or []
+        if not isinstance(slots, list):
+            return
+        severity_rank = {"optional": 0, "warning": 1, "blocking": 2}
+        existing: dict[str, int] = {}
+        for item in missing:
+            rank = severity_rank.get(item.severity, 1)
+            if rank > existing.get(item.category, -1):
+                existing[item.category] = rank
+
+        for slot in slots:
+            if not isinstance(slot, dict):
+                continue
+            severity = slot.get("severity")
+            if severity not in severity_rank:
+                severity = "warning"
+            slot_name = slot.get("slot_name") or "other"
+            category = _MISSING_SLOT_CATEGORY_TO_GAP.get(
+                slot.get("slot_category"), "other"
+            )
+            slot_rank = severity_rank[severity]
+            if existing.get(category, -1) >= slot_rank:
+                # Already represented at >= severity by a deterministic check.
+                continue
+            reason = slot.get("reason") or (
+                f"Step 2 reported a missing required slot: {slot_name}"
+            )
+            question = slot.get("suggested_question")
+            message = reason
+            if isinstance(question, str) and question.strip():
+                message = f"{reason} Suggested question: {question.strip()}"
+            evidence = slot.get("evidence")
+            missing.append(
+                MissingInputItem(
+                    field=f"structured_query.missing_slots[slot_name={slot_name}]",
+                    severity=severity,  # type: ignore[arg-type]
+                    message=message,
+                    category=category,  # type: ignore[arg-type]
+                    evidence_field=evidence if isinstance(evidence, str) else None,
+                )
+            )
+            existing[category] = slot_rank
 
     @staticmethod
     def _readiness_summary(
