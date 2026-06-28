@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 from .common import ToolCallRecord
@@ -76,6 +76,10 @@ class StructureInputRecord(BaseModel):
     preferred_input_reason: Optional[str] = None
     prediction_required: bool = False
     source_priority_notes: list[str] = Field(default_factory=list)
+    # Step 7 tool-call compact metadata for Step 8 consumer convenience.
+    step7_tool_output_metadata: list[dict[str, Any]] = Field(default_factory=list)
+    # Search tooling for ambiguous name-derived candidates should stay compact.
+    database_search_candidates: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class PreparedStructureInputPackage(BaseModel):

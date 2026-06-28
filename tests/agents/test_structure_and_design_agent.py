@@ -11,6 +11,7 @@ import pytest
 
 from app.agents.candidate_context_agent import CandidateContextAgent
 from app.agents.developability_agent import DevelopabilityAgent
+from app.agents import structure_and_design_agent as structure_and_design_module
 from app.agents.structure_and_design_agent import StructureAndDesignAgent
 from app.agents.supervisor_agent import SupervisorAgent
 from app.llm.provider import MockLLMProvider
@@ -610,10 +611,27 @@ def test_step7_name_only_routes_to_database_search_tools(
     )
     skipped = [
         tc for tc in pkg.structure_tool_call_records
-        if tc.tool_name in {"RCSBData_get_entry", "RCSBData_get_assembly", "SAbDab_get_structure", "alphafold_get_prediction"}
+        if tc.tool_name in {"RCSBData_get_entry", "RCSBData_get_assembly", "SAbDab_get_structure"}
     ]
     assert skipped and all(tc.run_status == "skipped" for tc in skipped)
     assert all(tc.tool_input_summary.get("routing_decision") == "not_applicable" for tc in skipped)
+
+    # Database search results are normalized as ambiguous candidate
+    # options. They do not get promoted to primary structure refs.
+    for rec in pkg.prepared_structure_inputs:
+        if rec.input_case != "database_search_result":
+            continue
+        assert rec.database_search_candidates == []
+
+
+def test_step7_scope_tools_match_inventory_runtime_scope():
+    mcp = _mcp()
+    runtime_scope = set(mcp.list_tools(agent_name="structure_and_design_agent", step_id="step_07"))
+    assert runtime_scope == set(structure_and_design_module._STEP7_SCOPED_TOOLS), (
+        "Step 7 runtime scope must stay in sync with _STEP7_SCOPED_TOOLS.\n"
+        f"runtime_scope={sorted(runtime_scope)}\n"
+        f"routing_table={sorted(structure_and_design_module._STEP7_SCOPED_TOOLS)}"
+    )
 
 
 def test_step7_candidate_pdb_id_routes_to_rcsb_and_sabdab_step7_tools(
@@ -623,6 +641,7 @@ def test_step7_candidate_pdb_id_routes_to_rcsb_and_sabdab_step7_tools(
     cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
     cct = local_storage.read_json(cct_path)
     antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    antibody_id = antibody["candidate_id"]
     antibody.setdefault("identifiers", []).append(
         {"id_type": "pdb_id", "id_value": "1N8Z", "source": "candidate_profile"}
     )
@@ -635,16 +654,31 @@ def test_step7_candidate_pdb_id_routes_to_rcsb_and_sabdab_step7_tools(
         mcp_client=_mcp(),
     ).run_step_7(run_id)
     tc_by_name = {
-        tc.tool_name: tc for tc in pkg.structure_tool_call_records if tc.tool_name in {
+        tc.tool_name: tc for tc in pkg.structure_tool_call_records
+        if tc.tool_name in {
             "RCSBData_get_entry", "RCSBData_get_assembly", "SAbDab_get_structure"
+        } and tc.tool_input_summary.get("candidate_id") == antibody_id
         }
-    }
     assert "RCSBData_get_entry" in tc_by_name
     assert tc_by_name["RCSBData_get_entry"].tool_input_summary.get("routing_decision") == "selected"
     assert "RCSBData_get_assembly" in tc_by_name
     assert tc_by_name["RCSBData_get_assembly"].tool_input_summary.get("arguments", {}).get("assembly_id") == "1"
     assert "SAbDab_get_structure" in tc_by_name
     assert tc_by_name["SAbDab_get_structure"].tool_input_summary.get("routing_decision") == "selected"
+
+    rec = next(
+        r for r in pkg.prepared_structure_inputs if r.input_case == "known_pdb_id"
+    )
+    compacted = {m["tool_name"]: m for m in rec.step7_tool_output_metadata}
+    entry_meta = compacted["RCSBData_get_entry"]["compact_output"]
+    assert entry_meta["compact_type"] == "rcsb_entry"
+    assert entry_meta["pdb_id"]
+    assert entry_meta["entry_metadata"] is not None
+    assert compacted["RCSBData_get_assembly"]["compact_output"]["compact_type"] == "rcsb_assembly"
+    assert compacted["RCSBData_get_assembly"]["compact_output"]["assembly_id"] == "1"
+    assert compacted["SAbDab_get_structure"]["compact_output"]["compact_type"] == "sabdab_structure"
+    assert compacted["SAbDab_get_structure"]["compact_output"]["pdb_id"] == entry_meta["pdb_id"]
+    assert rec.structure_refs and any(s.source_kind == "pdb_id" for s in rec.structure_refs)
 
 
 def test_step7_sequence_only_uniprot_routes_to_alphafold_not_structure_search(
@@ -663,22 +697,62 @@ def test_step7_sequence_only_uniprot_routes_to_alphafold_not_structure_search(
         ]
     local_storage.write_json(cct_path, cct)
 
-    pkg = StructureAndDesignAgent(
+    agent = StructureAndDesignAgent(
         storage=local_storage,
         registry=registry_service,
         workflow_state=workflow_state_service,
         mcp_client=_mcp(),
-    ).run_step_7(run_id)
+    )
+    pkg = agent.run_step_7(run_id)
+    step8 = agent.run_step_8(run_id)
     tc_names = {tc.tool_name for tc in pkg.structure_tool_call_records}
-    assert "alphafold_get_prediction" in tc_names
+    assert "alphafold_get_prediction" not in tc_names
     for name in {"RCSBData_get_entry", "RCSBData_get_assembly", "RCSBAdvSearch_search_structures", "PDBeSearch_search_structures"}:
         callset = [tc for tc in pkg.structure_tool_call_records if tc.tool_name == name]
         assert callset
         assert all(call.tool_input_summary.get("routing_decision") == "not_applicable" for call in callset)
         assert all(call.run_status == "skipped" for call in callset)
-    af_calls = [tc for tc in pkg.structure_tool_call_records if tc.tool_name == "alphafold_get_prediction"]
-    assert af_calls
-    assert all(tc.run_status in {"success", "skipped", "dependency_unavailable"} for tc in af_calls)
+    assert all(tc.tool_name != "alphafold_get_prediction" for tc in step8.tool_call_records)
+
+
+def test_step7_database_search_results_become_ambiguous_candidates_only(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[],
+    )
+    overrides = {
+        "RCSBAdvSearch_search_structures": lambda **kw: {
+            "query": kw.get("query"),
+            "structures": [
+                {"pdb_id": "1N8Z", "method": "xray", "resolution": 2.1},
+            ],
+        },
+        "PDBeSearch_search_structures": lambda **kw: {
+            "query": kw.get("query"),
+            "structures": [
+                {"pdb_id": "2N8Z", "method": "crystal", "resolution": 2.3},
+            ],
+        },
+    }
+    mcp = LocalMCPClient(
+        inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+        bindings=overrides,
+    )
+    pkg = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=mcp,
+    ).run_step_7(run_id)
+
+    db_recs = [r for r in pkg.prepared_structure_inputs if r.input_case == "database_search_result"]
+    assert db_recs
+    for rec in db_recs:
+        assert rec.database_search_candidates
+        assert all(item.get("resource_binding_status") == "ambiguous" for item in rec.database_search_candidates)
+        assert all(item.get("pdb_id") for item in rec.database_search_candidates)
+        assert not any(item.get("source") == "selected_structure_ref" for item in rec.database_search_candidates)
+        assert rec.structure_refs == []
 
 
 def test_step8_skips_when_no_usable_structure_ref(

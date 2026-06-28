@@ -370,6 +370,12 @@ class StructureAndDesignAgent:
             preferred_reason = "no structure file or PDB ID available; preparing sequence-only prediction input"
 
         structure_refs: list[StructureRef] = []
+        def _has_pdb_id(value: Any) -> bool:
+            if not value:
+                return False
+            needle = str(value).lower()
+            return any((s.pdb_id or "").lower() == needle for s in structure_refs)
+
         for m in cand_structure_mats:
             source_ref = m.get("material_id") or m.get("value")
             storage_ref = _structure_storage_ref(self.storage, m.get("value"))
@@ -404,13 +410,16 @@ class StructureAndDesignAgent:
                 )
             )
         for ident in cand_pdb_ids:
+            value = ident.get("id_value")
+            if not value or _has_pdb_id(value):
+                continue
             structure_refs.append(
                 StructureRef(
-                    pdb_id=ident.get("id_value"),
+                    pdb_id=value,
                     structure_format="pdb",
                     validation_status="unknown",
                     source_kind="pdb_id",
-                    source_ref=ident.get("id_value"),
+                    source_ref=value,
                     related_candidate_ids=[candidate_id],
                     resource_binding_status="explicit",
                     binding_confidence=1.0,
@@ -418,7 +427,7 @@ class StructureAndDesignAgent:
             )
         for material in cand_pdb_material_refs:
             value = material.get("value")
-            if value and not any(s.pdb_id == value for s in structure_refs):
+            if value and not _has_pdb_id(value):
                 storage_ref = _structure_storage_ref(self.storage, value)
                 structure_refs.append(StructureRef(
                     pdb_id=value,
@@ -433,7 +442,7 @@ class StructureAndDesignAgent:
                 ))
         for ref in refs_by_type.get("pdb_id", []):
             value = ref.get("value")
-            if value and not any(s.pdb_id == value for s in structure_refs):
+            if value and not _has_pdb_id(value):
                 structure_refs.append(
                     StructureRef(
                         pdb_id=value,
@@ -762,28 +771,33 @@ class StructureAndDesignAgent:
                 None,
             )
             if seq_ref:
-                # AlphaFold wrapper accepts UniProt identifiers. Step 7 now
-                # represents identifiers explicitly instead of encoding them
-                # as pseudo-sequences.
-                uniprot = (
-                    seq_ref.get("source_ref")
-                    if seq_ref.get("prediction_input_kind") == "uniprot_id"
-                    else None
-                )
-                if uniprot:
-                    out.append(
-                        ("alphafold_get_prediction", {"uniprot": uniprot}, "prediction_confidence")
-                    )
-                else:
-                    # Can't run AF without a UniProt; lane partial.
-                    pass
+                # Sequence-only prediction is intentionally deferred from Step 8 in this
+                # implementation boundary; Step 7 normalizes sequence refs only.
+                pass
 
         return out
+
+    # ── Step 7 scope / output compacting helpers ───────────────────────────
+    def _step7_scoped_tools(self) -> tuple[str, ...]:
+        """Return the effective scoped toolset for Step 7 from MCP runtime.
+
+        The routing policy is intentionally defined centrally in
+        `_STEP7_SCOPED_TOOLS`; we intersect it with the MCP-scoped tool list so
+        runtime drift is surfaced via drift-fence tests.
+        """
+        try:
+            runtime_scoped = set(
+                self.mcp_client.list_tools(agent_name=_AGENT_NAME, step_id=_STEP_07)
+            )
+        except Exception:
+            runtime_scoped = set(_STEP7_SCOPED_TOOLS)
+        return tuple(sorted(set(_STEP7_SCOPED_TOOLS) & runtime_scoped))
 
     # ── Step 7 scoped tool routing ───────────────────────────────────────
     def _route_step7_scoped_tools(
         self, run_id: str, candidate: dict, record: StructureInputRecord
     ) -> list[ToolCallRecord]:
+        scoped_tools = set(self._step7_scoped_tools())
         calls: list[ToolCallRecord] = []
         input_case = record.input_case
         candidate_id = record.candidate_id
@@ -796,6 +810,26 @@ class StructureAndDesignAgent:
                 "candidate_type": candidate.get("candidate_type"),
                 "input_case": input_case,
             }
+
+        # Keep a deterministic coverage of the routing table; if runtime scope is
+        # missing entries, make the omission explicit as skipped audit entries.
+        for tool_name in _STEP7_SCOPED_TOOLS:
+            if tool_name not in scoped_tools:
+                calls.append(
+                    _skipped_tool_record(
+                        tool_name=tool_name,
+                        agent_name=_AGENT_NAME,
+                        step_id=_STEP_07,
+                        summary={
+                            **_summary_base(),
+                            "routing_decision": "not_in_runtime_scope",
+                            "reason": "tool not available from MCP runtime scope",
+                            "scope": {"step_7_scoped_tools": sorted(_STEP7_SCOPED_TOOLS)},
+                        },
+                    )
+                )
+        if not scoped_tools:
+            return calls
 
         def _skip(tool_name: str, reason: str) -> None:
             calls.append(
@@ -811,21 +845,26 @@ class StructureAndDesignAgent:
                 )
             )
 
-        def _run(tool_name: str, kwargs: dict[str, Any], decision: str) -> None:
-            calls.append(
-                self._call_tool(
-                    run_id=run_id,
-                    step_id=_STEP_07,
-                    tool_name=tool_name,
-                    kwargs=kwargs,
-                    output_dir="step_07",
-                    label=f"{input_case}:{structure_input_id}:{tool_name}",
-                    extra_input_summary={
-                        **_summary_base(),
-                        "routing_decision": decision,
-                        "arguments": {k: _short(v) for k, v in kwargs.items()},
-                    },
-                )
+        def _run_and_record(tool_name: str, kwargs: dict[str, Any], decision: str) -> None:
+            tc = self._call_tool(
+                run_id=run_id,
+                step_id=_STEP_07,
+                tool_name=tool_name,
+                kwargs=kwargs,
+                output_dir="step_07",
+                label=f"{input_case}:{structure_input_id}:{tool_name}",
+                extra_input_summary={
+                    **_summary_base(),
+                    "routing_decision": decision,
+                    "arguments": {k: _short(v) for k, v in kwargs.items()},
+                },
+            )
+            calls.append(tc)
+            _apply_step7_tool_output_metadata(
+                storage=self.storage,
+                record=record,
+                tool_call=tc,
+                tool_name=tool_name,
             )
 
         if input_case == "uploaded_structure_file":
@@ -843,78 +882,64 @@ class StructureAndDesignAgent:
         if input_case == "known_pdb_id":
             pdb_ref = next((s for s in record.structure_refs if s.pdb_id), None)
             if pdb_ref and pdb_ref.pdb_id:
-                _run("RCSBData_get_entry", {"pdb_id": pdb_ref.pdb_id}, "selected")
-                _run(
-                    "RCSBData_get_assembly",
-                    {"pdb_id": pdb_ref.pdb_id, "assembly_id": "1"},
-                    "selected",
-                )
-                if record.structure_role == "antibody_only":
-                    _run("SAbDab_get_structure", {"pdb_id": pdb_ref.pdb_id}, "selected")
-                else:
-                    _skip(
-                        "SAbDab_get_structure",
-                        "only applies to antibody role inputs",
+                if "RCSBData_get_entry" in scoped_tools:
+                    _run_and_record("RCSBData_get_entry", {"pdb_id": pdb_ref.pdb_id}, "selected")
+                if "RCSBData_get_assembly" in scoped_tools:
+                    _run_and_record(
+                        "RCSBData_get_assembly",
+                        {"pdb_id": pdb_ref.pdb_id, "assembly_id": "1"},
+                        "selected",
                     )
+                if record.structure_role == "antibody_only" and "SAbDab_get_structure" in scoped_tools:
+                    _run_and_record(
+                        "SAbDab_get_structure",
+                        {"pdb_id": pdb_ref.pdb_id},
+                        "selected",
+                    )
+                elif record.structure_role != "antibody_only":
+                    _skip("SAbDab_get_structure", "only applies to antibody role inputs")
             else:
                 _skip("RCSBData_get_entry", "known_pdb_id input case requires explicit PDB ID")
                 _skip("RCSBData_get_assembly", "known_pdb_id input case requires explicit PDB ID")
                 _skip("SAbDab_get_structure", "known_pdb_id input case requires explicit PDB ID")
             _skip("RCSBAdvSearch_search_structures", "explicit PDB ID route has precedence over search")
             _skip("PDBeSearch_search_structures", "explicit PDB ID route has precedence over search")
-            _skip("alphafold_get_prediction", "explicit PDB ID route does not need sequence-only prediction")
             return calls
 
         if input_case == "sequence_only_input":
             for name in _STEP7_SCOPED_TOOLS:
-                if name == "alphafold_get_prediction":
-                    continue
                 if name in {"RCSBData_get_entry", "RCSBData_get_assembly", "SAbDab_get_structure"}:
                     _skip(name, "sequence-only input uses UniProt prediction path, no PDB ID")
+                elif name == "alphafold_get_prediction":
+                    # AlphaFold is intentionally deferred from Step 7 in this boundary.
+                    # Do not emit a Step 7 call record to keep Step 8/contract
+                    # handoff explicit and compact.
+                    continue
                 else:
                     _skip(
                         name,
                         "sequence-only route uses local/sequence metadata unless explicit UniProt/ID is present",
                     )
-
-            uniprot = next(
-                (
-                    s.source_ref
-                    for s in record.sequence_refs_for_prediction
-                    if s.prediction_input_kind == "uniprot_id"
-                ),
-                None,
-            )
-            if uniprot:
-                _run("alphafold_get_prediction", {"uniprot": uniprot}, "selected")
-            else:
-                _skip("alphafold_get_prediction", "sequence-only route has no usable UniProt identifier")
             return calls
 
         if input_case == "database_search_result":
             query = _structure_query_from_candidate(candidate, record)
             if query:
-                _run("RCSBAdvSearch_search_structures", {"query": query}, "selected")
-                _run("PDBeSearch_search_structures", {"query": query}, "selected")
+                if "RCSBAdvSearch_search_structures" in scoped_tools:
+                    _run_and_record("RCSBAdvSearch_search_structures", {"query": query}, "selected")
+                if "PDBeSearch_search_structures" in scoped_tools:
+                    _run_and_record("PDBeSearch_search_structures", {"query": query}, "selected")
             else:
-                _skip(
-                    "RCSBAdvSearch_search_structures",
-                    "name-only input has no usable query material",
-                )
-                _skip(
-                    "PDBeSearch_search_structures",
-                    "name-only input has no usable query material",
-                )
+                _skip("RCSBAdvSearch_search_structures", "name-only input has no usable query material")
+                _skip("PDBeSearch_search_structures", "name-only input has no usable query material")
             _skip("RCSBData_get_entry", "database search handles identity inference, not exact PDB ID path")
             _skip("RCSBData_get_assembly", "database search handles identity inference, not exact assembly path")
             _skip("SAbDab_get_structure", "database search handles identity inference, not exact antibody-PDB path")
-            _skip("alphafold_get_prediction", "database search is name-based sequence-agnostic input")
             return calls
 
         for tool_name in _STEP7_SCOPED_TOOLS:
             _skip(tool_name, f"unhandled Step 7 input_case={input_case}")
         return calls
-
     # ── Step 9 ──────────────────────────────────────────────────────────────
     def run_step_9(self, run_id: str) -> CompoundScreeningArtifact:
         reg = self.registry.get(run_id)
@@ -1265,10 +1290,13 @@ def _parse_structure_chain_summary(
             data = storage.read_bytes(source_ref)
         else:
             return []
-        from Bio.PDB import MMCIFParser, PDBParser
-
         text = data.decode("utf-8", errors="replace")
         suffix = PurePosixPath(source_ref).suffix.lower()
+        fallback = _parse_structure_chain_ranges_from_text(text)
+        if fallback:
+            return fallback
+
+        from Bio.PDB import MMCIFParser, PDBParser
         parser = MMCIFParser(QUIET=True) if suffix in {".cif", ".mmcif"} else PDBParser(QUIET=True)
         structure = parser.get_structure("step7_input", StringIO(text))
         model = next(structure.get_models(), None)
@@ -1288,6 +1316,30 @@ def _parse_structure_chain_summary(
         return out
     except Exception:  # noqa: BLE001
         return []
+
+
+def _parse_structure_chain_ranges_from_text(text: str) -> list[tuple[str, int | None, int | None]]:
+    """Extract chain IDs + residue ranges from raw ATOM/HETATM records."""
+    chain_ranges: dict[str, list[int]] = {}
+    for line in text.splitlines():
+        if not line.startswith("ATOM"):
+            continue
+        if len(line) < 27:
+            continue
+        chain_id = line[21].strip()
+        if not chain_id or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9]{0,4}", chain_id):
+            continue
+        try:
+            residue_no = int(line[22:26].strip())
+        except ValueError:
+            continue
+        chain_ranges.setdefault(chain_id, []).append(residue_no)
+    out: list[tuple[str, int | None, int | None]] = []
+    for chain_id, residues in chain_ranges.items():
+        if not residues:
+            continue
+        out.append((chain_id, min(residues), max(residues)))
+    return out
 
 
 def _chain_role_from_material(material_type: str) -> Optional[str]:
@@ -1629,6 +1681,313 @@ def _selection_summary(plan: ToolInvocationPlan) -> dict[str, Any]:
         "validation_status": plan.validation_status,
         "validation_warnings": plan.validation_warnings,
     }
+
+
+def _apply_step7_tool_output_metadata(
+    storage: Storage, record: StructureInputRecord, tool_call: ToolCallRecord, tool_name: str
+) -> None:
+    """Compact Step 7 tool output into normalized Step 7 artifact fields.
+
+    This intentionally does not write raw tool payloads into normalized records.
+    """
+    compact: dict[str, Any] = {
+        "tool_name": tool_name,
+        "tool_call_id": tool_call.tool_call_id,
+        "run_status": tool_call.run_status,
+    }
+    if tool_call.error_message:
+        compact["error_message"] = str(tool_call.error_message)[:180]
+
+    payload = _read_tool_output_payload(storage, tool_call)
+    compact_output = _compact_step7_tool_output(tool_name, payload)
+    if compact_output:
+        compact["compact_output"] = compact_output
+
+    record.step7_tool_output_metadata.append(compact)
+
+    if tool_call.run_status != "success" or not compact_output:
+        return
+
+    if tool_name in {"RCSBData_get_entry", "RCSBData_get_assembly", "SAbDab_get_structure"}:
+        entry_ref = _step7_normalized_struct_ref(
+            source_kind="pdb_id",
+            pdb_id=compact_output.get("pdb_id"),
+            source_ref=compact_output.get("source_ref"),
+            validation_status=compact_output.get("validation_status", "unknown"),
+        )
+        if entry_ref:
+            if not any(
+                existing.pdb_id == entry_ref.pdb_id and existing.storage_ref == entry_ref.storage_ref
+                for existing in record.structure_refs
+            ):
+                record.structure_refs.append(entry_ref)
+
+        for chain in compact_output.get("chain_mapping", []) or []:
+            if not isinstance(chain, dict):
+                continue
+            chain_id = chain.get("chain_id")
+            chain_role = chain.get("chain_role")
+            chain_source = chain.get("mapping_confidence", 0.0)
+            if not chain_id or not chain_role:
+                continue
+            if any(existing.chain_id == chain_id for existing in record.chain_mapping):
+                continue
+            try:
+                record.chain_mapping.append(
+                    ChainMapping(
+                        chain_id=str(chain_id),
+                        chain_role=chain_role,  # type: ignore[arg-type]
+                        mapping_confidence=float(chain_source),
+                        source="inferred",
+                        source_ref=record.structure_input_id,
+                        chain_id_kind="prediction_placeholder",
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                continue
+
+    if tool_name in {"RCSBAdvSearch_search_structures", "PDBeSearch_search_structures"}:
+        for hit in compact_output.get("hits", []) if isinstance(compact_output, dict) else []:
+            if not isinstance(hit, dict):
+                continue
+            candidate = {
+                **{k: _short(v) for k, v in hit.items() if k in {"pdb_id", "query", "source", "method"}},
+                "resource_binding_status": "ambiguous",
+                "run_status": tool_call.run_status,
+                "tool_name": tool_name,
+                "source_ref": hit.get("source_ref"),
+                "chain_hints": hit.get("chain_hints", []),
+            }
+            record.database_search_candidates.append(candidate)
+
+
+def _compact_step7_tool_output(tool_name: str, payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    if tool_name == "RCSBData_get_entry":
+        return {
+            "compact_type": "rcsb_entry",
+            "pdb_id": _extract_scalar(payload, ("pdb_id", "id", "structure_id")),
+            "source_ref": _extract_scalar(payload, ("source_ref", "pdb_id")),
+            "status": payload.get("status"),
+            "entry_metadata": _compact_struct_metadata(payload.get("entry") or payload),
+            "chain_mapping": _extract_chain_mapping(payload),
+            "validation_status": "unknown",
+        }
+    if tool_name == "RCSBData_get_assembly":
+        return {
+            "compact_type": "rcsb_assembly",
+            "pdb_id": _extract_scalar(payload, ("pdb_id", "id", "structure_id")),
+            "assembly_id": payload.get("assembly_id"),
+            "source_ref": _extract_scalar(payload, ("pdb_id", "structure_id")),
+            "status": payload.get("status"),
+            "assembly_metadata": _compact_struct_metadata(payload.get("assembly") or payload.get("result") or {}),
+            "chain_mapping": _extract_chain_mapping(payload.get("assembly") or payload),
+            "validation_status": "unknown",
+        }
+    if tool_name == "SAbDab_get_structure":
+        return {
+            "compact_type": "sabdab_structure",
+            "pdb_id": _extract_scalar(payload, ("pdb_id", "pdb_code", "id", "structure_id")),
+            "source_ref": _extract_scalar(payload, ("pdb_id", "id", "structure_id")),
+            "status": payload.get("status"),
+            "source": payload.get("source"),
+            "structure_metadata": _compact_struct_metadata(payload.get("structure") or payload.get("result") or {}),
+            "chain_mapping": _extract_chain_mapping(payload.get("structure") or payload.get("result") or {}),
+            "validation_status": "unknown",
+        }
+    if tool_name == "RCSBAdvSearch_search_structures":
+        return {
+            "compact_type": "rcsb_search",
+            "query": _extract_scalar(payload, ("query",)),
+            "status": payload.get("status"),
+            "hits": _compact_search_hits(payload),
+        }
+    if tool_name == "PDBeSearch_search_structures":
+        return {
+            "compact_type": "pdbe_search",
+            "query": _extract_scalar(payload, ("query",)),
+            "status": payload.get("status"),
+            "hits": _compact_search_hits(payload),
+        }
+    if tool_name == "alphafold_get_prediction":
+        return {
+            "compact_type": "alphafold_prediction",
+            "uniprot": _extract_scalar(payload, ("uniprot", "qualifier", "query", "pdb_id")),
+            "status": payload.get("status"),
+            "model_ref": _extract_scalar(payload, ("model_url", "model_path", "file", "path", "url", "output")),
+            "source": payload.get("source"),
+        }
+    return {
+        "compact_type": "unknown",
+        "status": payload.get("status"),
+        "tool_output_keys": [k for k in payload.keys()],
+    }
+
+
+def _compact_search_hits(payload: Any) -> list[dict[str, Any]]:
+    hits_raw = []
+    if isinstance(payload, dict):
+        for key in ("hits", "structures", "results", "items", "documents", "data"):
+            if isinstance(payload.get(key), list):
+                hits_raw = payload[key]
+                break
+    elif isinstance(payload, list):
+        hits_raw = payload
+
+    out: list[dict[str, Any]] = []
+    for item in hits_raw[:25]:
+        if isinstance(item, str):
+            out.append({"pdb_id": item, "source_ref": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        pdb_id = _extract_scalar(item, ("pdb_id", "pdb_code", "id", "identifier"))
+        chain_hints = _extract_chain_ids(item)
+        out.append(
+            {
+                "pdb_id": pdb_id,
+                "method": _extract_scalar(item, ("method", "method_type")),
+                "resolution": _extract_scalar(item, ("resolution",)),
+                "title": _extract_scalar(item, ("title",)),
+                "chain_hints": chain_hints,
+                "source_ref": pdb_id,
+            }
+        )
+    return out
+
+
+def _compact_struct_metadata(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    fields = (
+        "title",
+        "method",
+        "resolution",
+        "deposition_date",
+        "release_date",
+        "organism",
+        "chains",
+        "chain_count",
+        "entity_count",
+        "status",
+    )
+    out = {}
+    for field in fields:
+        value = payload.get(field)
+        if value is not None:
+            out[field] = _short(value)
+    if "chains" in payload and not isinstance(payload.get("chains"), list):
+        out.pop("chains", None)
+    return out
+
+
+def _extract_chain_mapping(payload: Any) -> list[dict[str, Any]]:
+    if not payload:
+        return []
+    chain_ids = _extract_chain_ids(payload)
+    chain_role_hints = _extract_chain_roles(payload)
+    out: list[dict[str, Any]] = []
+    for chain_id in chain_ids:
+        role = chain_role_hints.get(chain_id, "other")
+        out.append({
+            "chain_id": chain_id,
+            "chain_role": role,
+            "mapping_confidence": 0.75 if role != "other" else 0.5,
+        })
+    return out
+
+
+def _extract_chain_roles(payload: Any) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not isinstance(payload, dict):
+        return out
+
+    for key, value in payload.items():
+        if not isinstance(key, str):
+            continue
+        k = key.lower()
+        if "chain" not in k:
+            continue
+        role = None
+        if "heavy" in k and "chain" in k:
+            role = "antibody_heavy"
+        elif "light" in k and "chain" in k:
+            role = "antibody_light"
+        elif "antigen" in k and "chain" in k:
+            role = "antigen"
+        if role and isinstance(value, str):
+            out[str(value)] = role
+
+    for chain_id in _extract_chain_ids(payload.get("chain_mapping") if isinstance(payload, dict) else None):
+        if chain_id not in out:
+            out.setdefault(chain_id, "other")
+    return out
+
+
+def _extract_chain_ids(payload: Any) -> list[str]:
+    ids: list[str] = []
+
+    def add_chain_id(value: Any) -> None:
+        if isinstance(value, str):
+            text = value.strip()
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,4}", text):
+                if text not in ids:
+                    ids.append(text)
+
+    def walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key in {"chain_id", "chain"} and isinstance(value, str):
+                    add_chain_id(value)
+                elif key == "chains":
+                    walk(value)
+                elif isinstance(value, (dict, list)):
+                    walk(value)
+        elif isinstance(obj, list):
+            for entry in obj:
+                walk(entry)
+
+    walk(payload)
+    return ids
+
+
+def _extract_scalar(payload: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in payload and payload[key] not in ("", None):
+            return payload[key]
+    return None
+
+
+def _read_tool_output_payload(storage: Storage, tool_call: ToolCallRecord) -> dict[str, Any] | None:
+    if tool_call.run_status != "success" or not tool_call.tool_output_ref:
+        return None
+    try:
+        raw = storage.read_json(tool_call.tool_output_ref) or {}
+        output = raw.get("output")
+        if isinstance(output, dict):
+            return output
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _step7_normalized_struct_ref(
+    *, source_kind: str, pdb_id: Any, source_ref: Any,
+    validation_status: str
+) -> StructureRef | None:
+    if not pdb_id:
+        return None
+    return StructureRef(
+        pdb_id=str(pdb_id),
+        source_kind=source_kind,  # type: ignore[arg-type]
+        source_ref=(str(source_ref) if source_ref is not None else None),
+        structure_format="pdb",
+        validation_status=validation_status,  # type: ignore[arg-type]
+        related_candidate_ids=[],
+        resource_binding_status="inferred",
+        binding_confidence=0.6,
+    )
 
 
 def _skipped_tool_record(*, tool_name: str, agent_name: str, step_id: str, summary: dict[str, Any]) -> ToolCallRecord:
