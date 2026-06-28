@@ -111,6 +111,23 @@ def _identifiers_by_type(candidate: dict, types: Iterable[str]) -> list[dict]:
     ]
 
 
+def _structure_storage_ref(storage: Storage, value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if Path(value).is_file() or storage.exists(value):
+        return value
+    return None
+
+
+def _pdb_path_like(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    return PurePosixPath(value.strip()).suffix.lower() in _PDB_EXTS
+
+
 # ── agent ───────────────────────────────────────────────────────────────────
 
 class StructureAndDesignAgent:
@@ -318,6 +335,7 @@ class StructureAndDesignAgent:
         structure_refs: list[StructureRef] = []
         for m in cand_structure_mats:
             source_ref = m.get("material_id") or m.get("value")
+            storage_ref = _structure_storage_ref(self.storage, m.get("value"))
             structure_refs.append(
                 StructureRef(
                     pdb_id=None,
@@ -326,12 +344,14 @@ class StructureAndDesignAgent:
                     validation_status="unknown",
                     source_kind="candidate_material",
                     source_ref=source_ref,
+                    storage_ref=storage_ref,
                     related_candidate_ids=[candidate_id],
                     resource_binding_status="explicit",
                     binding_confidence=1.0,
                 )
             )
         for f in structure_files:
+            storage_ref = f.get("storage_path") if _pdb_path_like(f.get("storage_path")) else None
             structure_refs.append(
                 StructureRef(
                     pdb_id=None,
@@ -340,6 +360,7 @@ class StructureAndDesignAgent:
                     validation_status="unknown",
                     source_kind="uploaded_file",
                     source_ref=f.get("storage_path") or f.get("file_id"),
+                    storage_ref=storage_ref,
                     related_candidate_ids=[candidate_id],
                     resource_binding_status=f.get("resource_binding_status", "inferred"),
                     binding_confidence=float(f.get("binding_confidence", 0.6)),
@@ -361,12 +382,14 @@ class StructureAndDesignAgent:
         for material in cand_pdb_material_refs:
             value = material.get("value")
             if value and not any(s.pdb_id == value for s in structure_refs):
+                storage_ref = _structure_storage_ref(self.storage, value)
                 structure_refs.append(StructureRef(
                     pdb_id=value,
                     structure_format="pdb",
                     validation_status="unknown",
                     source_kind="candidate_material",
                     source_ref=material.get("material_id") or value,
+                    storage_ref=storage_ref,
                     related_candidate_ids=[candidate_id],
                     resource_binding_status="explicit",
                     binding_confidence=1.0,
@@ -381,6 +404,7 @@ class StructureAndDesignAgent:
                         validation_status="unknown",
                         source_kind="pdb_id",
                         source_ref=value,
+                        storage_ref=None,
                         related_candidate_ids=[candidate_id],
                         resource_binding_status=ref.get("resource_binding_status", "inferred"),
                         binding_confidence=float(ref.get("binding_confidence", 0.6)),
@@ -551,6 +575,21 @@ class StructureAndDesignAgent:
 
             tools_to_call = self._tools_for_step8_case(sin)
             if not tools_to_call:
+                if input_case == "uploaded_structure_file":
+                    tool_calls.append(
+                        _skipped_tool_record(
+                            tool_name="structure_input_missing_ref",
+                            agent_name=_AGENT_NAME,
+                            step_id=_STEP_08,
+                            summary={
+                                "label": f"step08:{structure_input_id}:structure_input",
+                                "candidate_id": candidate_id,
+                                "input_case": input_case,
+                                "reason": "no_usable_structure_reference",
+                                "structure_refs": _compact_structure_refs_for_audit(sin.get("structure_refs") or []),
+                            },
+                        )
+                    )
                 run_status = "partial"
                 partial = True
 
@@ -652,11 +691,10 @@ class StructureAndDesignAgent:
         out: list[tuple[str, dict, str]] = []
 
         if input_case == "uploaded_structure_file":
-            file_ref = next(
-                (s for s in sin.get("structure_refs") or [] if s.get("file_id") or s.get("pdb_id")),
-                None,
-            )
-            ref_value = (file_ref or {}).get("file_id") or (file_ref or {}).get("pdb_id") or "uploaded"
+            structure_ref = _step8_structure_ref(sin.get("structure_refs") or [])
+            if not structure_ref:
+                return out
+            ref_value = structure_ref["value"]
             out.append(("CrystalStructure_validate", {"pdb_id_or_path": ref_value}, "structure_quality"))
             out.append(
                 ("ProteinsPlus_profile_structure_quality",
@@ -669,16 +707,17 @@ class StructureAndDesignAgent:
                 None,
             )
             pdb_id = (pdb_ref or {}).get("pdb_id")
-            if pdb_id:
-                out.append(("RCSBData_get_entry", {"pdb_id": pdb_id}, "structure_quality"))
-                out.append(
-                    ("get_refinement_resolution_by_pdb_id",
-                     {"pdb_id": pdb_id}, "refinement_resolution")
-                )
-                out.append(
-                    ("ProteinsPlus_profile_structure_quality",
-                     {"pdb_id_or_path": pdb_id}, "structure_quality")
-                )
+            if not pdb_id:
+                return out
+            out.append(("RCSBData_get_entry", {"pdb_id": pdb_id}, "structure_quality"))
+            out.append(
+                ("get_refinement_resolution_by_pdb_id",
+                 {"pdb_id": pdb_id}, "refinement_resolution")
+            )
+            out.append(
+                ("ProteinsPlus_profile_structure_quality",
+                 {"pdb_id_or_path": pdb_id}, "structure_quality")
+            )
 
         elif input_case == "sequence_only_input":
             seq_ref = next(
@@ -875,26 +914,36 @@ def _bind_step7_resources(
             by_type.setdefault(candidate.get("candidate_type", ""), []).append(candidate["candidate_id"])
     unresolved: list[dict] = []
 
+    def _one_or_none(ids: list[str], confidence: float) -> tuple[list[str], str, float]:
+        deduped = list(dict.fromkeys(ids))
+        if len(deduped) == 1:
+            return deduped, "inferred", confidence
+        if deduped:
+            return [], "ambiguous", 0.0
+        return [], "unassigned", 0.0
+
     def compatible_ids(resource: dict, resource_kind: str) -> tuple[list[str], str, float]:
         explicit_ids = _explicit_resource_candidate_ids(resource, set(bound))
         if explicit_ids:
             return explicit_ids, "explicit", 1.0
         role = _resource_role(resource, resource_kind)
         if role in {"target", "antigen"}:
-            ids = by_type.get("target_antigen", [])
-            return (ids, "inferred", 0.8) if len(ids) == 1 else ([], "ambiguous", 0.0)
+            return _one_or_none(by_type.get("target_antigen", []), 0.8)
         if role in {"antibody", "antibody_heavy", "antibody_light"}:
-            ids = by_type.get("antibody", [])
-            return (ids, "inferred", 0.8) if len(ids) == 1 else ([], "ambiguous", 0.0)
+            return _one_or_none(by_type.get("antibody", []), 0.8)
         if role == "complex":
-            ids = by_type.get("adc_construct", [])
-            if len(ids) == 1:
-                return ids, "inferred", 0.7
-            target_ids = by_type.get("target_antigen", [])
-            return (target_ids, "inferred", 0.5) if len(target_ids) == 1 else ([], "ambiguous", 0.0)
-        if resource_kind in {"structure", "pdb_id", "uniprot_id"}:
-            ids = by_type.get("target_antigen", [])
-            return (ids, "inferred", 0.5) if len(ids) == 1 else ([], "ambiguous", 0.0)
+            return _one_or_none(by_type.get("adc_construct", []), 0.7)
+        if resource_kind in {"sequence"}:
+            return _one_or_none([*by_type.get("target_antigen", []), *by_type.get("antibody", [])], 0.5)
+        if resource_kind in {"uniprot_id"}:
+            return _one_or_none(by_type.get("target_antigen", []), 0.5)
+        if resource_kind in {"structure", "pdb_id"}:
+            ids = [
+                *by_type.get("target_antigen", []),
+                *by_type.get("antibody", []),
+                *by_type.get("adc_construct", []),
+            ]
+            return _one_or_none(ids, 0.5)
         return [], "unassigned", 0.0
 
     def bind_file(resource: dict, kind: str) -> None:
@@ -1258,6 +1307,43 @@ def _artifact_type_for_tool(tool_name: str) -> str:
     if tool_name == "alphafold_get_prediction":
         return "predicted_monomer_structure"
     return "other"
+
+
+def _step8_structure_ref(structure_refs: list[Any]) -> dict[str, Any] | None:
+    def _pathlike(value: Any) -> bool:
+        return _pdb_path_like(value)
+
+    for sref in structure_refs:
+        if isinstance(sref, dict) and sref.get("file_id"):
+            return {"value": sref["file_id"], "source": "file_id"}
+    for sref in structure_refs:
+        if isinstance(sref, dict) and sref.get("pdb_id"):
+            return {"value": sref["pdb_id"], "source": "pdb_id"}
+    for sref in structure_refs:
+        if not isinstance(sref, dict):
+            continue
+        for key in ("storage_ref", "source_ref", "original_storage_ref"):
+            if key == "original_storage_ref":
+                continue
+            value = sref.get(key)
+            if _pathlike(value):
+                return {"value": value, "source": key}
+    return None
+
+
+def _compact_structure_refs_for_audit(structure_refs: list[Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for sref in structure_refs:
+        if not isinstance(sref, dict):
+            continue
+        out.append(
+            {
+                "file_id": sref.get("file_id"),
+                "pdb_id": sref.get("pdb_id"),
+                "storage_ref": sref.get("storage_ref"),
+            }
+        )
+    return out
 
 
 def _compound_hit_from_call(candidate: dict, tc: ToolCallRecord, kwargs: dict, tool_name: str) -> CompoundHit:

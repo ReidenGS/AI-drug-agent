@@ -17,6 +17,7 @@ class StructureRef(BaseModel):
         "uploaded_file", "pdb_id", "candidate_material", "predicted_needed", "unknown"
     ] = "unknown"
     source_ref: Optional[str] = None
+    storage_ref: Optional[str] = None
     related_candidate_ids: list[str] = Field(default_factory=list)
     resource_binding_status: Literal["explicit", "inferred", "ambiguous", "unassigned"] = "unassigned"
     binding_confidence: float = 0.0

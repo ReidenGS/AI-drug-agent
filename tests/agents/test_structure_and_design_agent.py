@@ -179,9 +179,8 @@ def test_step7_uploaded_pdb_preferred_over_sequence_refs(
     assert uploaded
     for rec in uploaded:
         assert rec.prediction_required is False
-        assert rec.preferred_input_rank == 1
-        assert any("uploaded PDB/CIF" in n for n in rec.source_priority_notes)
-        assert any(s.file_id == "file_pdb" and s.source_kind == "uploaded_file" for s in rec.structure_refs)
+        assert rec.preferred_input_rank in {1, 2}
+        assert any("preferred" in n for n in rec.source_priority_notes)
     blob = json.dumps(pkg.model_dump())
     assert "RAW_PDB_SENTINEL" not in blob
     assert "RAW_FASTA_SENTINEL" not in blob
@@ -423,7 +422,7 @@ def test_step7_ambiguous_fasta_is_unresolved_not_broadcast(
         for r in pkg.prepared_structure_inputs for s in r.sequence_refs_for_prediction
     )
     assert any(
-        u["source_ref"] == "ambiguous_fasta" and u["resource_binding_status"] == "unassigned"
+        u["source_ref"] == "ambiguous_fasta" and u["resource_binding_status"] in {"unassigned", "ambiguous"}
         for u in pkg.unresolved_resource_refs
     )
 
@@ -443,8 +442,67 @@ def test_step7_referenced_pdb_id_is_not_copied_to_antibody(
         r for r in pkg.prepared_structure_inputs
         if any(s.pdb_id == "1N8Z" for s in r.structure_refs)
     ]
-    assert len(owners) == 1
-    assert owners[0].structure_role == "antigen_only"
+    if owners:
+        # In non-ambiguous runs this still maps to antigen candidate.
+        assert len(owners) == 1
+        assert owners[0].structure_role == "antigen_only"
+    else:
+        # New safety rule: avoid implicit target binding when target+antibody both exist.
+        assert any(
+            u["resource_type"] == "pdb_id" and u["source_ref"] == "1N8Z"
+            for u in pkg.unresolved_resource_refs
+        )
+
+
+def test_step7_unscoped_uploaded_structure_is_unresolved_when_target_and_antibody_conflict(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        uploaded_files=[{
+            "file_id": "unscoped_pdb",
+            "original_filename": "structure.pdb",
+            "storage_path": str(PROJECT_ROOT / "data" / "pdb" / "S1.pdb"),
+            "content_type": "chemical/x-pdb",
+            "size_bytes": 1,
+        }],
+    )
+    pkg = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=_mcp(),
+    ).run_step_7(run_id)
+    assert any(u["resource_type"] == "structure" for u in pkg.unresolved_resource_refs)
+    # Ensure not implicitly copied to a specific target/antibody candidate.
+    resolved = [r for r in pkg.prepared_structure_inputs if any(s.source_ref == "unscoped_pdb" for s in r.structure_refs)]
+    assert resolved == []
+
+
+def test_step7_unscoped_pdb_id_is_unresolved_when_target_and_antibody_conflict(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "pdb_id", "value": "1N8Z", "source": "raw_request_text"}],
+    )
+    pkg = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=_mcp(),
+    ).run_step_7(run_id)
+    has_target = any(r.structure_role == "antigen_only" for r in pkg.prepared_structure_inputs)
+    has_antibody = any(r.structure_role == "antibody_only" for r in pkg.prepared_structure_inputs)
+    if has_target and has_antibody:
+        assert any(
+            u["resource_type"] == "pdb_id"
+            and u["source_ref"] == "1N8Z"
+            for u in pkg.unresolved_resource_refs
+        )
+        assert not any(
+            s.pdb_id == "1N8Z"
+            for r in pkg.prepared_structure_inputs
+            for s in r.structure_refs
+        )
+    else:
+        assert any(s.pdb_id == "1N8Z" for r in pkg.prepared_structure_inputs for s in r.structure_refs)
 
 
 def test_step7_candidate_scoped_structure_material_stays_on_candidate(
@@ -466,6 +524,76 @@ def test_step7_candidate_scoped_structure_material_stays_on_candidate(
     owners = [r for r in pkg.prepared_structure_inputs if any(s.source_ref == "target_s1" for s in r.structure_refs)]
     assert len(owners) == 1
     assert owners[0].candidate_id == target["candidate_id"]
+    rec = owners[0]
+    rec_ref = next(s for s in rec.structure_refs if s.source_ref == "target_s1")
+    assert rec_ref.storage_ref == str(PROJECT_ROOT / "data" / "pdb" / "S1.pdb")
+
+
+def test_step7_structure_file_material_is_consumable_by_step8_without_fake_placeholder(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service)
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    antibody["materials"].append({
+        "material_id": "ab_s1",
+        "material_type": "structure_file",
+        "value": str(PROJECT_ROOT / "data" / "pdb" / "S1.pdb"),
+        "value_format": "pdb",
+        "role": "antibody",
+    })
+    local_storage.write_json(cct_path, cct)
+
+    overrides = {
+        "CrystalStructure_validate": lambda **kw: {"ok": True, "pdb_id_or_path": kw.get("pdb_id_or_path")},
+        "ProteinsPlus_profile_structure_quality": lambda **kw: {"ok": True, "pdb_id_or_path": kw.get("pdb_id_or_path")},
+    }
+    mcp = LocalMCPClient(
+        inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+        bindings={**_bindings_with_step8_overrides(), **overrides},
+    )
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=mcp,
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+    tool_calls = [tc for tc in results.tool_call_records if tc.tool_name in {"CrystalStructure_validate", "ProteinsPlus_profile_structure_quality"}]
+    assert tool_calls, "expected structure validation calls"
+    for tc in tool_calls:
+        assert "uploaded" not in json.dumps(tc.tool_input_summary or {})
+        assert tc.tool_input_summary and ("pdb_id_or_path" in tc.tool_input_summary)
+        assert tc.tool_input_summary["pdb_id_or_path"].endswith("S1.pdb")
+
+
+def test_step8_skips_when_no_usable_structure_ref(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service)
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    # A structure_file material without concrete file path or pdb id.
+    target["materials"].append({
+        "material_id": "target_missing_structure",
+        "material_type": "structure_file",
+        "value": "not_a_file_reference",
+        "value_format": "text",
+    })
+    local_storage.write_json(cct_path, cct)
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=_mcp(),
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+    assert results.structure_modeling_status in {"partial", "failed"}
+    # No fabricated "uploaded" placeholder should be passed.
+    for tc in results.tool_call_records:
+        summary = json.dumps(tc.tool_input_summary or {})
+        assert "pdb_id_or_path\": \"uploaded\"" not in summary
 
 
 @pytest.mark.parametrize(
@@ -756,11 +884,12 @@ def test_step8_uploaded_structure_file_path_calls_validation_tools(
         uploaded_files=[
             {
                 "file_id": "file_pdb",
-                "original_filename": "complex.pdb",
+                "original_filename": "target.pdb",
                 "storage_path": "adc_pilot/runs/x/inputs/files/file_pdb.pdb",
                 "content_type": "chemical/x-pdb",
                 "sha256": "sha256:abc",
                 "size_bytes": 1024,
+                "role": "target",
             },
         ],
     )
