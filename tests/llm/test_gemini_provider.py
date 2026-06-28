@@ -259,6 +259,58 @@ def test_stage2_multi_tool_rejects_entry_with_non_object_arguments():
         )
 
 
+# ── Step 6 schema mapping task shapes ──────────────────────────────────────
+
+
+def test_step6_schema_mapping_stage1_accepts_valid_payload_without_task_intent():
+    provider = _provider_with_response(
+        '{"selections":[{"tool_name":"DrugProps_pains_filter",'
+        '"selection_reason":"smiles"}]}'
+    )
+    out = provider.generate_json(
+        "pick", schema={"task": "step6_schema_mapping_stage_1"}
+    )
+    assert out["selections"][0]["tool_name"] == "DrugProps_pains_filter"
+
+
+def test_step6_schema_mapping_stage2_accepts_valid_payload_without_task_intent():
+    provider = _provider_with_response(
+        '{"tools":[{"tool_name":"DrugProps_pains_filter",'
+        '"can_invoke":true,'
+        '"argument_mapping":{"smiles":"candidate:c1:material:m1:value"},'
+        '"missing_required_fields":[],'
+        '"argument_mapping_reason":"mapped"}]}'
+    )
+    out = provider.generate_json(
+        "map", schema={"task": "step6_schema_mapping_stage_2"}
+    )
+    assert out["tools"][0]["can_invoke"] is True
+
+
+def test_step6_schema_mapping_stage1_rejects_non_list_selections():
+    provider = _provider_with_responses(
+        [SimpleNamespace(text='{"selections":"not-a-list"}')] * 3
+    )
+    with pytest.raises(GeminiProviderError, match="step6_schema_mapping_stage_1.*selections"):
+        provider.generate_json(
+            "pick", schema={"task": "step6_schema_mapping_stage_1"}
+        )
+
+
+def test_step6_schema_mapping_stage2_rejects_malformed_tools():
+    provider = _provider_with_responses(
+        [SimpleNamespace(text=(
+            '{"tools":[{"tool_name":"DrugProps_pains_filter",'
+            '"can_invoke":"yes","argument_mapping":{},'
+            '"missing_required_fields":[]}]}'
+        ))] * 3
+    )
+    with pytest.raises(GeminiProviderError, match="step6_schema_mapping_stage_2.*can_invoke"):
+        provider.generate_json(
+            "map", schema={"task": "step6_schema_mapping_stage_2"}
+        )
+
+
 def test_stage2_multi_tool_rejects_entry_missing_lane_type_or_tool_name():
     provider = _provider_with_responses(
         [SimpleNamespace(text='{"tools":[{"arguments":{}}]}')] * 3

@@ -9,6 +9,7 @@ import pytest
 import app.deps as deps
 from app.llm.gemini_provider import GeminiProvider
 from app.llm.provider import MockLLMProvider
+from app.llm.qwen_provider import QwenProvider
 from app.settings import Settings, get_settings
 
 
@@ -56,6 +57,12 @@ def test_gemini_api_key_alone_does_not_select_gemini(monkeypatch):
     silently."""
     monkeypatch.setenv("LLM_PROVIDER", "mock")
     monkeypatch.setenv("GEMINI_API_KEY", "looks-like-a-real-key-but-isnt")
+    assert isinstance(deps.get_llm_provider(), MockLLMProvider)
+
+
+def test_qwen_api_key_alone_does_not_select_qwen(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("QWEN_API_KEY", "qwen-fake-key")
     assert isinstance(deps.get_llm_provider(), MockLLMProvider)
 
 
@@ -177,3 +184,60 @@ def test_default_openai_model_pinned():
     from app.settings import Settings
 
     assert Settings.model_fields["openai_model"].default == "gpt-4.1-mini"
+
+
+# ── Qwen provider selection ────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "raw_value",
+    ["qwen", "Qwen", "QWEN", "  qwen  ", "QwEn"],
+    ids=lambda v: repr(v),
+)
+def test_qwen_case_variants_all_select_qwen(monkeypatch, raw_value):
+    monkeypatch.setenv("LLM_PROVIDER", raw_value)
+    monkeypatch.setenv("QWEN_API_KEY", "qwen-fake-key")
+    assert isinstance(deps.get_llm_provider(), QwenProvider)
+
+
+def test_explicit_qwen_requires_key(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "qwen")
+    monkeypatch.delenv("QWEN_API_KEY", raising=False)
+    with pytest.raises(ValueError) as excinfo:
+        deps.get_llm_provider()
+    msg = str(excinfo.value)
+    assert "QWEN_API_KEY" in msg
+    assert "qwen-fake-key" not in msg
+
+
+def test_qwen_model_env_value_is_passed_to_provider(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "qwen")
+    monkeypatch.setenv("QWEN_API_KEY", "qwen-fake-key")
+    monkeypatch.setenv("QWEN_MODEL", "qwen-max")
+    provider = deps.get_llm_provider()
+    assert isinstance(provider, QwenProvider)
+    assert provider.model == "qwen-max"
+
+
+def test_qwen_base_url_env_value_is_passed_to_provider(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "qwen")
+    monkeypatch.setenv("QWEN_API_KEY", "qwen-fake-key")
+    monkeypatch.setenv("QWEN_BASE_URL", "https://example.test/compatible/v1")
+    provider = deps.get_llm_provider()
+    assert isinstance(provider, QwenProvider)
+    assert provider.base_url == "https://example.test/compatible/v1"
+
+
+def test_qwen_timeout_env_value_is_passed_to_provider(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "qwen")
+    monkeypatch.setenv("QWEN_API_KEY", "qwen-fake-key")
+    monkeypatch.setenv("QWEN_TIMEOUT", "12.5")
+    provider = deps.get_llm_provider()
+    assert isinstance(provider, QwenProvider)
+    assert provider.timeout == 12.5
+
+
+def test_default_qwen_model_pinned():
+    from app.settings import Settings
+
+    assert Settings.model_fields["qwen_model"].default == "qwen-plus"

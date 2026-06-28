@@ -159,6 +159,73 @@ def test_step6_produces_summary_from_step5(
     assert state["steps"]["step_06"] == "completed"
 
 
+def test_step6_selection_audit_uses_schema_mapping_fields(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_through_step_5(local_storage, registry_service, workflow_state_service)
+    DevelopabilityAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(),
+    ).run(run_id)
+    persisted = local_storage.read_json(
+        local_storage.run_key(run_id, "structured_liability_summary.json")
+    )
+    audit = persisted["selection_audit"]
+
+    for old_key in (
+        "step_06_runtime_eligible_tools_by_candidate_lane",
+        "step_06_stage1_allowed_tools_by_lane",
+        "step_06_suppressed_tools_with_reason",
+        "argument_construction_source_distribution",
+    ):
+        assert old_key not in audit
+
+    for new_key in (
+        "step_06_stage1_scope_tool_names",
+        "step_06_stage1_catalog_tool_names",
+        "step_06_stage1_disclosed_tool_names",
+        "step_06_stage1_hidden_tools_with_reason",
+        "step_06_stage1_disclosure_summary",
+        "step_06_stage1_selected_tools",
+        "step_06_stage2_schema_survivors",
+        "step_06_stage2_mapped_tools",
+        "step_06_runtime_resolved_tools",
+        "step_06_executed_tools",
+        "step_06_recorded_tool_call_tools",
+        "step_06_stage2_uninvokable_tool_details",
+        "step_06_runtime_chain_expanded_tools",
+        "step_06_runtime_chain_expansion_details",
+        "step_06_selection_progress",
+        "argument_mapping_source_distribution",
+    ):
+        assert new_key in audit
+
+    scope = set(audit["step_06_stage1_scope_tool_names"])
+    catalog = set(audit["step_06_stage1_catalog_tool_names"])
+    disclosed = set(audit["step_06_stage1_disclosed_tool_names"])
+    selected = set(audit["step_06_stage1_selected_tools"])
+    mapped = set(audit["step_06_stage2_mapped_tools"])
+    resolved = set(audit["step_06_runtime_resolved_tools"])
+    executed = set(audit["step_06_executed_tools"])
+    recorded = set(audit["step_06_recorded_tool_call_tools"])
+
+    assert scope, "scope should contain full Step 6 MCP-scoped tool surface"
+    assert catalog, "catalog should contain LLM-visible disclosed tools"
+    assert catalog == disclosed
+    assert catalog <= scope
+    assert selected <= catalog
+    assert mapped <= selected
+    assert resolved <= mapped
+    assert executed <= resolved
+    assert executed <= recorded
+    assert isinstance(audit["step_06_runtime_chain_expansion_details"], list)
+
+    assert isinstance(audit["step_06_selection_progress"], list)
+    assert isinstance(audit["step_06_stage2_uninvokable_tool_details"], list)
+
+
 # ── 3. inventory scope: Step 6 agent only calls Step 6 tools ─────────────────
 
 def test_step6_only_calls_step6_inventory_tools(
@@ -200,9 +267,10 @@ def test_step6_only_calls_step6_inventory_tools(
                 assert tc["tool_name"] in step6_tool_names, (
                     f"Step 6 agent called non-Step-6 tool: {tc['tool_name']}"
                 )
-                # Nothing the agent calls should be rejected by scope — if it
-                # were, the lane routing has a bug.
-                assert tc["run_status"] != "skipped" or lane["input_status"] == "missing"
+                # Turn B may record skipped tools when Stage 2 cannot map
+                # required args to field refs. It must still never be a
+                # Step-scope rejection.
+                assert tc.get("error_message") != "tool_not_in_agent_scope"
 
 
 # ── 4. unwired wrappers → dependency_unavailable, status partial ─────────────

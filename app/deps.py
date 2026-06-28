@@ -14,6 +14,7 @@ from .services.tool_inventory_service import ToolInventoryService
 from .llm.provider import LLMProvider, MockLLMProvider
 from .llm.gemini_provider import GeminiProvider
 from .llm.openai_provider import OpenAIProvider
+from .llm.qwen_provider import QwenProvider
 from .mcp.client import LocalMCPClient, MCPClient
 
 
@@ -54,7 +55,7 @@ def get_mcp_client() -> MCPClient:
 def get_llm_provider() -> LLMProvider:
     """Return the configured LLM provider.
 
-    Live providers (gemini / openai) are selected ONLY when
+    Live providers (gemini / openai / qwen) are selected ONLY when
     ``LLM_PROVIDER`` is set explicitly. Having the corresponding API key
     is necessary but not sufficient, so local/test runs stay deterministic
     unless a live provider is explicitly requested.
@@ -74,4 +75,16 @@ def get_llm_provider() -> LLMProvider:
                 "either set the key or use LLM_PROVIDER=mock."
             )
         return OpenAIProvider(api_key=settings.openai_api_key, model=settings.openai_model)
+    if settings.llm_provider == "qwen":
+        if not settings.qwen_api_key:
+            raise ValueError(
+                "LLM_PROVIDER=qwen but QWEN_API_KEY is empty; "
+                "either set the key or use LLM_PROVIDER=mock."
+            )
+        return QwenProvider(
+            api_key=settings.qwen_api_key,
+            model=settings.qwen_model,
+            base_url=settings.qwen_base_url,
+            timeout=settings.qwen_timeout,
+        )
     return MockLLMProvider()

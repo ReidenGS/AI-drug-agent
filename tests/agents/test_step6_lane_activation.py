@@ -21,7 +21,10 @@ Also pins:
 
 from __future__ import annotations
 
+import json
 from typing import Any
+
+import pytest
 
 from app.agents.developability_agent import DevelopabilityAgent
 from app.agents.step_06_capability_registry import STEP_06_CAPABILITY_REGISTRY
@@ -69,6 +72,10 @@ _DEFAULT_OK_BINDINGS = {
     "PDBePISA_get_interfaces": {"status": "mocked", "interfaces": []},
     "PDBePISA_get_monomer_analysis": {"status": "mocked", "monomers": []},
 }
+
+_FASTA_PATH = "adc_pilot/runs/run_x/inputs/heavy_chain.fasta"
+_FASTA_CONTENT = ">chainA\nEVQLVESGGGLVQPGGSLRLSCAASGFNI\n"
+_S1_PDB_PATH = "adc_pilot/runs/run_x/inputs/S1.pdb"
 
 
 def _seed_synthetic_cct(
@@ -131,12 +138,16 @@ def _seed_synthetic_cct(
     return run_id
 
 
-def _material(mat_type: str, value: str) -> dict:
+def _material(
+    mat_type: str,
+    value: str,
+    value_format: str | None = None,
+) -> dict:
     return {
         "material_id": f"mat_{mat_type}",
         "material_type": mat_type,
         "value": value,
-        "value_format": None,
+        "value_format": value_format,
         "extraction_status": "extracted",
         "validation_status": "unknown",
         "role": None,
@@ -205,7 +216,11 @@ def test_step6_smiles_runs_bindingdb_prior_without_chembl_id(
     assert bio["input_status"] == "sufficient"
     names = {tc["tool_name"] for tc in bio["tool_call_records"]}
     assert "BindingDB_get_targets_by_compound" in names
-    assert "ChEMBL_search_activities" not in names
+    successful_names = {
+        tc["tool_name"] for tc in bio["tool_call_records"]
+        if tc["run_status"] == "success"
+    }
+    assert "ChEMBL_search_activities" not in successful_names
 
 
 # ── 1. payload SMILES only → compound liability + bioactivity lanes only ────
@@ -248,6 +263,15 @@ def test_step6_payload_smiles_only_runs_compound_lane_and_marks_others_missing(
 
     # Summary status stays in the "completed-ish" band, not failed.
     assert persisted["prefilter_status"] in {"completed", "partial"}
+    audit = persisted["selection_audit"]
+    assert set(audit["step_06_stage1_catalog_tool_names"]) == set(
+        audit["step_06_stage1_disclosed_tool_names"]
+    )
+    assert set(audit["step_06_stage1_catalog_tool_names"]) < set(
+        audit["step_06_stage1_scope_tool_names"]
+    )
+    assert "PROSITE_scan_sequence" in audit["step_06_stage1_scope_tool_names"]
+    assert "PROSITE_scan_sequence" not in audit["step_06_stage1_catalog_tool_names"]
 
 
 def test_step6_payload_name_does_not_run_smiles_liability_tools(
@@ -270,14 +294,15 @@ def test_step6_payload_name_does_not_run_smiles_liability_tools(
     lanes = _lane_results(persisted)
 
     assert lanes["payload_linker_compound_liability"]["run_status"] == "skipped"
-    assert lanes["payload_linker_compound_liability"]["input_status"] == "missing"
-    called = {
+    assert lanes["payload_linker_compound_liability"]["input_status"] == "insufficient"
+    successful = {
         tc["tool_name"]
         for cand in persisted["candidate_liability_results"]
         for lane in cand["lane_results"]
         for tc in lane["tool_call_records"]
+        if tc["run_status"] == "success"
     }
-    assert not (called & {
+    assert not (successful & {
         "DrugProps_pains_filter",
         "DrugProps_lipinski_filter",
         "DrugProps_calculate_qed",
@@ -286,7 +311,11 @@ def test_step6_payload_name_does_not_run_smiles_liability_tools(
         "ADMETAI_predict_toxicity",
         "ADMETAI_predict_physicochemical_properties",
     })
-    assert "ChEMBL_search_activities" not in called
+    assert "ChEMBL_search_activities" not in successful
+    audit = persisted["selection_audit"]
+    assert "ambiguous_modality_fail_open" in (
+        audit["step_06_stage1_disclosure_summary"]["cand_synthetic_1"]["disclosure_tags"]
+    )
 
 
 def test_step6_antibody_name_does_not_run_sequence_tools(
@@ -309,14 +338,15 @@ def test_step6_antibody_name_does_not_run_sequence_tools(
     lanes = _lane_results(persisted)
 
     assert lanes["antibody_protein_sequence_liability"]["run_status"] == "skipped"
-    assert lanes["antibody_protein_sequence_liability"]["input_status"] == "missing"
-    called = {
+    assert lanes["antibody_protein_sequence_liability"]["input_status"] == "insufficient"
+    successful = {
         tc["tool_name"]
         for cand in persisted["candidate_liability_results"]
         for lane in cand["lane_results"]
         for tc in lane["tool_call_records"]
+        if tc["run_status"] == "success"
     }
-    assert "PROSITE_scan_sequence" not in called
+    assert "PROSITE_scan_sequence" not in successful
 
 
 def test_step6_target_name_without_accession_does_not_run_accession_tools(
@@ -340,15 +370,16 @@ def test_step6_target_name_without_accession_does_not_run_accession_tools(
     lanes = _lane_results(persisted)
 
     assert lanes["antigen_protein_feature_context"]["run_status"] == "skipped"
-    assert lanes["antigen_protein_feature_context"]["input_status"] == "missing"
-    called = {
+    assert lanes["antigen_protein_feature_context"]["input_status"] == "insufficient"
+    successful = {
         tc["tool_name"]
         for cand in persisted["candidate_liability_results"]
         for lane in cand["lane_results"]
         for tc in lane["tool_call_records"]
+        if tc["run_status"] == "success"
     }
-    assert "EBIProteins_get_features" not in called
-    assert "EBIProteins_get_epitopes" not in called
+    assert "EBIProteins_get_features" not in successful
+    assert "EBIProteins_get_epitopes" not in successful
 
 
 # ── 2. antibody sequence only → sequence lane only ──────────────────────────
@@ -450,6 +481,184 @@ def test_step6_pdb_only_runs_structure_lane(
         assert lanes[lane_type]["input_status"] == "missing"
 
 
+def test_step6_uploaded_fasta_is_resolved_at_runtime_and_injected(
+    local_storage, registry_service, workflow_state_service
+):
+    local_storage.write_bytes(_FASTA_PATH, _FASTA_CONTENT.encode("utf-8"))
+
+    class _FastaLLM:
+        name = "fasta_stage2"
+        model = "test"
+        def generate(self, *_a, **_kw):
+            raise NotImplementedError
+        def generate_json(self, prompt: str, *, schema: dict, system: str | None = None):
+            task = (schema or {}).get("task")
+            if task == "step6_schema_mapping_stage_1":
+                return {
+                    "selections": [
+                        {"tool_name": "PROSITE_scan_sequence", "selection_reason": "sequence lane"}
+                    ]
+                }
+            if task == "step6_schema_mapping_stage_2":
+                field_ref = next(
+                    f["field_ref"] for f in schema.get("candidate_available_fields", [])
+                    if f.get("value_kind") == "uploaded_fasta_ref"
+                )
+                return {
+                    "tools": [{
+                        "tool_name": "PROSITE_scan_sequence",
+                        "can_invoke": True,
+                        "argument_mapping": {"sequence": field_ref},
+                        "missing_required_fields": [],
+                        "argument_mapping_reason": "resolve uploaded FASTA",
+                    }]
+                }
+            return {}
+
+    observed: dict[str, Any] = {}
+    def _prosite(**kw):
+        observed["prosite_kwargs"] = dict(kw)
+        return {"status": "mocked", "motifs": []}
+
+    run_id = _seed_synthetic_cct(
+        local_storage, registry_service, workflow_state_service,
+        materials=[_material("antibody_heavy_chain_sequence", _FASTA_PATH, value_format="fasta")],
+    )
+    DevelopabilityAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={"PROSITE_scan_sequence": _prosite}),
+        llm=_FastaLLM(),
+    ).run(run_id)
+
+    persisted = local_storage.read_json(local_storage.run_key(run_id, "structured_liability_summary.json"))
+    lane = _lane_results(persisted)["antibody_protein_sequence_liability"]
+    calls = [
+        tc for tc in lane["tool_call_records"]
+        if tc["tool_name"] == "PROSITE_scan_sequence"
+    ]
+    assert calls, "PROSITE should be selected and attempted"
+    assert calls[0]["run_status"] == "success"
+    assert observed["prosite_kwargs"]["sequence"] == _FASTA_CONTENT.splitlines()[1]
+    assert _FASTA_PATH not in str(observed["prosite_kwargs"]["sequence"])
+    assert "EVQLVESGGGLVQPGGSLRLSCAASGFNI" not in str(calls[0]["tool_input_summary"])
+    assert _FASTA_PATH not in str(calls[0]["tool_input_summary"])
+    summary = persisted["selection_audit"]
+    assert "PROSITE_scan_sequence" in summary["step_06_stage1_selected_tools"]
+    assert "PROSITE_scan_sequence" in summary["step_06_stage2_mapped_tools"]
+    assert "PROSITE_scan_sequence" in summary["step_06_executed_tools"]
+    assert "PROSITE_scan_sequence" in summary["step_06_runtime_resolved_tools"]
+    assert "PROSITE_scan_sequence" not in summary["step_06_resolver_failed_tools"]
+
+
+def test_step6_structure_ref_maps_pdb_id_only_as_skipped_and_structure_file_as_executed(
+    local_storage, registry_service, workflow_state_service, monkeypatch
+):
+    captured: dict[str, dict[str, str]] = {}
+
+    class _StructureLLM:
+        name = "structure_schema"
+        model = "test"
+        def generate(self, *_a, **_kw):
+            raise NotImplementedError
+        def generate_json(self, prompt: str, *, schema: dict, system: str | None = None):
+            task = (schema or {}).get("task")
+            if task == "step6_schema_mapping_stage_1":
+                return {"selections": [
+                    {"tool_name": "PDBePISA_get_interfaces", "selection_reason": "structure"},
+                    {"tool_name": "ProteinsPlus_profile_structure_quality", "selection_reason": "structure"},
+                ]}
+            if task == "step6_schema_mapping_stage_2":
+                return {
+                    "tools": [
+                        {
+                            "tool_name": "PDBePISA_get_interfaces",
+                            "can_invoke": True,
+                            "argument_mapping": {"pdb_id": next(
+                                f["field_ref"] for f in schema.get("candidate_available_fields", [])
+                                if f.get("value_kind") == "structure_ref"
+                            )},
+                            "missing_required_fields": [],
+                            "argument_mapping_reason": "should fail for path-only ref",
+                        },
+                        {
+                            "tool_name": "ProteinsPlus_profile_structure_quality",
+                            "can_invoke": True,
+                            "argument_mapping": {"structure_file": next(
+                                f["field_ref"] for f in schema.get("candidate_available_fields", [])
+                                if f.get("value_kind") == "structure_ref"
+                            )},
+                            "missing_required_fields": [],
+                            "argument_mapping_reason": "compatible with structure file",
+                        },
+                    ]
+                }
+            return {}
+
+    def _proteinsplus(**kw):
+        captured["proteinsplus"] = dict(kw)
+        return {"status": "mocked", "quality": "ok"}
+
+    from app.agents import step_06_schema_mapping_selector as selector
+    real_signature_schema_for = selector.signature_schema_for
+
+    def _signature_schema_for(tool_name: str) -> dict:
+        if tool_name == "PDBePISA_get_interfaces":
+            return {
+                "type": "object",
+                "properties": {"pdb_id": {"type": "string"}},
+                "required": ["pdb_id"],
+            }
+        return {
+            "type": "object",
+            "properties": {"structure_file": {"type": "string"}},
+            "required": ["structure_file"],
+        }
+
+    monkeypatch.setattr(selector, "signature_schema_for", _signature_schema_for)
+    try:
+        run_id = _seed_synthetic_cct(
+            local_storage, registry_service, workflow_state_service,
+            materials=[_material("structure_file", _S1_PDB_PATH, value_format="pdb")],
+            candidate_type="adc_construct",
+        )
+        DevelopabilityAgent(
+            storage=local_storage, registry=registry_service,
+            workflow_state=workflow_state_service,
+            mcp_client=LocalMCPClient(bindings={
+                "PDBePISA_get_interfaces": lambda **_kw: {"status": "mocked", "interfaces": []},
+                "ProteinsPlus_profile_structure_quality": _proteinsplus,
+            }),
+            llm=_StructureLLM(),
+        ).run(run_id)
+    finally:
+        monkeypatch.setattr(selector, "signature_schema_for", real_signature_schema_for)
+
+    persisted = local_storage.read_json(local_storage.run_key(run_id, "structured_liability_summary.json"))
+    lane = _lane_results(persisted)["structure_interface_quality"]
+    assert lane["run_status"] == "partial" or lane["run_status"] == "ok"
+    call_names = {tc["tool_name"] for tc in lane["tool_call_records"]}
+    assert call_names == {"PDBePISA_get_interfaces", "ProteinsPlus_profile_structure_quality"}
+    tool_status = {tc["tool_name"]: tc["run_status"] for tc in lane["tool_call_records"]}
+    assert tool_status["PDBePISA_get_interfaces"] == "skipped"
+    assert tool_status["ProteinsPlus_profile_structure_quality"] == "success"
+    assert captured["proteinsplus"]["structure_file"] == _S1_PDB_PATH
+    summary = persisted["selection_audit"]
+    assert "PDBePISA_get_interfaces" in summary["step_06_stage2_uninvokable_tools"]
+    assert any(
+        entry.get("tool_name") == "PDBePISA_get_interfaces"
+        and entry.get("candidate_id") == "cand_synthetic_1"
+        and entry.get("lane_type") == "structure_interface_quality"
+        and "pdb_id" in entry.get("missing_required_fields", [])
+        for entry in summary.get("step_06_stage2_uninvokable_tool_details", [])
+        if isinstance(entry, dict)
+    )
+    assert "PDBePISA_get_interfaces" in summary["step_06_stage1_selected_tools"]
+    assert "ProteinsPlus_profile_structure_quality" in summary["step_06_stage2_mapped_tools"]
+    assert "ProteinsPlus_profile_structure_quality" in summary["step_06_runtime_resolved_tools"]
+    assert _FASTA_PATH not in str(persisted["selection_audit"])
+
+
 # ── 5. partial inputs do NOT flip the summary into failed ───────────────────
 
 def test_step6_partial_inputs_do_not_fail_prefilter(
@@ -488,20 +697,18 @@ class _OutOfScopeLLM:
 
     def generate_json(self, prompt: str, *, schema: dict, system: str | None = None) -> dict:
         task = (schema or {}).get("task")
-        if task in {"tool_selection_stage_1", "tool_selection_stage_1_multi_lane"}:
+        if task in {"tool_selection_stage_1", "tool_selection_stage_1_multi_lane", "step6_schema_mapping_stage_1"}:
             # Try to pick clearly out-of-scope Step 13 / Step 14 tool names
             # plus a hallucinated one. None is in the Step 6 catalog, so the
             # per-candidate selector must drop all and fall back deterministically.
-            lanes = (schema or {}).get("lanes") or [{"lane_type": "payload_linker_compound_liability"}]
-            lt = lanes[0].get("lane_type") if lanes else "payload_linker_compound_liability"
             return {
                 "selections": [
-                    {"lane_type": lt, "tool_name": "MultiAgentLiteratureSearch", "selection_reason": "step13"},
-                    {"lane_type": lt, "tool_name": "FDA_OrangeBook_get_patent_info", "selection_reason": "step14"},
-                    {"lane_type": lt, "tool_name": "TotallyHallucinatedTool", "selection_reason": "halluc"},
+                    {"tool_name": "MultiAgentLiteratureSearch", "selection_reason": "step13"},
+                    {"tool_name": "FDA_OrangeBook_get_patent_info", "selection_reason": "step14"},
+                    {"tool_name": "TotallyHallucinatedTool", "selection_reason": "halluc"},
                 ]
             }
-        if task in {"tool_selection_stage_2", "tool_selection_stage_2_multi_tool"}:
+        if task in {"tool_selection_stage_2", "tool_selection_stage_2_multi_tool", "step6_schema_mapping_stage_2"}:
             return {"arguments": {}, "argument_construction_reason": "", "tools": []}
         return {}
 
@@ -551,8 +758,9 @@ def test_step6_fake_llm_out_of_scope_tool_is_not_executed(
         assert forbidden not in called, (
             f"Step 6 must never call {forbidden}; got tool call set {called}"
         )
-    # And the deterministic fallback DID run.
-    assert "DrugProps_pains_filter" in called
+    # Turn B respects cleaned-empty selections instead of silently falling
+    # back to a deterministic tool execution.
+    assert "DrugProps_pains_filter" not in called
 
 
 # ── 7. Stage 1 / Stage 2 LLM payload boundary (catalog only, no _live) ──────
@@ -576,24 +784,27 @@ class _RecordingLLM:
     def generate_json(self, prompt: str, *, schema: dict, system: str | None = None) -> dict:
         self.calls.append({"system": system, "schema": schema})
         task = (schema or {}).get("task")
-        if task == "tool_selection_stage_1_multi_lane":
-            lanes = (schema or {}).get("lanes") or []
-            lt = lanes[0].get("lane_type") if lanes else "payload_linker_compound_liability"
+        if task == "step6_schema_mapping_stage_1":
             return {
                 "selections": [
-                    {"lane_type": lt, "tool_name": "DrugProps_pains_filter",
+                    {"tool_name": "DrugProps_pains_filter",
                      "selection_reason": "test"}
                 ]
             }
-        if task == "tool_selection_stage_2_multi_tool":
+        if task == "step6_schema_mapping_stage_2":
             tools = (schema or {}).get("tools") or []
+            field_ref = next(
+                f["field_ref"] for f in schema.get("candidate_available_fields", [])
+                if f.get("value_kind") == "smiles"
+            )
             out = []
             for t in tools:
                 out.append({
-                    "lane_type": t.get("lane_type"),
                     "tool_name": t.get("tool_name"),
-                    "arguments": {"smiles": "CCO"},
-                    "argument_construction_reason": "ok",
+                    "can_invoke": True,
+                    "argument_mapping": {"smiles": field_ref},
+                    "missing_required_fields": [],
+                    "argument_mapping_reason": "ok",
                 })
             return {"tools": out}
         return {}
@@ -607,16 +818,31 @@ class _SelectAllEligibleLLM:
         raise NotImplementedError
 
     def generate_json(self, prompt: str, *, schema: dict, system: str | None = None) -> dict:
-        if schema.get("task") == "tool_selection_stage_1_multi_lane":
+        if schema.get("task") == "step6_schema_mapping_stage_1":
             return {
                 "selections": [
                     {
-                        "lane_type": lane["lane_type"],
-                        "tool_name": tool_name,
+                        "tool_name": entry["tool_name"],
                         "selection_reason": "complementary production coverage",
                     }
-                    for lane in schema.get("lanes") or []
-                    for tool_name in lane.get("allowed_tools") or []
+                    for entry in schema.get("compact_catalog") or []
+                ]
+            }
+        if schema.get("task") == "step6_schema_mapping_stage_2":
+            field_ref = next(
+                f["field_ref"] for f in schema.get("candidate_available_fields", [])
+                if f.get("value_kind") == "smiles"
+            )
+            return {
+                "tools": [
+                    {
+                        "tool_name": tool["tool_name"],
+                        "can_invoke": True,
+                        "argument_mapping": {"smiles": field_ref},
+                        "missing_required_fields": [],
+                        "argument_mapping_reason": "test",
+                    }
+                    for tool in schema.get("tools") or []
                 ]
             }
         return {"tools": []}
@@ -639,13 +865,15 @@ def test_step6_five_complementary_smiles_tools_are_not_truncated(
         local_storage.run_key(run_id, "structured_liability_summary.json")
     )
     lane = _lane_results(persisted)["payload_linker_compound_liability"]
-    assert set(lane["selected_tools"]) == {
+    selected = set(lane["selected_tools"])
+    assert {
         "DrugProps_pains_filter",
         "DrugProps_lipinski_filter",
         "DrugProps_calculate_qed",
         "SwissADME_calculate_adme",
         "SwissADME_check_druglikeness",
-    }
+    } <= selected
+    assert "ADMETAI_predict_toxicity" in selected
 
 
 def test_step6_tool_selection_prompt_hides_live_and_uses_progressive_disclosure(
@@ -663,28 +891,31 @@ def test_step6_tool_selection_prompt_hides_live_and_uses_progressive_disclosure(
         llm=llm,
     ).run(run_id)
 
-    stage1 = [c for c in llm.calls if c["schema"].get("task") == "tool_selection_stage_1_multi_lane"]
-    stage2 = [c for c in llm.calls if c["schema"].get("task") == "tool_selection_stage_2_multi_tool"]
-    # Stage 1 must fire exactly once per candidate. Stage 2 may be skipped
-    # when deterministic argument mapping already satisfies required args.
+    stage1 = [c for c in llm.calls if c["schema"].get("task") == "step6_schema_mapping_stage_1"]
+    stage2 = [c for c in llm.calls if c["schema"].get("task") == "step6_schema_mapping_stage_2"]
+    # Stage 1 must fire exactly once per candidate. Stage 2 maps selected
+    # tool schemas to candidate_available_fields refs.
     assert stage1
 
-    # Stage 1 payload: compact catalog + per-lane signals; no full_schema, no `_live`.
+    # Stage 1 payload: disclosed compact catalog + safe candidate fields; no full_schema, no `_live`.
     for c in stage1:
         sc = c["schema"]
-        assert "compact_catalog" in sc and "lanes" in sc
+        assert "compact_catalog" in sc and "candidate_available_fields" in sc
         assert "full_schema" not in sc
         blob = str(sc)
         assert "_live" not in blob
         for entry in sc["compact_catalog"]:
-            assert set(entry) == {
+            assert set(entry).issuperset({
                 "tool_name", "short_description", "capability_tags",
                 "coarse_input_requirements", "step_id", "agent_name",
-            }
-        # Per-lane allowed_tools must stay inside the Step 6 catalog.
-        for lane in sc["lanes"]:
-            for t in lane.get("allowed_tools") or []:
-                assert t in _STEP6_VALID_TOOLS
+            })
+            assert set(entry).issubset({
+                "tool_name", "short_description", "capability_tags",
+                "coarse_input_requirements", "step_id", "agent_name",
+                "runtime_policy", "runtime_status",
+            })
+        for entry in sc["compact_catalog"]:
+            assert entry["tool_name"] in _STEP6_VALID_TOOLS
 
     # Stage 2 payload (if fired): per-tool schema; `_live` never exposed.
     for c in stage2:
@@ -697,11 +928,11 @@ def test_step6_tool_selection_prompt_hides_live_and_uses_progressive_disclosure(
             assert "_live" not in (full_schema.get("properties") or {})
 
 
-# ── Stage 2 is SKIPPED when deterministic mapping satisfies required args ──
+# ── Stage 2 maps schema args to field refs ─────────────────────────────────
 
 
 class _DeterministicProbeLLM:
-    """Stage 1 picks one tool; Stage 2 is never expected to be called."""
+    """Stage 1 picks one tool; Stage 2 maps its arg to a field_ref."""
     name = "det_probe"
     model = "test"
 
@@ -714,30 +945,33 @@ class _DeterministicProbeLLM:
     def generate_json(self, prompt, *, schema, system=None):
         task = (schema or {}).get("task") or ""
         self.tasks.append(task)
-        if task == "tool_selection_stage_1_multi_lane":
-            lanes = (schema or {}).get("lanes") or []
-            lt = lanes[0].get("lane_type") if lanes else "payload_linker_compound_liability"
+        if task == "step6_schema_mapping_stage_1":
             return {
                 "selections": [
-                    {"lane_type": lt, "tool_name": "DrugProps_pains_filter",
+                    {"tool_name": "DrugProps_pains_filter",
                      "selection_reason": "smiles available"}
                 ]
             }
-        if task == "tool_selection_stage_2_multi_tool":
-            # If Stage 2 fires we want to spot it; return empty so the
-            # agent surface still falls through to deterministic for
-            # safety, but the test asserts this branch never executes.
-            return {"tools": []}
+        if task == "step6_schema_mapping_stage_2":
+            field_ref = next(
+                f["field_ref"] for f in schema.get("candidate_available_fields", [])
+                if f.get("value_kind") == "smiles"
+            )
+            return {"tools": [{
+                "tool_name": "DrugProps_pains_filter",
+                "can_invoke": True,
+                "argument_mapping": {"smiles": field_ref},
+                "missing_required_fields": [],
+                "argument_mapping_reason": "test mapping",
+            }]}
         return {}
 
 
-def test_step6_skips_stage2_when_deterministic_satisfies_required_args(
+def test_step6_stage2_maps_required_args_to_field_refs(
     local_storage, registry_service, workflow_state_service
 ):
-    """For DrugProps_pains_filter the deterministic mapping already
-    returns ``{"smiles": <value>}`` which satisfies the schema's single
-    required field. The per-candidate selector must therefore SKIP the
-    Stage 2 LLM round-trip entirely."""
+    """Stage 2 now emits schema-arg → field_ref mapping; raw values are
+    resolved only at runtime."""
     llm = _DeterministicProbeLLM()
     run_id = _seed_synthetic_cct(
         local_storage, registry_service, workflow_state_service,
@@ -749,10 +983,8 @@ def test_step6_skips_stage2_when_deterministic_satisfies_required_args(
         mcp_client=LocalMCPClient(bindings=_bindings(_DEFAULT_OK_BINDINGS)),
         llm=llm,
     ).run(run_id)
-    assert llm.tasks.count("tool_selection_stage_1_multi_lane") == 1
-    assert llm.tasks.count("tool_selection_stage_2_multi_tool") == 0, (
-        f"Stage 2 should have been skipped; tasks={llm.tasks}"
-    )
+    assert llm.tasks.count("step6_schema_mapping_stage_1") == 1
+    assert llm.tasks.count("step6_schema_mapping_stage_2") == 1
 
     # And the plan still ran via deterministic args, not skipped.
     persisted = local_storage.read_json(
@@ -768,8 +1000,225 @@ def test_step6_skips_stage2_when_deterministic_satisfies_required_args(
         for tc in lane["tool_call_records"]
         if tc.get("tool_name") == "DrugProps_pains_filter"
     }
-    assert ("llm_stage1", "deterministic_mapping") in provenance
+    assert ("llm_stage1", "llm_stage2") in provenance
 
+
+def _single_sequence_tool_llm(tool_name: str):
+    class _LLM:
+        name = "single_seq"
+        model = "test"
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def generate(self, prompt: str, *, system: str | None = None, **kw: Any) -> str:
+            raise NotImplementedError
+
+        def generate_json(self, prompt: str, *, schema: dict, system: str | None = None) -> dict:
+            self.calls.append((schema or {}).get("task", ""))
+            task = (schema or {}).get("task")
+            if task == "step6_schema_mapping_stage_1":
+                return {"selections": [{"tool_name": tool_name, "selection_reason": "sequence lane"}]}
+            if task == "step6_schema_mapping_stage_2":
+                field_ref = next(
+                    f["field_ref"] for f in schema.get("candidate_available_fields", [])
+                    if f.get("material_type") == "antibody_heavy_chain_sequence"
+                )
+                return {
+                    "tools": [{
+                        "tool_name": tool_name,
+                        "can_invoke": True,
+                        "argument_mapping": {"sequence": field_ref},
+                        "missing_required_fields": [],
+                        "argument_mapping_reason": "force heavy sequence mapping",
+                    }]
+                }
+            return {}
+
+    return _LLM()
+
+
+def _mock_sequence_tool(tool_name: str, calls: list[dict[str, Any]]):
+    def _tool(**kw: Any) -> dict[str, Any]:
+        calls.append(dict(kw))
+        if tool_name == "PROSITE_scan_sequence":
+            return {"status": "mocked", "motifs": []}
+        return {"status": "mocked", "predictions": []}
+    return _tool
+
+
+@pytest.mark.parametrize("tool_name", ["PROSITE_scan_sequence", "IEDB_predict_mhci_binding"])
+def test_step6_single_sequence_tool_expands_to_both_antibody_chains(
+    local_storage, registry_service, workflow_state_service, tool_name: str
+):
+    heavy_seq = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
+    light_seq = "DIQMTQSPSSLSASVGDRVTITCQASQDIQLLNGRT"
+    calls: list[dict[str, Any]] = []
+    llm = _single_sequence_tool_llm(tool_name)
+    run_id = _seed_synthetic_cct(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        materials=[
+            _material("antibody_heavy_chain_sequence", heavy_seq),
+            _material("antibody_light_chain_sequence", light_seq),
+        ],
+        candidate_type="antibody",
+    )
+    DevelopabilityAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={tool_name: _mock_sequence_tool(tool_name, calls)}),
+        llm=llm,
+    ).run(run_id)
+
+    persisted = local_storage.read_json(local_storage.run_key(run_id, "structured_liability_summary.json"))
+    lane = _lane_results(persisted)["antibody_protein_sequence_liability"]
+    tool_calls = [
+        tc for tc in lane["tool_call_records"] if tc["tool_name"] == tool_name
+    ]
+    assert len(tool_calls) == 2
+    assert all(tc["run_status"] == "success" for tc in tool_calls)
+    assert {tc["tool_input_summary"].get("chain_role") for tc in tool_calls} == {"heavy", "light"}
+    expanded_refs = [
+        tc["tool_input_summary"].get("expanded_field_ref")
+        for tc in tool_calls
+        if tc["tool_input_summary"].get("runtime_chain_expansion")
+    ]
+    assert len(expanded_refs) == 2
+    assert len(set(expanded_refs)) == 2
+    assert all(tc["tool_input_summary"].get("runtime_chain_expansion") is True for tc in tool_calls)
+    for tc in tool_calls:
+        summary = tc["tool_input_summary"]
+        expanded_ref = summary.get("expanded_field_ref")
+        assert summary["argument_field_refs"].get("sequence") == expanded_ref
+        mapping_entries = [
+            e for e in summary.get("argument_mapping_audit", [])
+            if isinstance(e, dict) and e.get("schema_arg") == "sequence"
+        ]
+        assert mapping_entries
+        assert all(e.get("field_ref") == expanded_ref for e in mapping_entries)
+        resolver_entries = [
+            e for e in summary.get("runtime_resolver_audit", [])
+            if isinstance(e, dict) and e.get("schema_arg") == "sequence"
+        ]
+        assert resolver_entries
+        assert all(e.get("field_ref") == expanded_ref for e in resolver_entries)
+        assert heavy_seq not in json.dumps(tc["tool_input_summary"])
+        assert light_seq not in json.dumps(tc["tool_input_summary"])
+        assert tc["tool_input_summary"].get("expansion_reason") is not None
+        if tc["tool_output_ref"]:
+            out = local_storage.read_json(tc["tool_output_ref"])
+            assert heavy_seq not in json.dumps(out)
+            assert light_seq not in json.dumps(out)
+
+    summary = persisted["selection_audit"]
+    assert summary["step_06_runtime_chain_expanded_tools"].count(tool_name) >= 1
+    assert any(
+        entry.get("tool_name") == tool_name
+        for entry in summary.get("step_06_runtime_chain_expansion_details", [])
+    )
+
+
+def test_step6_single_sequence_tool_runs_once_when_only_one_chain(
+    local_storage, registry_service, workflow_state_service
+):
+    heavy_seq = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
+    calls: list[dict[str, Any]] = []
+    tool_name = "PROSITE_scan_sequence"
+    llm = _single_sequence_tool_llm(tool_name)
+    run_id = _seed_synthetic_cct(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        materials=[_material("antibody_heavy_chain_sequence", heavy_seq)],
+        candidate_type="antibody",
+    )
+    DevelopabilityAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={tool_name: _mock_sequence_tool(tool_name, calls)}),
+        llm=llm,
+    ).run(run_id)
+
+    persisted = local_storage.read_json(local_storage.run_key(run_id, "structured_liability_summary.json"))
+    lane = _lane_results(persisted)["antibody_protein_sequence_liability"]
+    tool_calls = [tc for tc in lane["tool_call_records"] if tc["tool_name"] == tool_name]
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["tool_input_summary"].get("runtime_chain_expansion") is not True
+    summary = persisted["selection_audit"]
+    assert summary["step_06_runtime_chain_expansion_details"] == []
+
+
+def test_step6_non_antibody_sequence_ref_does_not_expand(
+    local_storage, registry_service, workflow_state_service
+):
+    heavy_seq = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
+    light_seq = "DIQMTQSPSSLSASVGDRVTITCQASQDIQLLNGRT"
+    target_seq = "MKTAYIAKQRQISFVKSHFSRQDILDLWIY"
+
+    class _LLM:
+        name = "target_sequence_mapping"
+        model = "test"
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def generate(self, prompt, *, system=None, **kw):
+            raise NotImplementedError
+
+        def generate_json(self, prompt, *, schema, system=None):
+            task = (schema or {}).get("task")
+            if task == "step6_schema_mapping_stage_1":
+                return {"selections": [{"tool_name": "IEDB_predict_mhci_binding"}]}
+            if task == "step6_schema_mapping_stage_2":
+                field_ref = next(
+                    f["field_ref"] for f in schema.get("candidate_available_fields", [])
+                    if f.get("material_type") == "target_sequence"
+                )
+                return {
+                    "tools": [{
+                        "tool_name": "IEDB_predict_mhci_binding",
+                        "can_invoke": True,
+                        "argument_mapping": {"sequence": field_ref},
+                        "missing_required_fields": [],
+                        "argument_mapping_reason": "non-antibody sequence",
+                    }]
+                }
+            return {}
+
+    llm = _LLM()
+    calls: list[dict[str, Any]] = []
+    run_id = _seed_synthetic_cct(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        materials=[
+            _material("antibody_heavy_chain_sequence", heavy_seq),
+            _material("antibody_light_chain_sequence", light_seq),
+            _material("target_sequence", target_seq),
+        ],
+        candidate_type="antibody",
+    )
+    DevelopabilityAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={"IEDB_predict_mhci_binding": _mock_sequence_tool("IEDB_predict_mhci_binding", calls)}),
+        llm=llm,
+    ).run(run_id)
+
+    persisted = local_storage.read_json(
+        local_storage.run_key(run_id, "structured_liability_summary.json")
+    )
+    lane = _lane_results(persisted)["antibody_protein_sequence_liability"]
+    tool_calls = [tc for tc in lane["tool_call_records"] if tc["tool_name"] == "IEDB_predict_mhci_binding"]
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["tool_input_summary"].get("runtime_chain_expansion") is not True
+    assert "chain_role" not in (tool_calls[0]["tool_input_summary"] or {})
+    assert calls and calls[0].get("sequence") == target_seq
 
 # ── LLM call-count budget (per-candidate Stage1 + Stage2) ───────────────────
 
@@ -782,12 +1231,16 @@ class _CountingLLM:
     def __init__(self) -> None:
         self.tasks: list[str] = []
         from app.llm.provider import (  # noqa: PLC0415
+            _mock_step6_schema_mapping_stage1,
+            _mock_step6_schema_mapping_stage2,
             _mock_stage1_multi_lane,
             _mock_stage2_multi_tool,
             _mock_stage1_selection,
             _mock_stage2_arguments,
         )
         self._dispatch = {
+            "step6_schema_mapping_stage_1": _mock_step6_schema_mapping_stage1,
+            "step6_schema_mapping_stage_2": _mock_step6_schema_mapping_stage2,
             "tool_selection_stage_1_multi_lane": _mock_stage1_multi_lane,
             "tool_selection_stage_2_multi_tool": _mock_stage2_multi_tool,
             "tool_selection_stage_1": _mock_stage1_selection,
@@ -834,14 +1287,16 @@ def test_step6_one_candidate_multi_lane_makes_at_most_one_stage1_and_one_stage2(
         llm=llm,
     ).run(run_id)
 
-    stage1 = sum(1 for t in llm.tasks if t == "tool_selection_stage_1_multi_lane")
-    stage2 = sum(1 for t in llm.tasks if t == "tool_selection_stage_2_multi_tool")
+    stage1 = sum(1 for t in llm.tasks if t == "step6_schema_mapping_stage_1")
+    stage2 = sum(1 for t in llm.tasks if t == "step6_schema_mapping_stage_2")
     # Single candidate ⇒ exactly one Stage 1, at most one Stage 2.
     assert stage1 == 1, f"expected 1 Stage 1 call, got {stage1} (tasks={llm.tasks})"
     assert stage2 <= 1, f"expected ≤1 Stage 2 call, got {stage2} (tasks={llm.tasks})"
     # And no legacy per-lane / per-tool task names.
     assert "tool_selection_stage_1" not in llm.tasks
     assert "tool_selection_stage_2" not in llm.tasks
+    assert "tool_selection_stage_1_multi_lane" not in llm.tasks
+    assert "tool_selection_stage_2_multi_tool" not in llm.tasks
 
 
 def _seed_n_candidates(
@@ -909,8 +1364,8 @@ def test_step6_five_candidates_stay_under_ten_llm_calls(
         mcp_client=LocalMCPClient(bindings=_bindings(_DEFAULT_OK_BINDINGS)),
         llm=llm,
     ).run(run_id)
-    stage1 = sum(1 for t in llm.tasks if t == "tool_selection_stage_1_multi_lane")
-    stage2 = sum(1 for t in llm.tasks if t == "tool_selection_stage_2_multi_tool")
+    stage1 = sum(1 for t in llm.tasks if t == "step6_schema_mapping_stage_1")
+    stage2 = sum(1 for t in llm.tasks if t == "step6_schema_mapping_stage_2")
     assert stage1 == 5
     assert stage2 <= 5
     assert stage1 + stage2 <= 10
@@ -1036,16 +1491,14 @@ def test_step6_stage2_missing_required_args_does_not_crash(
 
         def generate_json(self, prompt, *, schema, system=None):
             task = (schema or {}).get("task")
-            if task == "tool_selection_stage_1_multi_lane":
-                lanes = (schema or {}).get("lanes") or []
-                lt = lanes[0].get("lane_type") if lanes else "payload_linker_compound_liability"
+            if task == "step6_schema_mapping_stage_1":
                 return {
                     "selections": [
-                        {"lane_type": lt, "tool_name": "DrugProps_pains_filter",
+                        {"tool_name": "DrugProps_pains_filter",
                          "selection_reason": "ok"}
                     ]
                 }
-            if task == "tool_selection_stage_2_multi_tool":
+            if task == "step6_schema_mapping_stage_2":
                 # Refuse to provide any arguments.
                 return {"tools": []}
             return {}
@@ -1060,9 +1513,9 @@ def test_step6_stage2_missing_required_args_does_not_crash(
         mcp_client=LocalMCPClient(bindings=_bindings(_DEFAULT_OK_BINDINGS)),
         llm=_EmptyStage2LLM(),
     ).run(run_id)
-    # No crash — agent should have completed Step 6 successfully via the
-    # deterministic argument mapping for DrugProps_pains_filter.
+    # No crash — valid Stage 2 can_invoke=false / omitted mapping is
+    # respected, so the step may finish with only missing lanes.
     persisted = local_storage.read_json(
         local_storage.run_key(run_id, "structured_liability_summary.json")
     )
-    assert persisted["prefilter_status"] in {"completed", "partial"}
+    assert persisted["prefilter_status"] in {"completed", "partial", "completed_with_missing_lanes"}

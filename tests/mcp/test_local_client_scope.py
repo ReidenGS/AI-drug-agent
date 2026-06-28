@@ -17,17 +17,26 @@ def test_local_client_blocks_out_of_scope_tool():
 
 
 def test_local_client_allows_in_scope_tool():
-    """An in-scope tool whose wrapper is still `_ni` returns
-    `dependency_unavailable`. `ADMETAI_predict_toxicity` is in Step 6
-    scope and is deferred (TU uses local `admet_ai` + torch model weights
-    — see audit doc). Update this test if/when that wrapper migrates."""
+    """An in-scope tool with a wired wrapper reaches its binding and
+    returns the wrapper's envelope. ``ADMETAI_predict_toxicity`` was
+    migrated to a live wrapper that routes through
+    ``ToolUniverseAdapter`` when ``_live=True`` and otherwise returns a
+    deterministic mock envelope. Here we exercise the mock-mode path
+    (no ``_live`` injection) to prove the binding is callable end-to-end
+    and that scope routing succeeds."""
     client = LocalMCPClient()
     res = client.call_tool(
         agent_name="developability_agent",
         step_id="step_06",
         tool_name="ADMETAI_predict_toxicity",
+        smiles="CCO",
     )
-    assert res["run_status"] == "dependency_unavailable"
+    assert res["run_status"] == "success"
+    payload = res["payload"]
+    assert payload["status"] == "mocked"
+    assert payload["source"] == "ADMETAI_predict_toxicity"
+    assert payload["smiles"] == "CCO"
+    assert payload["predictions"] is None
 
 
 def test_local_client_real_call_path_for_wired_wrapper():

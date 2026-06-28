@@ -5,16 +5,27 @@ Live mode (`_live=True`) for migrated wrappers routes through
 flag itself is the switch, and `LocalMCPClient` decides whether to inject
 `_live=True` based on `MCP_LIVE_TOOLS` + `MCP_LIVE_TOOL_ALLOWLIST`.
 
-Adapter-backed: DrugProps_calculate_qed / DrugProps_lipinski_filter /
-DrugProps_pains_filter / BindingDB_get_targets_by_compound /
-SwissADME_calculate_adme / SwissADME_check_druglikeness.
+Adapter-backed:
 
-Deferred (`_ni` → NotImplementedError on `_live=True`): all ADMETAI_*
-tools. Reason: TU implementation is `ADMETAITool`, which loads the
-`admet_ai` package's `ADMETModel` (PyTorch model weights), forcing a
-`torch` + `admet_ai` dependency at runtime. Heavy local model inference
-is out of scope for this migration round; we do not add `torch` or
-`admet_ai` as project dependencies.
+- DrugProps_calculate_qed / _lipinski_filter / _pains_filter
+- BindingDB_get_targets_by_compound
+- SwissADME_calculate_adme / SwissADME_check_druglikeness
+- ADMETAI_predict_toxicity / _physicochemical_properties /
+  _solubility_lipophilicity_hydration / _CYP_interactions /
+  _bioavailability / _clearance_distribution / _stress_response /
+  _nuclear_receptor_activity
+
+ADMETAI runtime contract: each wrapper validates a non-empty SMILES,
+returns a compact deterministic envelope under ``_live=False``, and
+delegates to ``tooluniverse_adapter.call_tool(...)`` under
+``_live=True``. The adapter routes through ToolUniverse's ``ADMETAITool``
+which depends on the local ``admet_ai`` Python package + PyTorch. When
+those dependencies are missing the adapter envelope returns
+``status="upstream_error"`` with the TU error message preserved; the
+wrapper never raises and never invents a prediction.
+
+No wrapper imports ``admet_ai``, ``torch``, or any external HTTP / API
+client directly. The MCP / ToolUniverse path is the only egress.
 """
 
 from __future__ import annotations
@@ -214,19 +225,130 @@ def SwissADME_check_druglikeness(
     return call_tool("SwissADME_check_druglikeness", args)
 
 
+# ── ADMETAI thin wrappers ───────────────────────────────────────────────
+#
+# Every ADMETAI tool's ToolUniverse spec requires a single ``smiles``
+# parameter. We mirror that surface exactly: validate non-empty SMILES,
+# return a deterministic mock envelope when ``_live`` is False, and
+# delegate to the adapter when ``_live`` is True. The adapter raises no
+# new exception classes — failures show up as ``status="upstream_error"``
+# envelopes carrying ToolUniverse's own error message (e.g. when the
+# local ``admet_ai`` Python package is missing).
+
+
+def _admetai_envelope(tool_name: str, smiles: str, *, _live: bool) -> dict[str, Any]:
+    if not smiles:
+        raise ValueError(f"{tool_name} requires a non-empty smiles string")
+    if not _live:
+        return {
+            "status": "mocked",
+            "source": tool_name,
+            "smiles": smiles,
+            "predictions": None,
+        }
+    from ..tooluniverse_adapter import call_tool
+
+    return call_tool(tool_name, {"smiles": smiles})
+
+
+def ADMETAI_predict_toxicity(
+    smiles: str = "", *, _live: bool = False
+) -> dict[str, Any]:
+    """ADMET-AI toxicity prediction. Required: ``smiles``."""
+    return _admetai_envelope("ADMETAI_predict_toxicity", smiles, _live=_live)
+
+
+def ADMETAI_predict_physicochemical_properties(
+    smiles: str = "", *, _live: bool = False
+) -> dict[str, Any]:
+    """ADMET-AI physicochemical property prediction. Required: ``smiles``."""
+    return _admetai_envelope(
+        "ADMETAI_predict_physicochemical_properties", smiles, _live=_live,
+    )
+
+
+def ADMETAI_predict_solubility_lipophilicity_hydration(
+    smiles: str = "", *, _live: bool = False
+) -> dict[str, Any]:
+    """ADMET-AI solubility / lipophilicity / hydration prediction.
+
+    Required: ``smiles``.
+    """
+    return _admetai_envelope(
+        "ADMETAI_predict_solubility_lipophilicity_hydration", smiles, _live=_live,
+    )
+
+
+def ADMETAI_predict_CYP_interactions(
+    smiles: str = "", *, _live: bool = False
+) -> dict[str, Any]:
+    """ADMET-AI cytochrome-P450 interaction prediction. Required: ``smiles``."""
+    return _admetai_envelope(
+        "ADMETAI_predict_CYP_interactions", smiles, _live=_live,
+    )
+
+
+def ADMETAI_predict_bioavailability(
+    smiles: str = "", *, _live: bool = False
+) -> dict[str, Any]:
+    """ADMET-AI oral bioavailability prediction. Required: ``smiles``."""
+    return _admetai_envelope(
+        "ADMETAI_predict_bioavailability", smiles, _live=_live,
+    )
+
+
+def ADMETAI_predict_clearance_distribution(
+    smiles: str = "", *, _live: bool = False
+) -> dict[str, Any]:
+    """ADMET-AI clearance / distribution prediction. Required: ``smiles``."""
+    return _admetai_envelope(
+        "ADMETAI_predict_clearance_distribution", smiles, _live=_live,
+    )
+
+
+def ADMETAI_predict_stress_response(
+    smiles: str = "", *, _live: bool = False
+) -> dict[str, Any]:
+    """ADMET-AI stress-response prediction. Required: ``smiles``."""
+    return _admetai_envelope(
+        "ADMETAI_predict_stress_response", smiles, _live=_live,
+    )
+
+
+def ADMETAI_predict_nuclear_receptor_activity(
+    smiles: str = "", *, _live: bool = False
+) -> dict[str, Any]:
+    """ADMET-AI nuclear-receptor activity prediction. Required: ``smiles``."""
+    return _admetai_envelope(
+        "ADMETAI_predict_nuclear_receptor_activity", smiles, _live=_live,
+    )
+
+
 BINDINGS = [
     ("DrugProps_pains_filter", DrugProps_pains_filter),
     ("DrugProps_lipinski_filter", DrugProps_lipinski_filter),
     ("DrugProps_calculate_qed", DrugProps_calculate_qed),
     ("SwissADME_calculate_adme", SwissADME_calculate_adme),
     ("SwissADME_check_druglikeness", SwissADME_check_druglikeness),
-    ("ADMETAI_predict_toxicity", _ni),
-    ("ADMETAI_predict_physicochemical_properties", _ni),
-    ("ADMETAI_predict_solubility_lipophilicity_hydration", _ni),
-    ("ADMETAI_predict_CYP_interactions", _ni),
-    ("ADMETAI_predict_bioavailability", _ni),
-    ("ADMETAI_predict_clearance_distribution", _ni),
-    ("ADMETAI_predict_stress_response", _ni),
-    ("ADMETAI_predict_nuclear_receptor_activity", _ni),
+    ("ADMETAI_predict_toxicity", ADMETAI_predict_toxicity),
+    (
+        "ADMETAI_predict_physicochemical_properties",
+        ADMETAI_predict_physicochemical_properties,
+    ),
+    (
+        "ADMETAI_predict_solubility_lipophilicity_hydration",
+        ADMETAI_predict_solubility_lipophilicity_hydration,
+    ),
+    ("ADMETAI_predict_CYP_interactions", ADMETAI_predict_CYP_interactions),
+    ("ADMETAI_predict_bioavailability", ADMETAI_predict_bioavailability),
+    (
+        "ADMETAI_predict_clearance_distribution",
+        ADMETAI_predict_clearance_distribution,
+    ),
+    ("ADMETAI_predict_stress_response", ADMETAI_predict_stress_response),
+    (
+        "ADMETAI_predict_nuclear_receptor_activity",
+        ADMETAI_predict_nuclear_receptor_activity,
+    ),
     ("BindingDB_get_targets_by_compound", BindingDB_get_targets_by_compound),
 ]

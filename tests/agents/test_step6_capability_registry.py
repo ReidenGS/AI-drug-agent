@@ -36,13 +36,26 @@ def test_future_and_dependency_unavailable_tools_do_not_enter_live_catalog():
         scoped_tools=scoped,
     )
     eligible_names = {entry.tool_name for entry in eligible}
+    # ADMETAI tools are now live-wired through ToolUniverseAdapter and
+    # belong in the eligible set alongside DrugProps / SwissADME.
     assert eligible_names == {
         "DrugProps_pains_filter",
         "DrugProps_lipinski_filter",
         "DrugProps_calculate_qed",
         "SwissADME_calculate_adme",
         "SwissADME_check_druglikeness",
+        "ADMETAI_predict_toxicity",
+        "ADMETAI_predict_physicochemical_properties",
+        "ADMETAI_predict_solubility_lipophilicity_hydration",
+        "ADMETAI_predict_CYP_interactions",
+        "ADMETAI_predict_bioavailability",
+        "ADMETAI_predict_clearance_distribution",
+        "ADMETAI_predict_stress_response",
+        "ADMETAI_predict_nuclear_receptor_activity",
     }
     excluded_by_name = {entry["tool_name"]: entry["reason"] for entry in excluded}
-    assert excluded_by_name["ADMETAI_predict_toxicity"] == "dependency_unavailable"
+    # ADMETAI must NOT appear in the excluded-by-dependency bucket any
+    # more; the only dependency_unavailable smiles-lane tool today is
+    # ProteinsPlus (lane=structure) which is not in this lane's catalog.
+    assert "ADMETAI_predict_toxicity" not in excluded_by_name
     assert not any(name.startswith(("DNA_", "RNAcentral_", "Rfam_", "miRBase_")) for name in eligible_names)

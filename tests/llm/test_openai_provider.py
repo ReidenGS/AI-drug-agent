@@ -111,6 +111,35 @@ def test_stage1_single_tool_path_passes_shared_validator():
     assert out["selections"][0]["tool_name"] == "DrugProps_calculate_qed"
 
 
+def test_step6_schema_mapping_stage1_passes_without_task_intent():
+    provider = _provider_with_responses([
+        _chat_response(
+            '{"selections":[{"tool_name":"DrugProps_pains_filter",'
+            '"selection_reason":"smiles"}]}'
+        )
+    ])
+    out = provider.generate_json(
+        "pick", schema={"task": "step6_schema_mapping_stage_1"}
+    )
+    assert out["selections"][0]["tool_name"] == "DrugProps_pains_filter"
+
+
+def test_step6_schema_mapping_stage2_passes_without_task_intent():
+    provider = _provider_with_responses([
+        _chat_response(
+            '{"tools":[{"tool_name":"DrugProps_pains_filter",'
+            '"can_invoke":true,'
+            '"argument_mapping":{"smiles":"candidate:c1:material:m1:value"},'
+            '"missing_required_fields":[],'
+            '"argument_mapping_reason":"mapped"}]}'
+        )
+    ])
+    out = provider.generate_json(
+        "map", schema={"task": "step6_schema_mapping_stage_2"}
+    )
+    assert out["tools"][0]["argument_mapping"]["smiles"].startswith("candidate:")
+
+
 # ── error paths ───────────────────────────────────────────────────────────
 
 
@@ -152,6 +181,30 @@ def test_stage1_multi_lane_rejects_selection_missing_lane_type():
     with pytest.raises(OpenAIProviderError, match="multi_lane.*lane_type"):
         provider.generate_json(
             "pick", schema={"task": "tool_selection_stage_1_multi_lane"}
+        )
+
+
+def test_step6_schema_mapping_stage1_rejects_malformed_selections():
+    provider = _provider_with_responses(
+        [_chat_response('{"selections":"not-a-list"}')] * 3
+    )
+    with pytest.raises(OpenAIProviderError, match="step6_schema_mapping_stage_1.*selections"):
+        provider.generate_json(
+            "pick", schema={"task": "step6_schema_mapping_stage_1"}
+        )
+
+
+def test_step6_schema_mapping_stage2_rejects_malformed_tools():
+    provider = _provider_with_responses(
+        [_chat_response(
+            '{"tools":[{"tool_name":"DrugProps_pains_filter",'
+            '"can_invoke":"yes","argument_mapping":{},'
+            '"missing_required_fields":[]}]}'
+        )] * 3
+    )
+    with pytest.raises(OpenAIProviderError, match="step6_schema_mapping_stage_2.*can_invoke"):
+        provider.generate_json(
+            "map", schema={"task": "step6_schema_mapping_stage_2"}
         )
 
 

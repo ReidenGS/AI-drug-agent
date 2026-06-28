@@ -193,11 +193,14 @@ def test_step6_chembl_search_activities_live_path(monkeypatch, install_universe)
     assert len(fake.calls) == 1
 
 
-def test_step6_admetai_deferred_surfaces_dependency_unavailable(
+def test_step6_admetai_dispatches_through_tooluniverse_when_live(
     monkeypatch, install_universe
 ):
+    """ADMETAI wrappers are now live-wired: under MCP_LIVE_TOOLS with
+    the tool in the allowlist, the LocalMCPClient routes the call
+    through the ToolUniverseAdapter and surfaces a successful envelope."""
     fake = install_universe(
-        tools={"ADMETAI_predict_toxicity": lambda args: {"ok": True}}
+        tools={"ADMETAI_predict_toxicity": lambda args: {"smiles": args.get("smiles")}}
     )
     _set_live(monkeypatch, allowlist="ADMETAI_predict_toxicity")
     client = LocalMCPClient()
@@ -207,10 +210,45 @@ def test_step6_admetai_deferred_surfaces_dependency_unavailable(
         tool_name="ADMETAI_predict_toxicity",
         smiles="CCO",
     )
-    assert res["run_status"] == "dependency_unavailable"
-    assert res["executor"] == "deferred"
-    assert res["reason"] == "wrapper_not_wired"
-    assert fake.calls == []  # deferred wrappers never reach the adapter
+    assert res["run_status"] == "success"
+    assert res["executor"] == "tooluniverse"
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["arguments"] == {"smiles": "CCO"}
+
+
+def test_step6_admetai_surfaces_upstream_error_when_admet_ai_missing(
+    monkeypatch, install_universe
+):
+    """If the runtime ``admet_ai`` package is missing the TU
+    ``ADMETAITool`` reports an error. The adapter normalises this to
+    an envelope carrying ``status="upstream_error"`` — the wrapper does
+    NOT raise (so LocalMCPClient still records ``run_status="success"``
+    + ``executor="tooluniverse"``), but the persisted envelope's
+    ``status`` is preserved so post-hoc inspection can audit it. This
+    matches the path the Step 5 agent already uses to distinguish a
+    real upstream error from a real success."""
+    fake = install_universe(
+        tools={"ADMETAI_predict_toxicity": lambda args: {
+            "status": "error",
+            "error": "ADMETModel requires 'admet-ai' package",
+        }}
+    )
+    _set_live(monkeypatch, allowlist="ADMETAI_predict_toxicity")
+    client = LocalMCPClient()
+    res = client.call_tool(
+        agent_name="developability_agent",
+        step_id="step_06",
+        tool_name="ADMETAI_predict_toxicity",
+        smiles="CCO",
+    )
+    # LocalMCPClient run_status reflects whether the wrapper raised; it
+    # did not. The TU upstream error is preserved INSIDE the envelope.
+    assert res["run_status"] == "success"
+    assert res["executor"] == "tooluniverse"
+    payload = res["payload"]
+    assert payload["status"] == "upstream_error"
+    assert "admet-ai" in (payload.get("error_message") or "")
+    assert len(fake.calls) == 1
 
 
 def test_step6_developability_cannot_call_step9_tool(

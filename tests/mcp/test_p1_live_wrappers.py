@@ -2008,7 +2008,7 @@ def test_swissadme_druglikeness_live_upstream_error(install_universe):
 
 # ADMETAI_* — deferred, no adapter routing
 
-_ADMETAI_DEFERRED = (
+_ADMETAI_TOOLS = (
     "ADMETAI_predict_toxicity",
     "ADMETAI_predict_physicochemical_properties",
     "ADMETAI_predict_solubility_lipophilicity_hydration",
@@ -2020,25 +2020,66 @@ _ADMETAI_DEFERRED = (
 )
 
 
-def test_admetai_tools_are_deferred():
+def test_admetai_mock_mode_returns_deterministic_envelope():
+    """Without ``_live=True`` every ADMETAI wrapper returns a compact
+    mock envelope. No ToolUniverse / network / model load."""
     bindings = dict(DEVELOPABILITY_BINDINGS)
-    for name in _ADMETAI_DEFERRED:
-        assert name in bindings, f"missing binding for deferred tool {name}"
-        with pytest.raises(NotImplementedError):
-            bindings[name](smiles="CCO", _live=True)
-        with pytest.raises(NotImplementedError):
-            bindings[name](smiles="CCO")
+    for name in _ADMETAI_TOOLS:
+        assert name in bindings, f"missing binding for {name}"
+        out = bindings[name](smiles="CCO")
+        assert out["status"] == "mocked"
+        assert out["source"] == name
+        assert out["smiles"] == "CCO"
+        assert out["predictions"] is None
 
 
-def test_admetai_deferred_does_not_touch_universe(install_universe):
-    fake = install_universe(
-        tools={name: lambda args: {"results": []} for name in _ADMETAI_DEFERRED}
-    )
+def test_admetai_requires_non_empty_smiles():
     bindings = dict(DEVELOPABILITY_BINDINGS)
-    for name in _ADMETAI_DEFERRED:
-        with pytest.raises(NotImplementedError):
-            bindings[name](smiles="CCO", _live=True)
-    assert fake.calls == []
+    for name in _ADMETAI_TOOLS:
+        with pytest.raises(ValueError):
+            bindings[name](smiles="")
+        with pytest.raises(ValueError):
+            bindings[name](smiles="", _live=True)
+
+
+def test_admetai_live_routes_through_tooluniverse_adapter(install_universe):
+    """_live=True dispatches each ADMETAI tool through TU with
+    ``{"smiles": <value>}`` — exactly the official spec's required
+    parameter — and returns the adapter envelope."""
+    canned = {
+        name: lambda args, _n=name: {"smiles_in": args.get("smiles"), "tool": _n}
+        for name in _ADMETAI_TOOLS
+    }
+    fake = install_universe(tools=canned)
+    bindings = dict(DEVELOPABILITY_BINDINGS)
+    for name in _ADMETAI_TOOLS:
+        env = bindings[name](smiles="CCO", _live=True)
+        assert env["status"] == "ok"
+        assert env["executor"] == "tooluniverse"
+        assert env["source"] == name
+        assert env["payload"] == {"smiles_in": "CCO", "tool": name}
+    assert {c["name"] for c in fake.calls} == set(_ADMETAI_TOOLS)
+    for c in fake.calls:
+        assert c["arguments"] == {"smiles": "CCO"}
+
+
+def test_admetai_live_upstream_error_envelope_when_universe_returns_error(
+    install_universe,
+):
+    """If ToolUniverse signals an error (e.g. ``admet_ai`` package
+    missing in the runtime venv), the wrapper does NOT raise — it
+    surfaces ``status="upstream_error"`` with TU's error message."""
+    install_universe(tools={
+        "ADMETAI_predict_toxicity": lambda args: {
+            "status": "error",
+            "error": "ADMETModel requires 'admet-ai' package",
+        }
+    })
+    bindings = dict(DEVELOPABILITY_BINDINGS)
+    env = bindings["ADMETAI_predict_toxicity"](smiles="CCO", _live=True)
+    assert env["status"] == "upstream_error"
+    assert env["executor"] == "tooluniverse"
+    assert "admet-ai" in (env.get("error_message") or "")
 
 
 # ── Step 9 variant batch: AlphaMissense migrated; DynaMut2 / ESM deferred ──
