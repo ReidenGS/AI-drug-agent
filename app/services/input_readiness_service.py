@@ -39,10 +39,12 @@ Severity policy:
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import PurePosixPath
 
 from ..schemas.step_03_input_readiness import (
     BasicADCInputPresence,
+    ClarificationRequest,
     InputReadinessStatus,
     MissingInputItem,
     SourceRefs,
@@ -56,6 +58,50 @@ from .workflow_state_service import WorkflowStateService
 
 
 _ARTIFACT_KEY = "inputs/input_readiness_status.json"
+
+
+# Deterministic, non-LLM fallback questions keyed by gap category / slot.
+# Used only when a Step 2 `missing_slot` carried no `suggested_question`.
+_CLARIFICATION_FALLBACK_QUESTIONS = {
+    "target": "What target or antigen should the ADC be designed against?",
+    "antibody": "Which antibody candidate should we use, or should we run discovery?",
+    "payload_or_linker": "Which payload and linker should the ADC use?",
+    "payload": "Which payload should the ADC carry?",
+    "linker": "Which linker chemistry should we use?",
+    "structure_or_sequence": "Please provide a PDB/CIF file, PDB ID, UniProt ID, or protein sequence.",
+    "structure": "Please provide a PDB/CIF file, PDB ID, UniProt ID, or protein sequence.",
+    "sequence": "Please provide a protein or antibody sequence, or a UniProt ID.",
+    "identifier": "Could you provide the relevant identifier (PDB ID, UniProt ID, or SMILES)?",
+    "task_intent": "What workflow should we run (design, evaluate, screen, or review)?",
+    "constraint": "Are there any constraints we should respect (e.g. DAR or affinity)?",
+    "constraints": "Are there any constraints we should respect (e.g. DAR or affinity)?",
+    "raw_user_query": "Could you describe what you'd like the pipeline to do?",
+    "uploaded_file": "Could you re-check or re-upload the referenced file?",
+    "other": "Could you provide more detail for this requirement?",
+}
+
+
+def _fallback_question(category: str, slot_name: str, reason: str) -> str:
+    q = _CLARIFICATION_FALLBACK_QUESTIONS.get(category) or _CLARIFICATION_FALLBACK_QUESTIONS.get(
+        slot_name
+    )
+    if q:
+        return q
+    reason = (reason or "").strip()
+    if reason:
+        return f"Could you clarify: {reason}"
+    return _CLARIFICATION_FALLBACK_QUESTIONS["other"]
+
+
+def _clarification_request_id(slot_name: str, slot_category: str, severity: str, question: str) -> str:
+    """Stable id from slot identity + a short hash of the question content.
+
+    Deterministic (no UUID / timestamp) so the same gap yields the same id
+    across runs, which lets an answer store dedupe without churn.
+    """
+    raw = "|".join([slot_name, slot_category, severity, question])
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+    return f"clr_{slot_name}_{digest}"
 
 
 # Step 2 `missing_slots` slot_category -> Step 3 `GapCategory`. Keeps the
@@ -526,6 +572,11 @@ class InputReadinessService:
         else:
             status_val = "ready"
 
+        # Clarification requests are built from the SAME gaps but are NOT
+        # subject to the checklist dedupe, so a Step 2 `suggested_question`
+        # survives even when its category was deduped from the checklist.
+        clarification_requests = self._build_clarification_requests(sq, missing)
+
         summary = self._readiness_summary(status_val, missing, presence)
         status = InputReadinessStatus(
             run_id=run_id,
@@ -537,6 +588,7 @@ class InputReadinessService:
             uploaded_file_checks=file_checks,
             missing_input_checklist=missing,
             blocking_reasons=blocking,
+            clarification_requests=clarification_requests,
         )
 
         artifact_id = new_artifact_id("input_readiness_status")
@@ -602,6 +654,86 @@ class InputReadinessService:
                 )
             )
             existing[category] = slot_rank
+
+    @staticmethod
+    def _build_clarification_requests(
+        structured_query: dict, missing: list[MissingInputItem]
+    ) -> list[ClarificationRequest]:
+        """Turn required-slot gaps into stable, user-facing questions.
+
+        Deterministic and additive. Step 2 `missing_slots` are the primary
+        source and are read DIRECTLY (not via the deduped checklist) so a
+        Step 2 `suggested_question` is never lost to checklist dedupe. A
+        deterministic gap only becomes a request when its category was not
+        already covered by a Step 2 slot. `blocking` / `warning` gaps yield
+        requests; `optional` gaps stay checklist-only (less noise — see the
+        dedicated test). Nothing here calls an LLM.
+        """
+        severity_with_question = {"blocking", "warning"}
+        requests: list[ClarificationRequest] = []
+        seen_ids: set[str] = set()
+        covered_categories: set[str] = set()
+
+        def _add(slot_name, slot_category, gap_category, severity, question, reason, source, evidence):
+            request_id = _clarification_request_id(
+                slot_name, slot_category, severity, question
+            )
+            if request_id in seen_ids:
+                return
+            seen_ids.add(request_id)
+            covered_categories.add(gap_category)
+            requests.append(
+                ClarificationRequest(
+                    request_id=request_id,
+                    slot_name=slot_name,
+                    slot_category=slot_category,
+                    severity=severity,  # type: ignore[arg-type]
+                    question=question,
+                    reason=reason,
+                    source=source,
+                    evidence_field=evidence if isinstance(evidence, str) else None,
+                )
+            )
+
+        # 1. Step 2 missing_slots — preserve the LLM's suggested_question.
+        for slot in structured_query.get("missing_slots") or []:
+            if not isinstance(slot, dict):
+                continue
+            severity = slot.get("severity")
+            if severity not in {"blocking", "warning", "optional"}:
+                severity = "warning"
+            if severity not in severity_with_question:
+                continue  # optional → checklist-only, no question
+            slot_name = slot.get("slot_name") or "other"
+            slot_category = slot.get("slot_category") or "other"
+            gap_category = _MISSING_SLOT_CATEGORY_TO_GAP.get(slot_category, "other")
+            reason = (slot.get("reason") or "").strip()
+            suggested = slot.get("suggested_question")
+            question = (
+                suggested.strip()
+                if isinstance(suggested, str) and suggested.strip()
+                else _fallback_question(gap_category, slot_name, reason)
+            )
+            _add(
+                slot_name, slot_category, gap_category, severity, question, reason,
+                "step2_missing_slots", slot.get("evidence"),
+            )
+
+        # 2. Deterministic gaps not already covered by a Step 2 slot category.
+        for item in missing:
+            if item.field.startswith("structured_query.missing_slots"):
+                continue  # already represented via the Step 2 loop above
+            if item.severity not in severity_with_question:
+                continue
+            if item.category in covered_categories:
+                continue
+            question = _fallback_question(item.category, item.category, item.message)
+            _add(
+                item.category, item.category, item.category, item.severity,
+                question, item.message, "deterministic_readiness", item.evidence_field,
+            )
+
+        return requests
 
     @staticmethod
     def _readiness_summary(

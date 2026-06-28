@@ -211,3 +211,246 @@ def test_step3_blocking_slot_does_not_duplicate_existing_category(
     # Deterministic target check already present; slot deduped against it.
     assert len(target_items) == 1
     assert not target_items[0].field.startswith("structured_query.missing_slots")
+
+
+# ── Step 3 clarification_requests (minimal backend skeleton) ─────────────────
+
+
+def test_step3_blocking_slot_generates_clarification_request(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _full_context_run(local_storage, registry_service, workflow_state_service)
+    _bootstrap_step_2(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        run_id,
+        missing_slots=[
+            MissingSlot(
+                slot_name="structure_or_sequence",
+                slot_category="structure",
+                severity="blocking",
+                required_for=["structure_analysis"],
+                reason="No structure or sequence input provided.",
+                suggested_question="Please provide a PDB/CIF file, PDB ID, UniProt ID, or sequence.",
+            )
+        ],
+    )
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+
+    assert out.input_readiness_status == "blocked"
+    crs = out.clarification_requests
+    assert crs, "blocking missing_slot must yield a clarification request"
+    cr = next(c for c in crs if c.slot_name == "structure_or_sequence")
+    assert cr.severity == "blocking"
+    assert cr.source == "step2_missing_slots"
+    assert cr.question == "Please provide a PDB/CIF file, PDB ID, UniProt ID, or sequence."
+    assert cr.resolved is False
+    assert cr.request_id.startswith("clr_structure_or_sequence_")
+
+
+def test_step3_warning_slot_generates_request_without_blocking(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _full_context_run(local_storage, registry_service, workflow_state_service)
+    _bootstrap_step_2(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        run_id,
+        missing_slots=[
+            MissingSlot(
+                slot_name="linker",
+                slot_category="linker",
+                severity="warning",
+                reason="No linker chemistry specified.",
+                suggested_question="Which linker chemistry should we use?",
+            )
+        ],
+    )
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+
+    assert out.input_readiness_status != "blocked"
+    assert out.input_readiness_status == "needs_user_input"
+    linker_reqs = [c for c in out.clarification_requests if c.slot_name == "linker"]
+    assert linker_reqs and linker_reqs[0].severity == "warning"
+    assert not out.blocking_reasons
+
+
+def test_step3_optional_slot_stays_checklist_only_no_request(
+    local_storage, registry_service, workflow_state_service
+):
+    """Design choice: optional slots are informational and do NOT generate a
+    clarification request (less noise); they remain on the checklist."""
+    run_id = _full_context_run(local_storage, registry_service, workflow_state_service)
+    _bootstrap_step_2(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        run_id,
+        missing_slots=[
+            MissingSlot(
+                slot_name="constraint",
+                slot_category="constraint",
+                severity="optional",
+                reason="No explicit constraints.",
+                suggested_question="Any constraints?",
+            )
+        ],
+    )
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+    assert not any(c.slot_name == "constraint" for c in out.clarification_requests)
+    assert any(
+        m.field.startswith("structured_query.missing_slots") and m.category == "constraints"
+        for m in out.missing_input_checklist
+    )
+
+
+def test_step3_clarification_preserves_step2_question_when_checklist_dedupes(
+    local_storage, registry_service, workflow_state_service
+):
+    """The core fix: when a deterministic check and a Step 2 slot share a
+    category, the checklist may dedupe the Step 2 entry, but the Step 2
+    `suggested_question` MUST survive in clarification_requests."""
+    intake = IntakeService(local_storage, registry_service, workflow_state_service)
+    rec = intake.submit(raw_user_query="design an ADC", user_provided_context={})
+    run_id = rec.run_id
+    step2_question = "What target or antigen should the ADC be designed against?"
+    _bootstrap_step_2(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        run_id,
+        missing_slots=[
+            MissingSlot(
+                slot_name="target_or_antigen",
+                slot_category="target",
+                severity="blocking",
+                reason="No target.",
+                suggested_question=step2_question,
+            )
+        ],
+    )
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+
+    # Checklist deduped the Step 2 target slot against the deterministic one.
+    target_items = [m for m in out.missing_input_checklist if m.category == "target"]
+    assert len(target_items) == 1
+    assert not target_items[0].field.startswith("structured_query.missing_slots")
+
+    # But the Step 2 suggested_question survives in clarification_requests,
+    # sourced from Step 2 (not the deterministic fallback).
+    target_reqs = [c for c in out.clarification_requests if c.slot_category == "target"]
+    assert len(target_reqs) == 1
+    assert target_reqs[0].question == step2_question
+    assert target_reqs[0].source == "step2_missing_slots"
+
+
+def test_step3_deterministic_gap_yields_request_when_no_step2_slot(
+    local_storage, registry_service, workflow_state_service
+):
+    """Old Step 2 artifacts (no missing_slots) still surface a question for a
+    deterministic blocking gap, sourced as deterministic_readiness."""
+    intake = IntakeService(local_storage, registry_service, workflow_state_service)
+    rec = intake.submit(raw_user_query="design an ADC", user_provided_context={})
+    run_id = rec.run_id
+    _bootstrap_step_2(local_storage, registry_service, workflow_state_service, run_id)
+    # Simulate a pre-missing_slots artifact.
+    key = local_storage.run_key(run_id, "inputs/structured_query.json")
+    sq = local_storage.read_json(key)
+    sq.pop("missing_slots", None)
+    local_storage.write_json(key, sq)
+
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+    assert out.input_readiness_status == "blocked"
+    target_reqs = [c for c in out.clarification_requests if c.slot_category == "target"]
+    assert target_reqs and target_reqs[0].source == "deterministic_readiness"
+
+
+def test_step3_request_id_is_deterministic_across_runs(
+    local_storage, registry_service, workflow_state_service
+):
+    def _run_once() -> list[str]:
+        intake = IntakeService(local_storage, registry_service, workflow_state_service)
+        rec = intake.submit(raw_user_query="design an ADC", user_provided_context={})
+        _bootstrap_step_2(
+            local_storage,
+            registry_service,
+            workflow_state_service,
+            rec.run_id,
+            missing_slots=[
+                MissingSlot(
+                    slot_name="target_or_antigen",
+                    slot_category="target",
+                    severity="blocking",
+                    reason="No target.",
+                    suggested_question="What target or antigen should the ADC be designed against?",
+                )
+            ],
+        )
+        out = InputReadinessService(
+            local_storage, registry_service, workflow_state_service
+        ).check(rec.run_id)
+        return [c.request_id for c in out.clarification_requests]
+
+    first = _run_once()
+    second = _run_once()
+    assert first == second
+    assert all(rid.startswith("clr_") for rid in first)
+
+
+def test_step3_old_artifact_without_missing_slots_has_empty_or_deterministic_requests(
+    local_storage, registry_service, workflow_state_service
+):
+    """Backward compatible: a fully satisfied run with no missing_slots has
+    no clarification requests."""
+    run_id = _full_context_run(local_storage, registry_service, workflow_state_service)
+    _bootstrap_step_2(local_storage, registry_service, workflow_state_service, run_id)
+    key = local_storage.run_key(run_id, "inputs/structured_query.json")
+    sq = local_storage.read_json(key)
+    sq.pop("missing_slots", None)
+    local_storage.write_json(key, sq)
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+    assert out.input_readiness_status == "ready"
+    assert out.clarification_requests == []
+
+
+def test_step3_clarification_requests_do_not_leak_sequences_or_keys(
+    local_storage, registry_service, workflow_state_service
+):
+    heavy = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
+    run_id = _full_context_run(local_storage, registry_service, workflow_state_service)
+    _bootstrap_step_2(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        run_id,
+        missing_slots=[
+            MissingSlot(
+                slot_name="structure_or_sequence",
+                slot_category="structure",
+                severity="blocking",
+                reason="No structure or sequence input provided.",
+                suggested_question="Please provide a PDB/CIF file, PDB ID, UniProt ID, or sequence.",
+            )
+        ],
+    )
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+    blob = str([c.model_dump() for c in out.clarification_requests])
+    assert heavy not in blob
+    assert "api_key" not in blob.lower()
+    assert "system instructions" not in blob.lower()
