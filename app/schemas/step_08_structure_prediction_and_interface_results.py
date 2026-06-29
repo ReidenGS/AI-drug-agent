@@ -87,6 +87,45 @@ class StructureOutputArtifact(BaseModel):
     created_at: Optional[str] = None
 
 
+class ComplexStructureRef(BaseModel):
+    source_kind: Literal[
+        "existing_pdb_complex",
+        "uploaded_local_complex",
+        "predicted_complex",
+        "unknown",
+    ]
+    source_ref: Optional[str] = None
+    storage_ref: Optional[str] = None
+    pdb_id: Optional[str] = None
+    structure_format: Literal["pdb", "cif", "mmcif", "unknown"] = "unknown"
+    source_tool_call_id: Optional[str] = None
+    confidence_summary: dict = Field(default_factory=dict)
+
+
+class InterfaceAnalysisRecord(BaseModel):
+    source_tool: Optional[str] = None
+    source_tool_call_id: Optional[str] = None
+    chain_pair: dict = Field(default_factory=dict)
+    interface_residue_count: Optional[int] = None
+    interface_area: Optional[float] = None
+    h_bond_count: Optional[int] = None
+    salt_bridge_count: Optional[int] = None
+    quality_flags: list[str] = Field(default_factory=list)
+    source_ref: Optional[str] = None
+
+
+class Step8DownstreamHandoff(BaseModel):
+    has_complex_structure: bool = False
+    has_interface_features: bool = False
+    structure_for_variant_generation_ref: Optional[str] = None
+    interface_quality_available: bool = False
+    prediction_confidence_available: bool = False
+    refinement_resolution_available: bool = False
+    validation_available: bool = False
+    missing_for_step9: list[str] = Field(default_factory=list)
+    handoff_notes: list[str] = Field(default_factory=list)
+
+
 class CandidateStructureResult(BaseModel):
     candidate_id: str
     structure_input_id: str
@@ -101,6 +140,9 @@ class CandidateStructureResult(BaseModel):
     chain_mapping: list[dict] = Field(default_factory=list)
     interface_features: list[InterfaceFeature] = Field(default_factory=list)
     structure_confidence_records: list[StructureConfidenceRecord] = Field(default_factory=list)
+    complex_structure_refs: list[ComplexStructureRef] = Field(default_factory=list)
+    interface_analysis_records: list[InterfaceAnalysisRecord] = Field(default_factory=list)
+    downstream_handoff: Step8DownstreamHandoff = Field(default_factory=Step8DownstreamHandoff)
 
 
 class StructurePredictionAndInterfaceResults(BaseModel):

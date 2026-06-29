@@ -9,6 +9,10 @@ from pydantic import ValidationError
 
 from app.schemas.common import ToolCallRecord
 from app.schemas.step_08_structure_prediction_and_interface_results import (
+    CandidateStructureResult,
+    ComplexStructureRef,
+    InterfaceAnalysisRecord,
+    Step8DownstreamHandoff,
     StructureConfidenceRecord,
     StructureOutputArtifact,
     StructurePredictionAndInterfaceResults,
@@ -73,6 +77,63 @@ def test_step_08_output_artifact_is_structured():
         run_id=_RUN, created_at=_NOW, output_artifacts=[art]
     )
     assert table.output_artifacts[0].artifact_type == "refinement_or_validation_report"
+
+
+def test_step_08_business_output_fields_are_additive_and_defaulted():
+    result = CandidateStructureResult(
+        candidate_id="cand_1",
+        structure_input_id="si_1",
+        run_case="existing_complex_interface_evaluation",
+        run_status="ok",
+    )
+    assert result.complex_structure_refs == []
+    assert result.interface_analysis_records == []
+    assert result.downstream_handoff == Step8DownstreamHandoff()
+
+
+def test_step_08_accepts_complex_refs_interface_records_and_handoff():
+    result = CandidateStructureResult(
+        candidate_id="cand_1",
+        structure_input_id="si_1",
+        run_case="existing_complex_interface_evaluation",
+        run_status="ok",
+        complex_structure_refs=[
+            ComplexStructureRef(
+                source_kind="existing_pdb_complex",
+                source_ref="1n8z",
+                pdb_id="1n8z",
+                structure_format="pdb",
+                source_tool_call_id="tc_pisa",
+                confidence_summary={"interface_evaluation": "success"},
+            )
+        ],
+        interface_analysis_records=[
+            InterfaceAnalysisRecord(
+                source_tool="PDBePISA_get_interfaces",
+                source_tool_call_id="tc_pisa",
+                chain_pair={"chain_id_1": "A", "chain_id_2": "B"},
+                interface_residue_count=2,
+                interface_area=123.4,
+                h_bond_count=2,
+                source_ref="1n8z",
+            )
+        ],
+        downstream_handoff=Step8DownstreamHandoff(
+            has_complex_structure=True,
+            has_interface_features=True,
+            structure_for_variant_generation_ref="1n8z",
+            interface_quality_available=True,
+            refinement_resolution_available=True,
+        ),
+    )
+    table = StructurePredictionAndInterfaceResults(
+        run_id=_RUN,
+        created_at=_NOW,
+        candidate_structure_results=[result],
+    )
+    dumped = table.model_dump()
+    roundtrip = StructurePredictionAndInterfaceResults.model_validate(dumped)
+    assert roundtrip.candidate_structure_results[0].downstream_handoff.has_complex_structure is True
 
 
 # ── Step 9 compound source library ───────────────────────────────────────────

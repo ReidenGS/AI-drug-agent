@@ -1144,6 +1144,27 @@ def test_step8_produces_confidence_records_and_keeps_raw_at_ref(
     assert all_features
     assert all_features[0].chain_id_1 == "A"
     assert all_features[0].chain_id_2 == "B"
+    analysis_records = [
+        rec for cr in results.candidate_structure_results
+        for rec in cr.interface_analysis_records
+    ]
+    assert analysis_records
+    assert analysis_records[0].source_tool == "PDBePISA_get_interfaces"
+    assert analysis_records[0].chain_pair == {"chain_id_1": "A", "chain_id_2": "B"}
+    assert analysis_records[0].interface_residue_count == 2
+    assert analysis_records[0].interface_area == 123.4
+    assert analysis_records[0].h_bond_count == 2
+    handoffs = [cr.downstream_handoff for cr in results.candidate_structure_results]
+    assert any(h.has_complex_structure for h in handoffs)
+    assert any(h.has_interface_features for h in handoffs)
+    assert any(h.interface_quality_available for h in handoffs)
+    assert any(h.refinement_resolution_available for h in handoffs)
+    assert any(h.structure_for_variant_generation_ref == "1N8Z" for h in handoffs)
+    complex_refs = [
+        ref for cr in results.candidate_structure_results
+        for ref in cr.complex_structure_refs
+    ]
+    assert any(ref.source_kind == "existing_pdb_complex" and ref.pdb_id == "1N8Z" for ref in complex_refs)
 
     # output_artifacts use structured envelope (artifact_id + storage_ref).
     assert results.output_artifacts
@@ -1154,6 +1175,7 @@ def test_step8_produces_confidence_records_and_keeps_raw_at_ref(
     # Raw payload markers stay in tool_outputs/ — never in normalized records.
     blob = json.dumps(results.model_dump())
     assert "hits_step8_" not in blob
+    assert "raw_marker" not in blob
 
     # And the raw files actually exist.
     for tc in results.tool_call_records:
@@ -1234,6 +1256,21 @@ def test_step8_uploaded_structure_file_path_calls_validation_tools(
     results = agent.run_step_8(run_id)
     assert results.structure_modeling_status == "ok"
     assert all(cr.run_status == "ok" for cr in results.candidate_structure_results)
+    uploaded_handoffs = [
+        cr.downstream_handoff for cr in results.candidate_structure_results
+        if cr.complex_structure_refs
+    ]
+    assert uploaded_handoffs
+    assert any(h.has_complex_structure for h in uploaded_handoffs)
+    assert any(h.validation_available for h in uploaded_handoffs)
+    assert any(not h.has_interface_features for h in uploaded_handoffs)
+    uploaded_refs = [
+        ref for cr in results.candidate_structure_results
+        for ref in cr.complex_structure_refs
+        if ref.source_kind == "uploaded_local_complex"
+    ]
+    assert uploaded_refs
+    assert all(ref.storage_ref and ref.storage_ref.endswith(".pdb") for ref in uploaded_refs)
     tools = {tc.tool_name for tc in results.tool_call_records}
     assert "CrystalStructure_validate" in tools
     assert "ProteinsPlus_profile_structure_quality" not in tools
@@ -1272,6 +1309,13 @@ def test_step8_sequence_only_records_nim_prediction_route_as_unavailable(
     results = agent.run_step_8(run_id)
     assert results.structure_modeling_status == "partial"
     assert any(cr.run_status == "partial" for cr in results.candidate_structure_results)
+    assert all(not cr.complex_structure_refs for cr in results.candidate_structure_results)
+    missing = [
+        item for cr in results.candidate_structure_results
+        for item in cr.downstream_handoff.missing_for_step9
+    ]
+    assert "complex_structure_missing" in missing
+    assert "complex_prediction_unavailable" in missing
 
     nim_calls = [
         tc for tc in results.tool_call_records

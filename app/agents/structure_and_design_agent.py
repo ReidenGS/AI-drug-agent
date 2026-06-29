@@ -51,8 +51,11 @@ from ..schemas.step_07_prepared_structure_input_package import (
 )
 from ..schemas.step_08_structure_prediction_and_interface_results import (
     CandidateStructureResult,
+    ComplexStructureRef,
+    InterfaceAnalysisRecord,
     InterfaceFeature,
     InterfaceMetrics,
+    Step8DownstreamHandoff,
     StructureConfidenceRecord,
     StructureOutput,
     StructureOutputArtifact,
@@ -635,6 +638,8 @@ class StructureAndDesignAgent:
             confidence_records: list[StructureConfidenceRecord] = []
             structure_outputs: list[StructureOutput] = []
             interface_features: list[InterfaceFeature] = []
+            interface_analysis_records: list[InterfaceAnalysisRecord] = []
+            complex_structure_refs: list[ComplexStructureRef] = []
             run_status = "ok"
             partial = False
 
@@ -687,6 +692,12 @@ class StructureAndDesignAgent:
                     interface_features.extend(
                         _extract_interface_features_for_step8(self.storage, tc)
                     )
+                    interface_analysis_records.extend(
+                        _extract_interface_analysis_records_for_step8(self.storage, tc)
+                    )
+                    complex_structure_refs.extend(
+                        _extract_complex_structure_refs_for_step8(self.storage, sin, tc)
+                    )
                     if tc.tool_output_artifact_id and tc.tool_output_ref:
                         output_artifacts.append(
                             StructureOutputArtifact(
@@ -720,6 +731,15 @@ class StructureAndDesignAgent:
                     chain_mapping=sin.get("chain_mapping") or [],
                     interface_features=interface_features,
                     structure_confidence_records=confidence_records,
+                    complex_structure_refs=_dedupe_complex_structure_refs(complex_structure_refs),
+                    interface_analysis_records=interface_analysis_records,
+                    downstream_handoff=_build_step8_downstream_handoff(
+                        complex_structure_refs=_dedupe_complex_structure_refs(complex_structure_refs),
+                        interface_features=interface_features,
+                        interface_analysis_records=interface_analysis_records,
+                        confidence_records=confidence_records,
+                        tool_calls=routed_calls,
+                    ),
                 )
             )
 
@@ -1847,6 +1867,177 @@ def _extract_interface_features_for_step8(
             )
         )
     return features
+
+
+def _extract_interface_analysis_records_for_step8(
+    storage: Storage, tool_call: ToolCallRecord
+) -> list[InterfaceAnalysisRecord]:
+    if tool_call.tool_name != "PDBePISA_get_interfaces":
+        return []
+    payload = _read_tool_output_payload(storage, tool_call)
+    if not isinstance(payload, dict):
+        return []
+    raw_interfaces = payload.get("interfaces")
+    if not isinstance(raw_interfaces, list):
+        return []
+
+    records: list[InterfaceAnalysisRecord] = []
+    source_ref = _extract_scalar(payload, ("pdb_id", "source_ref", "query"))
+    for item in raw_interfaces[:25]:
+        if not isinstance(item, dict):
+            continue
+        chain_a = _extract_scalar(item, ("chain_id_1", "chain_1", "chain_a", "chainId1"))
+        chain_b = _extract_scalar(item, ("chain_id_2", "chain_2", "chain_b", "chainId2"))
+        if not chain_a or not chain_b:
+            chains = _extract_chain_ids(item)
+            if len(chains) >= 2:
+                chain_a, chain_b = chains[0], chains[1]
+        residues = item.get("interface_residues") or item.get("residues") or []
+        residue_count = len(residues) if isinstance(residues, list) else None
+        records.append(
+            InterfaceAnalysisRecord(
+                source_tool=tool_call.tool_name,
+                source_tool_call_id=tool_call.tool_call_id,
+                chain_pair={
+                    k: v for k, v in {
+                        "chain_id_1": str(chain_a) if chain_a else None,
+                        "chain_id_2": str(chain_b) if chain_b else None,
+                    }.items() if v
+                },
+                interface_residue_count=residue_count,
+                interface_area=_float_or_none(item.get("interface_area") or item.get("area")),
+                h_bond_count=_int_or_none(item.get("h_bond_count") or item.get("hbonds")),
+                salt_bridge_count=_int_or_none(
+                    item.get("salt_bridge_count") or item.get("salt_bridges")
+                ),
+                quality_flags=[],
+                source_ref=str(source_ref) if source_ref else None,
+            )
+        )
+    return records
+
+
+def _extract_complex_structure_refs_for_step8(
+    storage: Storage, sin: dict, tool_call: ToolCallRecord
+) -> list[ComplexStructureRef]:
+    summary = tool_call.tool_input_summary or {}
+    refs: list[ComplexStructureRef] = []
+    if tool_call.tool_name == "PDBePISA_get_interfaces":
+        pdb_id = _step8_pdb_id(sin.get("structure_refs") or [])
+        if pdb_id:
+            refs.append(
+                ComplexStructureRef(
+                    source_kind="existing_pdb_complex",
+                    source_ref=pdb_id,
+                    pdb_id=pdb_id,
+                    structure_format="pdb",
+                    source_tool_call_id=tool_call.tool_call_id,
+                    confidence_summary={"interface_evaluation": tool_call.run_status},
+                )
+            )
+    elif tool_call.tool_name == "CrystalStructure_validate":
+        local_ref = _step8_local_structure_ref(storage, sin.get("structure_refs") or [])
+        if local_ref:
+            refs.append(
+                ComplexStructureRef(
+                    source_kind="uploaded_local_complex",
+                    source_ref=local_ref.get("source"),
+                    storage_ref=str(local_ref["value"]),
+                    structure_format=_format_for_file(str(local_ref["value"])),
+                    source_tool_call_id=tool_call.tool_call_id,
+                    confidence_summary={"validation": tool_call.run_status},
+                )
+            )
+    elif tool_call.tool_name in _STEP8_NIM_COMPLEX_TOOLS:
+        payload = _read_tool_output_payload(storage, tool_call)
+        model_ref = _prediction_model_ref(payload)
+        if model_ref:
+            refs.append(
+                ComplexStructureRef(
+                    source_kind="predicted_complex",
+                    source_ref=tool_call.tool_name,
+                    storage_ref=model_ref,
+                    structure_format=_format_for_file(model_ref),
+                    source_tool_call_id=tool_call.tool_call_id,
+                    confidence_summary=_prediction_confidence_summary(payload),
+                )
+            )
+    return refs
+
+
+def _dedupe_complex_structure_refs(refs: list[ComplexStructureRef]) -> list[ComplexStructureRef]:
+    out: list[ComplexStructureRef] = []
+    seen: set[tuple[Any, ...]] = set()
+    for ref in refs:
+        key = (ref.source_kind, ref.pdb_id, ref.storage_ref, ref.source_tool_call_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ref)
+    return out
+
+
+def _build_step8_downstream_handoff(
+    *,
+    complex_structure_refs: list[ComplexStructureRef],
+    interface_features: list[InterfaceFeature],
+    interface_analysis_records: list[InterfaceAnalysisRecord],
+    confidence_records: list[StructureConfidenceRecord],
+    tool_calls: list[ToolCallRecord],
+) -> Step8DownstreamHandoff:
+    missing: list[str] = []
+    notes: list[str] = []
+    has_complex = bool(complex_structure_refs)
+    has_interfaces = bool(interface_features or interface_analysis_records)
+    confidence_types = {c.confidence_type for c in confidence_records}
+    if not has_complex:
+        missing.append("complex_structure_missing")
+    if not has_interfaces:
+        missing.append("interface_features_missing")
+    if any(
+        tc.tool_name in _STEP8_NIM_COMPLEX_TOOLS
+        and tc.run_status == "dependency_unavailable"
+        for tc in tool_calls
+    ):
+        missing.append("complex_prediction_unavailable")
+        notes.append("NvidiaNIM complex prediction route is deferred/unavailable")
+
+    structure_ref = None
+    if complex_structure_refs:
+        first = complex_structure_refs[0]
+        structure_ref = first.storage_ref or first.pdb_id or first.source_ref
+
+    return Step8DownstreamHandoff(
+        has_complex_structure=has_complex,
+        has_interface_features=has_interfaces,
+        structure_for_variant_generation_ref=structure_ref,
+        interface_quality_available="interface_quality" in confidence_types or has_interfaces,
+        prediction_confidence_available="prediction_confidence" in confidence_types,
+        refinement_resolution_available="refinement_resolution" in confidence_types,
+        validation_available="structure_quality" in confidence_types,
+        missing_for_step9=list(dict.fromkeys(missing)),
+        handoff_notes=notes,
+    )
+
+
+def _prediction_model_ref(payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    value = _extract_scalar(
+        payload,
+        ("model_ref", "model_path", "structure_path", "output_path", "path", "file", "url", "output"),
+    )
+    return str(value) if value else None
+
+
+def _prediction_confidence_summary(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in ("ptm", "iptm", "plddt", "confidence", "score"):
+        if key in payload and payload[key] is not None:
+            out[key] = _short(payload[key])
+    return out
 
 
 def _float_or_none(value: Any) -> float | None:
