@@ -562,7 +562,6 @@ def test_step7_structure_file_material_is_consumable_by_step8_without_fake_place
 
     overrides = {
         "CrystalStructure_validate": lambda **kw: {"ok": True, "pdb_id_or_path": kw.get("pdb_id_or_path")},
-        "ProteinsPlus_profile_structure_quality": lambda **kw: {"ok": True, "pdb_id_or_path": kw.get("pdb_id_or_path")},
     }
     mcp = LocalMCPClient(
         inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
@@ -574,13 +573,17 @@ def test_step7_structure_file_material_is_consumable_by_step8_without_fake_place
     )
     agent.run_step_7(run_id)
     results = agent.run_step_8(run_id)
-    tool_calls = [tc for tc in results.tool_call_records if tc.tool_name in {"CrystalStructure_validate", "ProteinsPlus_profile_structure_quality"}]
+    tool_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name == "CrystalStructure_validate"
+        and tc.tool_input_summary.get("routing_decision") == "selected"
+    ]
     assert tool_calls, "expected structure validation calls"
     for tc in tool_calls:
         assert tc.tool_input_summary["pdb_id_or_path"] == str(
             PROJECT_ROOT / "data" / "pdb" / "S1.pdb"
         )
-        assert "uploaded" not in json.dumps(tc.tool_input_summary or {})
+        assert tc.tool_input_summary["pdb_id_or_path"] != "uploaded"
         assert tc.tool_input_summary and ("pdb_id_or_path" in tc.tool_input_summary)
         assert tc.tool_input_summary["pdb_id_or_path"].endswith("S1.pdb")
 
@@ -1062,6 +1065,17 @@ def _bindings_with_step8_overrides(extra: dict | None = None) -> dict:
     return base
 
 
+def test_step8_scope_tools_match_inventory_runtime_scope():
+    mcp = _mcp()
+    runtime_scope = set(mcp.list_tools(agent_name="structure_and_design_agent", step_id="step_08"))
+    routing_policy = set(structure_and_design_module._STEP8_SCOPED_TOOL_POLICY)
+    assert runtime_scope == routing_policy, (
+        "Step 8 runtime scope must stay in sync with _STEP8_SCOPED_TOOL_POLICY.\n"
+        f"runtime_scope={sorted(runtime_scope)}\n"
+        f"routing_policy={sorted(routing_policy)}"
+    )
+
+
 def test_step8_produces_confidence_records_and_keeps_raw_at_ref(
     local_storage, registry_service, workflow_state_service
 ):
@@ -1073,11 +1087,21 @@ def test_step8_produces_confidence_records_and_keeps_raw_at_ref(
     )
     # Inject canned payloads on the Step 8 tools we expect to be called.
     overrides = {
-        "RCSBData_get_entry": lambda **kw: {"hits_step8_rcsb": [kw.get("pdb_id")]},
+        "PDBePISA_get_interfaces": lambda **kw: {
+            "hits_step8_pisa": "raw_marker",
+            "pdb_id": kw.get("pdb_id"),
+            "interfaces": [
+                {
+                    "chain_id_1": "A",
+                    "chain_id_2": "B",
+                    "interface_area": 123.4,
+                    "h_bond_count": 2,
+                    "interface_residues": ["A:1", "B:2"],
+                }
+            ],
+        },
         "get_refinement_resolution_by_pdb_id":
             lambda **kw: {"hits_step8_resolution": 2.0, "pdb_id": kw.get("pdb_id")},
-        "ProteinsPlus_profile_structure_quality":
-            lambda **kw: {"hits_step8_proteinsplus": "ok"},
     }
     mcp = LocalMCPClient(
         inventory=ToolInventoryService(
@@ -1098,17 +1122,31 @@ def test_step8_produces_confidence_records_and_keeps_raw_at_ref(
         for c in cr.structure_confidence_records
     }
     assert "refinement_resolution" in confidence_types
-    quality_calls = [
+    assert "interface_quality" in confidence_types
+    selected = [
         tc for tc in results.tool_call_records
-        if tc.tool_name in {"RCSBData_get_entry", "ProteinsPlus_profile_structure_quality"}
+        if tc.tool_input_summary.get("routing_decision") == "selected"
     ]
-    assert quality_calls
-    assert all(tc.run_status in {"success", "dependency_unavailable", "skipped"} for tc in quality_calls)
+    selected_names = {tc.tool_name for tc in selected}
+    assert "PDBePISA_get_interfaces" in selected_names
+    assert "get_refinement_resolution_by_pdb_id" in selected_names
+    assert "RCSBData_get_entry" not in {tc.tool_name for tc in results.tool_call_records}
+    assert "ProteinsPlus_profile_structure_quality" not in {tc.tool_name for tc in results.tool_call_records}
+    assert all(tc.run_status in {"success", "dependency_unavailable", "skipped"} for tc in results.tool_call_records)
+
+    all_features = [
+        feature for cr in results.candidate_structure_results
+        for feature in cr.interface_features
+    ]
+    assert all_features
+    assert all_features[0].chain_id_1 == "A"
+    assert all_features[0].chain_id_2 == "B"
 
     # output_artifacts use structured envelope (artifact_id + storage_ref).
     assert results.output_artifacts
     art_types = {a.artifact_type for a in results.output_artifacts}
     assert "refinement_or_validation_report" in art_types
+    assert "interface_analysis_raw_output" in art_types
 
     # Raw payload markers stay in tool_outputs/ — never in normalized records.
     blob = json.dumps(results.model_dump())
@@ -1132,11 +1170,9 @@ def test_step8_tolerates_dependency_unavailable_wrappers(
 
     forced_unwired = {
         name: _ni for name in (
-            "RCSBData_get_entry",
+            "PDBePISA_get_interfaces",
             "get_refinement_resolution_by_pdb_id",
             "CrystalStructure_validate",
-            "alphafold_get_prediction",
-            "ProteinsPlus_profile_structure_quality",
         )
     }
     bindings = dict(_all_bindings())
@@ -1195,7 +1231,54 @@ def test_step8_uploaded_structure_file_path_calls_validation_tools(
     results = agent.run_step_8(run_id)
     tools = {tc.tool_name for tc in results.tool_call_records}
     assert "CrystalStructure_validate" in tools
-    assert "ProteinsPlus_profile_structure_quality" in tools
+    assert "ProteinsPlus_profile_structure_quality" not in tools
+    pisa_calls = [tc for tc in results.tool_call_records if tc.tool_name == "PDBePISA_get_interfaces"]
+    assert pisa_calls
+    assert all(tc.tool_input_summary.get("routing_decision") == "not_applicable" for tc in pisa_calls)
+    assert all("pdb_id" not in (tc.tool_input_summary.get("arguments") or {}) for tc in pisa_calls)
+
+
+def test_step8_sequence_only_records_nim_prediction_route_as_unavailable(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service, referenced_inputs=[])
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for cand in cct["candidate_records"]:
+        if cand.get("candidate_type") == "target_antigen":
+            cand["materials"] = [
+                {
+                    "material_id": "target_seq_for_step8",
+                    "material_type": "target_sequence",
+                    "value": "MKTAYIAKQNNVG",
+                }
+            ]
+        else:
+            cand["materials"] = []
+    local_storage.write_json(cct_path, cct)
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+
+    nim_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
+    ]
+    assert nim_calls
+    assert all(tc.run_status == "dependency_unavailable" for tc in nim_calls)
+    assert all(tc.tool_input_summary.get("routing_decision") == "not_applicable" for tc in nim_calls)
+    assert all("NVIDIA NIM runtime" in tc.tool_input_summary.get("reason", "") for tc in nim_calls)
+
+    blob = json.dumps(results.model_dump())
+    assert "MKTAYIAKQNNVG" not in blob
+    assert "RAW_PDB_SENTINEL" not in blob
+    assert "ATOM      1" not in blob
 
 
 # ── Step 9 ──────────────────────────────────────────────────────────────────

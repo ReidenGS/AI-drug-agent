@@ -49,6 +49,8 @@ from ..schemas.step_07_prepared_structure_input_package import (
 )
 from ..schemas.step_08_structure_prediction_and_interface_results import (
     CandidateStructureResult,
+    InterfaceFeature,
+    InterfaceMetrics,
     StructureConfidenceRecord,
     StructureOutput,
     StructureOutputArtifact,
@@ -85,6 +87,20 @@ _STEP7_SCOPED_TOOLS = (
     "SAbDab_get_structure",
     "alphafold_get_prediction",
 )
+_STEP8_SCOPED_TOOL_POLICY = {
+    "CrystalStructure_validate": "uploaded_structure_validation",
+    "get_refinement_resolution_by_pdb_id": "known_pdb_refinement_lookup",
+    "PDBePISA_get_interfaces": "existing_complex_interface_evaluation",
+    "NvidiaNIM_alphafold2_multimer": "future_complex_prediction",
+    "NvidiaNIM_openfold3": "future_complex_prediction",
+    "NvidiaNIM_boltz2": "future_complex_prediction",
+    "dynamic_package_discovery": "infrastructure_not_scientific_output",
+}
+_STEP8_NIM_COMPLEX_TOOLS = {
+    "NvidiaNIM_alphafold2_multimer",
+    "NvidiaNIM_openfold3",
+    "NvidiaNIM_boltz2",
+}
 _NAME_LIKE_MATERIAL_TYPES = {
     "target_antigen_name",
     "antibody_name",
@@ -616,47 +632,55 @@ class StructureAndDesignAgent:
 
             confidence_records: list[StructureConfidenceRecord] = []
             structure_outputs: list[StructureOutput] = []
+            interface_features: list[InterfaceFeature] = []
             run_status = "ok"
             partial = False
 
-            tools_to_call = self._tools_for_step8_case(sin)
-            if not tools_to_call:
+            routed_calls = self._route_step8_scoped_tools(run_id, sin)
+            selected_calls = [
+                tc for tc in routed_calls
+                if tc.tool_input_summary
+                and tc.tool_input_summary.get("routing_decision") == "selected"
+            ]
+            if not selected_calls:
                 if input_case == "uploaded_structure_file":
-                    tool_calls.append(
-                        _skipped_tool_record(
-                            tool_name="structure_input_missing_ref",
-                            agent_name=_AGENT_NAME,
-                            step_id=_STEP_08,
-                            summary={
-                                "label": f"step08:{structure_input_id}:structure_input",
-                                "candidate_id": candidate_id,
-                                "input_case": input_case,
-                                "reason": "no_usable_structure_reference",
-                                "structure_refs": _compact_structure_refs_for_audit(sin.get("structure_refs") or []),
-                            },
+                    if not any(
+                        tc.tool_name == "structure_input_missing_ref"
+                        for tc in routed_calls
+                    ):
+                        routed_calls.append(
+                            _nonexecuted_tool_record(
+                                tool_name="structure_input_missing_ref",
+                                agent_name=_AGENT_NAME,
+                                step_id=_STEP_08,
+                                run_status="skipped",
+                                summary={
+                                    "label": f"step08:{structure_input_id}:structure_input",
+                                    "candidate_id": candidate_id,
+                                    "input_case": input_case,
+                                    "routing_decision": "not_applicable",
+                                    "reason": "no_usable_structure_reference",
+                                    "structure_refs": _compact_structure_refs_for_audit(sin.get("structure_refs") or []),
+                                },
+                            )
                         )
-                    )
                 run_status = "partial"
                 partial = True
 
-            for tool_name, kwargs, conf_type in tools_to_call:
-                tc = self._call_tool(
-                    run_id=run_id,
-                    step_id=_STEP_08,
-                    tool_name=tool_name,
-                    kwargs=kwargs,
-                    output_dir="step_08",
-                    label=f"step08:{structure_input_id}:{tool_name}",
-                )
+            for tc in routed_calls:
                 tool_calls.append(tc)
                 if tc.run_status == "success":
+                    conf_type = _confidence_type_for_step8_tool(tc.tool_name)
                     confidence_records.append(
                         StructureConfidenceRecord(
                             confidence_type=conf_type,  # type: ignore[arg-type]
-                            value=_extract_confidence_value(tool_name, tc),
-                            source=tool_name,
+                            value=_extract_confidence_value(tc.tool_name, tc),
+                            source=tc.tool_name,
                             source_tool_call_id=tc.tool_call_id,
                         )
+                    )
+                    interface_features.extend(
+                        _extract_interface_features_for_step8(self.storage, tc)
                     )
                     if tc.tool_output_artifact_id and tc.tool_output_ref:
                         output_artifacts.append(
@@ -664,7 +688,7 @@ class StructureAndDesignAgent:
                                 artifact_id=tc.tool_output_artifact_id,
                                 related_candidate_id=candidate_id,
                                 related_structure_input_id=structure_input_id,
-                                artifact_type=_artifact_type_for_tool(tool_name),  # type: ignore[arg-type]
+                                artifact_type=_artifact_type_for_tool(tc.tool_name),  # type: ignore[arg-type]
                                 storage_ref=tc.tool_output_ref,
                                 storage_type="local_run_storage",
                                 content_type="json",
@@ -689,7 +713,7 @@ class StructureAndDesignAgent:
                     partial_run_flag=partial,
                     structure_outputs=structure_outputs,
                     chain_mapping=sin.get("chain_mapping") or [],
-                    interface_features=[],
+                    interface_features=interface_features,
                     structure_confidence_records=confidence_records,
                 )
             )
@@ -726,56 +750,160 @@ class StructureAndDesignAgent:
         self.workflow_state.mark(run_id, "step_08", "completed")
         return results
 
-    def _tools_for_step8_case(
-        self, sin: dict
-    ) -> list[tuple[str, dict[str, Any], str]]:
-        """Decide which Step 8 tools to call for one structure input record.
+    def _step8_scoped_tools(self) -> tuple[str, ...]:
+        runtime_scoped = self.mcp_client.list_tools(
+            agent_name=_AGENT_NAME, step_id=_STEP_08
+        )
+        return tuple(runtime_scoped)
 
-        Returns list of (tool_name, kwargs, confidence_type).
-        """
+    def _route_step8_scoped_tools(
+        self, run_id: str, sin: dict
+    ) -> list[ToolCallRecord]:
         input_case = sin.get("input_case")
-        out: list[tuple[str, dict, str]] = []
+        structure_input_id = sin.get("structure_input_id")
+        candidate_id = sin.get("candidate_id")
+        calls: list[ToolCallRecord] = []
 
-        if input_case == "uploaded_structure_file":
-            structure_ref = _step8_structure_ref(self.storage, sin.get("structure_refs") or [])
-            if not structure_ref:
-                return out
-            ref_value = structure_ref["value"]
-            out.append(("CrystalStructure_validate", {"pdb_id_or_path": ref_value}, "structure_quality"))
-            out.append(
-                ("ProteinsPlus_profile_structure_quality",
-                 {"pdb_id_or_path": ref_value}, "structure_quality")
+        def _summary_base() -> dict[str, Any]:
+            return {
+                "label": f"step08:{structure_input_id}",
+                "candidate_id": candidate_id,
+                "input_case": input_case,
+                "run_case": _run_case_from_input_case(input_case),
+            }
+
+        try:
+            scoped_tools = set(self._step8_scoped_tools())
+        except Exception as e:
+            return [
+                _nonexecuted_tool_record(
+                    tool_name=tool_name,
+                    agent_name=_AGENT_NAME,
+                    step_id=_STEP_08,
+                    run_status="skipped",
+                    summary={
+                        **_summary_base(),
+                        "routing_decision": "scope_unavailable",
+                        "reason": f"step_8 scope introspection failed: {str(e)}",
+                    },
+                )
+                for tool_name in _STEP8_SCOPED_TOOL_POLICY
+            ]
+
+        for tool_name in _STEP8_SCOPED_TOOL_POLICY:
+            if tool_name not in scoped_tools:
+                calls.append(
+                    _nonexecuted_tool_record(
+                        tool_name=tool_name,
+                        agent_name=_AGENT_NAME,
+                        step_id=_STEP_08,
+                        run_status="skipped",
+                        summary={
+                            **_summary_base(),
+                            "routing_decision": "scope_unavailable",
+                            "reason": "tool not available from MCP runtime scope",
+                        },
+                    )
+                )
+
+        def _skip(tool_name: str, reason: str, *, status: str = "skipped") -> None:
+            calls.append(
+                _nonexecuted_tool_record(
+                    tool_name=tool_name,
+                    agent_name=_AGENT_NAME,
+                    step_id=_STEP_08,
+                    run_status=status,
+                    summary={
+                        **_summary_base(),
+                        "routing_decision": "not_applicable",
+                        "reason": reason,
+                    },
+                )
             )
 
-        elif input_case == "known_pdb_id":
-            pdb_ref = next(
-                (s for s in sin.get("structure_refs") or [] if s.get("pdb_id")),
-                None,
-            )
-            pdb_id = (pdb_ref or {}).get("pdb_id")
-            if not pdb_id:
-                return out
-            out.append(("RCSBData_get_entry", {"pdb_id": pdb_id}, "structure_quality"))
-            out.append(
-                ("get_refinement_resolution_by_pdb_id",
-                 {"pdb_id": pdb_id}, "refinement_resolution")
-            )
-            out.append(
-                ("ProteinsPlus_profile_structure_quality",
-                 {"pdb_id_or_path": pdb_id}, "structure_quality")
+        def _run(tool_name: str, kwargs: dict[str, Any], reason: str) -> None:
+            calls.append(
+                self._call_tool(
+                    run_id=run_id,
+                    step_id=_STEP_08,
+                    tool_name=tool_name,
+                    kwargs=kwargs,
+                    output_dir="step_08",
+                    label=f"step08:{structure_input_id}:{tool_name}",
+                    extra_input_summary={
+                        **_summary_base(),
+                        "routing_decision": "selected",
+                        "routing_reason": reason,
+                        "arguments": {k: _short(v) for k, v in kwargs.items()},
+                    },
+                )
             )
 
-        elif input_case == "sequence_only_input":
-            seq_ref = next(
-                (s for s in sin.get("sequence_refs_for_prediction") or []),
-                None,
-            )
-            if seq_ref:
-                # Sequence-only prediction is intentionally deferred from Step 8 in this
-                # implementation boundary; Step 7 normalizes sequence refs only.
-                pass
+        pdb_id = _step8_pdb_id(sin.get("structure_refs") or [])
+        local_ref = _step8_local_structure_ref(self.storage, sin.get("structure_refs") or [])
+        has_sequences = bool(sin.get("sequence_refs_for_prediction") or [])
 
-        return out
+        if "CrystalStructure_validate" in scoped_tools:
+            if input_case == "uploaded_structure_file" and local_ref:
+                _run(
+                    "CrystalStructure_validate",
+                    {"pdb_id_or_path": local_ref["value"]},
+                    "uploaded/local PDB or CIF validation by concrete storage_ref path",
+                )
+            else:
+                _skip(
+                    "CrystalStructure_validate",
+                    "requires uploaded/local PDB or CIF storage_ref; Step 8 will not fabricate path/cell parameters",
+                )
+
+        if "get_refinement_resolution_by_pdb_id" in scoped_tools:
+            if input_case == "known_pdb_id" and pdb_id:
+                _run(
+                    "get_refinement_resolution_by_pdb_id",
+                    {"pdb_id": pdb_id},
+                    "known PDB ID refinement metadata lookup",
+                )
+            else:
+                _skip(
+                    "get_refinement_resolution_by_pdb_id",
+                    "requires real PDB ID; uploaded file paths are not valid pdb_id values",
+                )
+
+        if "PDBePISA_get_interfaces" in scoped_tools:
+            if input_case == "known_pdb_id" and pdb_id:
+                _run(
+                    "PDBePISA_get_interfaces",
+                    {"pdb_id": pdb_id},
+                    "existing complex interface evaluation for real PDB ID",
+                )
+            else:
+                _skip(
+                    "PDBePISA_get_interfaces",
+                    "requires real PDB ID for an existing complex; uploaded paths are not sent as pdb_id",
+                )
+
+        for tool_name in sorted(_STEP8_NIM_COMPLEX_TOOLS):
+            if tool_name not in scoped_tools:
+                continue
+            if input_case == "sequence_only_input" and has_sequences:
+                _skip(
+                    tool_name,
+                    "complex prediction route requires audited NVIDIA NIM runtime and argument contract; explicit deferred Step 8 route",
+                    status="dependency_unavailable",
+                )
+            else:
+                _skip(
+                    tool_name,
+                    "complex prediction not applicable for this prepared structure input",
+                )
+
+        if "dynamic_package_discovery" in scoped_tools:
+            _skip(
+                "dynamic_package_discovery",
+                "infrastructure discovery tool is scoped but not a Step 8 scientific prediction/evaluation output",
+            )
+
+        return calls
 
     # ── Step 7 scope / output compacting helpers ───────────────────────────
     def _step7_scoped_tools(self) -> tuple[str, ...]:
@@ -1606,21 +1734,31 @@ def _extract_confidence_value(tool_name: str, tc: ToolCallRecord) -> float | Non
     return None
 
 
+def _confidence_type_for_step8_tool(tool_name: str) -> str:
+    if tool_name == "PDBePISA_get_interfaces":
+        return "interface_quality"
+    if tool_name == "get_refinement_resolution_by_pdb_id":
+        return "refinement_resolution"
+    if tool_name == "CrystalStructure_validate":
+        return "structure_quality"
+    if tool_name in _STEP8_NIM_COMPLEX_TOOLS:
+        return "prediction_confidence"
+    return "other"
+
+
 def _artifact_type_for_tool(tool_name: str) -> str:
     if tool_name == "CrystalStructure_validate":
         return "refinement_or_validation_report"
     if tool_name == "get_refinement_resolution_by_pdb_id":
         return "refinement_or_validation_report"
-    if tool_name == "ProteinsPlus_profile_structure_quality":
-        return "structure_quality_report"
-    if tool_name == "RCSBData_get_entry":
-        return "structure_quality_report"
-    if tool_name == "alphafold_get_prediction":
-        return "predicted_monomer_structure"
+    if tool_name == "PDBePISA_get_interfaces":
+        return "interface_analysis_raw_output"
+    if tool_name in _STEP8_NIM_COMPLEX_TOOLS:
+        return "predicted_complex_structure"
     return "other"
 
 
-def _step8_structure_ref(storage: Storage, structure_refs: list[Any]) -> dict[str, Any] | None:
+def _step8_local_structure_ref(storage: Storage, structure_refs: list[Any]) -> dict[str, Any] | None:
     for sref in structure_refs:
         if not isinstance(sref, dict):
             continue
@@ -1628,10 +1766,82 @@ def _step8_structure_ref(storage: Storage, structure_refs: list[Any]) -> dict[st
             value = sref.get(key)
             if _is_concrete_pdb_path(storage, value):
                 return {"value": value, "source": key}
+    return None
+
+
+def _step8_pdb_id(structure_refs: list[Any]) -> str | None:
     for sref in structure_refs:
         if isinstance(sref, dict) and sref.get("pdb_id"):
-            return {"value": sref["pdb_id"], "source": "pdb_id"}
+            value = str(sref["pdb_id"]).strip()
+            if _looks_like_pdb_id(value):
+                return value
     return None
+
+
+def _extract_interface_features_for_step8(
+    storage: Storage, tool_call: ToolCallRecord
+) -> list[InterfaceFeature]:
+    if tool_call.tool_name != "PDBePISA_get_interfaces":
+        return []
+    payload = _read_tool_output_payload(storage, tool_call)
+    if not isinstance(payload, dict):
+        return []
+    raw_interfaces = payload.get("interfaces")
+    if not isinstance(raw_interfaces, list):
+        return []
+
+    features: list[InterfaceFeature] = []
+    for item in raw_interfaces[:25]:
+        if not isinstance(item, dict):
+            continue
+        chain_a = _extract_scalar(item, ("chain_id_1", "chain_1", "chain_a", "chainId1"))
+        chain_b = _extract_scalar(item, ("chain_id_2", "chain_2", "chain_b", "chainId2"))
+        if not chain_a or not chain_b:
+            chains = _extract_chain_ids(item)
+            if len(chains) >= 2:
+                chain_a, chain_b = chains[0], chains[1]
+        if not chain_a or not chain_b:
+            continue
+        residues = item.get("interface_residues") or item.get("residues") or []
+        if not isinstance(residues, list):
+            residues = []
+        features.append(
+            InterfaceFeature(
+                chain_id_1=str(chain_a),
+                chain_id_2=str(chain_b),
+                interface_residues=[_short(str(r)) for r in residues[:100]],
+                metrics=InterfaceMetrics(
+                    interface_area=_float_or_none(
+                        item.get("interface_area") or item.get("area")
+                    ),
+                    solvation_energy=_float_or_none(
+                        item.get("solvation_energy") or item.get("solvationEnergy")
+                    ),
+                    h_bond_count=_int_or_none(
+                        item.get("h_bond_count") or item.get("hbonds")
+                    ),
+                    salt_bridge_count=_int_or_none(
+                        item.get("salt_bridge_count") or item.get("salt_bridges")
+                    ),
+                ),
+                quality_flags=[],
+            )
+        )
+    return features
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _compact_structure_refs_for_audit(structure_refs: list[Any]) -> list[dict[str, Any]]:
@@ -2082,17 +2292,34 @@ def _step7_normalized_struct_ref(
 
 
 def _skipped_tool_record(*, tool_name: str, agent_name: str, step_id: str, summary: dict[str, Any]) -> ToolCallRecord:
+    return _nonexecuted_tool_record(
+        tool_name=tool_name,
+        agent_name=agent_name,
+        step_id=step_id,
+        run_status="skipped",
+        summary=summary,
+    )
+
+
+def _nonexecuted_tool_record(
+    *,
+    tool_name: str,
+    agent_name: str,
+    step_id: str,
+    run_status: str,
+    summary: dict[str, Any],
+) -> ToolCallRecord:
     now = now_iso()
     return ToolCallRecord(
         tool_call_id=new_tool_call_id(),
         tool_name=tool_name,
         agent_name=agent_name,
         step_id=step_id,
-        run_status="skipped",
+        run_status=run_status,  # type: ignore[arg-type]
         started_at=now,
         finished_at=now,
         tool_input_summary=summary,
-        error_message="tool invocation plan validation_status=skipped",
+        error_message=f"tool invocation not executed: {run_status}",
     )
 
 
