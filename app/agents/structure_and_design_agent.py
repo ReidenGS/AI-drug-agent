@@ -2387,7 +2387,7 @@ def _compact_step7_tool_output(tool_name: str, payload: dict[str, Any] | None) -
             "compact_type": "alphafold_prediction",
             "uniprot": _extract_scalar(payload, ("uniprot", "qualifier", "query", "pdb_id")),
             "status": payload.get("status"),
-            "model_ref": _extract_scalar(payload, ("model_url", "model_path", "file", "path", "url", "output")),
+            "model_ref": _prediction_model_ref(payload),
             "source": payload.get("source"),
         }
     return {

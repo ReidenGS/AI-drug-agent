@@ -792,6 +792,133 @@ def test_step7_sequence_only_without_uniprot_skips_alphafold_lookup(
     assert not any(ref.source_kind == "predicted_needed" for ref in rec.structure_refs)
 
 
+@pytest.mark.parametrize(
+    ("payload_key", "payload_value"),
+    [
+        ("model_url", "https://alphafold.test/P04626.pdb"),
+        ("model_path", "mock://alphafold/P04626.pdb"),
+        ("artifact_ref", "s3://bucket/alphafold/P04626.pdb"),
+    ],
+)
+def test_step7_alphafold_safe_model_ref_promotes_predicted_structure_ref(
+    local_storage, registry_service, workflow_state_service, payload_key, payload_value
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "uniprot_id", "value": "P04626", "source": "raw"}],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for cand in cct["candidate_records"]:
+        cand["materials"] = [
+            m for m in cand.get("materials", [])
+            if not (isinstance(m, dict) and str(m.get("material_type", "")).endswith("_name"))
+        ]
+    local_storage.write_json(cct_path, cct)
+
+    def _af(**kw):
+        return {"uniprot": kw.get("uniprot"), "status": "success", payload_key: payload_value}
+
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(
+            inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+            bindings={"alphafold_get_prediction": _af},
+        ),
+    ).run_step_7(run_id)
+
+    rec = next(r for r in pkg.prepared_structure_inputs if r.input_case == "sequence_only_input")
+    assert any(
+        ref.source_kind == "predicted_needed" and ref.storage_ref == payload_value
+        for ref in rec.structure_refs
+    )
+    compacted = {m["tool_name"]: m for m in rec.step7_tool_output_metadata}
+    assert compacted["alphafold_get_prediction"]["compact_output"]["model_ref"] == payload_value
+
+
+def test_step7_alphafold_generic_url_does_not_promote_model_ref(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "uniprot_id", "value": "P04626", "source": "raw"}],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for cand in cct["candidate_records"]:
+        cand["materials"] = [
+            m for m in cand.get("materials", [])
+            if not (isinstance(m, dict) and str(m.get("material_type", "")).endswith("_name"))
+        ]
+    local_storage.write_json(cct_path, cct)
+
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(
+            inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+            bindings={
+                "alphafold_get_prediction": lambda **kw: {
+                    "uniprot": kw.get("uniprot"),
+                    "status": "success",
+                    "url": "https://alphafold.test/generic-url.pdb",
+                }
+            },
+        ),
+    ).run_step_7(run_id)
+
+    rec = next(r for r in pkg.prepared_structure_inputs if r.input_case == "sequence_only_input")
+    assert not any(ref.source_kind == "predicted_needed" and ref.storage_ref for ref in rec.structure_refs)
+    compacted = {m["tool_name"]: m for m in rec.step7_tool_output_metadata}
+    assert compacted["alphafold_get_prediction"]["compact_output"]["model_ref"] is None
+
+
+def test_step7_alphafold_raw_output_does_not_leak_or_promote_model_ref(
+    local_storage, registry_service, workflow_state_service
+):
+    raw_pdb = "HEADER    RAW ALPHAFOLD MODEL\nATOM      1  N   ALA A   1\nHETATM    2  O   HOH A   2"
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "uniprot_id", "value": "P04626", "source": "raw"}],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for cand in cct["candidate_records"]:
+        cand["materials"] = [
+            m for m in cand.get("materials", [])
+            if not (isinstance(m, dict) and str(m.get("material_type", "")).endswith("_name"))
+        ]
+    local_storage.write_json(cct_path, cct)
+
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(
+            inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+            bindings={
+                "alphafold_get_prediction": lambda **kw: {
+                    "uniprot": kw.get("uniprot"),
+                    "status": "success",
+                    "output": raw_pdb,
+                }
+            },
+        ),
+    ).run_step_7(run_id)
+
+    rec = next(r for r in pkg.prepared_structure_inputs if r.input_case == "sequence_only_input")
+    assert not any(ref.source_kind == "predicted_needed" and ref.storage_ref for ref in rec.structure_refs)
+    compacted = {m["tool_name"]: m for m in rec.step7_tool_output_metadata}
+    assert compacted["alphafold_get_prediction"]["compact_output"]["model_ref"] is None
+    blob = json.dumps(pkg.model_dump())
+    assert "HEADER" not in blob
+    assert "ATOM" not in blob
+    assert "HETATM" not in blob
+
+
 def test_step7_scope_failure_records_scope_unavailable(
     local_storage, registry_service, workflow_state_service
 ):
