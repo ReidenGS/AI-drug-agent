@@ -385,7 +385,7 @@ class DevelopabilityAgent:
     ) -> tuple[ToolCallRecord, str, Any]:
         tc_id = new_tool_call_id()
         started = now_iso()
-        runtime_arguments: dict[str, Any] = {}
+        runtime_arguments: dict[str, Any] = dict(plan.arguments)
         resolver_audit: list[dict] = []
         unresolved: list[str] = []
         for arg_name, field_ref in sorted((plan.argument_field_refs or {}).items()):
@@ -405,9 +405,11 @@ class DevelopabilityAgent:
                 runtime_arguments[arg_name] = resolved.raw_value
             else:
                 unresolved.append(arg_name)
-        if not plan.argument_field_refs:
-            runtime_arguments = dict(plan.arguments)
-        input_status = "sufficient" if runtime_arguments else "insufficient"
+        input_status = (
+            "sufficient"
+            if runtime_arguments and plan.validation_status != "skipped" and not unresolved
+            else "insufficient"
+        )
 
         if plan.validation_status == "skipped" or unresolved:
             finished = now_iso()

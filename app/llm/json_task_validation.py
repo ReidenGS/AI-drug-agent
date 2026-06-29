@@ -73,6 +73,7 @@ def shape_instruction(task: str) -> str:
         return (
             '{"tools":[{"tool_name":"string","can_invoke":true,'
             '"argument_mapping":{"schema_arg":"field_ref"},'
+            '"argument_literals":{"schema_arg":"official_schema_literal"},'
             '"missing_required_fields":["string"],'
             '"argument_mapping_reason":"string"}]}'
         )
@@ -331,6 +332,10 @@ def validate_task_shape(data: dict, task: str, *, error_factory: ErrorFactory) -
             if not isinstance(entry.get("argument_mapping"), dict):
                 raise error_factory(
                     f"step6_schema_mapping_stage_2 tools[{i}] requires object `argument_mapping`"
+                )
+            if "argument_literals" in entry and not isinstance(entry["argument_literals"], dict):
+                raise error_factory(
+                    f"step6_schema_mapping_stage_2 tools[{i}] `argument_literals` must be an object"
                 )
             if not isinstance(entry.get("missing_required_fields"), list):
                 raise error_factory(

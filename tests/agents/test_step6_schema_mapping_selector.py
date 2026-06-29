@@ -392,6 +392,102 @@ def test_stage2_maps_pdb_id_identifier_to_pdb_id_schema(monkeypatch):
     assert audit["stage2_mapped_tools"] == ["PDBePISA_get_interfaces"]
 
 
+def test_stage2_autofills_swissadme_official_operation_literal(monkeypatch):
+    proj = _projection(_candidate(materials=[_material("m_smiles", "payload_smiles", SMILES)]))
+    import app.agents.step_06_schema_mapping_selector as selector
+
+    monkeypatch.setattr(
+        selector,
+        "signature_schema_for",
+        lambda _name: {
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "enum": ["calculate_adme"]},
+                "smiles": {"type": "string"},
+            },
+            "required": ["operation", "smiles"],
+        },
+    )
+    smiles_ref = next(f.field_ref for f in proj.available_fields if f.value_kind == "smiles")
+    llm = _RecordingLLM(
+        stage1={"selections": [{"tool_name": "SwissADME_calculate_adme", "selection_reason": "adme"}]},
+        stage2={"tools": [{
+            "tool_name": "SwissADME_calculate_adme",
+            "can_invoke": True,
+            "argument_mapping": {"smiles": smiles_ref},
+            "missing_required_fields": [],
+            "argument_mapping_reason": "smiles mapped; operation is fixed by schema",
+        }]},
+    )
+
+    plans, _disclosure, audit = select_step6_schema_mapped_invocations(
+        agent_name="developability_agent",
+        step_id="step_06",
+        mcp_client=_MCP(["SwissADME_calculate_adme"]),
+        llm=llm,
+        candidate_id="cand_schema_map",
+        available_fields=proj.available_fields,
+        modality_summary=proj.modality_summary,
+    )
+
+    plan = plans["payload_linker_compound_liability"][0]
+    assert plan.validation_status == "ok"
+    assert plan.argument_field_refs == {"smiles": smiles_ref}
+    assert plan.arguments == {"operation": "calculate_adme"}
+    assert "SwissADME_calculate_adme" in audit["stage2_mapped_tools"]
+    literal_audit = [
+        entry for entry in plan.argument_mapping_audit
+        if entry.get("schema_arg") == "operation"
+    ]
+    assert literal_audit
+    assert literal_audit[0]["argument_value_source"] == "mapped_from_official_schema_literal"
+
+
+def test_stage2_rejects_hallucinated_swissadme_operation_literal(monkeypatch):
+    proj = _projection(_candidate(materials=[_material("m_smiles", "payload_smiles", SMILES)]))
+    import app.agents.step_06_schema_mapping_selector as selector
+
+    monkeypatch.setattr(
+        selector,
+        "signature_schema_for",
+        lambda _name: {
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "enum": ["calculate_adme"]},
+                "smiles": {"type": "string"},
+            },
+            "required": ["operation", "smiles"],
+        },
+    )
+    smiles_ref = next(f.field_ref for f in proj.available_fields if f.value_kind == "smiles")
+    llm = _RecordingLLM(
+        stage1={"selections": [{"tool_name": "SwissADME_calculate_adme", "selection_reason": "adme"}]},
+        stage2={"tools": [{
+            "tool_name": "SwissADME_calculate_adme",
+            "can_invoke": True,
+            "argument_mapping": {"smiles": smiles_ref},
+            "argument_literals": {"operation": "delete_everything"},
+            "missing_required_fields": [],
+            "argument_mapping_reason": "bad op",
+        }]},
+    )
+
+    plans, _disclosure, _audit = select_step6_schema_mapped_invocations(
+        agent_name="developability_agent",
+        step_id="step_06",
+        mcp_client=_MCP(["SwissADME_calculate_adme"]),
+        llm=llm,
+        candidate_id="cand_schema_map",
+        available_fields=proj.available_fields,
+        modality_summary=proj.modality_summary,
+    )
+
+    plan = plans["payload_linker_compound_liability"][0]
+    assert plan.validation_status == "warning"
+    assert plan.arguments == {"operation": "calculate_adme"}
+    assert any("not allowed by official schema" in w for w in plan.validation_warnings)
+
+
 def test_stage_prompts_do_not_contain_raw_values():
     proj = _projection(
         _candidate(

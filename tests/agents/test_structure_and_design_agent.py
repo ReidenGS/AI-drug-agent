@@ -1600,7 +1600,7 @@ def test_step8_raw_antigen_antibody_sequences_record_nim_deferred_plan(
         for plan in cr.complex_prediction_plans
     ]
     assert plans
-    assert any(plan.input_status == "selected_but_deferred" for plan in plans)
+    assert any(plan.input_status == "ready" for plan in plans)
     assert all(not cr.complex_structure_refs for cr in results.candidate_structure_results)
     assert any(
         "complex_prediction_unavailable" in cr.downstream_handoff.missing_for_step9
@@ -1612,7 +1612,7 @@ def test_step8_raw_antigen_antibody_sequences_record_nim_deferred_plan(
     ]
     assert nim_calls
     assert any(tc.run_status == "dependency_unavailable" for tc in nim_calls)
-    assert any(tc.tool_input_summary.get("routing_decision") == "selected_but_deferred" for tc in nim_calls)
+    assert any(tc.tool_input_summary.get("routing_decision") == "selected" for tc in nim_calls)
     audit_blob = json.dumps([tc.tool_input_summary for tc in nim_calls])
     assert "MKTAYIAK" not in audit_blob
     assert "EVQLVES" not in audit_blob
@@ -1659,13 +1659,87 @@ def test_step8_nim_contract_treats_fasta_refs_as_runtime_ready():
         "NvidiaNIM_boltz2", sin, [sin]
     )
 
-    assert plan.input_status == "selected_but_deferred"
-    assert plan.runtime_status == "runtime_unavailable"
+    assert plan.input_status == "ready"
+    assert plan.runtime_status == "not_checked"
     assert not plan.missing_prediction_inputs
     assert all(item["sequence_readiness"] == "ready" for item in plan.sequence_inputs)
     audit_blob = json.dumps(plan.model_dump())
     assert ">antigen" not in audit_blob
     assert "MKTAYIAK" not in audit_blob
+
+
+def test_step8_nim_wrappers_are_tooluniverse_bindings_or_explicit_dependency():
+    from app.mcp.tools import nvidianim
+
+    bindings = dict(nvidianim.BINDINGS)
+    assert bindings["NvidiaNIM_alphafold2_multimer"].__name__ != "_ni"
+    assert bindings["NvidiaNIM_openfold3"].__name__ != "_ni"
+    assert bindings["NvidiaNIM_boltz2"].__name__ != "_ni"
+    with pytest.raises(NotImplementedError, match="requires live ToolUniverse execution"):
+        bindings["NvidiaNIM_boltz2"](polymers=[])
+
+
+def test_step8_nim_success_persists_compact_input_not_raw_sequences(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service, referenced_inputs=[])
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    target["materials"] = [
+        {"material_id": "target_seq_step8", "material_type": "target_sequence", "value": "MKTAYIAKQNNVG"}
+    ]
+    antibody["materials"].extend([
+        {
+            "material_id": "heavy_seq_step8",
+            "material_type": "antibody_heavy_chain_sequence",
+            "value": "EVQLVESGGGLVQPGGSLRLSCAAS",
+        },
+        {
+            "material_id": "light_seq_step8",
+            "material_type": "antibody_light_chain_sequence",
+            "value": "DIQMTQSPSSLSASVGDRVTITC",
+        },
+    ])
+    local_storage.write_json(cct_path, cct)
+
+    def _nim_success(**_kw):
+        return {"status": "ok", "model_ref": "s3://bucket/predicted_complex.pdb"}
+
+    mcp = LocalMCPClient(
+        inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+        bindings=_bindings_with_step8_overrides({
+            "NvidiaNIM_alphafold2_multimer": _nim_success,
+            "NvidiaNIM_openfold3": _nim_success,
+            "NvidiaNIM_boltz2": _nim_success,
+        }),
+    )
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=mcp,
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+
+    nim_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
+    ]
+    assert nim_calls
+    assert any(tc.run_status == "success" for tc in nim_calls)
+    for tc in nim_calls:
+        if not tc.tool_output_ref:
+            continue
+        payload = local_storage.read_json(tc.tool_output_ref)
+        dumped = json.dumps(payload)
+        assert "MKTAYIAK" not in dumped
+        assert "EVQLVES" not in dumped
+        assert "DIQMTQ" not in dumped
+        assert "sequence_inputs" in dumped
+        assert "sha256_prefix" in dumped
 
 
 def test_step8_selected_tool_failure_still_marks_partial(

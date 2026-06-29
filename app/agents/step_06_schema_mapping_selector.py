@@ -62,11 +62,17 @@ STEP6_STAGE2_SCHEMA_MAPPING_SYSTEM_PROMPT = """You are mapping selected Step 6 t
 Rules:
 1. Use only each tool's official full_schema and candidate_available_fields.
 2. Output argument_mapping as schema_arg -> field_ref. Do not output raw values.
-3. If required args cannot be satisfied by field refs, set can_invoke=false
+3. For required enum/const/default-like schema args that are not candidate
+   data, you may output argument_literals as schema_arg -> literal ONLY when
+   the literal is explicitly allowed by that tool's full_schema. Do not invent
+   literal values.
+4. If required args cannot be satisfied by field refs or official schema
+   literals, set can_invoke=false
    and list missing_required_fields. Do not guess identifiers or convert
    uploaded paths into pdb_id.
-4. Return exactly JSON: {"tools":[{"tool_name":"...","can_invoke":true|false,
-   "argument_mapping":{},"missing_required_fields":[],"argument_mapping_reason":"..."}]}.
+5. Return exactly JSON: {"tools":[{"tool_name":"...","can_invoke":true|false,
+   "argument_mapping":{},"argument_literals":{},"missing_required_fields":[],
+   "argument_mapping_reason":"..."}]}.
 No prose, no markdown, no tool calls.
 """.strip()
 
@@ -492,17 +498,32 @@ def _plan_from_stage2_response(
         if isinstance(arg, str) and isinstance(ref, str)
     } if isinstance(raw_mapping, dict) else {}
     valid_mapping, warnings = _validate_field_mapping(mapping, schema, available_fields)
+    raw_literals = response.get("argument_literals") or {}
+    literals = {
+        str(arg): value
+        for arg, value in raw_literals.items()
+        if isinstance(arg, str)
+    } if isinstance(raw_literals, dict) else {}
+    valid_literals, literal_warnings = _validate_schema_literals(literals, schema)
+    warnings.extend(literal_warnings)
     required = list(schema.get("required") or [])
+    for arg in required:
+        if arg in valid_mapping or arg in valid_literals:
+            continue
+        literal = _deterministic_schema_literal(arg, schema)
+        if literal is not None:
+            valid_literals[arg] = literal
     missing = [
         arg for arg in required
-        if arg not in valid_mapping or not valid_mapping.get(arg)
+        if (arg not in valid_mapping or not valid_mapping.get(arg))
+        and arg not in valid_literals
     ]
     response_missing = [
         str(x) for x in (response.get("missing_required_fields") or [])
         if isinstance(x, str)
     ]
     missing = sorted(set(missing + response_missing))
-    can_invoke = bool(response.get("can_invoke")) and not missing and bool(valid_mapping)
+    can_invoke = bool(response.get("can_invoke")) and not missing and bool(valid_mapping or valid_literals)
     if not can_invoke:
         status: Literal["ok", "warning", "skipped"] = "skipped"
     elif warnings:
@@ -515,15 +536,27 @@ def _plan_from_stage2_response(
             "schema_arg": arg,
             "field_ref": ref,
             "mapping_source": source,
+            "argument_value_source": "mapped_from_field_ref",
             "argument_mapping_reason": response.get("argument_mapping_reason") or "",
         }
         for arg, ref in sorted(valid_mapping.items())
     ]
+    audit.extend(
+        {
+            "tool_name": tool_name,
+            "schema_arg": arg,
+            "literal_value": value,
+            "mapping_source": source,
+            "argument_value_source": "mapped_from_official_schema_literal",
+            "argument_mapping_reason": response.get("argument_mapping_reason") or "",
+        }
+        for arg, value in sorted(valid_literals.items())
+    )
     try:
         return ToolInvocationPlan(
             tool_name=tool_name,
             selection_reason=entry.get("selection_reason") or "",
-            arguments={},
+            arguments=valid_literals,
             argument_field_refs=valid_mapping,
             argument_mapping_audit=audit,
             argument_construction_reason=response.get("argument_mapping_reason") or "",
@@ -566,6 +599,42 @@ def _validate_field_mapping(
     return out, warnings
 
 
+def _validate_schema_literals(
+    literals: dict[str, Any], schema: dict
+) -> tuple[dict[str, Any], list[str]]:
+    properties = schema.get("properties") or {}
+    out: dict[str, Any] = {}
+    warnings: list[str] = []
+    for arg, value in literals.items():
+        prop = properties.get(arg)
+        if not isinstance(prop, dict):
+            warnings.append(f"literal argument `{arg}` not in schema; dropping")
+            continue
+        ok, coerced = _literal_allowed_by_schema(value, prop)
+        if not ok:
+            warnings.append(f"literal argument `{arg}` not allowed by official schema; dropping")
+            continue
+        out[arg] = coerced
+    return out, warnings
+
+
+def _literal_allowed_by_schema(value: Any, prop: dict) -> tuple[bool, Any]:
+    if "const" in prop:
+        const = prop.get("const")
+        return value == const, const
+    enum_values = prop.get("enum")
+    if isinstance(enum_values, list) and enum_values:
+        for allowed in enum_values:
+            if value == allowed or str(value) == str(allowed):
+                return True, allowed
+        return False, value
+    if "default" in prop:
+        default = prop.get("default")
+        if value == default or str(value) == str(default):
+            return True, default
+    return False, value
+
+
 def _field_can_satisfy_arg(arg: str, field: AvailableField) -> bool:
     lowered = arg.lower()
     if lowered in {"smiles", "canonical_smiles"}:
@@ -590,11 +659,16 @@ def _field_can_satisfy_arg(arg: str, field: AvailableField) -> bool:
 
 def _deterministic_mapping_response(tool_name: str, schema: dict, fields: list[AvailableField]) -> dict:
     mapping: dict[str, str] = {}
+    literals: dict[str, Any] = {}
     missing: list[str] = []
     for arg in schema.get("required") or []:
         match = next((f for f in fields if _field_can_satisfy_arg(str(arg), f)), None)
         if match is None:
-            missing.append(str(arg))
+            literal = _deterministic_schema_literal(str(arg), schema)
+            if literal is None:
+                missing.append(str(arg))
+            else:
+                literals[str(arg)] = literal
         else:
             mapping[str(arg)] = match.field_ref
     if not schema.get("required"):
@@ -604,11 +678,26 @@ def _deterministic_mapping_response(tool_name: str, schema: dict, fields: list[A
                 mapping[str(arg)] = match.field_ref
     return {
         "tool_name": tool_name,
-        "can_invoke": not missing and bool(mapping),
+        "can_invoke": not missing and bool(mapping or literals),
         "argument_mapping": mapping,
+        "argument_literals": literals,
         "missing_required_fields": missing,
         "argument_mapping_reason": "deterministic fallback after malformed Stage 2",
     }
+
+
+def _deterministic_schema_literal(arg: str, schema: dict) -> Any | None:
+    prop = (schema.get("properties") or {}).get(arg)
+    if not isinstance(prop, dict):
+        return None
+    if "const" in prop:
+        return prop.get("const")
+    enum_values = prop.get("enum")
+    if isinstance(enum_values, list) and len(enum_values) == 1:
+        return enum_values[0]
+    if "default" in prop:
+        return prop.get("default")
+    return None
 
 
 def _skipped_plan(

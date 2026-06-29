@@ -551,7 +551,7 @@ def test_step6_uploaded_fasta_is_resolved_at_runtime_and_injected(
     assert "PROSITE_scan_sequence" not in summary["step_06_resolver_failed_tools"]
 
 
-def test_step6_structure_ref_maps_pdb_id_only_as_skipped_and_structure_file_as_executed(
+def test_step6_uploaded_structure_ref_cannot_satisfy_pdb_id_only_structure_tools(
     local_storage, registry_service, workflow_state_service, monkeypatch
 ):
     captured: dict[str, dict[str, str]] = {}
@@ -584,12 +584,12 @@ def test_step6_structure_ref_maps_pdb_id_only_as_skipped_and_structure_file_as_e
                         {
                             "tool_name": "ProteinsPlus_profile_structure_quality",
                             "can_invoke": True,
-                            "argument_mapping": {"structure_file": next(
+                            "argument_mapping": {"pdb_id": next(
                                 f["field_ref"] for f in schema.get("candidate_available_fields", [])
                                 if f.get("value_kind") == "structure_ref"
                             )},
                             "missing_required_fields": [],
-                            "argument_mapping_reason": "compatible with structure file",
+                            "argument_mapping_reason": "should fail for path-only ref",
                         },
                     ]
                 }
@@ -600,51 +600,41 @@ def test_step6_structure_ref_maps_pdb_id_only_as_skipped_and_structure_file_as_e
         return {"status": "mocked", "quality": "ok"}
 
     from app.agents import step_06_schema_mapping_selector as selector
-    real_signature_schema_for = selector.signature_schema_for
-
     def _signature_schema_for(tool_name: str) -> dict:
-        if tool_name == "PDBePISA_get_interfaces":
-            return {
-                "type": "object",
-                "properties": {"pdb_id": {"type": "string"}},
-                "required": ["pdb_id"],
-            }
         return {
             "type": "object",
-            "properties": {"structure_file": {"type": "string"}},
-            "required": ["structure_file"],
+            "properties": {"pdb_id": {"type": "string"}},
+            "required": ["pdb_id"],
         }
 
     monkeypatch.setattr(selector, "signature_schema_for", _signature_schema_for)
-    try:
-        run_id = _seed_synthetic_cct(
-            local_storage, registry_service, workflow_state_service,
-            materials=[_material("structure_file", _S1_PDB_PATH, value_format="pdb")],
-            candidate_type="adc_construct",
-        )
-        DevelopabilityAgent(
-            storage=local_storage, registry=registry_service,
-            workflow_state=workflow_state_service,
-            mcp_client=LocalMCPClient(bindings={
-                "PDBePISA_get_interfaces": lambda **_kw: {"status": "mocked", "interfaces": []},
-                "ProteinsPlus_profile_structure_quality": _proteinsplus,
-            }),
-            llm=_StructureLLM(),
-        ).run(run_id)
-    finally:
-        monkeypatch.setattr(selector, "signature_schema_for", real_signature_schema_for)
+    run_id = _seed_synthetic_cct(
+        local_storage, registry_service, workflow_state_service,
+        materials=[_material("structure_file", _S1_PDB_PATH, value_format="pdb")],
+        candidate_type="adc_construct",
+    )
+    DevelopabilityAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={
+            "PDBePISA_get_interfaces": lambda **_kw: {"status": "mocked", "interfaces": []},
+            "ProteinsPlus_profile_structure_quality": _proteinsplus,
+        }),
+        llm=_StructureLLM(),
+    ).run(run_id)
 
     persisted = local_storage.read_json(local_storage.run_key(run_id, "structured_liability_summary.json"))
     lane = _lane_results(persisted)["structure_interface_quality"]
-    assert lane["run_status"] == "partial" or lane["run_status"] == "ok"
+    assert lane["run_status"] == "skipped"
     call_names = {tc["tool_name"] for tc in lane["tool_call_records"]}
     assert call_names == {"PDBePISA_get_interfaces", "ProteinsPlus_profile_structure_quality"}
     tool_status = {tc["tool_name"]: tc["run_status"] for tc in lane["tool_call_records"]}
     assert tool_status["PDBePISA_get_interfaces"] == "skipped"
-    assert tool_status["ProteinsPlus_profile_structure_quality"] == "success"
-    assert captured["proteinsplus"]["structure_file"] == _S1_PDB_PATH
+    assert tool_status["ProteinsPlus_profile_structure_quality"] == "skipped"
+    assert "proteinsplus" not in captured
     summary = persisted["selection_audit"]
     assert "PDBePISA_get_interfaces" in summary["step_06_stage2_uninvokable_tools"]
+    assert "ProteinsPlus_profile_structure_quality" in summary["step_06_stage2_uninvokable_tools"]
     assert any(
         entry.get("tool_name") == "PDBePISA_get_interfaces"
         and entry.get("candidate_id") == "cand_synthetic_1"
@@ -653,9 +643,17 @@ def test_step6_structure_ref_maps_pdb_id_only_as_skipped_and_structure_file_as_e
         for entry in summary.get("step_06_stage2_uninvokable_tool_details", [])
         if isinstance(entry, dict)
     )
+    assert any(
+        entry.get("tool_name") == "ProteinsPlus_profile_structure_quality"
+        and entry.get("candidate_id") == "cand_synthetic_1"
+        and entry.get("lane_type") == "structure_interface_quality"
+        and "pdb_id" in entry.get("missing_required_fields", [])
+        for entry in summary.get("step_06_stage2_uninvokable_tool_details", [])
+        if isinstance(entry, dict)
+    )
     assert "PDBePISA_get_interfaces" in summary["step_06_stage1_selected_tools"]
-    assert "ProteinsPlus_profile_structure_quality" in summary["step_06_stage2_mapped_tools"]
-    assert "ProteinsPlus_profile_structure_quality" in summary["step_06_runtime_resolved_tools"]
+    assert "ProteinsPlus_profile_structure_quality" not in summary["step_06_stage2_mapped_tools"]
+    assert "ProteinsPlus_profile_structure_quality" not in summary["step_06_runtime_resolved_tools"]
     assert _FASTA_PATH not in str(persisted["selection_audit"])
 
 
@@ -874,6 +872,49 @@ def test_step6_five_complementary_smiles_tools_are_not_truncated(
         "SwissADME_check_druglikeness",
     } <= selected
     assert "ADMETAI_predict_toxicity" in selected
+
+
+def test_step6_swissadme_executes_with_official_operation_literal(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_synthetic_cct(
+        local_storage, registry_service, workflow_state_service,
+        materials=[_material("payload_smiles", "CCO")],
+    )
+    captured: list[dict] = []
+
+    def _swiss(**kwargs):
+        captured.append(dict(kwargs))
+        return {"status": "mocked", "adme": {}}
+
+    DevelopabilityAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={"SwissADME_calculate_adme": _swiss}),
+        llm=_SelectAllEligibleLLM(),
+    ).run(run_id)
+
+    assert captured
+    assert captured[0]["operation"] == "calculate_adme"
+    assert captured[0]["smiles"] == "CCO"
+    persisted = local_storage.read_json(
+        local_storage.run_key(run_id, "structured_liability_summary.json")
+    )
+    blob = json.dumps(persisted)
+    assert "CCO" not in blob
+    audit_entries = [
+        entry
+        for cand in persisted["candidate_liability_results"]
+        for lane in cand["lane_results"]
+        for entry in lane.get("argument_mapping_audit", [])
+        if entry.get("tool_name") == "SwissADME_calculate_adme"
+    ]
+    assert any(
+        entry.get("schema_arg") == "operation"
+        and entry.get("argument_value_source") == "mapped_from_official_schema_literal"
+        for entry in audit_entries
+    )
 
 
 def test_step6_tool_selection_prompt_hides_live_and_uses_progressive_disclosure(

@@ -858,7 +858,14 @@ class StructureAndDesignAgent:
                 )
             )
 
-        def _run(tool_name: str, kwargs: dict[str, Any], reason: str) -> None:
+        def _run(
+            tool_name: str,
+            kwargs: dict[str, Any],
+            reason: str,
+            *,
+            extra: dict[str, Any] | None = None,
+            persisted_input: dict[str, Any] | None = None,
+        ) -> None:
             calls.append(
                 self._call_tool(
                     run_id=run_id,
@@ -872,7 +879,9 @@ class StructureAndDesignAgent:
                         "routing_decision": "selected",
                         "routing_reason": reason,
                         "arguments": {k: _short(v) for k, v in kwargs.items()},
+                        **(extra or {}),
                     },
+                    persisted_input=persisted_input,
                 )
             )
 
@@ -921,21 +930,40 @@ class StructureAndDesignAgent:
             if tool_name not in scoped_tools:
                 continue
             plan = _plan_step8_nim_complex_prediction(tool_name, sin, all_inputs)
-            if plan.input_status == "selected_but_deferred":
-                calls.append(
-                    _nonexecuted_tool_record(
-                        tool_name=tool_name,
-                        agent_name=_AGENT_NAME,
-                        step_id=_STEP_08,
-                        run_status="dependency_unavailable",
-                        summary={
-                            **_summary_base(),
-                            "routing_decision": "selected_but_deferred",
-                            "reason": "NvidiaNIM complex prediction input appears sufficient, but wrapper/runtime is deferred",
+            if plan.input_status in {"ready", "selected_but_deferred"}:
+                runtime = _build_nim_runtime_invocation(
+                    tool_name=tool_name,
+                    plan=plan,
+                    all_inputs=all_inputs or [sin],
+                    storage=self.storage,
+                )
+                if runtime.get("status") == "ok":
+                    _run(
+                        tool_name,
+                        runtime["kwargs"],
+                        "NvidiaNIM ToolUniverse wrapper selected for complex prediction; runtime may report dependency/upstream availability",
+                        extra={
+                            "arguments": runtime["compact_arguments"],
                             "complex_prediction_plan": plan.model_dump(),
                         },
+                        persisted_input=runtime["compact_arguments"],
                     )
-                )
+                else:
+                    calls.append(
+                        _nonexecuted_tool_record(
+                            tool_name=tool_name,
+                            agent_name=_AGENT_NAME,
+                            step_id=_STEP_08,
+                            run_status="skipped",
+                            summary={
+                                **_summary_base(),
+                                "routing_decision": "input_missing",
+                                "reason": runtime.get("reason") or "sequence inputs could not be resolved for runtime",
+                                "complex_prediction_plan": plan.model_dump(),
+                                "runtime_sequence_resolution": runtime.get("audit") or [],
+                            },
+                        )
+                    )
             else:
                 calls.append(
                     _nonexecuted_tool_record(
@@ -1296,6 +1324,7 @@ class StructureAndDesignAgent:
         output_dir: str,
         label: str,
         extra_input_summary: Optional[dict[str, Any]] = None,
+        persisted_input: Optional[dict[str, Any]] = None,
     ) -> ToolCallRecord:
         tc_id = new_tool_call_id()
         started = now_iso()
@@ -1317,28 +1346,35 @@ class StructureAndDesignAgent:
                     "tool_call_id": tc_id,
                     "tool_name": tool_name,
                     "label": label,
-                    "input": kwargs,
+                    "input": persisted_input if persisted_input is not None else kwargs,
                     "output": result["payload"],
                 },
             )
             output_ref = output_key
+
+        payload = result.get("payload")
+        run_status = result.get("run_status", "pending")
+        error_message = result.get("error_message") or result.get("reason")
+        if isinstance(payload, dict) and payload.get("status") == "upstream_error":
+            run_status = "failed"
+            error_message = payload.get("error_message") or "upstream_error"
 
         return ToolCallRecord(
             tool_call_id=tc_id,
             tool_name=tool_name,
             agent_name=_AGENT_NAME,
             step_id=step_id,
-            run_status=result.get("run_status", "pending"),
+            run_status=run_status,
             started_at=started,
             finished_at=finished,
             tool_input_summary={
                 "label": label,
-                **{k: _short(v) for k, v in kwargs.items()},
+                **{k: _short(v) for k, v in (persisted_input if persisted_input is not None else kwargs).items()},
                 **(extra_input_summary or {}),
             },
             tool_output_artifact_id=output_artifact_id,
             tool_output_ref=output_ref,
-            error_message=result.get("error_message"),
+            error_message=error_message,
         )
 
 
@@ -1927,8 +1963,8 @@ def _plan_step8_nim_complex_prediction(
 
     return ComplexPredictionPlan(
         tool_name=tool_name,
-        input_status="selected_but_deferred",
-        runtime_status="runtime_unavailable",
+        input_status="ready",
+        runtime_status="not_checked",
         can_invoke=False,
         sequence_inputs=_compact_prediction_sequence_inputs_for_ids(
             sequence_lookup,
@@ -1938,9 +1974,149 @@ def _plan_step8_nim_complex_prediction(
         structure_inputs=_compact_prediction_structure_inputs(sin),
         contract_notes=[
             "antigen and antibody raw/fasta-resolvable sequence refs are available",
-            "NvidiaNIM wrapper/runtime/API-key contract is deferred",
+            "NvidiaNIM ToolUniverse wrapper can be attempted; upstream credentials/runtime may still be unavailable",
         ],
     )
+
+
+def _build_nim_runtime_invocation(
+    *,
+    tool_name: str,
+    plan: ComplexPredictionPlan,
+    all_inputs: list[dict],
+    storage: Storage,
+) -> dict[str, Any]:
+    lookup = _prediction_sequence_lookup(all_inputs)
+    resolved: list[dict[str, Any]] = []
+    audit: list[dict[str, Any]] = []
+    for item in plan.sequence_inputs:
+        if not isinstance(item, dict):
+            continue
+        sequence_id = item.get("sequence_id")
+        if not isinstance(sequence_id, str) or not sequence_id:
+            continue
+        seq = lookup.get(sequence_id)
+        value, err = _runtime_sequence_value(seq, storage=storage)
+        audit_entry = {
+            "sequence_id": sequence_id,
+            "chain_role": item.get("chain_role"),
+            "prediction_input_kind": item.get("prediction_input_kind"),
+            "sequence_value_status": item.get("sequence_value_status"),
+            "resolve_status": "resolved" if value else "unresolved",
+            "error_message": err,
+        }
+        if value:
+            audit_entry["sequence_length"] = len(value)
+            audit_entry["sha256_prefix"] = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+            resolved.append({
+                "sequence_id": sequence_id,
+                "chain_role": item.get("chain_role"),
+                "sequence": value,
+            })
+        audit.append({k: v for k, v in audit_entry.items() if v not in (None, "", [])})
+    if len(resolved) < 3:
+        return {
+            "status": "unresolved",
+            "reason": "NvidiaNIM runtime sequence resolution requires antigen, antibody heavy, and antibody light sequences",
+            "audit": audit,
+        }
+    kwargs = _nim_kwargs(tool_name, resolved)
+    return {
+        "status": "ok",
+        "kwargs": kwargs,
+        "compact_arguments": {
+            "sequence_inputs": [
+                {
+                    "sequence_id": item["sequence_id"],
+                    "chain_role": item.get("chain_role"),
+                    "sequence_length": len(item["sequence"]),
+                    "sha256_prefix": hashlib.sha256(item["sequence"].encode("utf-8")).hexdigest()[:12],
+                }
+                for item in resolved
+            ],
+            "sequence_count": len(resolved),
+            "argument_schema": _nim_argument_schema_name(tool_name),
+        },
+        "audit": audit,
+    }
+
+
+def _runtime_sequence_value(seq: dict[str, Any] | None, *, storage: Storage) -> tuple[str | None, str | None]:
+    if not isinstance(seq, dict):
+        return None, "sequence_id not found in prepared inputs"
+    kind = seq.get("prediction_input_kind")
+    status = seq.get("sequence_value_status")
+    if kind == "amino_acid_sequence" and status == "inline":
+        value = seq.get("sequence")
+        return (str(value), None) if value else (None, "inline sequence missing")
+    if kind == "fasta_ref" and (seq.get("sequence_storage_ref") or seq.get("source_ref")):
+        path = str(seq.get("sequence_storage_ref") or seq.get("source_ref"))
+        try:
+            content = storage.read_bytes(path).decode("utf-8")
+        except Exception as exc:  # noqa: BLE001
+            return None, f"FASTA ref could not be read: {type(exc).__name__}"
+        sequences = _extract_fasta_sequences(content)
+        if not sequences:
+            return None, "FASTA ref did not contain a sequence"
+        return sequences[0], None
+    if kind == "uniprot_id" or status == "identifier_only":
+        return None, "identifier-only sequence requires resolver before runtime"
+    return None, "sequence input is not runtime-ready"
+
+
+def _extract_fasta_sequences(content: str) -> list[str]:
+    sequences: list[str] = []
+    current: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(">"):
+            if current:
+                sequences.append("".join(current))
+                current = []
+            continue
+        letters = "".join(ch for ch in stripped if ch.isalpha())
+        if letters:
+            current.append(letters)
+    if current:
+        sequences.append("".join(current))
+    return sequences
+
+
+def _nim_kwargs(tool_name: str, resolved: list[dict[str, Any]]) -> dict[str, Any]:
+    if tool_name == "NvidiaNIM_alphafold2_multimer":
+        return {"sequences": [item["sequence"] for item in resolved]}
+    if tool_name == "NvidiaNIM_openfold3":
+        return {
+            "inputs": [
+                {"id": item.get("chain_role") or item["sequence_id"], "sequence": item["sequence"]}
+                for item in resolved
+            ]
+        }
+    if tool_name == "NvidiaNIM_boltz2":
+        return {
+            "polymers": [
+                {
+                    "id": item.get("chain_role") or item["sequence_id"],
+                    "molecule_type": "protein",
+                    "sequence": item["sequence"],
+                }
+                for item in resolved
+            ],
+            "output_format": "mmcif",
+        }
+    return {}
+
+
+def _nim_argument_schema_name(tool_name: str) -> str:
+    if tool_name == "NvidiaNIM_alphafold2_multimer":
+        return "sequences"
+    if tool_name == "NvidiaNIM_openfold3":
+        return "inputs"
+    if tool_name == "NvidiaNIM_boltz2":
+        return "polymers"
+    return "unknown"
 
 
 def _complex_prediction_plan_from_tool_call(tc: ToolCallRecord) -> ComplexPredictionPlan | None:
