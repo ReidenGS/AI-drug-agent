@@ -352,6 +352,24 @@ class MockLLMProvider:
         ctx = raw.get("user_provided_context") or {}
         user_query = raw.get("raw_user_query") or ""
         uploaded_files = raw.get("uploaded_files") or []
+        # Clarification follow-up answers (if this is a revision turn) are
+        # the mock's stand-in for the LLM "remembering" the previous turn:
+        # we fold the answer texts into the detection haystack and index them
+        # by the slot they answered. The original query is preserved in
+        # `user_query`, so intent classification is unchanged.
+        answer_by_slot: dict[str, str] = {}
+        answer_texts: list[str] = []
+        for a in ctx.get("clarification_answers") or []:
+            if not isinstance(a, dict):
+                continue
+            txt = str(a.get("answer_text") or "").strip()
+            if not txt:
+                continue
+            answer_texts.append(txt)
+            for key in (a.get("slot_name"), a.get("slot_category")):
+                if key and key not in answer_by_slot:
+                    answer_by_slot[key] = txt
+
         haystack = " ".join(
             [
                 user_query,
@@ -360,13 +378,29 @@ class MockLLMProvider:
                 ctx.get("payload_linker_text") or "",
                 ctx.get("constraints_text") or "",
                 ctx.get("notes") or "",
+                " ".join(answer_texts),
             ]
         )
 
-        target = ctx.get("target_or_antigen_text") or _find_first(haystack, _TARGET_HINTS)
-        candidate = ctx.get("candidate_text")
-        payload = _find_first(haystack, _PAYLOAD_HINTS)
-        linker = _find_first(haystack, _LINKER_HINTS)
+        target = (
+            ctx.get("target_or_antigen_text")
+            or _find_first(haystack, _TARGET_HINTS)
+            or answer_by_slot.get("target_or_antigen")
+            or answer_by_slot.get("target")
+        )
+        candidate = (
+            ctx.get("candidate_text")
+            or answer_by_slot.get("antibody")
+            or answer_by_slot.get("antibody_candidate")
+        )
+        payload = (
+            _find_first(haystack, _PAYLOAD_HINTS)
+            or answer_by_slot.get("payload")
+        )
+        linker = (
+            _find_first(haystack, _LINKER_HINTS)
+            or answer_by_slot.get("linker")
+        )
 
         # If the user gave a free-form payload_linker_text but it didn't match
         # the hint list, surface it as the payload string anyway. We do NOT
@@ -517,7 +551,7 @@ def _classify_intent(
     string "ADC".
     """
     text = (user_query or "").lower() + " " + " ".join(
-        str(v or "").lower() for v in ctx.values()
+        v.lower() for v in ctx.values() if isinstance(v, str)
     )
     adc_signal = any(k in text for k in _ADC_KEYWORDS) or bool(
         mentioned_drugs or []
@@ -852,7 +886,7 @@ def _classify_primary_intent(
     keyword check below mirrors a professor benchmark example.
     """
     text = (user_query or "").lower() + " " + " ".join(
-        str(v or "").lower() for v in (ctx or {}).values()
+        v.lower() for v in (ctx or {}).values() if isinstance(v, str)
     )
     ref_id_types = {r.get("id_type") for r in referenced}
     has_pdb = "pdb_id" in ref_id_types

@@ -16,6 +16,16 @@ class UserProvidedContext(BaseModel):
     payload_linker_text: Optional[str] = None
     constraints_text: Optional[str] = None
     notes: Optional[str] = None
+    # ── Clarification-loop carry-over (additive; all default empty so first-
+    # turn intake and old artifacts are unchanged). These are populated only
+    # on a clarification revision turn so the Step 2 LLM can remember the
+    # previous intent and combine the user's short follow-up answer with it.
+    # They are loose containers (the program passes them through; the LLM
+    # re-parses). They must never carry prompts, keys, or extracted sequences.
+    previous_task_intent: Optional[dict] = None
+    previous_missing_slots: list[dict] = Field(default_factory=list)
+    previous_clarification_requests: list[dict] = Field(default_factory=list)
+    clarification_answers: list[dict] = Field(default_factory=list)
 
 
 class UploadedFile(BaseModel):

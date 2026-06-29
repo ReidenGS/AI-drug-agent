@@ -10,6 +10,10 @@ class ActiveArtifacts(BaseModel):
     raw_request_record_id: Optional[str] = None
     structured_query_id: Optional[str] = None
     input_readiness_status_id: Optional[str] = None
+    # Latest clarification revision artifact for this run (additive; None
+    # until a clarification answer is submitted). Links this run to the
+    # next revision run created from the user's clarification answers.
+    clarification_state_id: Optional[str] = None
     run_step_plan_id: Optional[str] = None
     candidate_context_table_id: Optional[str] = None
     structured_liability_summary_id: Optional[str] = None

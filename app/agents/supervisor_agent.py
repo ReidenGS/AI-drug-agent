@@ -203,6 +203,19 @@ not write a long explanation. If `missing_slots` is empty, set `response`
 to null or "". Never put prompts, API keys, raw file content, or full
 sequences in `response`.
 
+Clarification follow-up turns:
+`user_provided_context` may contain `previous_task_intent`,
+`previous_missing_slots`, `previous_clarification_requests`, and
+`clarification_answers` from an earlier clarification turn. When present:
+- Treat `clarification_answers` as the user's answers to the previous
+  turn's questions; use each `answer_text` to satisfy the matching previous
+  missing slot (by `slot_name` / `slot_category`).
+- Preserve `previous_task_intent` (keep the same primary_intent) unless an
+  answer explicitly changes the task; do NOT treat a short answer like
+  "HER2" as a new standalone task when `previous_task_intent` is present.
+- Re-emit `missing_slots` for what is STILL missing after applying the
+  answers; a slot answered this turn should no longer be missing.
+
 Return exactly one JSON object matching the schema. Keep `parse_warnings`
 as a string array and `user_constraints` as an object array with
 `constraint_text` and `source`. Keep `requested_outputs` within the
