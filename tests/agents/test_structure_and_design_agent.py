@@ -1485,7 +1485,7 @@ def test_step8_sequence_only_records_nim_prediction_route_as_unavailable(
     assert "ATOM      1" not in blob
 
 
-def test_step8_antigen_antibody_sequence_pair_records_nim_deferred_plan(
+def test_step8_uniprot_antigen_with_antibody_sequences_is_contract_unresolved(
     local_storage, registry_service, workflow_state_service
 ):
     run_id = _seed(
@@ -1497,6 +1497,80 @@ def test_step8_antigen_antibody_sequence_pair_records_nim_deferred_plan(
     cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
     cct = local_storage.read_json(cct_path)
     antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    antibody["materials"].extend([
+        {
+            "material_id": "heavy_seq_step8",
+            "material_type": "antibody_heavy_chain_sequence",
+            "value": "EVQLVESGGGLVQPGGSLRLSCAAS",
+        },
+        {
+            "material_id": "light_seq_step8",
+            "material_type": "antibody_light_chain_sequence",
+            "value": "DIQMTQSPSSLSASVGDRVTITC",
+        },
+    ])
+    local_storage.write_json(cct_path, cct)
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+
+    assert results.structure_modeling_status == "ok"
+    assert all(cr.run_status == "ok" for cr in results.candidate_structure_results)
+    plans = [
+        plan for cr in results.candidate_structure_results
+        for plan in cr.complex_prediction_plans
+    ]
+    assert plans
+    assert any(plan.input_status == "contract_unresolved" for plan in plans)
+    assert not any(plan.input_status == "selected_but_deferred" for plan in plans)
+    assert any(
+        "antigen_sequence_unresolved_from_uniprot_id" in plan.missing_prediction_inputs
+        for plan in plans
+    )
+    assert all(not cr.complex_structure_refs for cr in results.candidate_structure_results)
+    assert not any(
+        "complex_prediction_unavailable" in cr.downstream_handoff.missing_for_step9
+        for cr in results.candidate_structure_results
+    )
+    assert any(
+        "antigen_sequence_unresolved_from_uniprot_id" in cr.downstream_handoff.missing_for_step9
+        for cr in results.candidate_structure_results
+    )
+    nim_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
+    ]
+    assert nim_calls
+    assert all(tc.run_status == "skipped" for tc in nim_calls)
+    assert all(tc.tool_input_summary.get("routing_decision") == "contract_unresolved" for tc in nim_calls)
+    audit_blob = json.dumps([tc.tool_input_summary for tc in nim_calls])
+    assert "EVQLVES" not in audit_blob
+    assert "DIQMTQ" not in audit_blob
+    assert "sha256_prefix" in audit_blob
+    assert "P04626" in audit_blob
+
+
+def test_step8_raw_antigen_antibody_sequences_record_nim_deferred_plan(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service, referenced_inputs=[])
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    target["materials"] = [
+        {
+            "material_id": "target_seq_step8",
+            "material_type": "target_sequence",
+            "value": "MKTAYIAKQNNVG",
+        }
+    ]
     antibody["materials"].extend([
         {
             "material_id": "heavy_seq_step8",
@@ -1540,9 +1614,58 @@ def test_step8_antigen_antibody_sequence_pair_records_nim_deferred_plan(
     assert any(tc.run_status == "dependency_unavailable" for tc in nim_calls)
     assert any(tc.tool_input_summary.get("routing_decision") == "selected_but_deferred" for tc in nim_calls)
     audit_blob = json.dumps([tc.tool_input_summary for tc in nim_calls])
+    assert "MKTAYIAK" not in audit_blob
     assert "EVQLVES" not in audit_blob
     assert "DIQMTQ" not in audit_blob
     assert "sha256_prefix" in audit_blob
+
+
+def test_step8_nim_contract_treats_fasta_refs_as_runtime_ready():
+    sin = {
+        "input_case": "sequence_only_input",
+        "structure_refs": [],
+        "sequence_refs_for_prediction": [
+            {
+                "sequence_id": "antigen_fasta",
+                "chain_role": "antigen",
+                "prediction_input_kind": "fasta_ref",
+                "sequence_value_status": "referenced",
+                "source_kind": "uploaded_fasta",
+                "source_ref": "inputs/files/antigen.fasta",
+                "sequence_storage_ref": "runs/x/inputs/files/antigen.fasta",
+            },
+            {
+                "sequence_id": "heavy_fasta",
+                "chain_role": "antibody_heavy",
+                "prediction_input_kind": "fasta_ref",
+                "sequence_value_status": "referenced",
+                "source_kind": "uploaded_fasta",
+                "source_ref": "inputs/files/heavy.fasta",
+                "sequence_storage_ref": "runs/x/inputs/files/heavy.fasta",
+            },
+            {
+                "sequence_id": "light_fasta",
+                "chain_role": "antibody_light",
+                "prediction_input_kind": "fasta_ref",
+                "sequence_value_status": "referenced",
+                "source_kind": "uploaded_fasta",
+                "source_ref": "inputs/files/light.fasta",
+                "sequence_storage_ref": "runs/x/inputs/files/light.fasta",
+            },
+        ],
+    }
+
+    plan = structure_and_design_module._plan_step8_nim_complex_prediction(
+        "NvidiaNIM_boltz2", sin, [sin]
+    )
+
+    assert plan.input_status == "selected_but_deferred"
+    assert plan.runtime_status == "runtime_unavailable"
+    assert not plan.missing_prediction_inputs
+    assert all(item["sequence_readiness"] == "ready" for item in plan.sequence_inputs)
+    audit_blob = json.dumps(plan.model_dump())
+    assert ">antigen" not in audit_blob
+    assert "MKTAYIAK" not in audit_blob
 
 
 def test_step8_selected_tool_failure_still_marks_partial(

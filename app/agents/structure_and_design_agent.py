@@ -646,7 +646,7 @@ class StructureAndDesignAgent:
             run_status = "ok"
             partial = False
 
-            routed_calls = self._route_step8_scoped_tools(run_id, sin)
+            routed_calls = self._route_step8_scoped_tools(run_id, sin, inputs)
             selected_calls = [
                 tc for tc in routed_calls
                 if tc.tool_input_summary
@@ -794,7 +794,7 @@ class StructureAndDesignAgent:
         return tuple(runtime_scoped)
 
     def _route_step8_scoped_tools(
-        self, run_id: str, sin: dict
+        self, run_id: str, sin: dict, all_inputs: list[dict] | None = None
     ) -> list[ToolCallRecord]:
         input_case = sin.get("input_case")
         structure_input_id = sin.get("structure_input_id")
@@ -920,7 +920,7 @@ class StructureAndDesignAgent:
         for tool_name in sorted(_STEP8_NIM_COMPLEX_TOOLS):
             if tool_name not in scoped_tools:
                 continue
-            plan = _plan_step8_nim_complex_prediction(tool_name, sin)
+            plan = _plan_step8_nim_complex_prediction(tool_name, sin, all_inputs)
             if plan.input_status == "selected_but_deferred":
                 calls.append(
                     _nonexecuted_tool_record(
@@ -1815,7 +1815,11 @@ def _step8_tool_call_affects_partial(tc: ToolCallRecord) -> bool:
     return False
 
 
-def _plan_step8_nim_complex_prediction(tool_name: str, sin: dict) -> ComplexPredictionPlan:
+def _plan_step8_nim_complex_prediction(
+    tool_name: str,
+    sin: dict,
+    all_inputs: list[dict] | None = None,
+) -> ComplexPredictionPlan:
     input_case = sin.get("input_case")
     if input_case == "known_pdb_id":
         return ComplexPredictionPlan(
@@ -1837,13 +1841,13 @@ def _plan_step8_nim_complex_prediction(tool_name: str, sin: dict) -> ComplexPred
             contract_notes=["uploaded/local structure already has explicit complex chain evidence"],
         )
 
+    sequence_lookup = _prediction_sequence_lookup(all_inputs or [sin])
     sequence_inputs = _compact_prediction_sequence_inputs(sin)
     mapping = sin.get("antigen_antibody_mapping") or {}
     antigen_ids = list(mapping.get("antigen_sequence_ids") or [])
     heavy_ids = list(mapping.get("antibody_heavy_sequence_ids") or [])
     light_ids = list(mapping.get("antibody_light_sequence_ids") or [])
 
-    roles = {entry.get("chain_role") for entry in sequence_inputs}
     if not antigen_ids:
         antigen_ids = [entry["sequence_id"] for entry in sequence_inputs if entry.get("chain_role") == "antigen"]
     if not heavy_ids:
@@ -1852,12 +1856,58 @@ def _plan_step8_nim_complex_prediction(tool_name: str, sin: dict) -> ComplexPred
         light_ids = [entry["sequence_id"] for entry in sequence_inputs if entry.get("chain_role") == "antibody_light"]
 
     missing: list[str] = []
-    if not antigen_ids:
-        missing.append("antigen_sequence")
-    if not heavy_ids and "antibody" not in roles:
-        missing.append("antibody_heavy_sequence")
-    if not light_ids and "antibody" not in roles:
-        missing.append("antibody_light_sequence")
+    unresolved: list[str] = []
+
+    antigen_missing = _missing_prediction_sequence_input(
+        role="antigen",
+        sequence_ids=antigen_ids,
+        sequence_lookup=sequence_lookup,
+    )
+    if antigen_missing:
+        if antigen_missing.endswith("_unresolved_from_uniprot_id"):
+            unresolved.append(antigen_missing)
+        else:
+            missing.append(antigen_missing)
+
+    heavy_missing = _missing_prediction_sequence_input(
+        role="antibody_heavy",
+        sequence_ids=heavy_ids,
+        sequence_lookup=sequence_lookup,
+    )
+    if heavy_missing:
+        if heavy_missing.endswith("_unresolved_from_uniprot_id"):
+            unresolved.append(heavy_missing)
+        else:
+            missing.append(heavy_missing)
+
+    light_missing = _missing_prediction_sequence_input(
+        role="antibody_light",
+        sequence_ids=light_ids,
+        sequence_lookup=sequence_lookup,
+    )
+    if light_missing:
+        if light_missing.endswith("_unresolved_from_uniprot_id"):
+            unresolved.append(light_missing)
+        else:
+            missing.append(light_missing)
+
+    if unresolved:
+        return ComplexPredictionPlan(
+            tool_name=tool_name,
+            input_status="contract_unresolved",
+            runtime_status="not_checked",
+            can_invoke=False,
+            missing_prediction_inputs=list(dict.fromkeys([*unresolved, *missing])),
+            sequence_inputs=_compact_prediction_sequence_inputs_for_ids(
+                sequence_lookup,
+                [*antigen_ids, *heavy_ids, *light_ids],
+                fallback=sequence_inputs,
+            ),
+            structure_inputs=_compact_prediction_structure_inputs(sin),
+            contract_notes=[
+                "identifier-only sequence inputs require explicit runtime sequence resolution before NvidiaNIM complex prediction"
+            ],
+        )
 
     if missing:
         return ComplexPredictionPlan(
@@ -1866,7 +1916,11 @@ def _plan_step8_nim_complex_prediction(tool_name: str, sin: dict) -> ComplexPred
             runtime_status="not_checked",
             can_invoke=False,
             missing_prediction_inputs=missing,
-            sequence_inputs=sequence_inputs,
+            sequence_inputs=_compact_prediction_sequence_inputs_for_ids(
+                sequence_lookup,
+                [*antigen_ids, *heavy_ids, *light_ids],
+                fallback=sequence_inputs,
+            ),
             structure_inputs=_compact_prediction_structure_inputs(sin),
             contract_notes=["missing antigen-antibody pair sequence input for complex prediction"],
         )
@@ -1876,10 +1930,14 @@ def _plan_step8_nim_complex_prediction(tool_name: str, sin: dict) -> ComplexPred
         input_status="selected_but_deferred",
         runtime_status="runtime_unavailable",
         can_invoke=False,
-        sequence_inputs=sequence_inputs,
+        sequence_inputs=_compact_prediction_sequence_inputs_for_ids(
+            sequence_lookup,
+            [*antigen_ids, *heavy_ids, *light_ids],
+            fallback=sequence_inputs,
+        ),
         structure_inputs=_compact_prediction_structure_inputs(sin),
         contract_notes=[
-            "antigen and antibody sequence refs are available",
+            "antigen and antibody raw/fasta-resolvable sequence refs are available",
             "NvidiaNIM wrapper/runtime/API-key contract is deferred",
         ],
     )
@@ -1907,12 +1965,103 @@ def _compact_prediction_sequence_inputs(sin: dict) -> list[dict[str, Any]]:
             "sequence_value_status": seq.get("sequence_value_status"),
             "resource_binding_status": seq.get("resource_binding_status"),
         }
+        storage_ref = seq.get("sequence_storage_ref")
+        if storage_ref:
+            item["sequence_storage_ref"] = _short(str(storage_ref))
+        readiness, reason = _prediction_sequence_readiness(seq)
+        item["sequence_readiness"] = readiness
+        item["readiness_reason"] = reason
         sequence = seq.get("sequence")
         if isinstance(sequence, str) and sequence:
             item["sequence_length"] = len(sequence)
             item["sha256_prefix"] = hashlib.sha256(sequence.encode("utf-8")).hexdigest()[:12]
         out.append({k: v for k, v in item.items() if v not in (None, "", [])})
     return out
+
+
+def _prediction_sequence_lookup(inputs: list[dict]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for sin in inputs:
+        if not isinstance(sin, dict):
+            continue
+        for seq in sin.get("sequence_refs_for_prediction") or []:
+            if not isinstance(seq, dict):
+                continue
+            sequence_id = seq.get("sequence_id")
+            if isinstance(sequence_id, str) and sequence_id:
+                out.setdefault(sequence_id, seq)
+    return out
+
+
+def _compact_prediction_sequence_inputs_for_ids(
+    sequence_lookup: dict[str, dict[str, Any]],
+    sequence_ids: list[str],
+    *,
+    fallback: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not sequence_ids:
+        return fallback
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for sequence_id in sequence_ids:
+        if not sequence_id or sequence_id in seen:
+            continue
+        seen.add(sequence_id)
+        seq = sequence_lookup.get(sequence_id)
+        if not seq:
+            out.append(
+                {
+                    "sequence_id": sequence_id,
+                    "sequence_readiness": "unknown",
+                    "readiness_reason": "sequence_id_not_found_in_prepared_inputs",
+                }
+            )
+            continue
+        out.extend(_compact_prediction_sequence_inputs({"sequence_refs_for_prediction": [seq]}))
+    return out or fallback
+
+
+def _prediction_sequence_readiness(seq: dict[str, Any]) -> tuple[str, str]:
+    input_kind = seq.get("prediction_input_kind")
+    value_status = seq.get("sequence_value_status")
+    if input_kind == "amino_acid_sequence" and value_status == "inline":
+        return "ready", "inline_amino_acid_sequence"
+    if input_kind == "fasta_ref" and (seq.get("sequence_storage_ref") or seq.get("source_ref")):
+        return "ready", "fasta_ref_resolvable_at_runtime"
+    if input_kind == "uniprot_id" or value_status == "identifier_only":
+        return "unresolved_identifier", "uniprot_id_requires_sequence_resolution"
+    if input_kind == "unknown" or value_status == "unavailable":
+        return "unavailable", "sequence_value_unavailable"
+    return "unavailable", "sequence_input_not_runtime_ready"
+
+
+def _missing_prediction_sequence_input(
+    *,
+    role: str,
+    sequence_ids: list[str],
+    sequence_lookup: dict[str, dict[str, Any]],
+) -> str | None:
+    if not sequence_ids:
+        return f"{role}_sequence"
+    saw_uniprot = False
+    saw_unresolved = False
+    for sequence_id in sequence_ids:
+        seq = sequence_lookup.get(sequence_id)
+        if not seq:
+            saw_unresolved = True
+            continue
+        readiness, _reason = _prediction_sequence_readiness(seq)
+        if readiness == "ready":
+            return None
+        if seq.get("prediction_input_kind") == "uniprot_id" or seq.get("sequence_value_status") == "identifier_only":
+            saw_uniprot = True
+        else:
+            saw_unresolved = True
+    if saw_uniprot:
+        return f"{role}_sequence_unresolved_from_uniprot_id"
+    if saw_unresolved:
+        return f"{role}_sequence_runtime_resolution_needed"
+    return f"{role}_sequence"
 
 
 def _compact_prediction_structure_inputs(sin: dict) -> list[dict[str, Any]]:
