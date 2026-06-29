@@ -1937,7 +1937,7 @@ def _extract_complex_structure_refs_for_step8(
             )
     elif tool_call.tool_name == "CrystalStructure_validate":
         local_ref = _step8_local_structure_ref(storage, sin.get("structure_refs") or [])
-        if local_ref:
+        if local_ref and _step8_has_explicit_complex_evidence(sin):
             refs.append(
                 ComplexStructureRef(
                     source_kind="uploaded_local_complex",
@@ -1987,9 +1987,14 @@ def _build_step8_downstream_handoff(
 ) -> Step8DownstreamHandoff:
     missing: list[str] = []
     notes: list[str] = []
-    has_complex = bool(complex_structure_refs)
+    true_complex_refs = [
+        ref for ref in complex_structure_refs
+        if ref.source_kind in {"existing_pdb_complex", "predicted_complex", "uploaded_local_complex"}
+    ]
+    has_complex = bool(true_complex_refs)
     has_interfaces = bool(interface_features or interface_analysis_records)
     confidence_types = {c.confidence_type for c in confidence_records}
+    validation_available = "structure_quality" in confidence_types
     if not has_complex:
         missing.append("complex_structure_missing")
     if not has_interfaces:
@@ -2003,18 +2008,21 @@ def _build_step8_downstream_handoff(
         notes.append("NvidiaNIM complex prediction route is deferred/unavailable")
 
     structure_ref = None
-    if complex_structure_refs:
-        first = complex_structure_refs[0]
+    if true_complex_refs:
+        first = true_complex_refs[0]
         structure_ref = first.storage_ref or first.pdb_id or first.source_ref
+    validated_structure_ref = _validated_structure_ref_from_tool_calls(tool_calls)
 
     return Step8DownstreamHandoff(
         has_complex_structure=has_complex,
+        has_validated_structure=validation_available,
         has_interface_features=has_interfaces,
         structure_for_variant_generation_ref=structure_ref,
+        validated_structure_ref=validated_structure_ref,
         interface_quality_available="interface_quality" in confidence_types or has_interfaces,
         prediction_confidence_available="prediction_confidence" in confidence_types,
         refinement_resolution_available="refinement_resolution" in confidence_types,
-        validation_available="structure_quality" in confidence_types,
+        validation_available=validation_available,
         missing_for_step9=list(dict.fromkeys(missing)),
         handoff_notes=notes,
     )
@@ -2025,9 +2033,68 @@ def _prediction_model_ref(payload: dict[str, Any] | None) -> str | None:
         return None
     value = _extract_scalar(
         payload,
-        ("model_ref", "model_path", "structure_path", "output_path", "path", "file", "url", "output"),
+        (
+            "model_ref",
+            "model_path",
+            "model_url",
+            "structure_path",
+            "structure_url",
+            "output_path",
+            "artifact_ref",
+            "artifact_url",
+            "storage_ref",
+            "file_ref",
+        ),
     )
-    return str(value) if value else None
+    if not value:
+        return None
+    candidate = str(value)
+    if _looks_like_raw_structure_body(candidate):
+        return None
+    return candidate
+
+
+def _step8_has_explicit_complex_evidence(sin: dict) -> bool:
+    status_values: list[str] = []
+    for sref in sin.get("structure_refs") or []:
+        if isinstance(sref, dict):
+            status_values.append(str(sref.get("resource_binding_status") or ""))
+    if any(status.lower() == "ambiguous" for status in status_values):
+        return False
+
+    roles = {
+        str(item.get("chain_role") or "").lower()
+        for item in sin.get("chain_mapping") or []
+        if isinstance(item, dict)
+    }
+    has_antigen = "antigen" in roles or "target" in roles
+    has_antibody = any(role in roles for role in ("antibody", "antibody_heavy", "antibody_light", "fab", "fc"))
+    return has_antigen and has_antibody
+
+
+def _validated_structure_ref_from_tool_calls(tool_calls: list[ToolCallRecord]) -> str | None:
+    for tc in tool_calls:
+        if tc.tool_name != "CrystalStructure_validate" or tc.run_status != "success":
+            continue
+        summary = tc.tool_input_summary or {}
+        value = summary.get("pdb_id_or_path")
+        if not value and isinstance(summary.get("arguments"), dict):
+            value = summary["arguments"].get("pdb_id_or_path")
+        if value:
+            return str(value)
+    return None
+
+
+def _looks_like_raw_structure_body(value: str) -> bool:
+    if len(value) > 500:
+        return True
+    upper = value[:500].upper()
+    if upper.startswith(("ATOM", "HETATM", "HEADER")):
+        return True
+    if any(marker in upper for marker in ("\nATOM", "\nHETATM", "HEADER ", "\nHEADER")):
+        return True
+    lower = value[:500].lower()
+    return "data_" in lower or "loop_" in lower
 
 
 def _prediction_confidence_summary(payload: dict[str, Any] | None) -> dict[str, Any]:

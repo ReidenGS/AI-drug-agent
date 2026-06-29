@@ -16,6 +16,7 @@ from app.agents.structure_and_design_agent import StructureAndDesignAgent
 from app.agents.supervisor_agent import SupervisorAgent
 from app.llm.provider import MockLLMProvider
 from app.mcp.client import LocalMCPClient
+from app.schemas.common import ToolCallRecord
 from app.services.input_readiness_service import InputReadinessService
 from app.services.intake_service import IntakeService
 from app.services.structured_query_service import StructuredQueryService
@@ -1258,19 +1259,20 @@ def test_step8_uploaded_structure_file_path_calls_validation_tools(
     assert all(cr.run_status == "ok" for cr in results.candidate_structure_results)
     uploaded_handoffs = [
         cr.downstream_handoff for cr in results.candidate_structure_results
-        if cr.complex_structure_refs
+        if any(c.source == "CrystalStructure_validate" for c in cr.structure_confidence_records)
     ]
     assert uploaded_handoffs
-    assert any(h.has_complex_structure for h in uploaded_handoffs)
+    assert all(not h.has_complex_structure for h in uploaded_handoffs)
+    assert all(h.structure_for_variant_generation_ref is None for h in uploaded_handoffs)
+    assert any(h.has_validated_structure for h in uploaded_handoffs)
     assert any(h.validation_available for h in uploaded_handoffs)
     assert any(not h.has_interface_features for h in uploaded_handoffs)
-    uploaded_refs = [
-        ref for cr in results.candidate_structure_results
-        for ref in cr.complex_structure_refs
-        if ref.source_kind == "uploaded_local_complex"
+    assert any(h.validated_structure_ref and h.validated_structure_ref.endswith(".pdb") for h in uploaded_handoffs)
+    missing = [
+        item for h in uploaded_handoffs
+        for item in h.missing_for_step9
     ]
-    assert uploaded_refs
-    assert all(ref.storage_ref and ref.storage_ref.endswith(".pdb") for ref in uploaded_refs)
+    assert "complex_structure_missing" in missing
     tools = {tc.tool_name for tc in results.tool_call_records}
     assert "CrystalStructure_validate" in tools
     assert "ProteinsPlus_profile_structure_quality" not in tools
@@ -1373,6 +1375,78 @@ def test_step8_selected_tool_failure_still_marks_partial(
     assert failed
     assert any(tc.run_status == "failed" for tc in failed)
     assert any(tc.tool_input_summary.get("routing_decision") == "selected" for tc in failed)
+
+
+def test_step8_nim_success_accepts_explicit_model_artifact_ref(local_storage):
+    output_ref = local_storage.run_key("run_step8_unit", "tool_outputs", "step_08", "nim_model.json")
+    local_storage.write_json(
+        output_ref,
+        {
+            "tool_call_id": "tc_nim_model",
+            "tool_name": "NvidiaNIM_boltz2",
+            "label": "unit",
+            "input": {},
+            "output": {
+                "model_ref": "s3://bucket/predicted_complex.pdb",
+                "ptm": 0.72,
+            },
+        },
+    )
+    tc = ToolCallRecord(
+        tool_call_id="tc_nim_model",
+        tool_name="NvidiaNIM_boltz2",
+        run_status="success",
+        tool_output_ref=output_ref,
+    )
+
+    refs = structure_and_design_module._extract_complex_structure_refs_for_step8(
+        local_storage, {}, tc
+    )
+
+    assert len(refs) == 1
+    assert refs[0].source_kind == "predicted_complex"
+    assert refs[0].storage_ref == "s3://bucket/predicted_complex.pdb"
+    assert refs[0].confidence_summary["ptm"] == 0.72
+
+
+def test_step8_prediction_model_ref_rejects_raw_or_generic_outputs(local_storage):
+    assert structure_and_design_module._prediction_model_ref(
+        {"output": "s3://bucket/looks-like-a-ref-but-generic-output.pdb"}
+    ) is None
+    assert structure_and_design_module._prediction_model_ref(
+        {"url": "https://example.test/generic-url.pdb"}
+    ) is None
+    assert structure_and_design_module._prediction_model_ref(
+        {"model_url": "https://example.test/model.pdb"}
+    ) == "https://example.test/model.pdb"
+
+    raw_pdb = "HEADER    RAW STRUCTURE\nATOM      1  N   ALA A   1\nHETATM    2  O   HOH A   2"
+    assert structure_and_design_module._prediction_model_ref({"model_ref": raw_pdb}) is None
+
+    output_ref = local_storage.run_key("run_step8_unit", "tool_outputs", "step_08", "nim_raw.json")
+    local_storage.write_json(
+        output_ref,
+        {
+            "tool_call_id": "tc_nim_raw",
+            "tool_name": "NvidiaNIM_boltz2",
+            "label": "unit",
+            "input": {},
+            "output": {"output": raw_pdb},
+        },
+    )
+    tc = ToolCallRecord(
+        tool_call_id="tc_nim_raw",
+        tool_name="NvidiaNIM_boltz2",
+        run_status="success",
+        tool_output_ref=output_ref,
+    )
+    refs = structure_and_design_module._extract_complex_structure_refs_for_step8(
+        local_storage, {}, tc
+    )
+
+    assert refs == []
+    assert "HEADER" not in json.dumps([r.model_dump() for r in refs])
+    assert "ATOM" not in json.dumps([r.model_dump() for r in refs])
 
 
 # ── Step 9 ──────────────────────────────────────────────────────────────────

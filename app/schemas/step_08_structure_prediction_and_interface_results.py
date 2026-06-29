@@ -116,8 +116,10 @@ class InterfaceAnalysisRecord(BaseModel):
 
 class Step8DownstreamHandoff(BaseModel):
     has_complex_structure: bool = False
+    has_validated_structure: bool = False
     has_interface_features: bool = False
     structure_for_variant_generation_ref: Optional[str] = None
+    validated_structure_ref: Optional[str] = None
     interface_quality_available: bool = False
     prediction_confidence_available: bool = False
     refinement_resolution_available: bool = False
