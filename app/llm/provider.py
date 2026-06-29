@@ -461,6 +461,7 @@ class MockLLMProvider:
             normalized_entities=normalized_entities,
             mentioned_drugs=mentioned_drugs,
         )
+        response = _compose_missing_slots_response(missing_slots)
 
         return {
             "task_intent": {
@@ -488,6 +489,7 @@ class MockLLMProvider:
             "entity_decompositions": decompositions,
             "clarification_questions": clarifications,
             "missing_slots": missing_slots,
+            "response": response,
         }
 
 
@@ -1268,6 +1270,60 @@ def _compute_missing_slots(
             )
 
     return slots
+
+
+_SLOT_PHRASES = {
+    "target_or_antigen": "target or antigen",
+    "antibody": "antibody candidate",
+    "payload": "payload",
+    "linker": "linker chemistry",
+    "structure_or_sequence": "structure or sequence (PDB/CIF, PDB ID, UniProt ID, or protein sequence)",
+    "pdb_id": "PDB ID",
+    "uniprot_id": "UniProt ID",
+    "smiles": "SMILES",
+    "task_intent": "workflow you want to run",
+    "constraint": "constraints",
+    "other": "additional details",
+}
+
+
+def _join_phrases(phrases: list[str]) -> str:
+    if not phrases:
+        return ""
+    if len(phrases) == 1:
+        return phrases[0]
+    if len(phrases) == 2:
+        return f"{phrases[0]} and {phrases[1]}"
+    return ", ".join(phrases[:-1]) + f", and {phrases[-1]}"
+
+
+def _compose_missing_slots_response(missing_slots: list[dict]) -> str | None:
+    """Compose a concise user-facing follow-up from the mock's missing_slots.
+
+    Mirrors the prompt's contract: prioritize blocking slots, combine
+    warnings compactly, phrase naturally. Optional slots are omitted.
+    Returns None when there is nothing to ask for.
+    """
+    blocking = [
+        _SLOT_PHRASES.get(s.get("slot_name"), "the required information")
+        for s in missing_slots
+        if s.get("severity") == "blocking"
+    ]
+    warning = [
+        _SLOT_PHRASES.get(s.get("slot_name"), "the requested information")
+        for s in missing_slots
+        if s.get("severity") == "warning"
+    ]
+    if not blocking and not warning:
+        return None
+    parts: list[str] = []
+    if blocking:
+        parts.append(f"Please provide the {_join_phrases(blocking)} for the ADC.")
+        if warning:
+            parts.append(f"If available, also provide the {_join_phrases(warning)} you want to use.")
+    else:
+        parts.append(f"Please provide the {_join_phrases(warning)} you want to use.")
+    return " ".join(parts)
 
 
 def _uploaded_file_refs(files: list) -> list[dict]:

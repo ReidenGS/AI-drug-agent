@@ -30,7 +30,7 @@ from typing import Any, Optional
 
 from ..llm.provider import LLMProvider
 from ..schemas.step_01_raw_request_record import RawRequestRecord
-from ..llm.json_task_validation import normalize_missing_slots
+from ..llm.json_task_validation import normalize_missing_slots, normalize_response
 from ..schemas.step_02_structured_query import (
     EntityComponent,
     EntityDecomposition,
@@ -192,6 +192,16 @@ required_slot_schema (satisfied_by = any one is enough):
     do NOT demand full ADC-design completeness. Use warning unless there is
     no searchable entity at all (then blocking other/task_intent).
 You only REPORT missing_slots here; the readiness check decides the final stop.
+
+User-facing message (`response`):
+If `missing_slots` is non-empty, ALSO write `response`: one concise,
+natural, user-facing message that asks for the missing information.
+Prioritize blocking slots; combine multiple warning slots compactly into
+the same message. Phrase it for an end user and do not expose internal
+schema field names unless they help. Keep it short (a sentence or two), do
+not write a long explanation. If `missing_slots` is empty, set `response`
+to null or "". Never put prompts, API keys, raw file content, or full
+sequences in `response`.
 
 Return exactly one JSON object matching the schema. Keep `parse_warnings`
 as a string array and `user_constraints` as an object array with
@@ -825,6 +835,10 @@ def normalize_llm_payload_for_step2(
     # compacted with a parse_warning. Shares the provider validator's logic
     # so OpenAI/Gemini/Qwen/Mock all agree on the cleaned shape.
     normalize_missing_slots(out)
+    # response drift: absent -> None, non-string scalar -> str, list/dict ->
+    # compact string or None, over-long -> trimmed. Same shared logic as the
+    # provider validator so every provider/mock agrees on the cleaned shape.
+    normalize_response(out)
 
     return out
 
@@ -938,6 +952,7 @@ class SupervisorAgent:
                 for ms in (llm_payload.get("missing_slots") or [])
                 if isinstance(ms, dict)
             ],
+            response=llm_payload.get("response"),
         )
         return sq
 

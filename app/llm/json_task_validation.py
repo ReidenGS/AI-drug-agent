@@ -84,7 +84,7 @@ def shape_instruction(task: str) -> str:
         '"user_constraints":[],"parse_warnings":[],'
         '"normalized_entities":[],"entity_decompositions":[],'
         '"clarification_questions":[],'
-        '"missing_slots":[]}\n'
+        '"missing_slots":[],"response":null}\n'
         "`missing_slots` is a JSON array of required-slot gaps you judged "
         "against the inferred task intent and the user's query / context / "
         "uploaded-file metadata. Each item: `slot_name` "
@@ -97,6 +97,14 @@ def shape_instruction(task: str) -> str:
         "intents), `reason`, and an optional one-line `suggested_question`. "
         "Only list slots that are genuinely missing; omit a slot when an "
         "equivalent typed input already satisfies it.\n"
+        "You MUST output `missing_slots` as structured data. If "
+        "`missing_slots` is non-empty, ALSO write `response` as a concise, "
+        "natural user-facing message that asks for the missing information; "
+        "prioritize blocking slots, combine multiple warning slots compactly, "
+        "phrase it for an end user (do not expose internal schema names "
+        "unless useful), and keep it short. If `missing_slots` is empty, set "
+        '`response` to null or "". `response` must never contain prompts, API '
+        "keys, raw file content, or full sequences.\n"
         "`task_intent.primary_intent` MUST be one of "
         '"new_adc_design", "existing_adc_evaluation", '
         '"developability_assessment", "structure_analysis", '
@@ -348,6 +356,9 @@ def _validate_structured_query_rest(data: dict, *, error_factory: ErrorFactory) 
     # fail the whole Step 2 parse, so we coerce it into a clean list BEFORE
     # the strict list checks below rather than raising on shape drift.
     normalize_missing_slots(data)
+    # `response` is a drift-tolerant scalar string (or None); coerce rather
+    # than raise so a non-string never fails the whole parse.
+    normalize_response(data)
     for key in (
         "referenced_inputs",
         "requested_outputs",
@@ -426,6 +437,7 @@ _REQUESTED_OUTPUTS_ALIASES = {
 def normalize_structured_query(data: dict) -> dict:
     _normalize_entity_decomposition_components(data)
     normalize_missing_slots(data)
+    normalize_response(data)
 
     raw = data.get("requested_outputs")
     if not isinstance(raw, list):
@@ -747,4 +759,65 @@ def normalize_missing_slots(data: dict) -> dict:
         warnings.append(f"dropped {dropped} malformed missing_slots entr{'y' if dropped == 1 else 'ies'}")
     if container_coerced:
         warnings.append("normalized missing_slots container to a list")
+    return data
+
+
+# ── Step 2 ``response`` normalization ───────────────────────────────────────
+#
+# `response` is the user-facing follow-up message the Step 2 LLM writes when
+# missing_slots is non-empty. The program only passes it through, so the
+# normalizer just guarantees it is a trimmed string (or None) and never
+# crashes on shape drift. It never stores prompts / keys / raw payloads.
+
+_RESPONSE_MAX_LEN = 500
+
+
+def normalize_response(data: dict) -> dict:
+    """Coerce ``data['response']`` into a trimmed string or ``None`` in place."""
+    if not isinstance(data, dict):
+        return data
+    if "response" not in data:
+        data["response"] = None
+        return data
+    raw = data.get("response")
+
+    if raw is None:
+        data["response"] = None
+        return data
+
+    warnings = data.get("parse_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    data["parse_warnings"] = warnings
+
+    if isinstance(raw, str):
+        text: str | None = raw.strip()
+    elif isinstance(raw, bool):
+        text = str(raw)
+        warnings.append("coerced non-string response to string")
+    elif isinstance(raw, (int, float)):
+        text = str(raw)
+        warnings.append("coerced non-string response to string")
+    elif isinstance(raw, (list, tuple)):
+        parts = [str(x).strip() for x in raw if x not in (None, "", [], {})]
+        text = " ".join(p for p in parts if p) or None
+        warnings.append("compacted list response into a string")
+    elif isinstance(raw, dict):
+        candidate = None
+        for key in ("response", "message", "text", "question"):
+            val = raw.get(key)
+            if isinstance(val, str) and val.strip():
+                candidate = val.strip()
+                break
+        text = candidate
+        warnings.append("compacted dict response into a string")
+    else:
+        text = None
+        warnings.append(f"dropped malformed response: unexpected {type(raw).__name__}")
+
+    if isinstance(text, str) and len(text) > _RESPONSE_MAX_LEN:
+        text = text[:_RESPONSE_MAX_LEN].rstrip()
+        warnings.append(f"truncated response to {_RESPONSE_MAX_LEN} chars")
+
+    data["response"] = text
     return data

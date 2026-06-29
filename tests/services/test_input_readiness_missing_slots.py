@@ -454,3 +454,147 @@ def test_step3_clarification_requests_do_not_leak_sequences_or_keys(
     assert heavy not in blob
     assert "api_key" not in blob.lower()
     assert "system instructions" not in blob.lower()
+
+
+# ── Step 3 user-facing response passthrough (no LLM) ─────────────────────────
+
+
+def _set_step2_response(local_storage, run_id: str, response) -> None:
+    key = local_storage.run_key(run_id, "inputs/structured_query.json")
+    sq = local_storage.read_json(key)
+    sq["response"] = response
+    local_storage.write_json(key, sq)
+
+
+def test_step3_passes_through_step2_response_when_blocked(
+    local_storage, registry_service, workflow_state_service
+):
+    intake = IntakeService(local_storage, registry_service, workflow_state_service)
+    rec = intake.submit(raw_user_query="design an ADC", user_provided_context={})
+    run_id = rec.run_id
+    _bootstrap_step_2(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        run_id,
+        missing_slots=[
+            MissingSlot(
+                slot_name="target_or_antigen",
+                slot_category="target",
+                severity="blocking",
+                reason="No target.",
+                suggested_question="What target or antigen should the ADC be designed against?",
+            )
+        ],
+    )
+    step2_msg = "Please provide the target or antigen for the ADC."
+    _set_step2_response(local_storage, run_id, step2_msg)
+
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+    assert out.input_readiness_status == "blocked"
+    assert out.response == step2_msg
+
+
+def test_step3_passes_through_step2_response_when_needs_user_input(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _full_context_run(local_storage, registry_service, workflow_state_service)
+    _bootstrap_step_2(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        run_id,
+        missing_slots=[
+            MissingSlot(
+                slot_name="linker",
+                slot_category="linker",
+                severity="warning",
+                reason="No linker chemistry specified.",
+            )
+        ],
+    )
+    step2_msg = "Please provide the linker chemistry you want to use."
+    _set_step2_response(local_storage, run_id, step2_msg)
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+    assert out.input_readiness_status == "needs_user_input"
+    assert out.response == step2_msg
+
+
+def test_step3_ready_status_has_no_response(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _full_context_run(local_storage, registry_service, workflow_state_service)
+    _bootstrap_step_2(local_storage, registry_service, workflow_state_service, run_id)
+    # Even if Step 2 left a stray response, a ready run does not surface it.
+    _set_step2_response(local_storage, run_id, "stray message")
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+    assert out.input_readiness_status == "ready"
+    assert out.response is None
+
+
+def test_step3_deterministic_fallback_response_when_step2_absent(
+    local_storage, registry_service, workflow_state_service
+):
+    """Step 2 left no response, but Step 3 has clarification_requests → the
+    fallback joins those questions deterministically (no LLM)."""
+    intake = IntakeService(local_storage, registry_service, workflow_state_service)
+    rec = intake.submit(raw_user_query="design an ADC", user_provided_context={})
+    run_id = rec.run_id
+    _bootstrap_step_2(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        run_id,
+        missing_slots=[
+            MissingSlot(
+                slot_name="target_or_antigen",
+                slot_category="target",
+                severity="blocking",
+                reason="No target.",
+                suggested_question="What target or antigen should the ADC be designed against?",
+            )
+        ],
+    )
+    # No structured_query.response set at all.
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+    assert out.input_readiness_status == "blocked"
+    assert out.response
+    assert out.clarification_requests
+    # Fallback is built from the clarification question(s).
+    assert any(c.question in out.response for c in out.clarification_requests)
+
+
+def test_step3_response_does_not_leak_sequences_or_keys(
+    local_storage, registry_service, workflow_state_service
+):
+    heavy = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
+    run_id = _full_context_run(local_storage, registry_service, workflow_state_service)
+    _bootstrap_step_2(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        run_id,
+        missing_slots=[
+            MissingSlot(
+                slot_name="linker",
+                slot_category="linker",
+                severity="warning",
+                reason="No linker chemistry specified.",
+            )
+        ],
+    )
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+    blob = out.response or ""
+    assert heavy not in blob
+    assert "api_key" not in blob.lower()
+    assert "system instructions" not in blob.lower()

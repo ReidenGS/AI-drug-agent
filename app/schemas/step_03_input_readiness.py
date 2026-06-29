@@ -119,3 +119,8 @@ class InputReadinessStatus(BaseModel):
     # Additive (Step 3 clarification-loop skeleton). Defaults to [] so old
     # artifacts that predate the field still validate.
     clarification_requests: list[ClarificationRequest] = Field(default_factory=list)
+    # User-facing follow-up message. Passed through from Step 2's
+    # `structured_query.response` when readiness is not `ready`; falls back
+    # to a deterministic join of clarification questions when Step 2 left it
+    # empty. Step 3 NEVER calls an LLM to produce this. None when ready.
+    response: Optional[str] = None

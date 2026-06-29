@@ -284,3 +284,101 @@ def test_mock_missing_slots_do_not_leak_sequences_or_keys():
     assert heavy not in blob
     assert "api_key" not in blob.lower()
     assert "system instructions" not in blob.lower()
+
+
+# ── Step 2 user-facing `response` field ──────────────────────────────────────
+
+
+def test_schema_accepts_response_and_defaults_none():
+    assert _sq().response is None
+    assert _sq(response="Please provide the target.").response == "Please provide the target."
+
+
+def test_schema_backward_compatible_old_artifact_without_response():
+    payload = _sq().model_dump()
+    payload.pop("response", None)
+    assert "response" not in payload
+    restored = StructuredQuery.model_validate(payload)
+    assert restored.response is None
+
+
+def test_prompt_includes_response_rules():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "response" in sp
+    assert "user-facing" in sp.lower()
+    # Tells the model to prioritize blocking slots in the message.
+    assert "blocking" in sp.lower()
+
+
+def test_normalizer_response_absent_becomes_none():
+    out = normalize_llm_payload_for_step2({"task_intent": {"task_type": "x"}})
+    assert out["response"] is None
+
+
+def test_normalizer_response_non_string_scalar_coerced():
+    out = normalize_llm_payload_for_step2({"response": 123})
+    assert out["response"] == "123"
+
+
+def test_normalizer_response_list_compacted():
+    out = normalize_llm_payload_for_step2({"response": ["need target", "need payload"]})
+    assert out["response"] == "need target need payload"
+
+
+def test_normalizer_response_dict_compacted():
+    out = normalize_llm_payload_for_step2(
+        {"response": {"message": "Please provide the target."}}
+    )
+    assert out["response"] == "Please provide the target."
+
+
+def test_normalizer_response_overlong_trimmed():
+    long = "x" * 900
+    out = normalize_llm_payload_for_step2({"response": long})
+    assert len(out["response"]) == 500
+    assert any("truncated response" in w for w in out["parse_warnings"])
+
+
+def test_mock_emits_response_when_missing_slots_present():
+    out = _parse("I want to design an ADC")
+    assert out["response"]
+    assert "target" in out["response"].lower()
+
+
+def test_mock_response_none_when_no_missing_slots():
+    out = _parse("Design HER2 ADC with vc-MMAE and trastuzumab")
+    assert out["missing_slots"] == []
+    assert out["response"] is None
+
+
+def test_mock_response_warning_only_combines_compactly():
+    out = _parse("Design a HER2 ADC with MMAE")
+    assert "target" not in out["response"].lower()
+    assert "antibody" in out["response"].lower()
+    assert "linker" in out["response"].lower()
+
+
+def test_supervisor_preserves_response_into_structured_query():
+    agent = SupervisorAgent(llm=MockLLMProvider())
+    sq = agent.parse_raw_to_structured_query(
+        {
+            "run_id": "run_resp",
+            "run_artifact_registry_id": "reg_resp",
+            "artifact_id": "art_resp",
+            "created_at": "2026-06-28T00:00:00Z",
+            "raw_user_query": "I want to design an ADC",
+            "user_provided_context": {},
+            "uploaded_files": [],
+        }
+    )
+    assert sq.response
+    assert "target" in sq.response.lower()
+
+
+def test_mock_response_does_not_leak_sequence_or_keys():
+    heavy = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
+    out = _parse(f"Design an ADC using antibody sequence {heavy}")
+    blob = (out.get("response") or "")
+    assert heavy not in blob
+    assert "api_key" not in blob.lower()
+    assert "system instructions" not in blob.lower()

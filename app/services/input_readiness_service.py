@@ -577,6 +577,12 @@ class InputReadinessService:
         # survives even when its category was deduped from the checklist.
         clarification_requests = self._build_clarification_requests(sq, missing)
 
+        # User-facing response is a pure passthrough of Step 2's LLM-written
+        # `structured_query.response` when readiness is not `ready`. Step 3
+        # NEVER calls an LLM; if Step 2 left it empty we deterministically
+        # join the clarification questions as a fallback.
+        response = self._resolve_response(sq, status_val, clarification_requests)
+
         summary = self._readiness_summary(status_val, missing, presence)
         status = InputReadinessStatus(
             run_id=run_id,
@@ -589,6 +595,7 @@ class InputReadinessService:
             missing_input_checklist=missing,
             blocking_reasons=blocking,
             clarification_requests=clarification_requests,
+            response=response,
         )
 
         artifact_id = new_artifact_id("input_readiness_status")
@@ -734,6 +741,32 @@ class InputReadinessService:
             )
 
         return requests
+
+    @staticmethod
+    def _resolve_response(
+        structured_query: dict,
+        status_val: str,
+        clarification_requests: list[ClarificationRequest],
+    ) -> str | None:
+        """Pass through Step 2's user-facing `response`, or fall back.
+
+        Pure passthrough + deterministic fallback — NO LLM call. When
+        readiness is `ready` there is nothing to ask, so `None`. Otherwise
+        prefer Step 2's `structured_query.response`; if Step 2 left it empty,
+        join the clarification questions (blocking first) as a fallback.
+        """
+        if status_val == "ready":
+            return None
+        step2_response = structured_query.get("response")
+        if isinstance(step2_response, str) and step2_response.strip():
+            return step2_response.strip()
+        if not clarification_requests:
+            return None
+        ordered = sorted(
+            clarification_requests,
+            key=lambda c: 0 if c.severity == "blocking" else 1,
+        )
+        return " ".join(c.question for c in ordered if c.question)
 
     @staticmethod
     def _readiness_summary(

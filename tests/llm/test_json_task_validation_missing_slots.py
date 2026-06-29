@@ -145,3 +145,43 @@ def test_normalize_is_idempotent():
     )
     twice = normalize_missing_slots({"missing_slots": list(once["missing_slots"])})
     assert twice["missing_slots"] == once["missing_slots"]
+
+
+# ── response normalization ───────────────────────────────────────────────────
+
+
+def test_validator_accepts_string_response():
+    data = _structured_query(response="Please provide the target.")
+    out = validate_task_shape(data, "structured_query", error_factory=_err)
+    assert out["response"] == "Please provide the target."
+
+
+def test_validator_defaults_absent_response_to_none():
+    out = validate_task_shape(_structured_query(), "structured_query", error_factory=_err)
+    assert out["response"] is None
+
+
+def test_validator_does_not_crash_on_non_string_response():
+    out = validate_task_shape(
+        _structured_query(response={"message": "need target"}),
+        "structured_query",
+        error_factory=_err,
+    )
+    assert out["response"] == "need target"
+
+
+def test_normalize_response_scalar_and_none():
+    from app.llm.json_task_validation import normalize_response
+
+    assert normalize_response({})["response"] is None
+    assert normalize_response({"response": None})["response"] is None
+    assert normalize_response({"response": 7})["response"] == "7"
+    assert normalize_response({"response": "  hi  "})["response"] == "hi"
+
+
+def test_normalize_response_truncates_overlong():
+    from app.llm.json_task_validation import normalize_response
+
+    out = normalize_response({"response": "y" * 800})
+    assert len(out["response"]) == 500
+    assert any("truncated response" in w for w in out["parse_warnings"])

@@ -201,3 +201,8 @@ class StructuredQuery(BaseModel):
     # Structured required-slot gaps (additive; defaults to [] so old
     # artifacts without this field still validate).
     missing_slots: list[MissingSlot] = Field(default_factory=list)
+    # User-facing follow-up message the Step 2 LLM writes when missing_slots
+    # is non-empty (additive; None/"" when nothing is missing). The program
+    # only passes this through — it never re-phrases it. Must never carry raw
+    # prompts, keys, file content, or full sequences.
+    response: Optional[str] = None
