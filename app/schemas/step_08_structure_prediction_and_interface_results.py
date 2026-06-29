@@ -128,6 +128,30 @@ class Step8DownstreamHandoff(BaseModel):
     handoff_notes: list[str] = Field(default_factory=list)
 
 
+class ComplexPredictionPlan(BaseModel):
+    tool_name: str
+    input_status: Literal[
+        "ready",
+        "input_missing",
+        "runtime_unavailable",
+        "contract_unresolved",
+        "not_applicable",
+        "selected_but_deferred",
+    ] = "not_applicable"
+    runtime_status: Literal[
+        "not_checked",
+        "runtime_unavailable",
+        "dependency_unavailable",
+        "not_applicable",
+        "ready",
+    ] = "not_checked"
+    can_invoke: bool = False
+    missing_prediction_inputs: list[str] = Field(default_factory=list)
+    sequence_inputs: list[dict] = Field(default_factory=list)
+    structure_inputs: list[dict] = Field(default_factory=list)
+    contract_notes: list[str] = Field(default_factory=list)
+
+
 class CandidateStructureResult(BaseModel):
     candidate_id: str
     structure_input_id: str
@@ -145,6 +169,11 @@ class CandidateStructureResult(BaseModel):
     complex_structure_refs: list[ComplexStructureRef] = Field(default_factory=list)
     interface_analysis_records: list[InterfaceAnalysisRecord] = Field(default_factory=list)
     downstream_handoff: Step8DownstreamHandoff = Field(default_factory=Step8DownstreamHandoff)
+    complex_prediction_plans: list[ComplexPredictionPlan] = Field(default_factory=list)
+    complex_prediction_input_status: Optional[str] = None
+    missing_prediction_inputs: list[str] = Field(default_factory=list)
+    prediction_runtime_status: Optional[str] = None
+    prediction_tool_contract_notes: list[str] = Field(default_factory=list)
 
 
 class StructurePredictionAndInterfaceResults(BaseModel):

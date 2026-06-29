@@ -1261,6 +1261,14 @@ def test_step8_produces_confidence_records_and_keeps_raw_at_ref(
     selected_names = {tc.tool_name for tc in selected}
     assert "PDBePISA_get_interfaces" in selected_names
     assert "get_refinement_resolution_by_pdb_id" in selected_names
+    nim_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
+        and tc.tool_input_summary.get("input_case") == "known_pdb_id"
+    ]
+    assert nim_calls
+    assert all(tc.run_status == "skipped" for tc in nim_calls)
+    assert all(tc.tool_input_summary.get("routing_decision") == "not_applicable" for tc in nim_calls)
     assert "RCSBData_get_entry" not in {tc.tool_name for tc in results.tool_call_records}
     assert "ProteinsPlus_profile_structure_quality" not in {tc.tool_name for tc in results.tool_call_records}
     assert all(tc.run_status in {"success", "dependency_unavailable", "skipped"} for tc in results.tool_call_records)
@@ -1400,6 +1408,13 @@ def test_step8_uploaded_structure_file_path_calls_validation_tools(
         for item in h.missing_for_step9
     ]
     assert "complex_structure_missing" in missing
+    plans = [
+        plan for cr in results.candidate_structure_results
+        for plan in cr.complex_prediction_plans
+    ]
+    assert plans
+    assert any(plan.input_status == "input_missing" for plan in plans)
+    assert any("antigen_antibody_pair" in plan.missing_prediction_inputs or "antigen_sequence" in plan.missing_prediction_inputs for plan in plans)
     tools = {tc.tool_name for tc in results.tool_call_records}
     assert "CrystalStructure_validate" in tools
     assert "ProteinsPlus_profile_structure_quality" not in tools
@@ -1436,29 +1451,98 @@ def test_step8_sequence_only_records_nim_prediction_route_as_unavailable(
     )
     agent.run_step_7(run_id)
     results = agent.run_step_8(run_id)
-    assert results.structure_modeling_status == "partial"
-    assert any(cr.run_status == "partial" for cr in results.candidate_structure_results)
+    assert results.structure_modeling_status == "ok"
+    assert all(cr.run_status == "ok" for cr in results.candidate_structure_results)
     assert all(not cr.complex_structure_refs for cr in results.candidate_structure_results)
     missing = [
         item for cr in results.candidate_structure_results
         for item in cr.downstream_handoff.missing_for_step9
     ]
     assert "complex_structure_missing" in missing
-    assert "complex_prediction_unavailable" in missing
+    assert "antibody_heavy_sequence" in missing
+    assert "antibody_light_sequence" in missing
 
     nim_calls = [
         tc for tc in results.tool_call_records
         if tc.tool_name in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
     ]
     assert nim_calls
-    assert all(tc.run_status == "dependency_unavailable" for tc in nim_calls)
-    assert all(tc.tool_input_summary.get("routing_decision") == "not_applicable" for tc in nim_calls)
-    assert all("NVIDIA NIM runtime" in tc.tool_input_summary.get("reason", "") for tc in nim_calls)
+    assert all(tc.run_status == "skipped" for tc in nim_calls)
+    assert all(tc.tool_input_summary.get("routing_decision") == "input_missing" for tc in nim_calls)
+    assert all("complex_prediction_plan" in tc.tool_input_summary for tc in nim_calls)
+    plans = [
+        plan for cr in results.candidate_structure_results
+        for plan in cr.complex_prediction_plans
+    ]
+    assert plans
+    assert all(plan.input_status == "input_missing" for plan in plans)
+    assert any("antibody_heavy_sequence" in plan.missing_prediction_inputs for plan in plans)
+    assert any("antibody_light_sequence" in plan.missing_prediction_inputs for plan in plans)
 
     blob = json.dumps(results.model_dump())
     assert "MKTAYIAKQNNVG" not in blob
     assert "RAW_PDB_SENTINEL" not in blob
     assert "ATOM      1" not in blob
+
+
+def test_step8_antigen_antibody_sequence_pair_records_nim_deferred_plan(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        referenced_inputs=[{"id_type": "uniprot_id", "value": "P04626", "source": "raw"}],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    antibody["materials"].extend([
+        {
+            "material_id": "heavy_seq_step8",
+            "material_type": "antibody_heavy_chain_sequence",
+            "value": "EVQLVESGGGLVQPGGSLRLSCAAS",
+        },
+        {
+            "material_id": "light_seq_step8",
+            "material_type": "antibody_light_chain_sequence",
+            "value": "DIQMTQSPSSLSASVGDRVTITC",
+        },
+    ])
+    local_storage.write_json(cct_path, cct)
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+
+    assert results.structure_modeling_status == "partial"
+    plans = [
+        plan for cr in results.candidate_structure_results
+        for plan in cr.complex_prediction_plans
+    ]
+    assert plans
+    assert any(plan.input_status == "selected_but_deferred" for plan in plans)
+    assert all(not cr.complex_structure_refs for cr in results.candidate_structure_results)
+    assert any(
+        "complex_prediction_unavailable" in cr.downstream_handoff.missing_for_step9
+        for cr in results.candidate_structure_results
+    )
+    nim_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
+    ]
+    assert nim_calls
+    assert any(tc.run_status == "dependency_unavailable" for tc in nim_calls)
+    assert any(tc.tool_input_summary.get("routing_decision") == "selected_but_deferred" for tc in nim_calls)
+    audit_blob = json.dumps([tc.tool_input_summary for tc in nim_calls])
+    assert "EVQLVES" not in audit_blob
+    assert "DIQMTQ" not in audit_blob
+    assert "sha256_prefix" in audit_blob
 
 
 def test_step8_selected_tool_failure_still_marks_partial(

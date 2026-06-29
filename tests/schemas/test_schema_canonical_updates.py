@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from app.schemas.common import ToolCallRecord
 from app.schemas.step_08_structure_prediction_and_interface_results import (
     CandidateStructureResult,
+    ComplexPredictionPlan,
     ComplexStructureRef,
     InterfaceAnalysisRecord,
     Step8DownstreamHandoff,
@@ -89,6 +90,8 @@ def test_step_08_business_output_fields_are_additive_and_defaulted():
     assert result.complex_structure_refs == []
     assert result.interface_analysis_records == []
     assert result.downstream_handoff == Step8DownstreamHandoff()
+    assert result.complex_prediction_plans == []
+    assert result.missing_prediction_inputs == []
 
 
 def test_step_08_accepts_complex_refs_interface_records_and_handoff():
@@ -125,6 +128,18 @@ def test_step_08_accepts_complex_refs_interface_records_and_handoff():
             interface_quality_available=True,
             refinement_resolution_available=True,
         ),
+        complex_prediction_plans=[
+            ComplexPredictionPlan(
+                tool_name="NvidiaNIM_boltz2",
+                input_status="selected_but_deferred",
+                runtime_status="runtime_unavailable",
+                can_invoke=False,
+                sequence_inputs=[{"sequence_id": "antigen_seq", "chain_role": "antigen"}],
+                contract_notes=["runtime deferred"],
+            )
+        ],
+        complex_prediction_input_status="selected_but_deferred",
+        prediction_runtime_status="runtime_unavailable",
     )
     table = StructurePredictionAndInterfaceResults(
         run_id=_RUN,

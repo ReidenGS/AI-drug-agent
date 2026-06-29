@@ -28,6 +28,7 @@ Hard constraints (architecture v0.1):
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from io import StringIO
 from pathlib import Path
@@ -51,6 +52,7 @@ from ..schemas.step_07_prepared_structure_input_package import (
 )
 from ..schemas.step_08_structure_prediction_and_interface_results import (
     CandidateStructureResult,
+    ComplexPredictionPlan,
     ComplexStructureRef,
     InterfaceAnalysisRecord,
     InterfaceFeature,
@@ -640,6 +642,7 @@ class StructureAndDesignAgent:
             interface_features: list[InterfaceFeature] = []
             interface_analysis_records: list[InterfaceAnalysisRecord] = []
             complex_structure_refs: list[ComplexStructureRef] = []
+            complex_prediction_plans: list[ComplexPredictionPlan] = []
             run_status = "ok"
             partial = False
 
@@ -679,6 +682,9 @@ class StructureAndDesignAgent:
 
             for tc in routed_calls:
                 tool_calls.append(tc)
+                plan = _complex_prediction_plan_from_tool_call(tc)
+                if plan:
+                    complex_prediction_plans.append(plan)
                 if tc.run_status == "success":
                     conf_type = _confidence_type_for_step8_tool(tc.tool_name)
                     confidence_records.append(
@@ -739,7 +745,13 @@ class StructureAndDesignAgent:
                         interface_analysis_records=interface_analysis_records,
                         confidence_records=confidence_records,
                         tool_calls=routed_calls,
+                        complex_prediction_plans=complex_prediction_plans,
                     ),
+                    complex_prediction_plans=complex_prediction_plans,
+                    complex_prediction_input_status=_summarize_prediction_input_status(complex_prediction_plans),
+                    missing_prediction_inputs=_summarize_missing_prediction_inputs(complex_prediction_plans),
+                    prediction_runtime_status=_summarize_prediction_runtime_status(complex_prediction_plans),
+                    prediction_tool_contract_notes=_summarize_prediction_contract_notes(complex_prediction_plans),
                 )
             )
 
@@ -866,8 +878,6 @@ class StructureAndDesignAgent:
 
         pdb_id = _step8_pdb_id(sin.get("structure_refs") or [])
         local_ref = _step8_local_structure_ref(self.storage, sin.get("structure_refs") or [])
-        has_sequences = bool(sin.get("sequence_refs_for_prediction") or [])
-
         if "CrystalStructure_validate" in scoped_tools:
             if input_case == "uploaded_structure_file" and local_ref:
                 _run(
@@ -910,16 +920,36 @@ class StructureAndDesignAgent:
         for tool_name in sorted(_STEP8_NIM_COMPLEX_TOOLS):
             if tool_name not in scoped_tools:
                 continue
-            if input_case == "sequence_only_input" and has_sequences:
-                _skip(
-                    tool_name,
-                    "complex prediction route requires audited NVIDIA NIM runtime and argument contract; explicit deferred Step 8 route",
-                    status="dependency_unavailable",
+            plan = _plan_step8_nim_complex_prediction(tool_name, sin)
+            if plan.input_status == "selected_but_deferred":
+                calls.append(
+                    _nonexecuted_tool_record(
+                        tool_name=tool_name,
+                        agent_name=_AGENT_NAME,
+                        step_id=_STEP_08,
+                        run_status="dependency_unavailable",
+                        summary={
+                            **_summary_base(),
+                            "routing_decision": "selected_but_deferred",
+                            "reason": "NvidiaNIM complex prediction input appears sufficient, but wrapper/runtime is deferred",
+                            "complex_prediction_plan": plan.model_dump(),
+                        },
+                    )
                 )
             else:
-                _skip(
-                    tool_name,
-                    "complex prediction not applicable for this prepared structure input",
+                calls.append(
+                    _nonexecuted_tool_record(
+                        tool_name=tool_name,
+                        agent_name=_AGENT_NAME,
+                        step_id=_STEP_08,
+                        run_status="skipped",
+                        summary={
+                            **_summary_base(),
+                            "routing_decision": plan.input_status,
+                            "reason": "; ".join(plan.contract_notes) or plan.input_status,
+                            "complex_prediction_plan": plan.model_dump(),
+                        },
+                    )
                 )
 
         if "dynamic_package_discovery" in scoped_tools:
@@ -1785,6 +1815,125 @@ def _step8_tool_call_affects_partial(tc: ToolCallRecord) -> bool:
     return False
 
 
+def _plan_step8_nim_complex_prediction(tool_name: str, sin: dict) -> ComplexPredictionPlan:
+    input_case = sin.get("input_case")
+    if input_case == "known_pdb_id":
+        return ComplexPredictionPlan(
+            tool_name=tool_name,
+            input_status="not_applicable",
+            runtime_status="not_applicable",
+            can_invoke=False,
+            structure_inputs=_compact_prediction_structure_inputs(sin),
+            contract_notes=["existing PDB/interface route is preferred; complex prediction not needed"],
+        )
+
+    if input_case == "uploaded_structure_file" and _step8_has_explicit_complex_evidence(sin):
+        return ComplexPredictionPlan(
+            tool_name=tool_name,
+            input_status="not_applicable",
+            runtime_status="not_applicable",
+            can_invoke=False,
+            structure_inputs=_compact_prediction_structure_inputs(sin),
+            contract_notes=["uploaded/local structure already has explicit complex chain evidence"],
+        )
+
+    sequence_inputs = _compact_prediction_sequence_inputs(sin)
+    mapping = sin.get("antigen_antibody_mapping") or {}
+    antigen_ids = list(mapping.get("antigen_sequence_ids") or [])
+    heavy_ids = list(mapping.get("antibody_heavy_sequence_ids") or [])
+    light_ids = list(mapping.get("antibody_light_sequence_ids") or [])
+
+    roles = {entry.get("chain_role") for entry in sequence_inputs}
+    if not antigen_ids:
+        antigen_ids = [entry["sequence_id"] for entry in sequence_inputs if entry.get("chain_role") == "antigen"]
+    if not heavy_ids:
+        heavy_ids = [entry["sequence_id"] for entry in sequence_inputs if entry.get("chain_role") == "antibody_heavy"]
+    if not light_ids:
+        light_ids = [entry["sequence_id"] for entry in sequence_inputs if entry.get("chain_role") == "antibody_light"]
+
+    missing: list[str] = []
+    if not antigen_ids:
+        missing.append("antigen_sequence")
+    if not heavy_ids and "antibody" not in roles:
+        missing.append("antibody_heavy_sequence")
+    if not light_ids and "antibody" not in roles:
+        missing.append("antibody_light_sequence")
+
+    if missing:
+        return ComplexPredictionPlan(
+            tool_name=tool_name,
+            input_status="input_missing",
+            runtime_status="not_checked",
+            can_invoke=False,
+            missing_prediction_inputs=missing,
+            sequence_inputs=sequence_inputs,
+            structure_inputs=_compact_prediction_structure_inputs(sin),
+            contract_notes=["missing antigen-antibody pair sequence input for complex prediction"],
+        )
+
+    return ComplexPredictionPlan(
+        tool_name=tool_name,
+        input_status="selected_but_deferred",
+        runtime_status="runtime_unavailable",
+        can_invoke=False,
+        sequence_inputs=sequence_inputs,
+        structure_inputs=_compact_prediction_structure_inputs(sin),
+        contract_notes=[
+            "antigen and antibody sequence refs are available",
+            "NvidiaNIM wrapper/runtime/API-key contract is deferred",
+        ],
+    )
+
+
+def _complex_prediction_plan_from_tool_call(tc: ToolCallRecord) -> ComplexPredictionPlan | None:
+    summary = tc.tool_input_summary or {}
+    raw = summary.get("complex_prediction_plan")
+    if not isinstance(raw, dict):
+        return None
+    return ComplexPredictionPlan.model_validate(raw)
+
+
+def _compact_prediction_sequence_inputs(sin: dict) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for seq in sin.get("sequence_refs_for_prediction") or []:
+        if not isinstance(seq, dict):
+            continue
+        item = {
+            "sequence_id": seq.get("sequence_id"),
+            "chain_role": seq.get("chain_role"),
+            "prediction_input_kind": seq.get("prediction_input_kind"),
+            "source_kind": seq.get("source_kind"),
+            "source_ref": seq.get("source_ref"),
+            "sequence_value_status": seq.get("sequence_value_status"),
+            "resource_binding_status": seq.get("resource_binding_status"),
+        }
+        sequence = seq.get("sequence")
+        if isinstance(sequence, str) and sequence:
+            item["sequence_length"] = len(sequence)
+            item["sha256_prefix"] = hashlib.sha256(sequence.encode("utf-8")).hexdigest()[:12]
+        out.append({k: v for k, v in item.items() if v not in (None, "", [])})
+    return out
+
+
+def _compact_prediction_structure_inputs(sin: dict) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for sref in sin.get("structure_refs") or []:
+        if not isinstance(sref, dict):
+            continue
+        out.append(
+            {
+                k: v for k, v in {
+                    "source_kind": sref.get("source_kind"),
+                    "source_ref": sref.get("source_ref"),
+                    "pdb_id": sref.get("pdb_id"),
+                    "structure_format": sref.get("structure_format"),
+                    "resource_binding_status": sref.get("resource_binding_status"),
+                }.items() if v not in (None, "", [])
+            }
+        )
+    return out
+
+
 def _artifact_type_for_tool(tool_name: str) -> str:
     if tool_name == "CrystalStructure_validate":
         return "refinement_or_validation_report"
@@ -1984,6 +2133,7 @@ def _build_step8_downstream_handoff(
     interface_analysis_records: list[InterfaceAnalysisRecord],
     confidence_records: list[StructureConfidenceRecord],
     tool_calls: list[ToolCallRecord],
+    complex_prediction_plans: list[ComplexPredictionPlan],
 ) -> Step8DownstreamHandoff:
     missing: list[str] = []
     notes: list[str] = []
@@ -2006,6 +2156,12 @@ def _build_step8_downstream_handoff(
     ):
         missing.append("complex_prediction_unavailable")
         notes.append("NvidiaNIM complex prediction route is deferred/unavailable")
+    for plan in complex_prediction_plans:
+        for item in plan.missing_prediction_inputs:
+            missing.append(item)
+        if plan.input_status == "contract_unresolved":
+            missing.append("complex_prediction_contract_unresolved")
+        notes.extend(plan.contract_notes)
 
     structure_ref = None
     if true_complex_refs:
@@ -2026,6 +2182,48 @@ def _build_step8_downstream_handoff(
         missing_for_step9=list(dict.fromkeys(missing)),
         handoff_notes=notes,
     )
+
+
+def _summarize_prediction_input_status(plans: list[ComplexPredictionPlan]) -> str | None:
+    if not plans:
+        return None
+    statuses = {plan.input_status for plan in plans}
+    if "selected_but_deferred" in statuses:
+        return "selected_but_deferred"
+    if "input_missing" in statuses:
+        return "input_missing"
+    if "contract_unresolved" in statuses:
+        return "contract_unresolved"
+    if statuses == {"not_applicable"}:
+        return "not_applicable"
+    return sorted(statuses)[0]
+
+
+def _summarize_missing_prediction_inputs(plans: list[ComplexPredictionPlan]) -> list[str]:
+    out: list[str] = []
+    for plan in plans:
+        out.extend(plan.missing_prediction_inputs)
+    return list(dict.fromkeys(out))
+
+
+def _summarize_prediction_runtime_status(plans: list[ComplexPredictionPlan]) -> str | None:
+    if not plans:
+        return None
+    statuses = {plan.runtime_status for plan in plans}
+    if "runtime_unavailable" in statuses:
+        return "runtime_unavailable"
+    if "dependency_unavailable" in statuses:
+        return "dependency_unavailable"
+    if statuses == {"not_applicable"}:
+        return "not_applicable"
+    return sorted(statuses)[0]
+
+
+def _summarize_prediction_contract_notes(plans: list[ComplexPredictionPlan]) -> list[str]:
+    out: list[str] = []
+    for plan in plans:
+        out.extend(plan.contract_notes)
+    return list(dict.fromkeys(out))
 
 
 def _prediction_model_ref(payload: dict[str, Any] | None) -> str | None:
