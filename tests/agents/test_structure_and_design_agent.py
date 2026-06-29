@@ -1117,6 +1117,9 @@ def test_step8_produces_confidence_records_and_keeps_raw_at_ref(
     agent.run_step_7(run_id)
     results = agent.run_step_8(run_id)
 
+    assert results.structure_modeling_status == "ok"
+    assert all(cr.run_status == "ok" for cr in results.candidate_structure_results)
+
     confidence_types = {
         c.confidence_type for cr in results.candidate_structure_results
         for c in cr.structure_confidence_records
@@ -1229,6 +1232,8 @@ def test_step8_uploaded_structure_file_path_calls_validation_tools(
     )
     agent.run_step_7(run_id)
     results = agent.run_step_8(run_id)
+    assert results.structure_modeling_status == "ok"
+    assert all(cr.run_status == "ok" for cr in results.candidate_structure_results)
     tools = {tc.tool_name for tc in results.tool_call_records}
     assert "CrystalStructure_validate" in tools
     assert "ProteinsPlus_profile_structure_quality" not in tools
@@ -1265,6 +1270,8 @@ def test_step8_sequence_only_records_nim_prediction_route_as_unavailable(
     )
     agent.run_step_7(run_id)
     results = agent.run_step_8(run_id)
+    assert results.structure_modeling_status == "partial"
+    assert any(cr.run_status == "partial" for cr in results.candidate_structure_results)
 
     nim_calls = [
         tc for tc in results.tool_call_records
@@ -1279,6 +1286,49 @@ def test_step8_sequence_only_records_nim_prediction_route_as_unavailable(
     assert "MKTAYIAKQNNVG" not in blob
     assert "RAW_PDB_SENTINEL" not in blob
     assert "ATOM      1" not in blob
+
+
+def test_step8_selected_tool_failure_still_marks_partial(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        referenced_inputs=[
+            {"id_type": "pdb_id", "value": "1N8Z", "source": "raw_request_text"},
+        ],
+    )
+
+    def _fail_pisa(**_):
+        raise RuntimeError("pisa unavailable")
+
+    mcp = LocalMCPClient(
+        inventory=ToolInventoryService(
+            os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))
+        ),
+        bindings=_bindings_with_step8_overrides(
+            {
+                "PDBePISA_get_interfaces": _fail_pisa,
+                "get_refinement_resolution_by_pdb_id":
+                    lambda **kw: {"resolution_angstrom": 2.0, "pdb_id": kw.get("pdb_id")},
+            }
+        ),
+    )
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=mcp,
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+
+    assert results.structure_modeling_status == "partial"
+    failed = [tc for tc in results.tool_call_records if tc.tool_name == "PDBePISA_get_interfaces"]
+    assert failed
+    assert any(tc.run_status == "failed" for tc in failed)
+    assert any(tc.tool_input_summary.get("routing_decision") == "selected" for tc in failed)
 
 
 # ── Step 9 ──────────────────────────────────────────────────────────────────

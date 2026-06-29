@@ -8,9 +8,11 @@ tool-calling agent. The three entry points are:
   candidate materials). One optional `RCSBData_get_entry` enrichment call per
   PDB id, by reference only.
 - `run_step_8(run_id)` — per `StructureInputRecord`, route to a small subset
-  of v0.2 inventory tools depending on `input_case`. Emit confidence /
-  validation records and `output_artifacts[]` pointing at raw payloads
-  stored under `tool_outputs/step_08/{tool_call_id}.json`.
+  consumes Step 7 prepared structure inputs and routes only `step_08`
+  scoped tools for existing complex interface evaluation, structure
+  validation/refinement lookup, and deferred complex-prediction audit.
+  Raw outputs are referenced via `output_artifacts[]` and stored under
+  `tool_outputs/step_08/{tool_call_id}.json`.
 - `run_step_9(run_id)` — compound library screening for compound-component
   candidates. Routes to ZINC tools when SMILES, ZINC id, or compound name is
   present. **No record claims `ZINC22` confirmation**; `source_library` stays
@@ -664,8 +666,11 @@ class StructureAndDesignAgent:
                                 },
                             )
                         )
-                run_status = "partial"
-                partial = True
+                    run_status = "partial"
+                    partial = True
+                elif input_case == "known_pdb_id":
+                    run_status = "partial"
+                    partial = True
 
             for tc in routed_calls:
                 tool_calls.append(tc)
@@ -695,7 +700,7 @@ class StructureAndDesignAgent:
                                 created_at=tc.finished_at,
                             )
                         )
-                elif tc.run_status in {"dependency_unavailable", "failed", "skipped"}:
+                elif _step8_tool_call_affects_partial(tc):
                     partial = True
                     if tc.run_status == "failed":
                         any_failed = True
@@ -1744,6 +1749,20 @@ def _confidence_type_for_step8_tool(tool_name: str) -> str:
     if tool_name in _STEP8_NIM_COMPLEX_TOOLS:
         return "prediction_confidence"
     return "other"
+
+
+def _step8_tool_call_affects_partial(tc: ToolCallRecord) -> bool:
+    if tc.run_status == "success":
+        return False
+    summary = tc.tool_input_summary or {}
+    routing_decision = summary.get("routing_decision")
+    if tc.run_status in {"failed", "dependency_unavailable", "partial"}:
+        return True
+    if routing_decision == "scope_unavailable":
+        return True
+    if routing_decision == "selected":
+        return True
+    return False
 
 
 def _artifact_type_for_tool(tool_name: str) -> str:
