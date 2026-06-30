@@ -23,6 +23,9 @@ from ..agents.step_06_capability_registry import (
 )
 from ..agents.step_06_interpretation import (
     aggregate_lane_risk,
+    derive_candidate_interpretation,
+    derive_lane_assessment,
+    derive_missing_lane_assessment,
     interpret_tool_payload,
     lane_summary as build_lane_summary,
 )
@@ -142,6 +145,7 @@ class DevelopabilityAgent:
             active_lanes: list[LaneType] = []
             for lane_type in _LANE_TYPES:
                 if not force_fail_open and not _lane_active_from_modality(lane_type, modality_summary):
+                    missing_assessment = derive_missing_lane_assessment(lane_type)
                     lane_results.append(
                         LaneResult(
                             lane_type=lane_type,
@@ -152,6 +156,7 @@ class DevelopabilityAgent:
                             liability_flags=[],
                             lane_risk_category="unknown",
                             lane_summary=_lane_missing_summary(lane_type),
+                            **missing_assessment,
                         )
                     )
                     continue
@@ -312,6 +317,25 @@ class DevelopabilityAgent:
                     "status": runtime_status,
                     "selected_tool_names": [plan.tool_name for plan in plans],
                 })
+                lane_risk_category = aggregate_lane_risk(
+                    lane_flags,
+                    any_success=any_success,
+                    all_dependency_unavailable=all_dep_unavail,
+                )
+                lane_assessment = derive_lane_assessment(
+                    lane_type=lane_type,
+                    plans_present=bool(plans),
+                    flags=lane_flags,
+                    lane_risk_category=lane_risk_category,
+                    any_success=any_success,
+                    all_dependency_unavailable=all_dep_unavail,
+                    has_upstream_error=any(
+                        _tool_call_output_envelope_status(r) == "upstream_error"
+                        for r in tool_records
+                    ),
+                    any_failed=any(r.run_status == "failed" for r in tool_records),
+                    tool_records=tool_records,
+                )
                 lane_results.append(
                     LaneResult(
                         lane_type=lane_type,
@@ -321,11 +345,7 @@ class DevelopabilityAgent:
                         tool_call_records=tool_records,
                         argument_mapping_audit=argument_mapping_audit,
                         liability_flags=lane_flags,
-                        lane_risk_category=aggregate_lane_risk(
-                            lane_flags,
-                            any_success=any_success,
-                            all_dependency_unavailable=all_dep_unavail,
-                        ),
+                        lane_risk_category=lane_risk_category,
                         lane_summary=_compose_lane_summary(
                             lane_type=lane_type,
                             candidate=candidate,
@@ -336,17 +356,26 @@ class DevelopabilityAgent:
                                 lane_type=lane_type,
                             ),
                         ),
+                        **lane_assessment,
                     )
                 )
 
             cand_status = _candidate_status(lane_results)
+            cand_interp = derive_candidate_interpretation(lane_results)
             candidate_liabilities.append(
                 CandidateLiability(
                     candidate_id=candidate.get("candidate_id", "unknown"),
                     candidate_prefilter_status=cand_status,
                     lane_results=lane_results,
-                    candidate_overall_liability_label="unknown",
-                    recommended_action="insufficient_data",
+                    candidate_overall_liability_label=cand_interp[
+                        "candidate_overall_liability_label"
+                    ],
+                    recommended_action=cand_interp["recommended_action"],
+                    context_completeness=cand_interp["context_completeness"],
+                    assessed_lane_count=cand_interp["assessed_lane_count"],
+                    not_assessed_lane_count=cand_interp["not_assessed_lane_count"],
+                    interpretation_summary=cand_interp["interpretation_summary"],
+                    missing_or_unassessed_items=cand_interp["missing_or_unassessed_items"],
                 )
             )
 

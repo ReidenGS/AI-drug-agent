@@ -333,6 +333,284 @@ _LANE_UNASSESSED_NOTES: dict[str, str] = {
 }
 
 
+# ── Reviewer-facing structured interpretation ──────────────────────────────
+#
+# Translate lane execution + interpreted flags into explicit assessment_status
+# / risk_label / not_assessed_reason / interpreted_findings /
+# missing_or_unassessed_items. Pure functions over already-computed inputs —
+# they do NOT change tool selection, schema mapping, MCP calls, or runtime
+# resolution, and never read or emit raw payloads / sequences.
+
+# Per-lane required typed input that, when absent, makes the lane
+# `not_assessed_missing_input`. Used to build structured gap entries.
+_LANE_REQUIRED_INPUT: dict[str, dict[str, str]] = {
+    _SMALL_MOLECULE_LANE: {
+        "item": "payload/linker compound SMILES",
+        "reason": "no payload/linker SMILES available for this candidate",
+        "suggested_next_input": "a payload or linker SMILES string",
+    },
+    _ANTIBODY_LANE: {
+        "item": "antibody heavy/light chain sequence",
+        "reason": "no antibody protein sequence available for this candidate",
+        "suggested_next_input": "antibody heavy and/or light chain amino-acid sequence",
+    },
+    _ANTIGEN_LANE: {
+        "item": "antigen UniProt / accession",
+        "reason": "no target/antigen UniProt accession available for this candidate",
+        "suggested_next_input": "a target/antigen UniProt accession",
+    },
+    _STRUCTURE_LANE: {
+        "item": "structure / PDB reference",
+        "reason": "no structure or PDB reference available for this candidate",
+        "suggested_next_input": "a PDB ID or uploaded structure file",
+    },
+    "compound_bioactivity_prior_context": {
+        "item": "compound ChEMBL ID",
+        "reason": "no compound ChEMBL ID available for this candidate",
+        "suggested_next_input": "a compound ChEMBL ID",
+    },
+}
+
+# severity → reviewer risk label.
+_SEVERITY_TO_LABEL = {"high": "high", "medium": "review", "low": "low"}
+
+
+def lane_missing_input_item(lane_type: str) -> dict:
+    """Structured (not free-text) missing-input descriptor for a lane."""
+    spec = _LANE_REQUIRED_INPUT.get(
+        lane_type,
+        {
+            "item": "required typed input",
+            "reason": "required input not available for this candidate",
+            "suggested_next_input": "the input this lane consumes",
+        },
+    )
+    return {
+        "item": spec["item"],
+        "reason": spec["reason"],
+        "blocking": False,
+        "suggested_next_input": spec["suggested_next_input"],
+    }
+
+
+def interpreted_findings_from_flags(
+    flags: list[dict], tool_records: Optional[list[Any]] = None
+) -> list[dict]:
+    """Map compact liability flags to reviewer-facing interpreted findings.
+
+    Carries only short evidence + source references (tool name + tool_call_id
+    by reference), never the raw payload.
+    """
+    ref_to_call_id: dict[str, str] = {}
+    for record in tool_records or []:
+        ref = getattr(record, "tool_output_ref", None)
+        call_id = getattr(record, "tool_call_id", None)
+        if ref and call_id:
+            ref_to_call_id[ref] = call_id
+    out: list[dict] = []
+    for flag in flags:
+        source_ref = flag.get("source_ref")
+        source_tool = flag.get("source_tool")
+        call_ids = [ref_to_call_id[source_ref]] if source_ref in ref_to_call_id else []
+        out.append(
+            {
+                "finding_type": flag.get("flag_type"),
+                "label": _SEVERITY_TO_LABEL.get(str(flag.get("severity")), "review"),
+                "evidence_summary": flag.get("evidence_summary"),
+                "source_tools": [source_tool] if source_tool else [],
+                "source_tool_call_ids": call_ids,
+            }
+        )
+    return out
+
+
+def derive_lane_assessment(
+    *,
+    lane_type: str,
+    plans_present: bool,
+    flags: list[dict],
+    lane_risk_category: str,
+    any_success: bool,
+    all_dependency_unavailable: bool,
+    has_upstream_error: bool,
+    any_failed: bool,
+    tool_records: Optional[list[Any]] = None,
+) -> dict:
+    """Compute additive reviewer-facing fields for ONE active lane."""
+    findings = interpreted_findings_from_flags(flags, tool_records)
+    # Always surface the ADC-developability aspects Step 6 does not assess.
+    not_assessed_note = _LANE_UNASSESSED_NOTES.get(lane_type)
+    extra_unassessed: list[dict] = []
+    if not_assessed_note:
+        extra_unassessed.append(
+            {
+                "item": "ADC-specific developability aspects",
+                "reason": not_assessed_note,
+                "blocking": False,
+                "suggested_next_input": "downstream ADC-stage assessment",
+            }
+        )
+
+    if not plans_present:
+        return {
+            "assessment_status": "not_assessed_missing_input",
+            "risk_label": "not_assessed",
+            "not_assessed_reason": (
+                "no invokable tool for this lane (required typed input could "
+                "not be resolved)"
+            ),
+            "interpreted_findings": [],
+            "missing_or_unassessed_items": [lane_missing_input_item(lane_type)],
+        }
+    if has_upstream_error:
+        return {
+            "assessment_status": "partial_upstream_error",
+            "risk_label": "review",
+            "not_assessed_reason": (
+                "one or more tool calls returned an upstream_error envelope; "
+                "lane is not cleanly assessed"
+            ),
+            "interpreted_findings": findings,
+            "missing_or_unassessed_items": extra_unassessed,
+        }
+    if all_dependency_unavailable:
+        return {
+            "assessment_status": "not_assessed_dependency_unavailable",
+            "risk_label": "not_assessed",
+            "not_assessed_reason": "tool dependency unavailable in this runtime",
+            "interpreted_findings": [],
+            "missing_or_unassessed_items": extra_unassessed,
+        }
+    if not any_success:
+        return {
+            "assessment_status": "failed",
+            "risk_label": "unknown",
+            "not_assessed_reason": "tool call(s) did not produce a usable output",
+            "interpreted_findings": findings,
+            "missing_or_unassessed_items": extra_unassessed,
+        }
+    if flags:
+        risk = "high" if lane_risk_category == "high" else "review"
+        return {
+            "assessment_status": "signal_detected",
+            "risk_label": risk,
+            "not_assessed_reason": None,
+            "interpreted_findings": findings,
+            "missing_or_unassessed_items": extra_unassessed,
+        }
+    # Ran successfully, no interpreted liability signal.
+    return {
+        "assessment_status": "no_signal",
+        "risk_label": "low",
+        "not_assessed_reason": None,
+        "interpreted_findings": [],
+        "missing_or_unassessed_items": extra_unassessed,
+    }
+
+
+def derive_missing_lane_assessment(lane_type: str) -> dict:
+    """Reviewer-facing fields for a lane skipped due to missing input."""
+    item = lane_missing_input_item(lane_type)
+    return {
+        "assessment_status": "not_assessed_missing_input",
+        "risk_label": "not_assessed",
+        "not_assessed_reason": item["reason"],
+        "interpreted_findings": [],
+        "missing_or_unassessed_items": [item],
+    }
+
+
+_ASSESSED_STATUSES = {"assessed", "no_signal", "signal_detected"}
+
+
+def derive_candidate_interpretation(lane_results: list[Any]) -> dict:
+    """Aggregate lane assessments into a candidate-level interpretation.
+
+    A candidate with only some lanes assessed is explicitly `partial` context
+    and never reported as fully acceptable.
+    """
+    statuses = [getattr(lr, "assessment_status", "not_assessed_missing_input") for lr in lane_results]
+    risk_labels = [getattr(lr, "risk_label", "not_assessed") for lr in lane_results]
+    assessed = [s for s in statuses if s in _ASSESSED_STATUSES]
+    assessed_count = len(assessed)
+    not_assessed_count = len(statuses) - assessed_count
+
+    if assessed_count == 0:
+        completeness = "none"
+    elif not_assessed_count == 0:
+        completeness = "complete"
+    else:
+        completeness = "partial"
+
+    has_high = "high" in risk_labels
+    has_signal = any(s == "signal_detected" for s in statuses)
+    has_upstream = any(s == "partial_upstream_error" for s in statuses)
+
+    if has_high:
+        label = "high-risk"
+    elif has_signal or has_upstream or completeness == "partial":
+        # Any liability signal, an upstream error, OR incomplete context →
+        # not fully acceptable, needs reviewer attention.
+        label = "review"
+    elif completeness == "complete":
+        label = "acceptable"
+    else:
+        label = "unknown"
+
+    if has_high:
+        action = "deprioritize"
+    elif completeness == "none":
+        action = "insufficient_data"
+    elif completeness == "complete" and not (has_signal or has_upstream):
+        action = "continue"
+    else:
+        action = "continue_with_review"
+
+    # Aggregate structured gaps from lanes (dedup by (item, reason)).
+    aggregated: list[dict] = []
+    seen: set[tuple] = set()
+    for lr in lane_results:
+        for item in getattr(lr, "missing_or_unassessed_items", []) or []:
+            key = (item.get("item"), item.get("reason"))
+            if key in seen:
+                continue
+            seen.add(key)
+            aggregated.append(item)
+
+    assessed_lanes = [
+        getattr(lr, "lane_type", "?") for lr in lane_results
+        if getattr(lr, "assessment_status", "") in _ASSESSED_STATUSES
+    ]
+    not_assessed_lanes = [
+        getattr(lr, "lane_type", "?") for lr in lane_results
+        if getattr(lr, "assessment_status", "") not in _ASSESSED_STATUSES
+    ]
+    summary = (
+        f"{assessed_count} of {len(lane_results)} lane(s) assessed "
+        f"[{', '.join(assessed_lanes) or 'none'}]; "
+        f"not assessed [{', '.join(not_assessed_lanes) or 'none'}]; "
+        f"context {completeness}; "
+        + (
+            "liability signal detected" if has_signal
+            else "no liability signal from assessed lanes"
+        )
+        + ("; upstream_error present" if has_upstream else "")
+        + (
+            "; context incomplete — not fully acceptable"
+            if completeness != "complete" else ""
+        )
+    )
+    return {
+        "context_completeness": completeness,
+        "assessed_lane_count": assessed_count,
+        "not_assessed_lane_count": not_assessed_count,
+        "candidate_overall_liability_label": label,
+        "recommended_action": action,
+        "interpretation_summary": summary,
+        "missing_or_unassessed_items": aggregated,
+    }
+
+
 def lane_summary(
     *,
     tool_records_summary: str,
