@@ -598,3 +598,136 @@ def test_step3_response_does_not_leak_sequences_or_keys(
     assert heavy not in blob
     assert "api_key" not in blob.lower()
     assert "system instructions" not in blob.lower()
+
+
+# ── antibody heavy/light sequence developability assessment ──────────────────
+
+
+def _seed_sequence_developability(
+    local_storage, registry_service, workflow_state_service, *, missing_slots=None
+) -> str:
+    """A developability_assessment run carrying antibody heavy/light chain
+    sequence referenced_inputs (no target/payload/linker)."""
+    intake = IntakeService(local_storage, registry_service, workflow_state_service)
+    rec = intake.submit(
+        raw_user_query=(
+            "Run a developability/liability pre-filter on these antibody "
+            "heavy and light chain sequences."
+        ),
+        user_provided_context={},
+    )
+    run_id = rec.run_id
+    sq = StructuredQuery(
+        run_id=run_id,
+        parsed_at=now_iso(),
+        source_raw_request_ref=SourceRawRequestRef(
+            raw_request_record_id=registry_service.get(run_id).active_artifacts.raw_request_record_id
+        ),
+        task_intent=TaskIntent(
+            task_type="developability_assessment",
+            primary_intent="developability_assessment",
+        ),
+        referenced_inputs=[
+            {"id_type": "antibody_heavy_chain_sequence", "value": "EVQLHEAVY", "source": "user"},
+            {"id_type": "antibody_light_chain_sequence", "value": "DIQMLIGHT", "source": "user"},
+        ],
+        missing_slots=missing_slots or [],
+        canonical_query=(
+            "developability/liability pre-filter for antibody heavy/light "
+            "sequences, not new ADC design"
+        ),
+    )
+    sq_id = new_artifact_id("structured_query")
+    local_storage.write_json(
+        local_storage.run_key(run_id, "inputs/structured_query.json"),
+        {"artifact_id": sq_id, **sq.model_dump()},
+    )
+    registry_service.update_active(run_id, structured_query_id=sq_id)
+    workflow_state_service.mark(run_id, "step_02", "completed")
+    return run_id
+
+
+def test_step3_sequence_developability_not_blocked(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_developability(
+        local_storage, registry_service, workflow_state_service
+    )
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+    assert out.input_readiness_status != "blocked"
+    assert not out.blocking_reasons
+    # No target gap fabricated from the legacy ADC checklist.
+    assert not any(m.category == "target" for m in out.missing_input_checklist)
+
+
+def test_step3_sequence_developability_does_not_ask_for_target(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_developability(
+        local_storage, registry_service, workflow_state_service
+    )
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+    assert not out.response or "target" not in out.response.lower()
+
+
+def test_step3_sequence_input_present_and_evidence(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_developability(
+        local_storage, registry_service, workflow_state_service
+    )
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+    p = out.basic_adc_input_presence
+    assert p.sequence_input_present is True
+    assert p.structure_or_sequence_present is True
+    assert p.antibody_candidate_present is True
+    assert p.sequence_input_evidence == (
+        "structured_query.referenced_inputs[id_type=antibody_heavy_chain_sequence]"
+    )
+    assert p.antibody_evidence == (
+        "structured_query.referenced_inputs[id_type=antibody_heavy_chain_sequence]"
+    )
+
+
+def test_step3_sequence_developability_still_blocks_on_blocking_missing_slot(
+    local_storage, registry_service, workflow_state_service
+):
+    """Intent gating suppresses the legacy checklist, but a Step 2 blocking
+    missing_slot still floors readiness to blocked."""
+    run_id = _seed_sequence_developability(
+        local_storage, registry_service, workflow_state_service,
+        missing_slots=[
+            MissingSlot(
+                slot_name="structure_or_sequence",
+                slot_category="sequence",
+                severity="blocking",
+                reason="Sequences could not be parsed.",
+                suggested_question="Please re-upload the antibody sequences.",
+            )
+        ],
+    )
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+    assert out.input_readiness_status == "blocked"
+    assert out.blocking_reasons
+
+
+def test_step3_sequence_developability_no_raw_sequence_leak(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_developability(
+        local_storage, registry_service, workflow_state_service
+    )
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+    blob = str(out.model_dump())
+    assert "EVQLHEAVY" not in blob
+    assert "DIQMLIGHT" not in blob

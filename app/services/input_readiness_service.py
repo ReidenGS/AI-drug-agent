@@ -120,6 +120,28 @@ _MISSING_SLOT_CATEGORY_TO_GAP = {
 }
 
 
+# `referenced_inputs` id_types that count as a protein/antibody SEQUENCE
+# input (alongside FASTA uploads and an inline chain on a Step 2 entity).
+_ANTIBODY_SEQUENCE_REF_ID_TYPES = {
+    "antibody_heavy_chain_sequence",
+    "antibody_light_chain_sequence",
+    "antibody_sequence_reference",
+}
+_SEQUENCE_REF_ID_TYPES = {"uniprot_id", *_ANTIBODY_SEQUENCE_REF_ID_TYPES}
+
+# Intents where Step 2's `missing_slots` (per its required_slot_schema) owns
+# the gap assessment, so Step 3 must NOT re-impose the legacy new-ADC-design
+# checklist (target / antibody / payload / linker). For these the readiness
+# floor comes from `missing_slots` + presence signals only.
+_NON_DESIGN_INTENTS = {
+    "developability_assessment",
+    "structure_analysis",
+    "compound_screening",
+    "literature_review",
+    "patent_ip_review",
+}
+
+
 _PDB_EXTS = {".pdb", ".cif", ".mmcif", ".ent"}
 _FASTA_EXTS = {".fasta", ".fa", ".faa", ".seq"}
 _CSV_EXTS = {".csv", ".tsv", ".xlsx", ".xls"}
@@ -357,11 +379,14 @@ class InputReadinessService:
         )
 
         # Split structure / sequence signals (the combined field stays for
-        # downstream agents that already read it).
+        # downstream agents that already read it). Heavy/light/generic
+        # antibody chain references in `referenced_inputs` are sequence input.
+        antibody_seq_ref_types = sorted(ref_id_types & _ANTIBODY_SEQUENCE_REF_ID_TYPES)
+        has_antibody_seq_ref = bool(antibody_seq_ref_types)
         structure_present = any_structure_file or "pdb_id" in ref_id_types
         sequence_present = (
             any_sequence_file
-            or "uniprot_id" in ref_id_types
+            or bool(ref_id_types & _SEQUENCE_REF_ID_TYPES)
             or _has_explicit_chain_sequence(entities)
         )
         structure_or_sequence_present = structure_present or sequence_present
@@ -375,6 +400,11 @@ class InputReadinessService:
         sequence_input_ev = None
         if any_sequence_file:
             sequence_input_ev = sequence_file_evidence
+        elif has_antibody_seq_ref:
+            sequence_input_ev = (
+                "structured_query.referenced_inputs[id_type="
+                f"{antibody_seq_ref_types[0]}]"
+            )
         elif "uniprot_id" in ref_id_types:
             sequence_input_ev = "structured_query.referenced_inputs[id_type=uniprot_id]"
         elif _has_explicit_chain_sequence(entities):
@@ -391,6 +421,11 @@ class InputReadinessService:
             structure_ev = "structured_query.referenced_inputs[id_type=pdb_id]"
         elif any_sequence_file:
             structure_ev = "raw_request_record.uploaded_files[*].inferred_role=fasta_sequence"
+        elif has_antibody_seq_ref:
+            structure_ev = (
+                "structured_query.referenced_inputs[id_type="
+                f"{antibody_seq_ref_types[0]}]"
+            )
         elif "uniprot_id" in ref_id_types:
             structure_ev = "structured_query.referenced_inputs[id_type=uniprot_id]"
 
@@ -401,9 +436,18 @@ class InputReadinessService:
             else ("structured_query.user_constraints" if sq.get("user_constraints") else None)
         )
 
+        antibody_present = (
+            bool(candidate_text) or any_sequence_file or has_antibody_seq_ref
+        )
+        antibody_ref_evidence = (
+            "structured_query.referenced_inputs[id_type="
+            f"{antibody_seq_ref_types[0]}]"
+            if has_antibody_seq_ref
+            else None
+        )
         presence = BasicADCInputPresence(
             target_or_antigen_present=bool(target_text),
-            antibody_candidate_present=bool(candidate_text) or any_sequence_file,
+            antibody_candidate_present=antibody_present,
             payload_present=bool(payload_text),
             linker_present=bool(linker_text),
             structure_or_sequence_present=structure_or_sequence_present,
@@ -414,7 +458,8 @@ class InputReadinessService:
             candidate_file_present=any_candidate_file,
             target_evidence=target_ev,
             antibody_evidence=candidate_ev
-            or (sequence_file_evidence if any_sequence_file else None),
+            or (sequence_file_evidence if any_sequence_file else None)
+            or antibody_ref_evidence,
             payload_evidence=payload_ev,
             linker_evidence=linker_ev,
             structure_or_sequence_evidence=structure_ev,
@@ -466,43 +511,56 @@ class InputReadinessService:
                     evidence_field=None,
                 )
             )
-        if not presence.target_or_antigen_present:
-            missing.append(
-                MissingInputItem(
-                    field="user_provided_context.target_or_antigen_text",
-                    severity="blocking",
-                    message="Target / antigen not provided (neither raw context nor structured_query)",
-                    category="target",
-                    evidence_field=None,
+        # The legacy new-ADC-design checklist (target blocking + antibody /
+        # payload / linker gaps) only applies when the task is a design-style
+        # request. For non-design intents (e.g. developability_assessment on
+        # antibody heavy/light sequences) Step 2's `missing_slots` owns the
+        # gap assessment, so Step 3 must NOT fabricate a target/payload/linker
+        # requirement. `canonical_query`'s "unspecified" wording is never
+        # parsed as a real entity here.
+        primary_intent = str(
+            ((sq or {}).get("task_intent") or {}).get("primary_intent") or ""
+        ).strip().lower()
+        apply_legacy_adc_checklist = primary_intent not in _NON_DESIGN_INTENTS
+
+        if apply_legacy_adc_checklist:
+            if not presence.target_or_antigen_present:
+                missing.append(
+                    MissingInputItem(
+                        field="user_provided_context.target_or_antigen_text",
+                        severity="blocking",
+                        message="Target / antigen not provided (neither raw context nor structured_query)",
+                        category="target",
+                        evidence_field=None,
+                    )
                 )
-            )
-        if not presence.antibody_candidate_present:
-            missing.append(
-                MissingInputItem(
-                    field="user_provided_context.candidate_text",
-                    severity="warning",
-                    message="No explicit antibody candidate; Step 5 will rely on discovery",
-                    category="antibody",
+            if not presence.antibody_candidate_present:
+                missing.append(
+                    MissingInputItem(
+                        field="user_provided_context.candidate_text",
+                        severity="warning",
+                        message="No explicit antibody candidate; Step 5 will rely on discovery",
+                        category="antibody",
+                    )
                 )
-            )
-        if not presence.payload_present:
-            missing.append(
-                MissingInputItem(
-                    field="user_provided_context.payload_linker_text",
-                    severity="warning",
-                    message="Payload not detected; Step 6 compound lanes will be partial/skipped",
-                    category="payload_or_linker",
+            if not presence.payload_present:
+                missing.append(
+                    MissingInputItem(
+                        field="user_provided_context.payload_linker_text",
+                        severity="warning",
+                        message="Payload not detected; Step 6 compound lanes will be partial/skipped",
+                        category="payload_or_linker",
+                    )
                 )
-            )
-        if not presence.linker_present:
-            missing.append(
-                MissingInputItem(
-                    field="user_provided_context.payload_linker_text",
-                    severity="optional",
-                    message="Linker not specified; defaults may be assumed downstream",
-                    category="payload_or_linker",
+            if not presence.linker_present:
+                missing.append(
+                    MissingInputItem(
+                        field="user_provided_context.payload_linker_text",
+                        severity="optional",
+                        message="Linker not specified; defaults may be assumed downstream",
+                        category="payload_or_linker",
+                    )
                 )
-            )
         if not presence.structure_or_sequence_present:
             missing.append(
                 MissingInputItem(
