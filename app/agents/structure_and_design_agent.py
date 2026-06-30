@@ -45,6 +45,8 @@ from ..mcp.client import MCPClient
 from ..schemas.common import ToolCallRecord
 from ..schemas.step_07_prepared_structure_input_package import (
     ChainMapping,
+    CrystalMetadata,
+    MolecularWeightEstimate,
     PreparedStructureInputPackage,
     SequenceRef,
     StructureInputRecord,
@@ -579,6 +581,11 @@ class StructureAndDesignAgent:
             structure_files=structure_files,
             candidate_structure_materials=cand_structure_mats,
         )
+        crystal_metadata, molecular_weight_estimate = _extract_structure_validation_metadata(
+            storage=self.storage,
+            structure_files=structure_files,
+            candidate_structure_materials=cand_structure_mats,
+        )
         chain_mapping = observed_chain_mapping or _chain_mapping_from_sequence_refs(sequence_refs)
         if input_case in {"uploaded_structure_file", "known_pdb_id"} and not chain_mapping:
             missing_flags.append("chain_ids_missing")
@@ -607,6 +614,8 @@ class StructureAndDesignAgent:
             chain_pair_candidates=[],
             antigen_antibody_mapping=None,
             residue_ranges=residue_ranges,
+            crystal_metadata=crystal_metadata,
+            molecular_weight_estimate=molecular_weight_estimate,
             missing_metadata_flags=missing_flags,
             preferred_input_rank=preferred_rank,
             preferred_input_reason=preferred_reason,
@@ -886,18 +895,33 @@ class StructureAndDesignAgent:
             )
 
         pdb_id = _step8_pdb_id(sin.get("structure_refs") or [])
-        local_ref = _step8_local_structure_ref(self.storage, sin.get("structure_refs") or [])
         if "CrystalStructure_validate" in scoped_tools:
-            if input_case == "uploaded_structure_file" and local_ref:
+            crystal_args, missing_crystal_args = _step8_crystal_validation_args(sin)
+            if input_case == "uploaded_structure_file" and not missing_crystal_args:
                 _run(
                     "CrystalStructure_validate",
-                    {"pdb_id_or_path": local_ref["value"]},
-                    "uploaded/local PDB or CIF validation by concrete storage_ref path",
+                    crystal_args,
+                    "uploaded/local PDB or CIF validation from Step 7 compact crystal metadata",
+                    extra={"available_metadata": _compact_crystal_validation_metadata_for_audit(sin)},
                 )
             else:
-                _skip(
-                    "CrystalStructure_validate",
-                    "requires uploaded/local PDB or CIF storage_ref; Step 8 will not fabricate path/cell parameters",
+                calls.append(
+                    _nonexecuted_tool_record(
+                        tool_name="CrystalStructure_validate",
+                        agent_name=_AGENT_NAME,
+                        step_id=_STEP_08,
+                        run_status="skipped",
+                        summary={
+                            **_summary_base(),
+                            "routing_decision": "input_missing" if input_case == "uploaded_structure_file" else "not_applicable",
+                            "reason": (
+                                "requires Step 7 compact crystal metadata parameters; "
+                                "uploaded paths are not sent to CrystalStructure_validate"
+                            ),
+                            "missing": missing_crystal_args,
+                            "available_metadata": _compact_crystal_validation_metadata_for_audit(sin),
+                        },
+                    )
                 )
 
         if "get_refinement_resolution_by_pdb_id" in scoped_tools:
@@ -1560,6 +1584,274 @@ def _observed_structure_metadata(
                     "source": "observed_structure", "source_ref": str(source_ref),
                 })
     return mappings, ranges
+
+
+def _extract_structure_validation_metadata(
+    *, storage: Storage, structure_files: list[dict],
+    candidate_structure_materials: list[dict],
+) -> tuple[CrystalMetadata | None, MolecularWeightEstimate | None]:
+    for resource in _structure_metadata_resources(structure_files, candidate_structure_materials):
+        source_ref = resource.get("storage_path")
+        if not source_ref:
+            continue
+        data = _read_structure_bytes(storage, str(source_ref))
+        if data is None:
+            continue
+        text = data.decode("utf-8", errors="replace")
+        suffix = PurePosixPath(str(source_ref)).suffix.lower()
+        source_kind = "uploaded_file" if resource.get("file_id") else "candidate_material"
+        compact_source = str(resource.get("file_id") or resource.get("material_id") or source_ref)
+        if suffix in {".cif", ".mmcif"}:
+            crystal = _extract_cif_crystal_metadata(text, source_kind=source_kind, source_ref=compact_source)
+        else:
+            crystal = _extract_pdb_crystal_metadata(text, source_kind=source_kind, source_ref=compact_source)
+        mw = _estimate_structure_molecular_weight(
+            text=text,
+            suffix=suffix,
+            source_kind=source_kind,
+            source_ref=compact_source,
+        )
+        return crystal, mw
+    return None, None
+
+
+def _structure_metadata_resources(
+    structure_files: list[dict], candidate_structure_materials: list[dict],
+) -> list[dict[str, Any]]:
+    resources: list[dict[str, Any]] = [dict(item) for item in structure_files]
+    for material in candidate_structure_materials:
+        resources.append({
+            "storage_path": material.get("value"),
+            "material_id": material.get("material_id"),
+        })
+    return resources
+
+
+def _read_structure_bytes(storage: Storage, source_ref: str) -> bytes | None:
+    try:
+        path = Path(source_ref)
+        if path.is_file():
+            return path.read_bytes()
+        if storage.exists(source_ref):
+            return storage.read_bytes(source_ref)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _extract_pdb_crystal_metadata(
+    text: str, *, source_kind: str, source_ref: str,
+) -> CrystalMetadata:
+    warnings: list[str] = []
+    for line in text.splitlines():
+        if not line.startswith("CRYST1"):
+            continue
+        try:
+            a = float(line[6:15].strip())
+            b = float(line[15:24].strip())
+            c = float(line[24:33].strip())
+            alpha = float(line[33:40].strip())
+            beta = float(line[40:47].strip())
+            gamma = float(line[47:54].strip())
+            space_group = line[55:66].strip() or None
+            z_raw = line[66:70].strip()
+            z_value = int(z_raw) if z_raw else None
+            if z_value is None:
+                warnings.append("CRYST1 Z value missing")
+            return CrystalMetadata(
+                a=a,
+                b=b,
+                c=c,
+                alpha=alpha,
+                beta=beta,
+                gamma=gamma,
+                space_group=space_group,
+                z_value=z_value,
+                source_kind="pdb_cryst1_record",
+                source_ref=source_ref,
+                parse_status="ok" if z_value is not None else "missing",
+                warnings=warnings,
+            )
+        except Exception:  # noqa: BLE001
+            return CrystalMetadata(
+                source_kind="pdb_cryst1_record",
+                source_ref=source_ref,
+                parse_status="invalid",
+                warnings=["CRYST1 record could not be parsed"],
+            )
+    return CrystalMetadata(
+        source_kind="pdb_cryst1_record",
+        source_ref=source_ref,
+        parse_status="missing",
+        warnings=["CRYST1 record missing"],
+    )
+
+
+def _extract_cif_crystal_metadata(
+    text: str, *, source_kind: str, source_ref: str,
+) -> CrystalMetadata:
+    try:
+        from Bio.PDB.MMCIF2Dict import MMCIF2Dict
+
+        data = MMCIF2Dict(StringIO(text))
+    except Exception:  # noqa: BLE001
+        return CrystalMetadata(
+            source_kind="cif_cell_metadata",
+            source_ref=source_ref,
+            parse_status="invalid",
+            warnings=["CIF cell metadata could not be parsed"],
+        )
+
+    def scalar(*keys: str) -> Any:
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, list) and value:
+                return value[0]
+            if value not in (None, "", "?"):
+                return value
+        return None
+
+    warnings: list[str] = []
+    a = _float_or_none(scalar("_cell.length_a"))
+    b = _float_or_none(scalar("_cell.length_b"))
+    c = _float_or_none(scalar("_cell.length_c"))
+    alpha = _float_or_none(scalar("_cell.angle_alpha"))
+    beta = _float_or_none(scalar("_cell.angle_beta"))
+    gamma = _float_or_none(scalar("_cell.angle_gamma"))
+    z_value = _int_or_none(scalar("_cell.Z_PDB", "_cell.pdbx_Z_PDB", "_cell.Z"))
+    space_group_raw = scalar("_symmetry.space_group_name_H-M", "_space_group.name_H-M_alt")
+    space_group = str(space_group_raw).strip() if space_group_raw not in (None, "", "?") else None
+    missing = [
+        name for name, value in {
+            "a": a, "b": b, "c": c, "alpha": alpha, "beta": beta, "gamma": gamma, "Z": z_value,
+        }.items() if value is None
+    ]
+    if missing:
+        warnings.append("CIF cell metadata missing: " + ",".join(missing))
+    return CrystalMetadata(
+        a=a,
+        b=b,
+        c=c,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+        space_group=space_group,
+        z_value=z_value,
+        source_kind="cif_cell_metadata",
+        source_ref=source_ref,
+        parse_status="ok" if not missing else "missing",
+        warnings=warnings,
+    )
+
+
+_RESIDUE_MASS_DA = {
+    "ALA": 71.0788, "ARG": 156.1875, "ASN": 114.1038, "ASP": 115.0886,
+    "CYS": 103.1388, "GLN": 128.1307, "GLU": 129.1155, "GLY": 57.0519,
+    "HIS": 137.1411, "ILE": 113.1594, "LEU": 113.1594, "LYS": 128.1741,
+    "MET": 131.1926, "PHE": 147.1766, "PRO": 97.1167, "SER": 87.0782,
+    "THR": 101.1051, "TRP": 186.2132, "TYR": 163.1760, "VAL": 99.1326,
+}
+
+
+def _estimate_structure_molecular_weight(
+    *, text: str, suffix: str, source_kind: str, source_ref: str,
+) -> MolecularWeightEstimate:
+    seqres_residues = _pdb_seqres_residue_names(text)
+    if seqres_residues:
+        return _residue_mass_estimate(
+            seqres_residues,
+            method="seqres_residue_sum",
+            source_kind=source_kind,
+            source_ref=source_ref,
+        )
+    atom_residues = _biopython_atom_residue_names(text, suffix)
+    if atom_residues:
+        return _residue_mass_estimate(
+            atom_residues,
+            method="atom_residue_sum",
+            source_kind=source_kind,
+            source_ref=source_ref,
+        )
+    return MolecularWeightEstimate(
+        value=None,
+        method=None,
+        status="missing",
+        source_kind=source_kind,
+        source_ref=source_ref,
+        warnings=["no SEQRES or standard polymer residues available for molecular weight estimate"],
+    )
+
+
+def _pdb_seqres_residue_names(text: str) -> list[str]:
+    residues: list[str] = []
+    for line in text.splitlines():
+        if not line.startswith("SEQRES"):
+            continue
+        residues.extend(part.upper() for part in line[19:].split() if part)
+    return residues
+
+
+def _biopython_atom_residue_names(text: str, suffix: str) -> list[str]:
+    try:
+        from Bio.PDB import MMCIFParser, PDBParser
+
+        parser = MMCIFParser(QUIET=True) if suffix in {".cif", ".mmcif"} else PDBParser(QUIET=True)
+        structure = parser.get_structure("step7_weight_input", StringIO(text))
+        residues: list[str] = []
+        seen: set[tuple[Any, ...]] = set()
+        for residue in structure.get_residues():
+            parent = residue.get_parent()
+            model = parent.get_parent() if parent is not None else None
+            key = (
+                getattr(model, "id", None),
+                getattr(parent, "id", None),
+                residue.id,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            if residue.id[0] != " ":
+                continue
+            residues.append(str(residue.resname).upper())
+        return residues
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _residue_mass_estimate(
+    residues: list[str], *, method: str, source_kind: str, source_ref: str,
+) -> MolecularWeightEstimate:
+    total = 0.0
+    unknown: dict[str, int] = {}
+    for residue in residues:
+        mass = _RESIDUE_MASS_DA.get(residue)
+        if mass is None:
+            unknown[residue] = unknown.get(residue, 0) + 1
+            continue
+        total += mass
+    warnings: list[str] = []
+    if unknown:
+        warnings.append(
+            "nonstandard residues excluded from molecular weight estimate: "
+            + ",".join(sorted(unknown))
+        )
+    if total <= 0:
+        return MolecularWeightEstimate(
+            value=None,
+            method=method,
+            status="missing",
+            warnings=warnings or ["no standard amino-acid residues available for molecular weight estimate"],
+            source_kind=source_kind,
+            source_ref=source_ref,
+        )
+    return MolecularWeightEstimate(
+        value=round(total, 3),
+        method=method,
+        status="estimated_with_warnings" if warnings else "estimated",
+        warnings=warnings,
+        source_kind=source_kind,
+        source_ref=source_ref,
+    )
 
 
 def _parse_structure_chain_summary(
@@ -2291,6 +2583,51 @@ def _step8_pdb_id(structure_refs: list[Any]) -> str | None:
     return None
 
 
+def _step8_crystal_validation_args(sin: dict) -> tuple[dict[str, Any], list[str]]:
+    crystal = sin.get("crystal_metadata") or {}
+    mw = sin.get("molecular_weight_estimate") or {}
+    args: dict[str, Any] = {"operation": "validate"}
+    missing: list[str] = []
+    a = _float_or_none(crystal.get("a")) if isinstance(crystal, dict) else None
+    z_value = _int_or_none(crystal.get("z_value")) if isinstance(crystal, dict) else None
+    mw_value = _float_or_none(mw.get("value")) if isinstance(mw, dict) else None
+    if a is None:
+        missing.append("a")
+    else:
+        args["a"] = a
+    if z_value is None:
+        missing.append("Z")
+    else:
+        args["Z"] = z_value
+    if mw_value is None:
+        missing.append("mw")
+    else:
+        args["mw"] = mw_value
+    return args, missing
+
+
+def _compact_crystal_validation_metadata_for_audit(sin: dict) -> dict[str, Any]:
+    crystal = sin.get("crystal_metadata") or {}
+    mw = sin.get("molecular_weight_estimate") or {}
+    out: dict[str, Any] = {}
+    if isinstance(crystal, dict):
+        out["crystal_metadata"] = {
+            k: crystal.get(k)
+            for k in (
+                "a", "b", "c", "alpha", "beta", "gamma", "space_group",
+                "z_value", "source_kind", "source_ref", "parse_status", "warnings",
+            )
+            if crystal.get(k) not in (None, "", [])
+        }
+    if isinstance(mw, dict):
+        out["molecular_weight_estimate"] = {
+            k: mw.get(k)
+            for k in ("value", "unit", "method", "status", "warnings", "source_kind", "source_ref")
+            if mw.get(k) not in (None, "", [])
+        }
+    return out
+
+
 def _extract_interface_features_for_step8(
     storage: Storage, tool_call: ToolCallRecord
 ) -> list[InterfaceFeature]:
@@ -2600,9 +2937,12 @@ def _validated_structure_ref_from_tool_calls(tool_calls: list[ToolCallRecord]) -
         if tc.tool_name != "CrystalStructure_validate" or tc.run_status != "success":
             continue
         summary = tc.tool_input_summary or {}
-        value = summary.get("pdb_id_or_path")
-        if not value and isinstance(summary.get("arguments"), dict):
-            value = summary["arguments"].get("pdb_id_or_path")
+        metadata = summary.get("available_metadata")
+        value = None
+        if isinstance(metadata, dict):
+            crystal = metadata.get("crystal_metadata")
+            if isinstance(crystal, dict):
+                value = crystal.get("source_ref")
         if value:
             return str(value)
     return None

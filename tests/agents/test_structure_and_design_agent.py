@@ -543,6 +543,56 @@ def test_step7_candidate_scoped_structure_material_stays_on_candidate(
     rec = owners[0]
     rec_ref = next(s for s in rec.structure_refs if s.source_ref == "target_s1")
     assert rec_ref.storage_ref == str(PROJECT_ROOT / "data" / "pdb" / "S1.pdb")
+    assert rec.crystal_metadata is not None
+    assert rec.crystal_metadata.parse_status == "ok"
+    assert rec.crystal_metadata.a is not None
+    assert rec.crystal_metadata.b is not None
+    assert rec.crystal_metadata.c is not None
+    assert rec.crystal_metadata.alpha is not None
+    assert rec.crystal_metadata.beta is not None
+    assert rec.crystal_metadata.gamma is not None
+    assert rec.crystal_metadata.space_group
+    assert rec.crystal_metadata.z_value is not None
+    assert rec.molecular_weight_estimate is not None
+    assert rec.molecular_weight_estimate.value is not None
+    assert rec.molecular_weight_estimate.method == "seqres_residue_sum"
+    assert rec.molecular_weight_estimate.status in {"estimated", "estimated_with_warnings"}
+    assert not any(ref.pdb_id == "XXXX" for ref in rec.structure_refs)
+    blob = json.dumps(rec.model_dump())
+    assert "HEADER" not in blob
+    assert "ATOM" not in blob
+    assert "HETATM" not in blob
+    assert "SEQRES" not in blob
+
+
+@pytest.mark.parametrize("fixture_name", ["S1.pdb", "S2.pdb", "S3.pdb"])
+def test_step7_real_pdb_fixtures_supply_compact_crystal_validation_metadata(
+    local_storage, fixture_name
+):
+    path = PROJECT_ROOT / "data" / "pdb" / fixture_name
+    crystal, mw = structure_and_design_module._extract_structure_validation_metadata(
+        storage=local_storage,
+        structure_files=[],
+        candidate_structure_materials=[{
+            "material_id": f"mat_{fixture_name}",
+            "value": str(path),
+        }],
+    )
+
+    assert crystal is not None
+    assert crystal.parse_status == "ok"
+    assert crystal.a and crystal.b and crystal.c
+    assert crystal.alpha and crystal.beta and crystal.gamma
+    assert crystal.space_group
+    assert crystal.z_value is not None
+    assert mw is not None
+    assert mw.value is not None
+    assert mw.method == "seqres_residue_sum"
+    blob = json.dumps({"crystal": crystal.model_dump(), "mw": mw.model_dump()})
+    assert "HEADER" not in blob
+    assert "ATOM" not in blob
+    assert "HETATM" not in blob
+    assert "SEQRES" not in blob
 
 
 def test_step7_structure_file_material_is_consumable_by_step8_without_fake_placeholder(
@@ -561,8 +611,9 @@ def test_step7_structure_file_material_is_consumable_by_step8_without_fake_place
     })
     local_storage.write_json(cct_path, cct)
 
+    captured: list[dict] = []
     overrides = {
-        "CrystalStructure_validate": lambda **kw: {"ok": True, "pdb_id_or_path": kw.get("pdb_id_or_path")},
+        "CrystalStructure_validate": lambda **kw: captured.append(dict(kw)) or {"ok": True, "validated": True},
     }
     mcp = LocalMCPClient(
         inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
@@ -580,13 +631,17 @@ def test_step7_structure_file_material_is_consumable_by_step8_without_fake_place
         and tc.tool_input_summary.get("routing_decision") == "selected"
     ]
     assert tool_calls, "expected structure validation calls"
+    assert captured
     for tc in tool_calls:
-        assert tc.tool_input_summary["pdb_id_or_path"] == str(
-            PROJECT_ROOT / "data" / "pdb" / "S1.pdb"
-        )
-        assert tc.tool_input_summary["pdb_id_or_path"] != "uploaded"
-        assert tc.tool_input_summary and ("pdb_id_or_path" in tc.tool_input_summary)
-        assert tc.tool_input_summary["pdb_id_or_path"].endswith("S1.pdb")
+        args = tc.tool_input_summary["arguments"]
+        assert args["operation"] == "validate"
+        assert args["a"] > 0
+        assert args["Z"] > 0
+        assert args["mw"] > 0
+        assert "pdb_id_or_path" not in args
+        assert "pdb_id_or_path" not in tc.tool_input_summary
+    assert all(set(call) >= {"operation", "a", "Z", "mw"} for call in captured)
+    assert all("pdb_id_or_path" not in call for call in captured)
 
 
 def test_step7_name_only_routes_to_database_search_tools(
@@ -1383,7 +1438,10 @@ def test_step8_uploaded_structure_file_path_calls_validation_tools(
     raw = local_storage.read_json(raw_path)
     raw["uploaded_files"][0]["storage_path"] = local_storage.run_key(run_id, "inputs/files/file_pdb.pdb")
     local_storage.write_json(raw_path, raw)
-    local_storage.write_bytes(raw["uploaded_files"][0]["storage_path"], b"HEADER    DUMMY\nEND\n")
+    local_storage.write_bytes(
+        raw["uploaded_files"][0]["storage_path"],
+        (PROJECT_ROOT / "data" / "pdb" / "S1.pdb").read_bytes(),
+    )
     agent = StructureAndDesignAgent(
         storage=local_storage, registry=registry_service,
         workflow_state=workflow_state_service, mcp_client=_mcp(),
@@ -1402,7 +1460,7 @@ def test_step8_uploaded_structure_file_path_calls_validation_tools(
     assert any(h.has_validated_structure for h in uploaded_handoffs)
     assert any(h.validation_available for h in uploaded_handoffs)
     assert any(not h.has_interface_features for h in uploaded_handoffs)
-    assert any(h.validated_structure_ref and h.validated_structure_ref.endswith(".pdb") for h in uploaded_handoffs)
+    assert any(h.validated_structure_ref for h in uploaded_handoffs)
     missing = [
         item for h in uploaded_handoffs
         for item in h.missing_for_step9
@@ -1422,6 +1480,59 @@ def test_step8_uploaded_structure_file_path_calls_validation_tools(
     assert pisa_calls
     assert all(tc.tool_input_summary.get("routing_decision") == "not_applicable" for tc in pisa_calls)
     assert all("pdb_id" not in (tc.tool_input_summary.get("arguments") or {}) for tc in pisa_calls)
+
+
+def test_step8_skips_crystal_validation_when_compact_metadata_missing(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        uploaded_files=[
+            {
+                "file_id": "file_pdb",
+                "original_filename": "target.pdb",
+                "storage_path": "adc_pilot/runs/x/inputs/files/file_pdb.pdb",
+                "content_type": "chemical/x-pdb",
+                "sha256": "sha256:abc",
+                "size_bytes": 1024,
+                "role": "target",
+            },
+        ],
+    )
+    raw_path = local_storage.run_key(run_id, "inputs/raw_request_record.json")
+    raw = local_storage.read_json(raw_path)
+    raw["uploaded_files"][0]["storage_path"] = local_storage.run_key(run_id, "inputs/files/file_pdb.pdb")
+    local_storage.write_json(raw_path, raw)
+    local_storage.write_bytes(raw["uploaded_files"][0]["storage_path"], b"HEADER    DUMMY\nEND\n")
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    pkg = agent.run_step_7(run_id)
+    uploaded = [r for r in pkg.prepared_structure_inputs if r.input_case == "uploaded_structure_file"]
+    assert uploaded
+    assert all(
+        not r.crystal_metadata or r.crystal_metadata.parse_status in {"missing", "invalid"}
+        for r in uploaded
+    )
+    results = agent.run_step_8(run_id)
+    crystal_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name == "CrystalStructure_validate"
+        and tc.tool_input_summary.get("input_case") == "uploaded_structure_file"
+    ]
+    assert crystal_calls
+    assert all(tc.run_status == "skipped" for tc in crystal_calls)
+    assert all(tc.tool_input_summary.get("routing_decision") == "input_missing" for tc in crystal_calls)
+    assert any("Z" in tc.tool_input_summary.get("missing", []) for tc in crystal_calls)
+    assert all("pdb_id_or_path" not in (tc.tool_input_summary.get("arguments") or {}) for tc in crystal_calls)
+    pisa_calls = [tc for tc in results.tool_call_records if tc.tool_name == "PDBePISA_get_interfaces"]
+    assert pisa_calls
+    assert all(tc.tool_input_summary.get("routing_decision") == "not_applicable" for tc in pisa_calls)
 
 
 def test_step8_sequence_only_records_nim_prediction_route_as_unavailable(
