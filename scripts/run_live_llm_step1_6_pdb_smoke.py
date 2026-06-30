@@ -35,6 +35,7 @@ sys.path.insert(0, str(ROOT))
 #    ``.env`` — env vars only.
 LIVE_ALLOWLIST = (
     "SAbDab_search_structures",
+    "iedb_search_bcr_sequences",
     "ChEMBL_search_molecules",
     "ChEMBL_search_substructure",
     "ChEMBL_search_activities",
