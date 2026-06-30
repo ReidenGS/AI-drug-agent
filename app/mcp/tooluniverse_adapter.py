@@ -39,9 +39,70 @@ Design rules:
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 from ..services.tool_inventory_service import ToolInventoryService
+
+
+# ── transient-failure retry policy ─────────────────────────────────────────
+#
+# Live ToolUniverse calls can hit transient upstream/network failures
+# (proxy drops, remote disconnects, timeouts, HTTP 5xx / rate limits). We
+# retry ONLY those a small bounded number of times with a short backoff.
+# Deterministic failures (validation / schema / missing-input / not-found)
+# are NEVER retried. A final failure always keeps `status="upstream_error"`
+# — we never mock a success or swallow the error.
+
+_MAX_LIVE_RETRIES = 2  # up to 2 retries → 3 total attempts
+_RETRY_BACKOFF_BASE_SECONDS = 0.25
+
+_TRANSIENT_ERROR_TOKENS = (
+    "proxyerror",
+    "remotedisconnected",
+    "remote disconnected",
+    "remote end closed",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connectionreset",
+    "connection aborted",
+    "connection refused",
+    "max retries exceeded",
+    "connectionerror",
+    "temporarily unavailable",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "server error",  # requests' "5xx Server Error"
+    "rate limit",
+    "too many requests",
+    "429",
+)
+
+
+def _is_transient_error(message: str | None) -> bool:
+    """Classify an upstream error message as transient (worth retrying).
+
+    Conservative: only known network/upstream-transient signatures match.
+    Validation / schema / missing-input / not-found errors do not, so they
+    are never retried.
+    """
+    if not message:
+        return False
+    lowered = message.lower()
+    return any(token in lowered for token in _TRANSIENT_ERROR_TOKENS)
+
+
+def _compact_error(message: str | None, *, limit: int = 200) -> str:
+    """One-line, length-capped error string (never a raw payload/sequence)."""
+    text = " ".join((message or "").split())
+    return text[:limit]
+
+
+def _sleep_backoff(attempt: int) -> None:
+    # `attempt` is 1-based for the retry just completed.
+    time.sleep(_RETRY_BACKOFF_BASE_SECONDS * attempt)
 
 
 # ── env hydration ──────────────────────────────────────────────────────────
@@ -263,31 +324,66 @@ def call_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> dict[s
     try:
         universe = _get_universe()
     except ToolUniverseAdapterError as exc:
+        # Building the universe failed (e.g. tooluniverse not installed) —
+        # deterministic, not a transient upstream failure: do not retry.
         return {
             **envelope_base,
             "status": "upstream_error",
             "error_message": str(exc),
+            "retry_count": 0,
+            "retryable": False,
+            "final_error_type": type(exc).__name__,
         }
 
-    try:
-        raw = universe.run_one_function(
-            {"name": tool_name, "arguments": args},
-            validate=True,
-            use_cache=False,
-        )
-    except Exception as exc:  # noqa: BLE001 — TU should not raise but be defensive
+    # Bounded retry loop for TRANSIENT upstream failures only. `retry_count`
+    # counts retries performed (0 on first-try success). Deterministic errors
+    # break out immediately and are returned as upstream_error with
+    # retryable=False.
+    retry_count = 0
+    last_error_message: str | None = None
+    last_error_type: str | None = None
+    last_error_details: Any = None
+
+    while True:
+        try:
+            raw = universe.run_one_function(
+                {"name": tool_name, "arguments": args},
+                validate=True,
+                use_cache=False,
+            )
+            error_message: str | None = None
+            error_type: str | None = None
+            error_details: Any = None
+            if isinstance(raw, dict) and raw.get("status") == "error":
+                error_message = raw.get("error") or "tooluniverse_error"
+                error_type = "tooluniverse_error"
+                error_details = raw.get("error_details")
+        except Exception as exc:  # noqa: BLE001 — TU should not raise but be defensive
+            raw = None
+            error_message = f"{type(exc).__name__}: {exc}"
+            error_type = type(exc).__name__
+            error_details = None
+
+        if error_message is None:
+            break  # success (raw is a usable response)
+
+        last_error_message = error_message
+        last_error_type = error_type
+        last_error_details = error_details
+        transient = _is_transient_error(error_message)
+        if transient and retry_count < _MAX_LIVE_RETRIES:
+            _sleep_backoff(retry_count + 1)
+            retry_count += 1
+            continue
+        # Exhausted retries OR non-retryable: surface upstream_error honestly.
         return {
             **envelope_base,
             "status": "upstream_error",
-            "error_message": f"{type(exc).__name__}: {exc}",
-        }
-
-    if isinstance(raw, dict) and raw.get("status") == "error":
-        return {
-            **envelope_base,
-            "status": "upstream_error",
-            "error_message": raw.get("error") or "tooluniverse_error",
-            "error_details": raw.get("error_details"),
+            "error_message": _compact_error(last_error_message),
+            "error_details": last_error_details,
+            "retry_count": retry_count,
+            "retryable": transient,
+            "final_error_type": last_error_type,
         }
 
     status = "ok"
@@ -310,8 +406,17 @@ def call_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> dict[s
     elif isinstance(raw, list) and not raw:
         status = "empty"
 
-    return {
+    envelope = {
         **envelope_base,
         "status": status,
         "payload": raw,
+        "retry_count": retry_count,
+        "retryable": False,
     }
+    if retry_count:
+        # Succeeded only after retrying a transient failure — record the
+        # last transient error compactly for audit (never a raw payload).
+        envelope["recovered_after_transient_error"] = True
+        envelope["final_error_type"] = last_error_type
+        envelope["final_error_message"] = _compact_error(last_error_message)
+    return envelope
