@@ -10,8 +10,9 @@ For every lane we assert:
    `LocalMCPClient` injects `_live=True` so the wrapper routes through
    `ToolUniverseAdapter` and the result envelope carries
    `executor="tooluniverse"`.
-2. With the allowlist empty (or the tool not on it), `_live=True` is NOT
-   injected and the wrapper stays on its deterministic mock envelope.
+2. With live ON and an empty allowlist, `_live=True` is injected for every
+   scoped tool (production all-live). With live ON and a non-empty allowlist,
+   tools not on that allowlist stay on their deterministic mock envelope.
 3. A still-deferred tool inside the agent's allowed step surfaces
    `dependency_unavailable` and the fake universe records zero calls —
    no silent fall-through to a fake "success".
@@ -95,11 +96,32 @@ def test_step5_candidate_context_live_path(
     assert len(fake.calls) == 1
 
 
-def test_step5_allowlist_miss_keeps_mock(monkeypatch, install_universe):
+def test_step5_empty_allowlist_is_all_live(monkeypatch, install_universe):
+    """Production all-live: live ON + empty allowlist injects `_live=True`
+    for every scoped tool, so the call routes through ToolUniverse."""
     fake = install_universe(
         tools={"ChEMBL_search_molecules": lambda args: {"results": [{"x": 1}]}}
     )
-    _set_live(monkeypatch, allowlist="")  # live ON, but allowlist empty
+    _set_live(monkeypatch, allowlist="")  # live ON, allowlist empty => all-live
+    client = LocalMCPClient()
+    res = client.call_tool(
+        agent_name="candidate_context_agent",
+        step_id="step_05",
+        tool_name="ChEMBL_search_molecules",
+        query="imatinib",
+    )
+    assert res["run_status"] == "success"
+    assert res["executor"] == "tooluniverse"
+    assert len(fake.calls) == 1
+
+
+def test_step5_nonempty_allowlist_miss_keeps_mock(monkeypatch, install_universe):
+    """Constrained smoke/debug: with a non-empty allowlist, a tool NOT on it
+    stays on the deterministic mock envelope."""
+    fake = install_universe(
+        tools={"ChEMBL_search_molecules": lambda args: {"results": [{"x": 1}]}}
+    )
+    _set_live(monkeypatch, allowlist="SAbDab_search_structures")  # other tool only
     client = LocalMCPClient()
     res = client.call_tool(
         agent_name="candidate_context_agent",
