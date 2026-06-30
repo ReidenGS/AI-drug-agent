@@ -117,6 +117,28 @@ _ANTIBODY_GENERIC_SEQ_MATERIAL_TYPES = (
 _ANTIBODY_SEQ_REFERENCE_ROLES = (
     "antibody_sequence_reference",
 )
+# referenced_inputs id_types that carry an inline antibody sequence (Step 2).
+_ANTIBODY_SEQUENCE_REF_ID_TYPES = (
+    "antibody_heavy_chain_sequence",
+    "antibody_light_chain_sequence",
+    "antibody_sequence_reference",
+)
+
+
+def _looks_like_antibody_name(text: str | None) -> bool:
+    """Heuristic: is ``text`` a plausible antibody NAME (vs a sentence)?
+
+    A real name is short (e.g. "trastuzumab", "Trastuzumab analog", "HER2
+    antibody"): few words, no sentence punctuation, not a long phrase. A
+    sentence-like label (a developability request paraphrase) must NOT be
+    sent to SAbDab / TheraSAbDab as a name query.
+    """
+    t = (text or "").strip()
+    if not t or len(t) > 60:
+        return False
+    if any(p in t for p in (".", "?", "!", ";", ":", ",")):
+        return False
+    return len(t.split()) <= 4
 
 _HEAVY_CHAIN_HINTS = {
     "heavy", "heavychain", "heavy_chain", "vh", "hc", "igh", "ighv",
@@ -338,9 +360,15 @@ class CandidateContextAgent:
         antibody_text = (
             entities.get("antibody_candidate_text") or ctx.get("candidate_text")
         )
+        inline_antibody_sequence_refs = [
+            r
+            for id_type in _ANTIBODY_SEQUENCE_REF_ID_TYPES
+            for r in refs_by_type.get(id_type, [])
+        ]
         ab_cand = self._build_antibody_candidate(
             antibody_text=antibody_text,
             sequence_files=sequence_files,
+            inline_sequence_refs=inline_antibody_sequence_refs,
             sq_artifact_id=sq_artifact_id,
         )
         if ab_cand is None:
@@ -558,18 +586,32 @@ class CandidateContextAgent:
         *,
         antibody_text: Optional[str],
         sequence_files: list[dict],
+        inline_sequence_refs: list[dict] | None = None,
         sq_artifact_id: str,
     ) -> Optional[CandidateRecord]:
-        if not (antibody_text or sequence_files):
+        inline_sequence_refs = inline_sequence_refs or []
+        if not (antibody_text or sequence_files or inline_sequence_refs):
             return None
         materials: list[Material] = []
+        context_notes: list[str] = []
+        has_sequence_input = bool(sequence_files or inline_sequence_refs)
+        # Only emit an `antibody_name` material (which drives SAbDab /
+        # TheraSAbDab name lookup) when the text is a plausible antibody NAME.
+        # A sentence-like label on a sequence-only developability request must
+        # NOT be sent as a name query — skip it and record a compact reason.
         if antibody_text:
-            materials.append(
-                self._material_with_role(
-                    "antibody_name", antibody_text, "text",
-                    role="antibody", role_status="explicit",
+            if _looks_like_antibody_name(antibody_text):
+                materials.append(
+                    self._material_with_role(
+                        "antibody_name", antibody_text, "text",
+                        role="antibody", role_status="explicit",
+                    )
                 )
-            )
+            elif has_sequence_input:
+                context_notes.append(
+                    "antibody_name_lookup_skipped:sequence_only_input "
+                    "(antibody label is not a usable name query)"
+                )
         for f in sequence_files:
             material_type = _infer_antibody_sequence_material_type(f)
             materials.append(
@@ -580,9 +622,29 @@ class CandidateContextAgent:
                     role="antibody_sequence_reference", role_status="explicit",
                 )
             )
-        return CandidateRecord(
+        # Inline heavy/light/generic antibody sequences from Step 2
+        # referenced_inputs become distinct candidate materials carrying the
+        # inline amino-acid sequence (value_format reflects inline AA, not a
+        # fasta ref). Step 6 available_fields exposes only a digest of these;
+        # the raw sequence is never surfaced to the LLM / audit / summaries.
+        for ref in inline_sequence_refs:
+            if not isinstance(ref, dict):
+                continue
+            id_type = str(ref.get("id_type") or "")
+            value = str(ref.get("value") or "").strip()
+            if id_type not in _ANTIBODY_SEQUENCE_REF_ID_TYPES or not value:
+                continue
+            materials.append(
+                self._material_with_role(
+                    id_type, value, "amino_acid_sequence",
+                    role="antibody_sequence_reference", role_status="explicit",
+                )
+            )
+        if not materials:
+            return None
+        record = CandidateRecord(
             candidate_id=new_artifact_id("candidate"),
-            candidate_label=antibody_text or "antibody_from_sequence_upload",
+            candidate_label=antibody_text or "antibody_from_sequence_input",
             candidate_type="antibody",
             source_records=[sq_artifact_id] if sq_artifact_id else [],
             identifiers=[],
@@ -594,6 +656,10 @@ class CandidateContextAgent:
             is_generated_candidate=False,
             context_status="partial",
         )
+        for note in context_notes:
+            if note not in record.context_notes:
+                record.context_notes.append(note)
+        return record
 
     def _build_reference_adc_candidates(
         self,
