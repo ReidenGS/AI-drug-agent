@@ -215,10 +215,13 @@ def summarize_candidate_modalities(
             continue
         mt = str(material.get("material_type") or "")
         if mt in {"antibody_sequence_reference"}:
-            summary.has_antibody_sequence = True
-            summary.has_uploaded_fasta_ref = True
-            tags.update({"antibody_sequence", "fasta_ref"})
-            unknown_notes.append("antibody sequence reference has unknown chain role")
+            summary.has_uploaded_fasta_ref = summary.has_uploaded_fasta_ref or _is_ref_shaped_material(material)
+            unknown_notes.extend(
+                [
+                    "antibody sequence reference has unknown chain role",
+                    "generic_antibody_sequence_reference_not_executable",
+                ]
+            )
         elif mt in {"target_sequence"} and _is_ref_shaped_material(material):
             summary.has_antigen_sequence = True
             summary.has_protein_sequence = True
@@ -239,6 +242,8 @@ def _field_from_material(candidate_id: str, material: dict[str, Any]) -> Availab
         return None
     value = str(raw_value)
     role = material.get("role")
+    if material_type == "antibody_sequence_reference":
+        return None
     field_type, value_kind = _material_field_type_and_value_kind(material)
     if not field_type or not value_kind:
         return None

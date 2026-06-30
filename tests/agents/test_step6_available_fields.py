@@ -298,23 +298,18 @@ def test_ambiguous_antibody_sequence_reference_is_not_executable_chain_input():
             ]
         )
     )
-    generic_ref = next(
-        f for f in projection.available_fields if f.field_type == "protein_sequence"
-    )
-    assert generic_ref.material_type == "antibody_sequence_reference"
-    assert generic_ref.chain_role is None
-    assert generic_ref.field_type == "protein_sequence"
-    assert generic_ref.value_kind == "uploaded_fasta_ref"
-    assert "use_heavy_chain_sequence" not in generic_ref.allowed_transforms
-    assert "use_light_chain_sequence" not in generic_ref.allowed_transforms
+    assert not any(f.material_type == "antibody_sequence_reference" and f.field_type == "protein_sequence" for f in projection.available_fields)
+    assert not any("use_sequence" in f.allowed_transforms for f in projection.available_fields)
 
     summary = projection.modality_summary
     assert summary.has_uploaded_fasta_ref is True
     assert summary.has_antibody_heavy_sequence is False
     assert summary.has_antibody_light_sequence is False
-    assert summary.has_antibody_sequence is True
+    assert summary.has_antibody_sequence is False
     assert summary.ambiguous_or_unknown is True
     assert summary.unknown_notes
+    notes = " ".join(summary.unknown_notes)
+    assert "generic_antibody_sequence_reference_not_executable" in notes
 
 
 def test_candidate_context_projection_keys_by_candidate_id():
