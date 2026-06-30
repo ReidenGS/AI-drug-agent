@@ -120,7 +120,7 @@ def test_step5_uploaded_heavy_and_light_fasta_files_route_to_antibody_candidate(
     assert projection.modality_summary.has_antibody_light_sequence
 
 
-def test_step5_antibody_named_fasta_routes_to_antibody_sequence_reference(
+def test_step5_antibody_named_fasta_with_unknown_chain_is_not_materialized(
     local_storage, registry_service, workflow_state_service
 ):
     uploaded = [
@@ -141,13 +141,26 @@ def test_step5_antibody_named_fasta_routes_to_antibody_sequence_reference(
     antibody = _record_by_type(table, "antibody")
 
     antibody_mats = [m for m in antibody.materials if m.material_type == "antibody_sequence_reference"]
-    assert len(antibody_mats) == 1
-    assert antibody_mats[0].value == uploaded[0]["storage_path"]
+    assert not antibody_mats
     assert not any(
-        m.material_type in {"antibody_heavy_chain_sequence", "antibody_light_chain_sequence"}
+        m.material_type in {
+            "antibody_heavy_chain_sequence",
+            "antibody_light_chain_sequence",
+        }
         for m in antibody.materials
     )
-    assert uploaded[0]["storage_path"] not in [m.value for m in _record_by_type(table, "target_antigen").materials]
+    assert not any(
+        m.material_type == "target_sequence"
+        for m in _record_by_type(table, "target_antigen").materials
+    )
+    assert any(
+        "antibody_sequence_role_unresolved" in note
+        for note in antibody.context_notes
+    )
+    assert any(
+        "antibody_sequence_role_unresolved" in gap
+        for gap in antibody.data_gaps
+    )
 
 
 def test_step5_antigen_cues_route_fasta_to_target_sequence(
@@ -247,7 +260,7 @@ def test_sequence_fasta_query_target_cue_routes_to_target_sequence(
     )
 
 
-def test_sequence_fasta_query_antibody_cue_routes_to_antibody_sequence_reference(
+def test_sequence_fasta_query_antibody_cue_does_not_materialize_without_chain(
     local_storage, registry_service, workflow_state_service
 ):
     ambiguous = {
@@ -268,9 +281,8 @@ def test_sequence_fasta_query_antibody_cue_routes_to_antibody_sequence_reference
     target = _record_by_type(table, "target_antigen")
     antibody = _record_by_type(table, "antibody")
 
-    assert any(
+    assert not any(
         m.material_type == "antibody_sequence_reference"
-        and m.value == ambiguous["storage_path"]
         for m in antibody.materials
     )
     assert not any(
@@ -279,8 +291,15 @@ def test_sequence_fasta_query_antibody_cue_routes_to_antibody_sequence_reference
     )
     assert not any(
         m.material_type in {"antibody_heavy_chain_sequence", "antibody_light_chain_sequence"}
-        and m.value == ambiguous["storage_path"]
         for m in antibody.materials
+    )
+    assert any(
+        "antibody_sequence_role_unresolved" in note
+        for note in antibody.context_notes
+    )
+    assert any(
+        "antibody_sequence_role_unresolved" in gap
+        for gap in antibody.data_gaps
     )
 
 

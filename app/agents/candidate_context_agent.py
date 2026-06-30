@@ -111,6 +111,10 @@ _ANTIBODY_HEAVY_SEQ_MATERIAL_TYPES = (
 _ANTIBODY_LIGHT_SEQ_MATERIAL_TYPES = (
     "antibody_light_chain_sequence",
 )
+_ANTIBODY_HEAVY_LIGHT_CHAIN_TYPES = (
+    "antibody_heavy_chain_sequence",
+    "antibody_light_chain_sequence",
+)
 _ANTIBODY_GENERIC_SEQ_MATERIAL_TYPES = (
     "antibody_sequence_reference",
 )
@@ -276,15 +280,22 @@ def _query_inferred_sequence_route(
     antibody_text: str,
     raw_user_query: str,
 ) -> str | None:
-    """Infer target/antibody role from conservative raw query sentence context."""
+    """Infer explicit sequence role from conservative raw query sentence context.
+
+    Only explicit heavy/light/target cues are accepted. A generic "antibody
+    sequence" hint without chain specificity is treated as unresolved so it is
+    not materialized as executable input.
+    """
     if not raw_user_query:
         return None
     target_cues = _TARGET_FASTA_HINTS | _token_set(target_text)
-    antibody_cues = (
-        _ANTIBODY_GENERIC_HINTS
-        | _token_set(antibody_text)
-        | {"antibody", "vh", "vl", "igg", "trastuzumab", "antibody_sequence"}
+    antibody_chain_cues = (
+        _HEAVY_CHAIN_HINTS
+        | _LIGHT_CHAIN_HINTS
+        | {"vh", "vl", "vc", "hc", "lc", "igg"}
+        | {"trastuzumab", "antibody"}
     )
+    antibody_chain_cues |= _token_set(antibody_text)
 
     for chunk in _query_sentence_chunks(raw_user_query):
         if not _sentence_targets_fasta_file(chunk, file):
@@ -292,13 +303,22 @@ def _query_inferred_sequence_route(
 
         chunk_tokens = _token_set(chunk)
         target_signal = bool(chunk_tokens & target_cues)
-        antibody_signal = bool(chunk_tokens & antibody_cues)
+        heavy_signal = bool(chunk_tokens & _HEAVY_CHAIN_HINTS)
+        light_signal = bool(chunk_tokens & _LIGHT_CHAIN_HINTS)
+        chain_signal = bool(chunk_tokens & antibody_chain_cues)
 
-        if target_signal and not antibody_signal:
+        if target_signal and not chain_signal:
             return "target"
-        if antibody_signal and not target_signal:
-            return "antibody"
-        if target_signal and antibody_signal:
+        if chain_signal and not target_signal and not heavy_signal and not light_signal:
+            # Generic antibody mention without chain-specific signal is unresolved.
+            return "antibody_sequence_unresolved"
+        if heavy_signal and not light_signal:
+            return "antibody_heavy_chain_sequence"
+        if light_signal and not heavy_signal:
+            return "antibody_light_chain_sequence"
+        if heavy_signal and light_signal:
+            return "ambiguous"
+        if target_signal and chain_signal:
             return "ambiguous"
 
     return None
@@ -311,27 +331,36 @@ def _fasta_classify_sequence_file_route(
     antibody_text: str,
     raw_user_query: str,
 ) -> str:
-    """Classify FASTA file metadata as antibody, target, or unassigned.
+    """Classify FASTA file metadata as antibody/target/ambiguous/unassigned.
 
     The classifier is conservative:
-    - explicit heavy/light/antibody hints always go to antibody candidate
-      materials;
-    - explicit target/antigen hints go to target sequence only when not in
-      conflict with explicit antibody routing.
+    - only explicit heavy/light cues map to concrete antibody sequence materials;
+    - generic "antibody sequence" without chain specificity stays unresolved;
+    - explicit target/antigen hints map to target sequence when unambiguous;
     - ambiguous or unknown metadata returns "unassigned".
     """
     if not isinstance(file, dict):
         return "unassigned"
 
     explicit_role = str(file.get("role") or "").lower()
+    explicit_chain_role = str(file.get("chain_role") or "").lower()
     if explicit_role in {"target", "target_sequence", "target_sequence_reference", "antigen"}:
         return "target"
+    if explicit_chain_role in {"heavy", "hc", "igh", "ighv", "heavy_chain", "heavychain"}:
+        return "antibody_heavy_chain_sequence"
+    if explicit_chain_role in {"light", "lc", "igk", "igl", "igkv", "iglv", "light_chain", "lightchain"}:
+        return "antibody_light_chain_sequence"
+    if explicit_role in {"antibody_heavy_chain_sequence", "antibody_light_chain_sequence"}:
+        material_type = explicit_role
+        return material_type
     if explicit_role in {"antibody", "antibody_sequence", "antibody_sequence_reference"}:
-        return "antibody"
+        return "antibody_sequence_unresolved"
 
     material_type = _infer_antibody_sequence_material_type(file)
     if material_type in {"antibody_heavy_chain_sequence", "antibody_light_chain_sequence"}:
         return material_type
+    if material_type:
+        return "antibody_sequence_unresolved"
 
     tokens = _fasta_file_tokens(file)
     target_tokens = _token_set(target_text)
@@ -339,11 +368,19 @@ def _fasta_classify_sequence_file_route(
 
     target_signal = bool((tokens & _TARGET_FASTA_HINTS) or (tokens & target_tokens))
     antibody_signal = bool((tokens & _ANTIBODY_GENERIC_HINTS) or (tokens & antibody_tokens))
+    heavy_signal = bool(tokens & _HEAVY_CHAIN_HINTS)
+    light_signal = bool(tokens & _LIGHT_CHAIN_HINTS)
 
     if target_signal and not antibody_signal:
         return "target"
-    if antibody_signal:
-        return "antibody"
+    if antibody_signal and not target_signal:
+        return "antibody_sequence_unresolved"
+    if heavy_signal and not light_signal and not target_signal:
+        return "antibody_heavy_chain_sequence"
+    if light_signal and not heavy_signal and not target_signal:
+        return "antibody_light_chain_sequence"
+    if heavy_signal and light_signal and not target_signal:
+        return "ambiguous"
 
     query_signal = _query_inferred_sequence_route(
         file,
@@ -353,8 +390,14 @@ def _fasta_classify_sequence_file_route(
     )
     if query_signal == "target":
         return "target"
-    if query_signal == "antibody":
-        return "antibody"
+    if query_signal == "antibody_heavy_chain_sequence":
+        return "antibody_heavy_chain_sequence"
+    if query_signal == "antibody_light_chain_sequence":
+        return "antibody_light_chain_sequence"
+    if query_signal == "antibody_sequence_unresolved":
+        return "antibody_sequence_unresolved"
+    if query_signal == "ambiguous":
+        return "ambiguous"
     return "unassigned"
 
 
@@ -378,16 +421,23 @@ def _split_sequence_files_by_semantic_routing(
         )
         if route == "target":
             target_files.append(file)
-        elif route in {"antibody", "antibody_heavy_chain_sequence", "antibody_light_chain_sequence"}:
+        elif route in {"antibody_heavy_chain_sequence", "antibody_light_chain_sequence"}:
             antibody_files.append(file)
         else:
+            if route not in {"unassigned", "ambiguous"}:
+                # Preserve compact reason for downstream audit notes.
+                file = {**file, "_sequence_route_reason": route}
+            else:
+                file = dict(file)
+                if "_sequence_route_reason" in file:
+                    del file["_sequence_route_reason"]
             unassigned_files.append(file)
 
     return antibody_files, target_files, unassigned_files
 
 
 def _unassigned_fasta_sequence_note(file: dict) -> str:
-    ref = file.get("file_id") or file.get("original_filename") or file.get("storage_path") or "unknown"
+    ref = file.get("file_id") or file.get("original_filename") or "unknown_fasta_sequence"
     return f"uploaded_fasta_sequence_file_unassigned:{ref}"
 
 
@@ -400,10 +450,25 @@ def _add_sequence_route_notes(
     if not candidate:
         return
     for file in sequence_files:
-        note = f"{note_prefix}:{file.get('file_id') or file.get('original_filename') or file.get('storage_path') or 'unknown'}"
+        route_reason = str(file.get("_sequence_route_reason") or "").strip()
+        if route_reason == "antibody_sequence_unresolved":
+            unresolved_reason = "antibody_sequence_role_unresolved"
+        elif route_reason == "ambiguous":
+            unresolved_reason = "sequence_file_route_ambiguous"
+        elif route_reason == "target_or_antibody_ambiguous":
+            unresolved_reason = "antibody_target_reference_conflict"
+        else:
+            unresolved_reason = None
+
+        note_ref = file.get("file_id") or file.get("original_filename") or "unknown_sequence_file"
+        note = f"{note_prefix}:{note_ref}"
+        if unresolved_reason:
+            note = f"{note}:{unresolved_reason}"
         if note not in candidate.context_notes:
             candidate.context_notes.append(note)
         gap = _unassigned_fasta_sequence_note(file)
+        if unresolved_reason and unresolved_reason not in gap:
+            gap = f"{gap}:{unresolved_reason}"
         if gap not in candidate.data_gaps:
             candidate.data_gaps.append(gap)
 
@@ -865,6 +930,10 @@ class CandidateContextAgent:
                 )
         for f in sequence_files:
             material_type = _infer_antibody_sequence_material_type(f)
+            if not material_type:
+                continue
+            if material_type not in _ANTIBODY_HEAVY_LIGHT_CHAIN_TYPES:
+                continue
             materials.append(
                 self._material_with_role(
                     material_type,
@@ -2211,12 +2280,12 @@ def _format_for_file(f: dict) -> str:
     return "pdb"
 
 
-def _infer_antibody_sequence_material_type(f: dict) -> str:
+def _infer_antibody_sequence_material_type(f: dict) -> str | None:
     """Infer heavy/light antibody sequence role from explicit file metadata.
 
-    This is deliberately conservative: unknown FASTA files stay generic
-    ``antibody_sequence_reference`` so Step 5 does not silently treat every
-    antibody sequence upload as a heavy chain.
+    This is deliberately conservative: unknown FASTA files return ``None`` so
+    Step 5 does not silently treat ambiguous uploads as executable sequence
+    input.
     """
     parts: list[str] = []
     for key in (
@@ -2237,7 +2306,7 @@ def _infer_antibody_sequence_material_type(f: dict) -> str:
         hint in collapsed for hint in ("lightchain", "igkv", "iglv")
     ):
         return "antibody_light_chain_sequence"
-    return "antibody_sequence_reference"
+    return None
 
 
 def _identifiers_for(
