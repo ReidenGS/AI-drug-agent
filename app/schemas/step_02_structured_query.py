@@ -134,6 +134,7 @@ MissingSlotName = Literal[
     "payload",
     "linker",
     "structure_or_sequence",
+    "sequence_role",
     "pdb_id",
     "uniprot_id",
     "smiles",

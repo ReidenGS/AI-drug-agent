@@ -90,8 +90,8 @@ Input-to-output mapping:
 - Heavy chain / VH / HC / IGH / IGHV / H chain sequence or FASTA ->
   `antibody_heavy_chain_sequence`. Light chain / VL / LC / kappa /
   lambda / IGK / IGL / IGKV / IGLV / L chain -> `antibody_light_chain_sequence`.
-  If the user only says antibody/protein sequence or FASTA with no chain
-  hint, use `antibody_sequence_reference`; do not default to heavy.
+  If an antibody FASTA/sequence lacks heavy/light role, do not use
+  `antibody_sequence_reference`; report blocking `sequence_role`.
 - Do not infer heavy vs light from sequence content. Do not extract CDR3
   from a full sequence. Preserve only an explicitly supplied CDR3 as
   `antibody_cdr3_sequence`; downstream runtime extracts CDR3 when needed.
@@ -191,6 +191,11 @@ required_slot_schema (satisfied_by = any one is enough):
   - blocking structure_or_sequence ONLY when no analyzable molecule/protein
     input exists at all (no payload/linker name or SMILES, no antibody/
     protein sequence, no UniProt/accession, no PDB/CIF/PDB ID).
+- conditional uploaded FASTA role:
+  - blocking sequence_role ONLY when an uploaded FASTA/sequence file exists
+    and its role is unclear from filename, metadata, query, or context.
+    Do not emit it when no FASTA exists or the role is clear.
+    question: "Is the uploaded FASTA heavy chain, light chain, target/antigen, or another protein?"
 - literature_review / patent_ip_review:
   - focus on a searchable entity (target/drug/compound) if none is present;
     do NOT demand full ADC-design completeness. Use warning unless there is

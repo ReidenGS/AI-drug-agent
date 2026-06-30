@@ -61,6 +61,23 @@ def test_schema_accepts_missing_slots():
     assert sq.missing_slots[0].severity == "blocking"
 
 
+def test_schema_accepts_conditional_sequence_role_missing_slot():
+    sq = _sq(
+        missing_slots=[
+            MissingSlot(
+                slot_name="sequence_role",
+                slot_category="sequence",
+                severity="blocking",
+                required_for=["uploaded_fasta_role_routing"],
+                reason="uploaded FASTA role is unclear",
+                suggested_question="What role should the uploaded FASTA have?",
+            )
+        ]
+    )
+    assert sq.missing_slots[0].slot_name == "sequence_role"
+    assert sq.missing_slots[0].slot_category == "sequence"
+
+
 def test_schema_defaults_missing_slots_empty():
     assert _sq().missing_slots == []
 
@@ -90,6 +107,13 @@ def test_prompt_advertises_required_slot_schema_and_missing_slots():
     assert "equivalent typed input" in sp
 
 
+def test_prompt_describes_conditional_uploaded_fasta_role_slot():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "conditional uploaded FASTA role" in sp
+    assert "blocking sequence_role ONLY when an uploaded FASTA/sequence file exists" in sp
+    assert "Do not emit it when no FASTA exists" in sp
+
+
 # ── normalizer drift handling ───────────────────────────────────────────────
 
 
@@ -112,6 +136,39 @@ def test_normalizer_missing_slots_dict_wrapped_to_list():
     assert out["missing_slots"][0]["slot_name"] == "payload"
     assert out["missing_slots"][0]["slot_category"] == "payload"  # backfilled
     assert any("container to a list" in w for w in out["parse_warnings"])
+
+
+def test_normalizer_missing_slots_preserves_sequence_role_aliases():
+    out = normalize_llm_payload_for_step2(
+        {
+            "missing_slots": [
+                {
+                    "slot_name": "fasta_role",
+                    "severity": "blocking",
+                    "reason": "ambiguous uploaded FASTA",
+                }
+            ]
+        }
+    )
+    assert out["missing_slots"][0]["slot_name"] == "sequence_role"
+    assert out["missing_slots"][0]["slot_category"] == "sequence"
+
+
+def test_normalizer_promotes_other_sequence_fasta_role_gap():
+    out = normalize_llm_payload_for_step2(
+        {
+            "missing_slots": [
+                {
+                    "slot_name": "other",
+                    "slot_category": "sequence",
+                    "severity": "blocking",
+                    "reason": "Uploaded FASTA role is unclear.",
+                }
+            ]
+        }
+    )
+    assert out["missing_slots"][0]["slot_name"] == "sequence_role"
+    assert out["missing_slots"][0]["slot_category"] == "sequence"
 
 
 def test_normalizer_missing_slots_string_becomes_other_slot():

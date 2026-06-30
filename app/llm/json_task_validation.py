@@ -106,8 +106,8 @@ def shape_instruction(task: str) -> str:
         "against the inferred task intent and the user's query / context / "
         "uploaded-file metadata. Each item: `slot_name` "
         '("target_or_antigen", "antibody", "payload", "linker", '
-        '"structure_or_sequence", "pdb_id", "uniprot_id", "smiles", '
-        '"task_intent", "constraint", "other"), `slot_category` ("target", '
+        '"structure_or_sequence", "sequence_role", "pdb_id", "uniprot_id", '
+        '"smiles", "task_intent", "constraint", "other"), `slot_category` ("target", '
         '"antibody", "payload", "linker", "structure", "sequence", '
         '"identifier", "task_intent", "constraint", "other"), `severity` '
         '("blocking", "warning", "optional"), `required_for` (list of '
@@ -593,6 +593,7 @@ _MISSING_SLOT_NAMES = frozenset(
         "payload",
         "linker",
         "structure_or_sequence",
+        "sequence_role",
         "pdb_id",
         "uniprot_id",
         "smiles",
@@ -627,6 +628,7 @@ _MISSING_SLOT_NAME_TO_CATEGORY = {
     "payload": "payload",
     "linker": "linker",
     "structure_or_sequence": "structure",
+    "sequence_role": "sequence",
     "pdb_id": "identifier",
     "uniprot_id": "identifier",
     "smiles": "identifier",
@@ -642,6 +644,9 @@ _MISSING_SLOT_NAME_ALIASES = {
     "antibody_candidate": "antibody",
     "structure": "structure_or_sequence",
     "sequence": "structure_or_sequence",
+    "fasta_role": "sequence_role",
+    "sequence_file_role": "sequence_role",
+    "uploaded_sequence_role": "sequence_role",
     "structure_or_sequence_input": "structure_or_sequence",
     "uniprot": "uniprot_id",
     "pdb": "pdb_id",
@@ -696,11 +701,17 @@ def _coerce_missing_slot_item(item: Any) -> dict | None:
     raw_name = item.get("slot_name")
     name = raw_name.strip().lower() if isinstance(raw_name, str) else ""
     name = _MISSING_SLOT_NAME_ALIASES.get(name, name)
+    raw_category = item.get("slot_category")
+    category = raw_category.strip().lower() if isinstance(raw_category, str) else ""
+    reason_probe = " ".join(
+        str(item.get(k) or "")
+        for k in ("reason", "suggested_question", "evidence")
+    ).lower()
+    if name == "other" and category == "sequence" and "fasta" in reason_probe and "role" in reason_probe:
+        name = "sequence_role"
     if name not in _MISSING_SLOT_NAMES:
         name = "other"
 
-    raw_category = item.get("slot_category")
-    category = raw_category.strip().lower() if isinstance(raw_category, str) else ""
     if category not in _MISSING_SLOT_CATEGORIES:
         category = _MISSING_SLOT_NAME_TO_CATEGORY.get(name, "other")
 
