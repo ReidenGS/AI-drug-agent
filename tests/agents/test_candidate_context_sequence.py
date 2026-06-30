@@ -151,6 +151,32 @@ def test_step5_skips_name_lookup_for_sentence_label(
     assert any("antibody_name_lookup_skipped" in n for n in ab["context_notes"])
 
 
+@pytest.mark.parametrize(
+    "label",
+    [
+        "antibody protein sequences",
+        "antibody heavy and light chain sequence developability pre-filter",
+    ],
+)
+def test_step5_skips_generic_sequence_task_labels_as_antibody_names(
+    local_storage, registry_service, workflow_state_service, label
+):
+    run_id, _ = _seed_sequence_run(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        antibody_text=label,
+    )
+    cct = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
+    ab = _antibody_record(cct)
+    assert any(m["material_type"] == "antibody_heavy_chain_sequence" for m in ab["materials"])
+    assert any(m["material_type"] == "antibody_light_chain_sequence" for m in ab["materials"])
+    assert not any(m["material_type"] == "antibody_name" for m in ab["materials"])
+    called = {tc["tool_name"] for tc in cct.get("tool_call_records", [])}
+    assert "SAbDab_search_structures" not in called
+    assert "TheraSAbDab_search_therapeutics" not in called
+
+
 def test_step6_available_fields_expose_both_chains_as_digests(
     local_storage, registry_service, workflow_state_service
 ):

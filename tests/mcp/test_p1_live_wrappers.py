@@ -1169,9 +1169,10 @@ def test_therasabdab_therapeutics_live_upstream_error(install_universe):
 
 # iedb_search_bcr_sequences
 
-def test_iedb_bcr_mock_unchanged():
+def test_iedb_bcr_non_live_reports_not_live():
     out = iedb_search_bcr_sequences()
-    assert out["status"] == "mocked"
+    assert out["status"] == "not_live"
+    assert "live" in out["reason"].lower()
     assert out["sequences"] == []
 
 

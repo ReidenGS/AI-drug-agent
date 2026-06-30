@@ -136,9 +136,30 @@ def _looks_like_antibody_name(text: str | None) -> bool:
     t = (text or "").strip()
     if not t or len(t) > 60:
         return False
+    lowered = " ".join(t.lower().split())
+    task_words = {
+        "sequence", "sequences", "developability", "prefilter", "pre-filter",
+        "filter", "liability", "liabilities", "heavy", "light", "chain",
+        "chains", "protein", "proteins", "input", "inputs", "assessment",
+    }
+    sequence_task_phrases = (
+        "antibody protein sequence",
+        "antibody protein sequences",
+        "heavy and light chain sequence",
+        "heavy/light chain sequence",
+        "developability pre-filter",
+        "developability prefilter",
+    )
+    if any(phrase in lowered for phrase in sequence_task_phrases):
+        return False
     if any(p in t for p in (".", "?", "!", ";", ":", ",")):
         return False
-    return len(t.split()) <= 4
+    tokens = [tok.strip("()[]{}").lower() for tok in t.split()]
+    if len(tokens) > 4:
+        return False
+    if "antibody" in tokens and any(tok in task_words for tok in tokens if tok != "antibody"):
+        return False
+    return True
 
 _HEAVY_CHAIN_HINTS = {
     "heavy", "heavychain", "heavy_chain", "vh", "hc", "igh", "ighv",
@@ -1521,10 +1542,37 @@ class CandidateContextAgent:
             **mcp_args,
         )
         finished = now_iso()
+        payload = result.get("payload")
+        envelope_status = payload.get("status") if isinstance(payload, dict) else None
+        run_status = result.get("run_status", "pending")
+        error_message = result.get("error_message")
+        if envelope_status in {"mocked", "not_live"}:
+            run_status = "dependency_unavailable"
+            reason = (
+                "iedb_search_bcr_sequences is not live-enabled; mocked BCR envelopes "
+                "are not treated as real Step 5 context"
+                if envelope_status == "mocked"
+                else (
+                    payload.get("reason")
+                    if isinstance(payload, dict)
+                    else "iedb_search_bcr_sequences is not live-enabled"
+                )
+            )
+            error_message = str(reason)
+            redacted_summary["execution_semantics"] = "not_live_mcp_execution"
+            redacted_summary["output_envelope_status"] = envelope_status
+            if isinstance(payload, dict):
+                payload = {
+                    "status": "not_live",
+                    "source": _IEDB_BCR_TOOL_NAME,
+                    "reason": reason,
+                }
+        elif envelope_status:
+            redacted_summary["output_envelope_status"] = envelope_status
 
         output_ref = None
         output_artifact_id = None
-        if "payload" in result:
+        if payload is not None:
             output_artifact_id = new_artifact_id("tool_output")
             output_key = self.storage.run_key(
                 run_id, "tool_outputs", "step_05", f"{tc_id}.json"
@@ -1539,21 +1587,21 @@ class CandidateContextAgent:
                     # arg dict. We accept the loss of a fully reproducible
                     # input echo in exchange for the privacy guarantee.
                     "input": redacted_summary,
-                    "output": result["payload"],
+                    "output": payload,
                 },
             )
             output_ref = output_key
 
         # Surface a compact context_note + non-leaking summary for the
         # candidate. Raw CDR3 still never reaches the record.
-        if result.get("run_status") in (None, "success") and output_ref:
+        if run_status == "success" and output_ref:
             record.candidate_notes = _notes_for(
                 ToolCallRecord(
                     tool_call_id=tc_id,
                     tool_name=_IEDB_BCR_TOOL_NAME,
                     agent_name=_AGENT_NAME,
                     step_id=_STEP_ID,
-                    run_status=result.get("run_status", "pending"),
+                    run_status=run_status,
                     started_at=started,
                     finished_at=finished,
                     tool_input_summary=redacted_summary,
@@ -1567,13 +1615,13 @@ class CandidateContextAgent:
             tool_name=_IEDB_BCR_TOOL_NAME,
             agent_name=_AGENT_NAME,
             step_id=_STEP_ID,
-            run_status=result.get("run_status", "pending"),
+            run_status=run_status,
             started_at=started,
             finished_at=finished,
             tool_input_summary=redacted_summary,
             tool_output_artifact_id=output_artifact_id,
             tool_output_ref=output_ref,
-            error_message=result.get("error_message"),
+            error_message=error_message,
         )
 
     def run_step(self, *, run_id: str, step_id: str, payload: dict[str, Any]) -> dict:  # noqa: ARG002

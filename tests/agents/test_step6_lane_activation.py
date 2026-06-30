@@ -1261,6 +1261,63 @@ def test_step6_non_antibody_sequence_ref_does_not_expand(
     assert "chain_role" not in (tool_calls[0]["tool_input_summary"] or {})
     assert calls and calls[0].get("sequence") == target_seq
 
+
+def test_step6_lane_summary_surfaces_upstream_error_envelope(
+    local_storage, registry_service, workflow_state_service
+):
+    heavy_seq = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
+    light_seq = "DIQMTQSPSSLSASVGDRVTITCQASQDIQLLNGRT"
+    llm = _single_sequence_tool_llm("IEDB_predict_mhci_binding")
+    run_id = _seed_synthetic_cct(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        materials=[
+            _material("antibody_heavy_chain_sequence", heavy_seq),
+            _material("antibody_light_chain_sequence", light_seq),
+        ],
+        candidate_type="antibody",
+    )
+
+    def _iedb_upstream_error(**_kw: Any) -> dict[str, Any]:
+        return {
+            "status": "upstream_error",
+            "source": "IEDB_predict_mhci_binding",
+            "executor": "tooluniverse",
+            "error_message": "IEDB HTTP 500",
+        }
+
+    DevelopabilityAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(bindings={"IEDB_predict_mhci_binding": _iedb_upstream_error}),
+        llm=llm,
+    ).run(run_id)
+
+    persisted = local_storage.read_json(local_storage.run_key(run_id, "structured_liability_summary.json"))
+    lane = _lane_results(persisted)["antibody_protein_sequence_liability"]
+    assert lane["run_status"] == "partial"
+    summary = lane["lane_summary"].lower()
+    assert "upstream_error" in summary
+    assert "outer run_statuses [success]" in summary
+    calls = [
+        tc for tc in lane["tool_call_records"]
+        if tc["tool_name"] == "IEDB_predict_mhci_binding"
+    ]
+    assert calls
+    assert all(tc["run_status"] == "success" for tc in calls)
+    assert all(tc["tool_output_ref"] for tc in calls)
+    assert all(
+        tc["tool_input_summary"].get("output_envelope_status") == "upstream_error"
+        for tc in calls
+    )
+    audit = persisted["selection_audit"]
+    assert "IEDB_predict_mhci_binding" in audit["step_06_upstream_error_tools"]
+    blob = json.dumps(persisted)
+    assert heavy_seq not in blob
+    assert light_seq not in blob
+
 # ── LLM call-count budget (per-candidate Stage1 + Stage2) ───────────────────
 
 
