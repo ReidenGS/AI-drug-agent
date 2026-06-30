@@ -52,9 +52,15 @@ def _inventory_or_skip() -> ToolInventoryService:
 def _seed_sequence_run(
     local_storage, registry_service, workflow_state_service,
     *, antibody_text: str | None = "these antibody heavy and light chain sequences",
+    referenced_inputs: list[dict] | None = None,
 ) -> str:
     """Step 1 + a directly-written Step 2 carrying inline heavy/light refs,
     then Step 3 + Step 4 so Step 5 can run."""
+    if referenced_inputs is None:
+        referenced_inputs = [
+            {"id_type": "antibody_heavy_chain_sequence", "value": HEAVY, "source": "user"},
+            {"id_type": "antibody_light_chain_sequence", "value": LIGHT, "source": "user"},
+        ]
     rec = IntakeService(local_storage, registry_service, workflow_state_service).submit(
         raw_user_query="Run a developability pre-filter on antibody heavy/light sequences.",
         user_provided_context={},
@@ -71,10 +77,7 @@ def _seed_sequence_run(
             primary_intent="developability_assessment",
         ),
         mentioned_entities={"antibody_candidate_text": antibody_text},
-        referenced_inputs=[
-            {"id_type": "antibody_heavy_chain_sequence", "value": HEAVY, "source": "user"},
-            {"id_type": "antibody_light_chain_sequence", "value": LIGHT, "source": "user"},
-        ],
+        referenced_inputs=referenced_inputs,
         missing_slots=[],
         canonical_query="developability/liability pre-filter for antibody heavy/light sequences",
     )
@@ -129,6 +132,32 @@ def test_heavy_light_refs_become_two_distinct_materials(
     assert sq_id in ab["source_records"]
 
 
+def test_heavy_ref_only_becomes_heavy_material(local_storage, registry_service, workflow_state_service):
+    run_id, _ = _seed_sequence_run(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "antibody_heavy_chain_sequence", "value": HEAVY, "source": "user"}],
+        antibody_text="trastuzumab",
+    )
+    cct = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
+    ab = _antibody_record(cct)
+    mat_types = {m["material_type"] for m in ab["materials"] if m["value_format"] == "amino_acid_sequence"}
+    assert mat_types == {"antibody_heavy_chain_sequence"}
+    assert not any(m["material_type"] == "antibody_light_chain_sequence" for m in ab["materials"])
+
+
+def test_light_ref_only_becomes_light_material(local_storage, registry_service, workflow_state_service):
+    run_id, _ = _seed_sequence_run(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "antibody_light_chain_sequence", "value": LIGHT, "source": "user"}],
+        antibody_text="trastuzumab",
+    )
+    cct = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
+    ab = _antibody_record(cct)
+    mat_types = {m["material_type"] for m in ab["materials"] if m["value_format"] == "amino_acid_sequence"}
+    assert mat_types == {"antibody_light_chain_sequence"}
+    assert not any(m["material_type"] == "antibody_heavy_chain_sequence" for m in ab["materials"])
+
+
 def test_step5_does_not_record_antibody_sequence_missing(
     local_storage, registry_service, workflow_state_service
 ):
@@ -136,6 +165,40 @@ def test_step5_does_not_record_antibody_sequence_missing(
     cct = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
     ab = _antibody_record(cct)
     assert not [g for g in ab["data_gaps"] if "antibody_sequence_missing" in g]
+
+
+def test_antibody_sequence_reference_referenced_input_is_not_materialized(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id, _ = _seed_sequence_run(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        referenced_inputs=[
+            {
+                "id_type": "antibody_sequence_reference",
+                "value": HEAVY + LIGHT,
+                "source": "user",
+            },
+        ],
+        antibody_text="trastuzumab",
+    )
+    cct = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
+    ab = _antibody_record(cct)
+
+    assert all(
+        m["material_type"]
+        not in {"antibody_sequence_reference", "antibody_heavy_chain_sequence", "antibody_light_chain_sequence"}
+        for m in ab["materials"]
+    )
+    assert not any(HEAVY in gap or LIGHT in gap for gap in ab["data_gaps"])
+    assert any(
+        "antibody_sequence_role_unresolved" in note for note in ab["context_notes"]
+    )
+    assert any(
+        "antibody_sequence_chain_role_unresolved" in gap or "heavy_or_light" in gap
+        for gap in ab["data_gaps"]
+    )
 
 
 def test_step5_skips_name_lookup_for_sentence_label(

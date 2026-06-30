@@ -189,6 +189,51 @@ def test_step7_uploaded_pdb_preferred_over_sequence_refs(
     assert "RAW_FASTA_SENTINEL" not in blob
 
 
+def test_step7_does_not_treat_generic_antibody_sequence_reference_as_prediction_input(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        referenced_inputs=[
+            {
+                "id_type": "antibody_sequence_reference",
+                "value": "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK",
+                "source": "user",
+            }
+        ],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    assert all(
+        m["material_type"] != "antibody_sequence_reference" for m in antibody["materials"]
+    )
+    assert any(
+        "antibody_sequence_role_unresolved" in note for note in antibody.get("context_notes", [])
+    )
+
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    ).run_step_7(run_id)
+
+    for rec in pkg.prepared_structure_inputs:
+        assert all(
+            s.prediction_input_kind != "amino_acid_sequence"
+            for s in rec.sequence_refs_for_prediction
+        )
+    artifact = local_storage.read_json(local_storage.run_key(run_id, "prepared_structure_input_package.json"))
+    artifact_blob = json.dumps(artifact)
+    assert "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK" not in artifact_blob
+    assert any(
+        "antibody_sequence_role_unresolved" in n for n in antibody["context_notes"]
+    )
+
+
 def test_step7_builds_input_package_from_referenced_pdb_and_uniprot(
     local_storage, registry_service, workflow_state_service
 ):

@@ -125,6 +125,8 @@ _ANTIBODY_SEQ_REFERENCE_ROLES = (
 _ANTIBODY_SEQUENCE_REF_ID_TYPES = (
     "antibody_heavy_chain_sequence",
     "antibody_light_chain_sequence",
+)
+_ANTIBODY_SEQUENCE_REFERENCE_ID_TYPES = (
     "antibody_sequence_reference",
 )
 
@@ -676,10 +678,16 @@ class CandidateContextAgent:
             for id_type in _ANTIBODY_SEQUENCE_REF_ID_TYPES
             for r in refs_by_type.get(id_type, [])
         ]
+        unresolved_antibody_sequence_refs = [
+            r
+            for id_type in _ANTIBODY_SEQUENCE_REFERENCE_ID_TYPES
+            for r in refs_by_type.get(id_type, [])
+        ]
         ab_cand = self._build_antibody_candidate(
             antibody_text=antibody_text,
             sequence_files=antibody_sequence_files,
             inline_sequence_refs=inline_antibody_sequence_refs,
+            unresolved_sequence_refs=unresolved_antibody_sequence_refs,
             sq_artifact_id=sq_artifact_id,
         )
         if ab_cand is None:
@@ -903,13 +911,16 @@ class CandidateContextAgent:
         antibody_text: Optional[str],
         sequence_files: list[dict],
         inline_sequence_refs: list[dict] | None = None,
+        unresolved_sequence_refs: list[dict] | None = None,
         sq_artifact_id: str,
     ) -> Optional[CandidateRecord]:
         inline_sequence_refs = inline_sequence_refs or []
-        if not (antibody_text or sequence_files or inline_sequence_refs):
+        unresolved_sequence_refs = unresolved_sequence_refs or []
+        if not (antibody_text or sequence_files or inline_sequence_refs or unresolved_sequence_refs):
             return None
         materials: list[Material] = []
         context_notes: list[str] = []
+        data_gaps: list[str] = []
         has_sequence_input = bool(sequence_files or inline_sequence_refs)
         # Only emit an `antibody_name` material (which drives SAbDab /
         # TheraSAbDab name lookup) when the text is a plausible antibody NAME.
@@ -942,7 +953,7 @@ class CandidateContextAgent:
                     role="antibody_sequence_reference", role_status="explicit",
                 )
             )
-        # Inline heavy/light/generic antibody sequences from Step 2
+        # Inline heavy/light antibody sequences from Step 2
         # referenced_inputs become distinct candidate materials carrying the
         # inline amino-acid sequence (value_format reflects inline AA, not a
         # fasta ref). Step 6 available_fields exposes only a digest of these;
@@ -960,7 +971,28 @@ class CandidateContextAgent:
                     role="antibody_sequence_reference", role_status="explicit",
                 )
             )
-        if not materials:
+        for ref in unresolved_sequence_refs:
+            if not isinstance(ref, dict):
+                continue
+            ref_value = str(ref.get("value") or "").strip()
+            if not ref_value:
+                continue
+            note_ref = str(ref.get("source") or "").strip() or str(ref.get("id_type") or "")
+            if not note_ref and str(ref.get("id")):
+                note_ref = str(ref.get("id"))
+            if not note_ref:
+                note_ref = "unresolved_antibody_sequence_reference"
+            context_notes.append(
+                f"antibody_sequence_role_unresolved:{note_ref} "
+                "(generic antibody_sequence_reference lacks heavy/light chain role; "
+                "please confirm heavy or light)."
+            )
+            data_gaps.append(
+                "sequence_input_missing:antibody_sequence_chain_role_unresolved:heavy_or_light_needed"
+            )
+            # Do not materialize `antibody_sequence_reference` inline content as
+            # executable Step 6/7/8 sequence input.
+        if not materials and not unresolved_sequence_refs:
             return None
         record = CandidateRecord(
             candidate_id=new_artifact_id("candidate"),
@@ -975,6 +1007,7 @@ class CandidateContextAgent:
             candidate_role="user_provided_candidate",
             is_generated_candidate=False,
             context_status="partial",
+            data_gaps=data_gaps,
         )
         for note in context_notes:
             if note not in record.context_notes:
