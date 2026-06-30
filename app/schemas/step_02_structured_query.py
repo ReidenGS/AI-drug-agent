@@ -206,3 +206,13 @@ class StructuredQuery(BaseModel):
     # only passes this through — it never re-phrases it. Must never carry raw
     # prompts, keys, file content, or full sequences.
     response: Optional[str] = None
+    # LLM-generated canonical (normalized) natural-language description of the
+    # CURRENT task. This is the stable working query downstream steps read;
+    # `raw_user_query` (Step 1) stays the original, auditable user input and is
+    # never overwritten. On a clarification turn the LLM updates this from
+    # `previous_canonical_query` + `clarification_answers`. Stable field name —
+    # NO query-like aliases (working_query / normalized_query / final_query /
+    # rewritten_query / user_query_summary / query_for_downstream /
+    # canonical_task / task_summary / query_summary). Never carries prompts,
+    # keys, raw payloads, or full sequences; capped at ~800 chars.
+    canonical_query: Optional[str] = None

@@ -169,11 +169,14 @@ def _gather_signals(*, readiness: dict, structured_query: dict) -> _Signals:
         or "uniprot_id" in ref_id_types
     )
     # "Meaningful query context" for Step 13/14: ANY entity, ANY referenced
-    # ID, or ANY user_goal_summary text. Evidence/patent agents can search
-    # off bare keywords; we only block them when literally nothing useful
-    # would survive the prompt.
-    user_goal = (structured_query.get("task_intent") or {}).get(
-        "user_goal_summary"
+    # ID, or ANY natural-language working query. Prefer the LLM-generated
+    # `canonical_query` (stable downstream working query); fall back to the
+    # legacy `task_intent.user_goal_summary` when canonical_query is empty.
+    canonical_query = structured_query.get("canonical_query")
+    user_goal = (
+        canonical_query
+        if isinstance(canonical_query, str) and canonical_query.strip()
+        else (structured_query.get("task_intent") or {}).get("user_goal_summary")
     ) or ""
     has_query_context = bool(
         has_target

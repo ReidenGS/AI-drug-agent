@@ -285,6 +285,12 @@ class ClarificationService:
         # keys), then layer the clarification carry-over on top.
         next_ctx: dict[str, Any] = dict(raw.get("user_provided_context") or {})
         next_ctx["previous_task_intent"] = previous_task_intent
+        # Carry the previous LLM canonical_query so the next Step 2 turn can
+        # UPDATE it with the answers rather than re-deriving from scratch. The
+        # service only transports it — it never composes a business query.
+        prev_canonical = sq.get("canonical_query")
+        if isinstance(prev_canonical, str) and prev_canonical.strip():
+            next_ctx["previous_canonical_query"] = prev_canonical.strip()
         next_ctx["previous_missing_slots"] = _compact_missing_slots(
             sq.get("missing_slots") or []
         )

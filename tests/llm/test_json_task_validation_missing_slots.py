@@ -185,3 +185,54 @@ def test_normalize_response_truncates_overlong():
     out = normalize_response({"response": "y" * 800})
     assert len(out["response"]) == 500
     assert any("truncated response" in w for w in out["parse_warnings"])
+
+
+# ── canonical_query normalization + alias promotion ─────────────────────────
+
+from app.llm.json_task_validation import normalize_canonical_query  # noqa: E402
+
+_QUERY_ALIASES = (
+    "working_query", "normalized_query", "final_query", "rewritten_query",
+    "user_query_summary", "query_for_downstream", "canonical_task",
+    "task_summary", "query_summary",
+)
+
+
+def test_validator_accepts_canonical_query():
+    data = _structured_query(canonical_query="Design a HER2 ADC")
+    out = validate_task_shape(data, "structured_query", error_factory=_err)
+    assert out["canonical_query"] == "Design a HER2 ADC"
+
+
+def test_validator_defaults_absent_canonical_query():
+    out = validate_task_shape(_structured_query(), "structured_query", error_factory=_err)
+    assert out["canonical_query"] is None
+
+
+def test_normalize_canonical_query_scalar_list_dict():
+    assert normalize_canonical_query({"canonical_query": 5})["canonical_query"] == "5"
+    assert normalize_canonical_query({"canonical_query": ["a", "b"]})["canonical_query"] == "a b"
+    assert (
+        normalize_canonical_query({"canonical_query": {"text": "Q"}})["canonical_query"] == "Q"
+    )
+
+
+def test_normalize_canonical_query_truncates_overlong():
+    out = normalize_canonical_query({"canonical_query": "y" * 1000})
+    assert len(out["canonical_query"]) == 800
+
+
+def test_normalize_promotes_each_alias_and_removes_it():
+    for alias in _QUERY_ALIASES:
+        out = normalize_canonical_query({alias: "Design HER2 ADC", "parse_warnings": []})
+        assert out["canonical_query"] == "Design HER2 ADC"
+        assert alias not in out
+        assert any("promoted query alias" in w for w in out["parse_warnings"])
+
+
+def test_validator_strips_alias_from_structured_query_artifact():
+    data = _structured_query(working_query="Design HER2 ADC", parse_warnings=[])
+    out = validate_task_shape(data, "structured_query", error_factory=_err)
+    assert out["canonical_query"] == "Design HER2 ADC"
+    for alias in _QUERY_ALIASES:
+        assert alias not in out

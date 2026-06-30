@@ -26,6 +26,9 @@ class UserProvidedContext(BaseModel):
     previous_missing_slots: list[dict] = Field(default_factory=list)
     previous_clarification_requests: list[dict] = Field(default_factory=list)
     clarification_answers: list[dict] = Field(default_factory=list)
+    # Previous turn's LLM canonical_query, carried so the Step 2 LLM can
+    # update it with the new answers instead of re-deriving from scratch.
+    previous_canonical_query: Optional[str] = None
 
 
 class UploadedFile(BaseModel):

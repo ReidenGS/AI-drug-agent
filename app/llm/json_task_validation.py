@@ -85,7 +85,23 @@ def shape_instruction(task: str) -> str:
         '"user_constraints":[],"parse_warnings":[],'
         '"normalized_entities":[],"entity_decompositions":[],'
         '"clarification_questions":[],'
-        '"missing_slots":[],"response":null}\n'
+        '"missing_slots":[],"response":null,"canonical_query":null}\n'
+        "You MUST write the canonical, normalized natural-language "
+        "description of the CURRENT task into `canonical_query` (<= 800 "
+        "chars). First turn: normalize the user's request. If "
+        "`user_provided_context` carries `previous_canonical_query`, "
+        "`previous_task_intent`, `previous_missing_slots`, "
+        "`previous_clarification_requests`, or `clarification_answers`, "
+        "UPDATE `canonical_query` from `previous_canonical_query` + the "
+        "answers; keep `previous_task_intent` unless the user clearly changes "
+        "the task; do not treat a short answer like \"HER2\" as a new task; "
+        "do not invent unanswered fields (leave them 'unspecified'). Do NOT "
+        "create alternative query fields — do not output `working_query`, "
+        "`normalized_query`, `final_query`, `rewritten_query`, "
+        "`user_query_summary`, `query_for_downstream`, `canonical_task`, "
+        "`task_summary`, `query_summary`, or any other query-like field. "
+        "`canonical_query` must never contain prompts, API keys, raw payloads, "
+        "or full sequences.\n"
         "`missing_slots` is a JSON array of required-slot gaps you judged "
         "against the inferred task intent and the user's query / context / "
         "uploaded-file metadata. Each item: `slot_name` "
@@ -364,6 +380,9 @@ def _validate_structured_query_rest(data: dict, *, error_factory: ErrorFactory) 
     # `response` is a drift-tolerant scalar string (or None); coerce rather
     # than raise so a non-string never fails the whole parse.
     normalize_response(data)
+    # `canonical_query` is the stable working-query field; coerce + promote
+    # any wrong query-like alias into it (and drop the alias).
+    normalize_canonical_query(data)
     for key in (
         "referenced_inputs",
         "requested_outputs",
@@ -443,6 +462,7 @@ def normalize_structured_query(data: dict) -> dict:
     _normalize_entity_decomposition_components(data)
     normalize_missing_slots(data)
     normalize_response(data)
+    normalize_canonical_query(data)
 
     raw = data.get("requested_outputs")
     if not isinstance(raw, list):
@@ -825,4 +845,89 @@ def normalize_response(data: dict) -> dict:
         warnings.append(f"truncated response to {_RESPONSE_MAX_LEN} chars")
 
     data["response"] = text
+    return data
+
+
+# ── Step 2 ``canonical_query`` normalization ────────────────────────────────
+#
+# `canonical_query` is the single stable working-query field. Real LLMs
+# sometimes emit a differently-named query field; we promote the first such
+# alias into `canonical_query`, then DELETE every alias key so none leak into
+# the StructuredQuery artifact. The value itself is coerced to a trimmed
+# string (or None) and capped, mirroring `normalize_response`.
+
+_CANONICAL_QUERY_MAX_LEN = 800
+
+_CANONICAL_QUERY_ALIASES = (
+    "working_query",
+    "normalized_query",
+    "final_query",
+    "rewritten_query",
+    "user_query_summary",
+    "query_for_downstream",
+    "canonical_task",
+    "task_summary",
+    "query_summary",
+)
+
+
+def _coerce_query_text(raw: object) -> tuple[Optional[str], Optional[str]]:
+    """Return (text_or_None, warning_or_None) for a query-like value."""
+    if raw is None:
+        return None, None
+    if isinstance(raw, str):
+        return raw.strip() or None, None
+    if isinstance(raw, bool) or isinstance(raw, (int, float)):
+        return str(raw), "coerced non-string canonical_query to string"
+    if isinstance(raw, (list, tuple)):
+        parts = [str(x).strip() for x in raw if x not in (None, "", [], {})]
+        return (" ".join(p for p in parts if p) or None), "compacted list canonical_query into a string"
+    if isinstance(raw, dict):
+        for key in ("canonical_query", "text", "summary", "description"):
+            val = raw.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip(), "compacted dict canonical_query into a string"
+        return None, "compacted dict canonical_query into a string"
+    return None, f"dropped malformed canonical_query: unexpected {type(raw).__name__}"
+
+
+def normalize_canonical_query(data: dict) -> dict:
+    """Coerce ``data['canonical_query']`` and promote any wrong alias in place."""
+    if not isinstance(data, dict):
+        return data
+
+    warnings = data.get("parse_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+
+    raw = data.get("canonical_query")
+    promoted_from: Optional[str] = None
+    # If canonical_query is absent/empty, adopt the first present alias value.
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        for alias in _CANONICAL_QUERY_ALIASES:
+            if alias in data and data.get(alias) not in (None, "", [], {}):
+                raw = data.get(alias)
+                promoted_from = alias
+                break
+
+    # Always strip every alias key so none reach the artifact.
+    removed_aliases = [a for a in _CANONICAL_QUERY_ALIASES if a in data]
+    for alias in removed_aliases:
+        data.pop(alias, None)
+
+    text, note = _coerce_query_text(raw)
+    if note:
+        warnings.append(note)
+    if isinstance(text, str) and len(text) > _CANONICAL_QUERY_MAX_LEN:
+        text = text[:_CANONICAL_QUERY_MAX_LEN].rstrip()
+        warnings.append(f"truncated canonical_query to {_CANONICAL_QUERY_MAX_LEN} chars")
+    if promoted_from:
+        warnings.append("promoted query alias to canonical_query")
+    elif removed_aliases:
+        # Aliases existed but canonical_query was already set — drop them.
+        warnings.append("removed query alias in favor of canonical_query")
+
+    data["canonical_query"] = text
+    if warnings:
+        data["parse_warnings"] = warnings
     return data

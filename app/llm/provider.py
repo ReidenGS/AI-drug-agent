@@ -496,6 +496,14 @@ class MockLLMProvider:
             mentioned_drugs=mentioned_drugs,
         )
         response = _compose_missing_slots_response(missing_slots)
+        canonical_query = _compose_canonical_query(
+            primary_intent=primary_intent,
+            target=target,
+            candidate=candidate,
+            payload=payload,
+            linker=linker,
+            missing_slots=missing_slots,
+        )
 
         return {
             "task_intent": {
@@ -524,6 +532,7 @@ class MockLLMProvider:
             "clarification_questions": clarifications,
             "missing_slots": missing_slots,
             "response": response,
+            "canonical_query": canonical_query,
         }
 
 
@@ -1358,6 +1367,57 @@ def _compose_missing_slots_response(missing_slots: list[dict]) -> str | None:
     else:
         parts.append(f"Please provide the {_join_phrases(warning)} you want to use.")
     return " ".join(parts)
+
+
+_INTENT_TASK_PHRASES = {
+    "new_adc_design": "Design a new antibody-drug conjugate",
+    "existing_adc_evaluation": "Evaluate an existing antibody-drug conjugate",
+    "developability_assessment": "Assess developability",
+    "structure_analysis": "Analyze the structure",
+    "compound_screening": "Screen compounds",
+    "literature_review": "Review the literature",
+    "patent_ip_review": "Review patents / IP",
+    "optimization": "Optimize the design",
+    "unclear_or_needs_clarification": "Clarify the requested workflow",
+}
+
+
+def _compose_canonical_query(
+    *,
+    primary_intent: str,
+    target: str | None,
+    candidate: str | None,
+    payload: str | None,
+    linker: str | None,
+    missing_slots: list[dict],
+) -> str:
+    """Compose the mock's canonical (normalized) task description.
+
+    Deterministic and compact — describes the task with whatever components
+    are known and marks the rest 'unspecified'. It does NOT dump structured
+    context and never invents unanswered fields. On a clarification turn the
+    `target`/`candidate`/... already reflect the folded-in answers, so the
+    canonical_query naturally updates (e.g. picks up "HER2").
+    """
+    head = _INTENT_TASK_PHRASES.get(primary_intent, "Process the ADC request")
+    missing_names = {s.get("slot_name") for s in missing_slots}
+
+    def _describe(slot: str, value: str | None, label: str) -> str:
+        if value:
+            return f"{label} {value}"
+        if slot in missing_names:
+            return f"{label} unspecified"
+        return ""
+
+    parts = [
+        _describe("target_or_antigen", target, "target"),
+        _describe("antibody", candidate, "antibody"),
+        _describe("payload", payload, "payload"),
+        _describe("linker", linker, "linker"),
+    ]
+    detail = "; ".join(p for p in parts if p)
+    text = head if not detail else f"{head} ({detail})."
+    return text[:800]
 
 
 def _uploaded_file_refs(files: list) -> list[dict]:

@@ -312,3 +312,50 @@ def test_sequence_answer_is_user_input_not_copied_to_normalized_artifacts(
     # The sequence is not promoted into normalized entity canonical names.
     norm_blob = str([ne.model_dump() for ne in sq2.normalized_entities])
     assert seq not in norm_blob
+
+
+# ── canonical_query carry-over ───────────────────────────────────────────────
+
+
+def test_next_context_includes_previous_canonical_query(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id, readiness = _turn_one(
+        local_storage, registry_service, workflow_state_service,
+        "I want to design a new antibody-drug conjugate.",
+    )
+    rid = _target_request_id(readiness)
+    svc = ClarificationService(local_storage, registry_service, workflow_state_service)
+    state = svc.submit_clarification_answer(
+        run_id, [{"request_id": rid, "answer_text": "HER2", "answered_at": "t"}]
+    )
+    next_raw = local_storage.read_json(
+        local_storage.run_key(state.next_run_id, "inputs/raw_request_record.json")
+    )
+    ctx = next_raw["user_provided_context"]
+    assert ctx.get("previous_canonical_query")
+    assert "antibody-drug conjugate" in ctx["previous_canonical_query"].lower()
+    # Original raw query preserved (auditable), not replaced by a marker.
+    assert "I want to design a new antibody-drug conjugate." in next_raw["raw_user_query"]
+
+
+def test_second_turn_updates_canonical_query_and_clears_target_block(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id, readiness = _turn_one(
+        local_storage, registry_service, workflow_state_service,
+        "I want to design a new antibody-drug conjugate.",
+    )
+    rid = _target_request_id(readiness)
+    svc = ClarificationService(local_storage, registry_service, workflow_state_service)
+    res = svc.submit_and_reparse(
+        run_id, [{"request_id": rid, "answer_text": "HER2", "answered_at": "t"}], _supervisor()
+    )
+    sq = res.structured_query
+    assert sq.task_intent.primary_intent == "new_adc_design"
+    assert "HER2" in (sq.canonical_query or "")
+    assert not any(
+        m.slot_name == "target_or_antigen" and m.severity == "blocking"
+        for m in sq.missing_slots
+    )
+    assert res.input_readiness_status.input_readiness_status != "blocked"

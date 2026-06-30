@@ -30,7 +30,11 @@ from typing import Any, Optional
 
 from ..llm.provider import LLMProvider
 from ..schemas.step_01_raw_request_record import RawRequestRecord
-from ..llm.json_task_validation import normalize_missing_slots, normalize_response
+from ..llm.json_task_validation import (
+    normalize_canonical_query,
+    normalize_missing_slots,
+    normalize_response,
+)
 from ..schemas.step_02_structured_query import (
     EntityComponent,
     EntityDecomposition,
@@ -215,6 +219,20 @@ Clarification follow-up turns:
   "HER2" as a new standalone task when `previous_task_intent` is present.
 - Re-emit `missing_slots` for what is STILL missing after applying the
   answers; a slot answered this turn should no longer be missing.
+
+Canonical query (`canonical_query`):
+Always write `canonical_query`: a concise (<= 800 chars) normalized
+natural-language description of the CURRENT task. First turn: normalize the
+user's request (summarize known info; if slots are missing, note them as
+unspecified — do NOT invent values). On a clarification turn, UPDATE it from
+`user_provided_context.previous_canonical_query` plus `clarification_answers`
+(e.g. fill the target with the answer "HER2"), keeping the previous intent.
+This is the stable downstream working query; the original user text stays in
+`raw_user_query`. Use ONLY the field name `canonical_query` — never
+`working_query`, `normalized_query`, `final_query`, `rewritten_query`,
+`user_query_summary`, `query_for_downstream`, `canonical_task`,
+`task_summary`, `query_summary`, or any other query-like field. Never put
+prompts, keys, raw payloads, or full sequences in `canonical_query`.
 
 Return exactly one JSON object matching the schema. Keep `parse_warnings`
 as a string array and `user_constraints` as an object array with
@@ -852,6 +870,11 @@ def normalize_llm_payload_for_step2(
     # compact string or None, over-long -> trimmed. Same shared logic as the
     # provider validator so every provider/mock agrees on the cleaned shape.
     normalize_response(out)
+    # canonical_query drift + alias promotion: absent -> None, scalar -> str,
+    # list/dict -> compact, over-long -> trimmed, and wrong query-like aliases
+    # (working_query/normalized_query/...) promoted into canonical_query then
+    # removed so they never reach the artifact.
+    normalize_canonical_query(out)
 
     return out
 
@@ -966,6 +989,7 @@ class SupervisorAgent:
                 if isinstance(ms, dict)
             ],
             response=llm_payload.get("response"),
+            canonical_query=llm_payload.get("canonical_query"),
         )
         return sq
 

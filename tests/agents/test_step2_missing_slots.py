@@ -382,3 +382,110 @@ def test_mock_response_does_not_leak_sequence_or_keys():
     assert heavy not in blob
     assert "api_key" not in blob.lower()
     assert "system instructions" not in blob.lower()
+
+
+# ── Step 2 canonical_query (stable working-query field) ──────────────────────
+
+_QUERY_ALIASES = (
+    "working_query", "normalized_query", "final_query", "rewritten_query",
+    "user_query_summary", "query_for_downstream", "canonical_task",
+    "task_summary", "query_summary",
+)
+
+
+def test_schema_accepts_canonical_query_and_defaults_none():
+    assert _sq().canonical_query is None
+    assert _sq(canonical_query="Design ADC for HER2").canonical_query == "Design ADC for HER2"
+
+
+def test_schema_backward_compatible_without_canonical_query():
+    payload = _sq().model_dump()
+    payload.pop("canonical_query", None)
+    restored = StructuredQuery.model_validate(payload)
+    assert restored.canonical_query is None
+
+
+def test_schema_has_no_query_alias_fields():
+    fields = set(StructuredQuery.model_fields)
+    assert "canonical_query" in fields
+    for alias in _QUERY_ALIASES:
+        assert alias not in fields
+
+
+def test_prompt_requires_canonical_query_and_forbids_aliases():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "canonical_query" in sp
+    for alias in _QUERY_ALIASES:
+        assert alias in sp  # named explicitly as forbidden
+
+
+def test_normalizer_canonical_query_absent_is_none():
+    out = normalize_llm_payload_for_step2({"task_intent": {"task_type": "x"}})
+    assert out["canonical_query"] is None
+
+
+def test_normalizer_canonical_query_promotes_alias_and_removes_it():
+    out = normalize_llm_payload_for_step2(
+        {"working_query": "Design a HER2 ADC", "parse_warnings": []}
+    )
+    assert out["canonical_query"] == "Design a HER2 ADC"
+    assert "working_query" not in out
+    assert any("promoted query alias" in w for w in out["parse_warnings"])
+
+
+def test_normalizer_canonical_query_overlong_truncated():
+    out = normalize_llm_payload_for_step2({"canonical_query": "x" * 1200})
+    assert len(out["canonical_query"]) == 800
+
+
+def test_mock_first_turn_emits_canonical_query():
+    out = _parse("I want to design a new antibody-drug conjugate.")
+    cq = out["canonical_query"]
+    assert cq and "antibody-drug conjugate" in cq.lower()
+    assert "unspecified" in cq.lower()  # missing slots noted, not invented
+    for alias in _QUERY_ALIASES:
+        assert alias not in out
+
+
+def test_mock_second_turn_canonical_query_includes_her2_and_keeps_intent():
+    out = _parse(
+        "I want to design a new antibody-drug conjugate.",
+        ctx={
+            "previous_task_intent": {"primary_intent": "new_adc_design", "secondary_intents": []},
+            "previous_canonical_query": "Design a new antibody-drug conjugate (target unspecified).",
+            "clarification_answers": [
+                {"request_id": "r1", "slot_name": "target_or_antigen",
+                 "slot_category": "target", "answer_text": "HER2", "answered_at": "t"}
+            ],
+        },
+    )
+    assert out["task_intent"]["primary_intent"] == "new_adc_design"
+    assert "HER2" in (out["canonical_query"] or "")
+    slots = _slots_by_name(out)
+    assert "target_or_antigen" not in slots
+
+
+def test_final_artifact_has_no_query_alias_keys():
+    """Even if the LLM emits a wrong alias, the StructuredQuery artifact must
+    not contain it."""
+    agent = SupervisorAgent(llm=MockLLMProvider())
+    sq = agent.parse_raw_to_structured_query(
+        {
+            "run_id": "run_cq", "run_artifact_registry_id": "reg_cq",
+            "artifact_id": "art_cq", "created_at": "2026-06-29T00:00:00Z",
+            "raw_user_query": "I want to design a new antibody-drug conjugate.",
+            "user_provided_context": {}, "uploaded_files": [],
+        }
+    )
+    dumped = sq.model_dump()
+    assert "canonical_query" in dumped
+    for alias in _QUERY_ALIASES:
+        assert alias not in dumped
+
+
+def test_mock_canonical_query_no_leakage():
+    heavy = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
+    out = _parse(f"Design an ADC using antibody sequence {heavy}")
+    cq = out.get("canonical_query") or ""
+    assert heavy not in cq
+    assert "api_key" not in cq.lower()
