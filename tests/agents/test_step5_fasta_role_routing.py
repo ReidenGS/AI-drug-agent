@@ -208,3 +208,130 @@ def test_step5_ambiguous_fasta_keeps_unassigned_notes_not_target_sequence(
         note.startswith("sequence_file_unassigned_for_target_skipped:")
         for note in target.context_notes
     )
+
+
+def test_sequence_fasta_query_target_cue_routes_to_target_sequence(
+    local_storage, registry_service, workflow_state_service
+):
+    ambiguous = {
+        "file_id": new_file_id(),
+        "original_filename": "sequence.fasta",
+        "storage_path": "/runs/inputs/sequence.fasta",
+    }
+    run_id = _bootstrap(
+        local_storage=local_storage,
+        registry_service=registry_service,
+        workflow_state_service=workflow_state_service,
+        uploaded_files=[ambiguous],
+        raw_user_query=(
+            "The uploaded sequence.fasta is the target antigen sequence for HER2."
+        ),
+    )
+    table = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
+    target = _record_by_type(table, "target_antigen")
+    antibody = _record_by_type(table, "antibody")
+
+    assert any(
+        m.material_type == "target_sequence" and m.value == ambiguous["storage_path"]
+        for m in target.materials
+    )
+    assert not any(
+        m.value == ambiguous["storage_path"] and m.material_type in {"antibody_heavy_chain_sequence", "antibody_light_chain_sequence"}
+        for m in antibody.materials
+    )
+
+
+def test_sequence_fasta_query_antibody_cue_routes_to_antibody_sequence_reference(
+    local_storage, registry_service, workflow_state_service
+):
+    ambiguous = {
+        "file_id": new_file_id(),
+        "original_filename": "sequence.fasta",
+        "storage_path": "/runs/inputs/sequence.fasta",
+    }
+    run_id = _bootstrap(
+        local_storage=local_storage,
+        registry_service=registry_service,
+        workflow_state_service=workflow_state_service,
+        uploaded_files=[ambiguous],
+        raw_user_query=(
+            "The uploaded sequence.fasta is the antibody sequence for trastuzumab."
+        ),
+    )
+    table = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
+    target = _record_by_type(table, "target_antigen")
+    antibody = _record_by_type(table, "antibody")
+
+    assert any(
+        m.material_type == "antibody_sequence_reference"
+        and m.value == ambiguous["storage_path"]
+        for m in antibody.materials
+    )
+    assert not any(
+        m.material_type == "target_sequence" and m.value == ambiguous["storage_path"]
+        for m in target.materials
+    )
+
+
+def test_sequence_fasta_query_contains_target_antibody_without_file_binding_keeps_unassigned(
+    local_storage, registry_service, workflow_state_service
+):
+    ambiguous = {
+        "file_id": new_file_id(),
+        "original_filename": "sequence.fasta",
+        "storage_path": "/runs/inputs/sequence.fasta",
+    }
+    run_id = _bootstrap(
+        local_storage=local_storage,
+        registry_service=registry_service,
+        workflow_state_service=workflow_state_service,
+        uploaded_files=[ambiguous],
+        raw_user_query=(
+            "Use the provided sequence.fasta and evaluate both HER2 target and"
+            " trastuzumab antibody together."
+        ),
+    )
+    table = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
+    target = _record_by_type(table, "target_antigen")
+    antibody = _record_by_type(table, "antibody")
+
+    assert not any(
+        m.material_type == "target_sequence" and m.value == ambiguous["storage_path"]
+        for m in target.materials
+    )
+    assert any(
+        (ambiguous["storage_path"] in gap) or (ambiguous["file_id"] in gap)
+        for gap in antibody.data_gaps
+    )
+
+
+def test_sequence_fasta_query_conflict_target_and_antibody_stays_unassigned(
+    local_storage, registry_service, workflow_state_service
+):
+    ambiguous = {
+        "file_id": new_file_id(),
+        "original_filename": "sequence.fasta",
+        "storage_path": "/runs/inputs/sequence.fasta",
+    }
+    run_id = _bootstrap(
+        local_storage=local_storage,
+        registry_service=registry_service,
+        workflow_state_service=workflow_state_service,
+        uploaded_files=[ambiguous],
+        raw_user_query=(
+            "The uploaded sequence.fasta is for both target (HER2 antigen)"
+            " and trastuzumab antibody."
+        ),
+    )
+    table = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
+    target = _record_by_type(table, "target_antigen")
+    antibody = _record_by_type(table, "antibody")
+
+    assert not any(
+        m.material_type == "target_sequence" and m.value == ambiguous["storage_path"]
+        for m in target.materials
+    )
+    assert any(
+        (ambiguous["storage_path"] in gap) or (ambiguous["file_id"] in gap)
+        for gap in antibody.data_gaps
+    )

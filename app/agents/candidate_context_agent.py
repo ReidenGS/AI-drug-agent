@@ -235,6 +235,75 @@ def _fasta_file_tokens(file: dict[str, Any]) -> set[str]:
     return _token_set(haystack)
 
 
+def _query_sentence_chunks(raw_user_query: str) -> list[str]:
+    """Split user query into compact sentence chunks for conservative matching."""
+    chunks: list[str] = []
+    for chunk in re.split(r"[.;!?\n]+", raw_user_query or ""):
+        chunk = chunk.strip()
+        if chunk:
+            chunks.append(chunk.lower())
+    return chunks
+
+
+def _sentence_targets_fasta_file(chunk: str, file: dict[str, Any]) -> bool:
+    """Return True only when chunk likely refers to this uploaded sequence file."""
+    if not chunk:
+        return False
+    chunk_l = chunk.lower()
+    filename = str(file.get("original_filename") or "").lower()
+    file_tokens = _fasta_file_tokens(file)
+    if filename and filename in chunk_l:
+        return True
+    if not file_tokens:
+        return False
+    if any(tok in chunk_l for tok in (".", "fasta", "sequence", "file")):
+        # "uploaded FASTA", "this FASTA", "this sequence file" style.
+        if "uploaded" in chunk:
+            return True
+        if "sequence" in chunk and ("file" in chunk or "fasta" in chunk):
+            # Ambiguous helper phrase should still need at least one strong
+            # filename-token fragment.
+            return bool(file_tokens.intersection(_token_set(chunk)))
+        if "this" in chunk or "that" in chunk:
+            return bool(file_tokens.intersection(_token_set(chunk)))
+    return False
+
+
+def _query_inferred_sequence_route(
+    file: dict[str, Any],
+    *,
+    target_text: str,
+    antibody_text: str,
+    raw_user_query: str,
+) -> str | None:
+    """Infer target/antibody role from conservative raw query sentence context."""
+    if not raw_user_query:
+        return None
+    target_cues = _TARGET_FASTA_HINTS | _token_set(target_text)
+    antibody_cues = (
+        _ANTIBODY_GENERIC_HINTS
+        | _token_set(antibody_text)
+        | {"antibody", "vh", "vl", "igg", "trastuzumab", "antibody_sequence"}
+    )
+
+    for chunk in _query_sentence_chunks(raw_user_query):
+        if not _sentence_targets_fasta_file(chunk, file):
+            continue
+
+        chunk_tokens = _token_set(chunk)
+        target_signal = bool(chunk_tokens & target_cues)
+        antibody_signal = bool(chunk_tokens & antibody_cues)
+
+        if target_signal and not antibody_signal:
+            return "target"
+        if antibody_signal and not target_signal:
+            return "antibody"
+        if target_signal and antibody_signal:
+            return "ambiguous"
+
+    return None
+
+
 def _fasta_classify_sequence_file_route(
     file: dict,
     *,
@@ -274,6 +343,17 @@ def _fasta_classify_sequence_file_route(
     if target_signal and not antibody_signal:
         return "target"
     if antibody_signal:
+        return "antibody"
+
+    query_signal = _query_inferred_sequence_route(
+        file,
+        target_text=target_text,
+        antibody_text=antibody_text,
+        raw_user_query=raw_user_query,
+    )
+    if query_signal == "target":
+        return "target"
+    if query_signal == "antibody":
         return "antibody"
     return "unassigned"
 
