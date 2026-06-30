@@ -486,11 +486,15 @@ class StructureAndDesignAgent:
         prediction_required = input_case == "sequence_only_input"
         for m in cand_sequence_mats:
             material_id = m.get("material_id", new_artifact_id("seq"))
+            raw_sequence = m.get("value")
+            sequence_length, sha256_prefix = _sequence_stats(raw_sequence)
             sequence_refs.append(
                 SequenceRef(
                     sequence_id=material_id,
                     chain_role=_chain_role_from_material(m.get("material_type", "")),
-                    sequence=str(m.get("value") or "") or None,
+                    sequence=(str(raw_sequence) if isinstance(raw_sequence, str) else None),
+                    sequence_length=sequence_length,
+                    sha256_prefix=sha256_prefix,
                     source_kind="material_sequence",
                     source_ref=material_id,
                     prediction_needed=prediction_required,
@@ -503,13 +507,23 @@ class StructureAndDesignAgent:
             )
         for f in sequence_files:
             sequence_id = f.get("file_id", new_artifact_id("seq"))
+            seq_file_length: int | None = None
+            seq_file_hash: str | None = None
+            source_ref = f.get("storage_path") or sequence_id
+            if source_ref:
+                seq_file_length, seq_file_hash = _sequence_stats_from_file(
+                    self.storage,
+                    source_ref,
+                )
             sequence_refs.append(
                 SequenceRef(
                     sequence_id=sequence_id,
                     chain_role=_chain_role_from_fasta_file(f, ctype),
                     sequence=None,
                     source_kind="uploaded_fasta",
-                    source_ref=f.get("storage_path") or sequence_id,
+                    source_ref=source_ref,
+                    sequence_length=seq_file_length,
+                    sha256_prefix=seq_file_hash,
                     prediction_needed=prediction_required,
                     sequence_storage_ref=f.get("storage_path") or None,
                     sequence_value_status="referenced",
@@ -633,6 +647,7 @@ class StructureAndDesignAgent:
             self.storage.run_key(run_id, "prepared_structure_input_package.json")
         )
         inputs = pkg.get("prepared_structure_inputs") or []
+        sequence_material_lookup = _step5_material_inline_sequence_lookup(self.storage, run_id)
 
         tool_calls: list[ToolCallRecord] = []
         output_artifacts: list[StructureOutputArtifact] = []
@@ -655,7 +670,12 @@ class StructureAndDesignAgent:
             run_status = "ok"
             partial = False
 
-            routed_calls = self._route_step8_scoped_tools(run_id, sin, inputs)
+            routed_calls = self._route_step8_scoped_tools(
+                run_id,
+                sin,
+                inputs,
+                sequence_material_lookup=sequence_material_lookup,
+            )
             selected_calls = [
                 tc for tc in routed_calls
                 if tc.tool_input_summary
@@ -803,7 +823,12 @@ class StructureAndDesignAgent:
         return tuple(runtime_scoped)
 
     def _route_step8_scoped_tools(
-        self, run_id: str, sin: dict, all_inputs: list[dict] | None = None
+        self,
+        run_id: str,
+        sin: dict,
+        all_inputs: list[dict] | None = None,
+        *,
+        sequence_material_lookup: dict[str, str] | None = None,
     ) -> list[ToolCallRecord]:
         input_case = sin.get("input_case")
         structure_input_id = sin.get("structure_input_id")
@@ -960,6 +985,7 @@ class StructureAndDesignAgent:
                     plan=plan,
                     all_inputs=all_inputs or [sin],
                     storage=self.storage,
+                    candidate_sequence_lookup=sequence_material_lookup,
                 )
                 if runtime.get("status") == "ok":
                     _run(
@@ -1639,6 +1665,62 @@ def _read_structure_bytes(storage: Storage, source_ref: str) -> bytes | None:
     return None
 
 
+def _sequence_stats(value: Any) -> tuple[int | None, str | None]:
+    if not isinstance(value, str):
+        return None, None
+    seq = value.strip()
+    if not seq:
+        return None, None
+    return len(seq), hashlib.sha256(seq.encode("utf-8")).hexdigest()[:12]
+
+
+def _sequence_from_file(storage: Storage, path: Any) -> str | None:
+    if not isinstance(path, str):
+        return None
+    try:
+        content = storage.read_bytes(path).decode("utf-8")
+    except Exception:  # noqa: BLE001
+        return None
+    sequences = _extract_fasta_sequences(content)
+    return sequences[0] if sequences else None
+
+
+def _sequence_stats_from_file(storage: Storage, path: Any) -> tuple[int | None, str | None]:
+    seq = _sequence_from_file(storage, path)
+    return _sequence_stats(seq)
+
+
+def _step5_material_inline_sequence_lookup(storage: Storage, run_id: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        cct = storage.read_json(storage.run_key(run_id, "candidate_context_table.json"))
+    except Exception:  # noqa: BLE001
+        return out
+
+    for candidate in cct.get("candidate_records") or []:
+        if not isinstance(candidate, dict):
+            continue
+        for material in candidate.get("materials") or []:
+            if not isinstance(material, dict):
+                continue
+            if material.get("material_type") not in {
+                "antibody_heavy_chain_sequence",
+                "antibody_light_chain_sequence",
+                "target_sequence",
+            }:
+                continue
+            material_id = material.get("material_id")
+            value = material.get("value")
+            if not isinstance(material_id, str) or not material_id:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                continue
+            if _looks_like_file_backed_sequence(value):
+                continue
+            out[material_id] = value
+    return out
+
+
 def _extract_pdb_crystal_metadata(
     text: str, *, source_kind: str, source_ref: str,
 ) -> CrystalMetadata:
@@ -2277,6 +2359,7 @@ def _build_nim_runtime_invocation(
     plan: ComplexPredictionPlan,
     all_inputs: list[dict],
     storage: Storage,
+    candidate_sequence_lookup: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     lookup = _prediction_sequence_lookup(all_inputs)
     resolved: list[dict[str, Any]] = []
@@ -2288,7 +2371,11 @@ def _build_nim_runtime_invocation(
         if not isinstance(sequence_id, str) or not sequence_id:
             continue
         seq = lookup.get(sequence_id)
-        value, err = _runtime_sequence_value(seq, storage=storage)
+        value, err = _runtime_sequence_value(
+            seq,
+            storage=storage,
+            candidate_sequence_lookup=candidate_sequence_lookup,
+        )
         audit_entry = {
             "sequence_id": sequence_id,
             "chain_role": item.get("chain_role"),
@@ -2333,14 +2420,31 @@ def _build_nim_runtime_invocation(
     }
 
 
-def _runtime_sequence_value(seq: dict[str, Any] | None, *, storage: Storage) -> tuple[str | None, str | None]:
+def _runtime_sequence_value(
+    seq: dict[str, Any] | None, *,
+    storage: Storage,
+    candidate_sequence_lookup: dict[str, str] | None = None,
+) -> tuple[str | None, str | None]:
     if not isinstance(seq, dict):
         return None, "sequence_id not found in prepared inputs"
     kind = seq.get("prediction_input_kind")
     status = seq.get("sequence_value_status")
     if kind == "amino_acid_sequence" and status == "inline":
         value = seq.get("sequence")
-        return (str(value), None) if value else (None, "inline sequence missing")
+        if value:
+            return (str(value), None)
+        if isinstance(candidate_sequence_lookup, dict):
+            sequence_id = seq.get("sequence_id")
+            if isinstance(sequence_id, str):
+                found = candidate_sequence_lookup.get(sequence_id)
+                if isinstance(found, str) and found:
+                    return found, None
+            source_ref = seq.get("source_ref")
+            if isinstance(source_ref, str):
+                found = candidate_sequence_lookup.get(source_ref)
+                if isinstance(found, str) and found:
+                    return found, None
+        return None, "inline sequence missing"
     if kind == "fasta_ref" and (seq.get("sequence_storage_ref") or seq.get("source_ref")):
         path = str(seq.get("sequence_storage_ref") or seq.get("source_ref"))
         try:
@@ -2431,6 +2535,8 @@ def _compact_prediction_sequence_inputs(sin: dict) -> list[dict[str, Any]]:
             "source_kind": seq.get("source_kind"),
             "source_ref": seq.get("source_ref"),
             "sequence_value_status": seq.get("sequence_value_status"),
+            "sequence_length": seq.get("sequence_length"),
+            "sha256_prefix": seq.get("sha256_prefix"),
             "resource_binding_status": seq.get("resource_binding_status"),
         }
         storage_ref = seq.get("sequence_storage_ref")
@@ -2441,8 +2547,10 @@ def _compact_prediction_sequence_inputs(sin: dict) -> list[dict[str, Any]]:
         item["readiness_reason"] = reason
         sequence = seq.get("sequence")
         if isinstance(sequence, str) and sequence:
-            item["sequence_length"] = len(sequence)
-            item["sha256_prefix"] = hashlib.sha256(sequence.encode("utf-8")).hexdigest()[:12]
+            if item.get("sequence_length") is None:
+                item["sequence_length"] = len(sequence)
+            if item.get("sha256_prefix") is None:
+                item["sha256_prefix"] = hashlib.sha256(sequence.encode("utf-8")).hexdigest()[:12]
         out.append({k: v for k, v in item.items() if v not in (None, "", [])})
     return out
 

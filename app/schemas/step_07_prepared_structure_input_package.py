@@ -26,7 +26,9 @@ class StructureRef(BaseModel):
 class SequenceRef(BaseModel):
     sequence_id: str
     chain_role: Optional[str] = None
-    sequence: Optional[str] = None
+    sequence: Optional[str] = Field(default=None, exclude=True)
+    sequence_length: Optional[int] = None
+    sha256_prefix: Optional[str] = None
     source_kind: Literal[
         "uploaded_fasta", "material_sequence", "uniprot_id", "unknown"
     ] = "unknown"

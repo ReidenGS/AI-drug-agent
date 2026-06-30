@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from copy import deepcopy
 from pathlib import Path
 
@@ -300,6 +301,68 @@ def test_step7_antibody_heavy_light_sequence_only_proceeds(
     chain_roles = {cm.chain_role for cm in antibody_rec.chain_mapping}
     assert {"antibody_heavy", "antibody_light"}.issubset(chain_roles)
     assert all(cm.chain_id_kind == "prediction_placeholder" for cm in antibody_rec.chain_mapping)
+
+
+def test_step7_heavy_light_inline_sequences_are_compact_in_prepared_artifact(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service)
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    heavy_seq = "EVQLVESGGGLVQPGGSLRLSCAAS1234HEAVY"
+    light_seq = "DIQMTQSPSSLSASVGDRVTITC5678LIGHT"
+    antibody["materials"].extend([
+        {
+            "material_id": "heavy_compact_seq",
+            "material_type": "antibody_heavy_chain_sequence",
+            "value": heavy_seq,
+            "value_format": "fasta",
+            "role": "antibody",
+        },
+        {
+            "material_id": "light_compact_seq",
+            "material_type": "antibody_light_chain_sequence",
+            "value": light_seq,
+            "value_format": "fasta",
+            "role": "antibody",
+        },
+    ])
+    local_storage.write_json(cct_path, cct)
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    pkg = agent.run_step_7(run_id)
+
+    artifact_path = local_storage.run_key(run_id, "prepared_structure_input_package.json")
+    artifact = local_storage.read_json(artifact_path)
+    artifact_blob = json.dumps(artifact)
+
+    assert heavy_seq not in artifact_blob
+    assert light_seq not in artifact_blob
+    for rec in artifact.get("prepared_structure_inputs", []):
+        for seq in rec.get("sequence_refs_for_prediction", []):
+            assert "sequence" not in seq
+
+    antibody_rec = next(r for r in pkg.prepared_structure_inputs if r.structure_role == "antibody_only")
+    heavy_ref = next(
+        s for s in antibody_rec.sequence_refs_for_prediction if s.sequence_id == "heavy_compact_seq"
+    )
+    light_ref = next(
+        s for s in antibody_rec.sequence_refs_for_prediction if s.sequence_id == "light_compact_seq"
+    )
+    assert heavy_ref.sequence_length == len(heavy_seq)
+    assert light_ref.sequence_length == len(light_seq)
+    assert heavy_ref.sha256_prefix == hashlib.sha256(heavy_seq.encode("utf-8")).hexdigest()[:12]
+    assert light_ref.sha256_prefix == hashlib.sha256(light_seq.encode("utf-8")).hexdigest()[:12]
+    assert heavy_ref.prediction_input_kind == "amino_acid_sequence"
+    assert light_ref.prediction_input_kind == "amino_acid_sequence"
+    assert heavy_ref.sequence_value_status == "inline"
+    assert light_ref.sequence_value_status == "inline"
 
 
 def test_step7_antigen_antibody_sequence_mapping_without_interface_invention(
@@ -1729,6 +1792,154 @@ def test_step8_raw_antigen_antibody_sequences_record_nim_deferred_plan(
     assert "EVQLVES" not in audit_blob
     assert "DIQMTQ" not in audit_blob
     assert "sha256_prefix" in audit_blob
+
+
+def test_step8_antibody_heavy_light_without_antigen_records_input_missing_antigen_with_compact_sequences(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service, referenced_inputs=[])
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    # Remove target sequence to force sequence-only antibody-only planning.
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    target["materials"] = []
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    heavy_seq = "EVQLVESGGGLVQPGGSLRLSCAASABCDEF"
+    light_seq = "DIQMTQSPSSLSASVGDRVTITCABCDE"
+    antibody["materials"].extend([
+        {
+            "material_id": "heavy_step8_seq",
+            "material_type": "antibody_heavy_chain_sequence",
+            "value": heavy_seq,
+        },
+        {
+            "material_id": "light_step8_seq",
+            "material_type": "antibody_light_chain_sequence",
+            "value": light_seq,
+        },
+    ])
+    local_storage.write_json(cct_path, cct)
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    agent.run_step_7(run_id)
+    artifact_path = local_storage.run_key(run_id, "prepared_structure_input_package.json")
+    artifact = local_storage.read_json(artifact_path)
+    artifact_blob = json.dumps(artifact)
+    assert heavy_seq not in artifact_blob
+    assert light_seq not in artifact_blob
+
+    results = agent.run_step_8(run_id)
+
+    plans = [
+        plan for cr in results.candidate_structure_results
+        for plan in cr.complex_prediction_plans
+    ]
+    assert plans
+    assert any(plan.input_status == "input_missing" for plan in plans)
+    assert any("antigen_sequence" in plan.missing_prediction_inputs for plan in plans)
+    assert any(
+        item.get("chain_role") == "antibody_heavy" and item.get("sequence_readiness") == "ready"
+        for plan in plans
+        for item in plan.sequence_inputs
+    )
+    assert any(
+        item.get("chain_role") == "antibody_light" and item.get("sequence_readiness") == "ready"
+        for plan in plans
+        for item in plan.sequence_inputs
+    )
+
+    nim_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
+    ]
+    assert nim_calls
+    assert all(tc.run_status == "skipped" for tc in nim_calls)
+    assert all(tc.tool_input_summary.get("routing_decision") == "input_missing" for tc in nim_calls)
+    audit_blob = json.dumps([tc.tool_input_summary or {} for tc in nim_calls])
+    assert heavy_seq not in audit_blob
+    assert light_seq not in audit_blob
+
+
+def test_step8_nim_runtime_resolves_inline_sequence_from_step5_material_lookup(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service, referenced_inputs=[])
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    target["materials"] = [
+        {"material_id": "target_seq_step8_runtime", "material_type": "target_sequence", "value": "MKTAYIAKQNNVG"}
+    ]
+    heavy_seq = "EVQLVESGGGLVQPGGSLRLSCAASRUNTIME"
+    light_seq = "DIQMTQSPSSLSASVGDRVTITCRUNTIME"
+    antibody["materials"].extend([
+        {"material_id": "heavy_step8_runtime", "material_type": "antibody_heavy_chain_sequence", "value": heavy_seq},
+        {"material_id": "light_step8_runtime", "material_type": "antibody_light_chain_sequence", "value": light_seq},
+    ])
+    local_storage.write_json(cct_path, cct)
+
+    captured: list[tuple[str, dict]] = []
+
+    def _capture(tool_name: str):
+        def _inner(**kw):
+            captured.append((tool_name, dict(kw)))
+            return {"status": "ok", "model_ref": f"s3://bucket/{tool_name}.pdb"}
+        return _inner
+
+    mcp = LocalMCPClient(
+        inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+        bindings=_bindings_with_step8_overrides({
+            "NvidiaNIM_alphafold2_multimer": _capture("NvidiaNIM_alphafold2_multimer"),
+            "NvidiaNIM_openfold3": _capture("NvidiaNIM_openfold3"),
+            "NvidiaNIM_boltz2": _capture("NvidiaNIM_boltz2"),
+        }),
+    )
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=mcp,
+    )
+    agent.run_step_7(run_id)
+    artifact_path = local_storage.run_key(run_id, "prepared_structure_input_package.json")
+    artifact = local_storage.read_json(artifact_path)
+    artifact_blob = json.dumps(artifact)
+
+    assert heavy_seq not in artifact_blob
+    assert light_seq not in artifact_blob
+    for rec in artifact.get("prepared_structure_inputs", []):
+        for seq in rec.get("sequence_refs_for_prediction", []):
+            assert "sequence" not in seq
+
+    results = agent.run_step_8(run_id)
+    assert results.structure_modeling_status in {"partial", "ok"}
+    assert captured
+    for tool_name, kwargs in captured:
+        if "sequences" in kwargs:
+            assert heavy_seq in kwargs["sequences"]
+            assert light_seq in kwargs["sequences"]
+            assert "MKTAYIAKQNNVG" in kwargs["sequences"]
+        if "inputs" in kwargs:
+            flat = "".join(item.get("sequence", "") for item in kwargs["inputs"])
+            assert heavy_seq in flat
+            assert light_seq in flat
+            assert "MKTAYIAKQNNVG" in flat
+        if "polymers" in kwargs:
+            flat = "".join(item.get("sequence", "") for item in kwargs["polymers"])
+            assert heavy_seq in flat
+            assert light_seq in flat
+            assert "MKTAYIAKQNNVG" in flat
+
+    call_summaries = [tc.tool_input_summary or {} for tc in results.tool_call_records]
+    summary_blob = json.dumps(call_summaries)
+    assert heavy_seq not in summary_blob
+    assert light_seq not in summary_blob
 
 
 def test_step8_nim_contract_treats_fasta_refs_as_runtime_ready():
