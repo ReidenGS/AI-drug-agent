@@ -168,6 +168,15 @@ _LIGHT_CHAIN_HINTS = {
     "light", "lightchain", "light_chain", "vl", "lc", "kappa", "lambda",
     "igk", "igl", "igkv", "iglv",
 }
+_ANTIBODY_GENERIC_HINTS = {
+    "antibody",
+}
+_TARGET_FASTA_HINTS = {
+    "antigen",
+    "target",
+    "targetsequence",
+    "antigensequence",
+}
 
 
 # Structure-reference role inference. We never open the PDB; we look at
@@ -193,6 +202,130 @@ _STRUCTURE_ROLE_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("experimental_fragment_reference",
         ("fragment", "_frag", "frag_", "fragment_reference")),
 )
+
+
+def _token_set(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    return {
+        token
+        for token in re.split(r"[^a-z0-9]+", value.lower())
+        if len(token) >= 3
+    }
+
+
+def _fasta_file_tokens(file: dict[str, Any]) -> set[str]:
+    """Extract defensive sequence-file tokens from metadata.
+
+    We only rely on metadata to infer routing signals; no FASTA contents
+    are read at this stage.
+    """
+    haystack = " ".join(
+        str(file.get(key) or "")
+        for key in (
+            "original_filename",
+            "file_id",
+            "role",
+            "chain_role",
+            "material_role",
+            "description",
+            "source",
+        )
+    )
+    return _token_set(haystack)
+
+
+def _fasta_classify_sequence_file_route(
+    file: dict,
+    *,
+    target_text: str,
+    antibody_text: str,
+    raw_user_query: str,
+) -> str:
+    """Classify FASTA file metadata as antibody, target, or unassigned.
+
+    The classifier is conservative:
+    - explicit heavy/light/antibody hints always go to antibody candidate
+      materials;
+    - explicit target/antigen hints go to target sequence only when not in
+      conflict with explicit antibody routing.
+    - ambiguous or unknown metadata returns "unassigned".
+    """
+    if not isinstance(file, dict):
+        return "unassigned"
+
+    explicit_role = str(file.get("role") or "").lower()
+    if explicit_role in {"target", "target_sequence", "target_sequence_reference", "antigen"}:
+        return "target"
+    if explicit_role in {"antibody", "antibody_sequence", "antibody_sequence_reference"}:
+        return "antibody"
+
+    material_type = _infer_antibody_sequence_material_type(file)
+    if material_type in {"antibody_heavy_chain_sequence", "antibody_light_chain_sequence"}:
+        return material_type
+
+    tokens = _fasta_file_tokens(file)
+    target_tokens = _token_set(target_text)
+    antibody_tokens = _token_set(antibody_text)
+
+    target_signal = bool((tokens & _TARGET_FASTA_HINTS) or (tokens & target_tokens))
+    antibody_signal = bool((tokens & _ANTIBODY_GENERIC_HINTS) or (tokens & antibody_tokens))
+
+    if target_signal and not antibody_signal:
+        return "target"
+    if antibody_signal:
+        return "antibody"
+    return "unassigned"
+
+
+def _split_sequence_files_by_semantic_routing(
+    sequence_files: list[dict],
+    *,
+    target_text: str,
+    antibody_text: str,
+    raw_user_query: str,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    antibody_files: list[dict] = []
+    target_files: list[dict] = []
+    unassigned_files: list[dict] = []
+
+    for file in sequence_files:
+        route = _fasta_classify_sequence_file_route(
+            file,
+            target_text=target_text,
+            antibody_text=antibody_text,
+            raw_user_query=raw_user_query,
+        )
+        if route == "target":
+            target_files.append(file)
+        elif route in {"antibody", "antibody_heavy_chain_sequence", "antibody_light_chain_sequence"}:
+            antibody_files.append(file)
+        else:
+            unassigned_files.append(file)
+
+    return antibody_files, target_files, unassigned_files
+
+
+def _unassigned_fasta_sequence_note(file: dict) -> str:
+    ref = file.get("file_id") or file.get("original_filename") or file.get("storage_path") or "unknown"
+    return f"uploaded_fasta_sequence_file_unassigned:{ref}"
+
+
+def _add_sequence_route_notes(
+    candidate: CandidateRecord | None,
+    sequence_files: list[dict],
+    *,
+    note_prefix: str,
+) -> None:
+    if not candidate:
+        return
+    for file in sequence_files:
+        note = f"{note_prefix}:{file.get('file_id') or file.get('original_filename') or file.get('storage_path') or 'unknown'}"
+        if note not in candidate.context_notes:
+            candidate.context_notes.append(note)
+        gap = _unassigned_fasta_sequence_note(file)
+        if gap not in candidate.data_gaps:
+            candidate.data_gaps.append(gap)
 
 
 def _infer_structure_role(
@@ -298,6 +431,14 @@ class CandidateContextAgent:
         refs = [r for r in (sq.get("referenced_inputs") or []) if isinstance(r, dict)]
         uploaded = raw.get("uploaded_files") or []
         sq_artifact_id = reg.active_artifacts.structured_query_id or ""
+        raw_user_query = raw.get("raw_user_query") or ""
+        target_text = (
+            entities.get("target_or_antigen_text")
+            or ctx.get("target_or_antigen_text")
+        )
+        antibody_text = (
+            entities.get("antibody_candidate_text") or ctx.get("candidate_text")
+        )
 
         # Index referenced_inputs by id_type once.
         refs_by_type: dict[str, list[dict]] = {}
@@ -313,6 +454,13 @@ class CandidateContextAgent:
             f for f in uploaded
             if PurePosixPath(f.get("original_filename", "")).suffix.lower() in _FASTA_EXTS
         ]
+        antibody_sequence_files, target_sequence_files, unassigned_sequence_files = \
+            _split_sequence_files_by_semantic_routing(
+                sequence_files,
+                target_text=target_text or "",
+                antibody_text=antibody_text or "",
+                raw_user_query=raw_user_query,
+            )
 
         tool_call_records: list[ToolCallRecord] = []
         candidate_records: list[CandidateRecord] = []
@@ -325,7 +473,6 @@ class CandidateContextAgent:
         # Batch-6 inputs from Step 2 enrichment.
         normalized_entities = sq.get("normalized_entities") or []
         entity_decompositions = sq.get("entity_decompositions") or []
-        raw_user_query = raw.get("raw_user_query") or ""
         raw_user_query_lower = raw_user_query.lower()
 
         # Did the user explicitly nominate these IDs as payload / linker / ligand candidates?
@@ -348,16 +495,12 @@ class CandidateContextAgent:
         candidate_records.extend(reference_adc_records)
 
         # ── target candidate ────────────────────────────────────────────────
-        target_text = (
-            entities.get("target_or_antigen_text")
-            or ctx.get("target_or_antigen_text")
-        )
         target_cand = self._build_target_candidate(
             target_text=target_text,
             refs_by_type=refs_by_type,
             sq_artifact_id=sq_artifact_id,
             structure_files=structure_files,
-            sequence_files=sequence_files,
+            sequence_files=target_sequence_files,
             raw_user_query=raw_user_query,
             normalized_entities=normalized_entities,
         )
@@ -375,12 +518,14 @@ class CandidateContextAgent:
             tool_call_records.extend(tcs)
             if tcs:
                 target_cand.candidate_notes = _notes_for(tcs[-1], "target context enrichment")
+            if unassigned_sequence_files:
+                _add_sequence_route_notes(
+                    target_cand, unassigned_sequence_files,
+                    note_prefix="sequence_file_unassigned_for_target_skipped",
+                )
             candidate_records.append(target_cand)
 
         # ── antibody candidate ──────────────────────────────────────────────
-        antibody_text = (
-            entities.get("antibody_candidate_text") or ctx.get("candidate_text")
-        )
         inline_antibody_sequence_refs = [
             r
             for id_type in _ANTIBODY_SEQUENCE_REF_ID_TYPES
@@ -388,13 +533,18 @@ class CandidateContextAgent:
         ]
         ab_cand = self._build_antibody_candidate(
             antibody_text=antibody_text,
-            sequence_files=sequence_files,
+            sequence_files=[*antibody_sequence_files, *unassigned_sequence_files],
             inline_sequence_refs=inline_antibody_sequence_refs,
             sq_artifact_id=sq_artifact_id,
         )
         if ab_cand is None:
             missing_flags.append("mentioned_entities.antibody_candidate_text")
         else:
+            if unassigned_sequence_files:
+                _add_sequence_route_notes(
+                    ab_cand, unassigned_sequence_files,
+                    note_prefix="sequence_file_unassigned_for_antibody_skipped",
+                )
             tcs = self._execute_enrichment_plans(
                 run_id=run_id,
                 record=ab_cand,
