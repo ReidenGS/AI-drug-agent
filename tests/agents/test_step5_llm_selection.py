@@ -1284,16 +1284,19 @@ def test_raw_fasta_pdb_contents_do_not_reach_llm_or_audit(
     assert ">trastuzumab_HC" not in pblob
 
 
-# ── 19. Sequence-only antibody candidate does not invent tool calls ────────
+# ── 19. Unclear sequence role should not invent antibody candidate ───────────
 
 
-def test_sequence_only_antibody_candidate_records_material_without_tool_calls(
+def test_unclear_sequence_fasta_is_not_invented_as_antibody_candidate(
     local_storage, registry_service, workflow_state_service,
 ):
-    """A candidate built purely from an uploaded FASTA (no antibody
-    name) should not surface a TheraSAbDab_search_therapeutics or
-    SAbDab_search_structures plan: the registry has no eligible slot.
-    Material + downstream gaps should be preserved."""
+    """Ambiguous sequence files should be kept as unresolved upload refs and
+    should not be silently turned into an antibody candidate.
+
+    The Step 2 `sequence_role` path now blocks before Step 6 when role is
+    ambiguous; Step 5 therefore records unassigned FASTA and avoids inventing
+    antibody sequence-material lanes without an explicit route.
+    """
     from app.services.intake_service import IntakeService  # noqa: PLC0415
     from app.services.structured_query_service import StructuredQueryService  # noqa: PLC0415
     from app.services.input_readiness_service import InputReadinessService  # noqa: PLC0415
@@ -1350,23 +1353,25 @@ def test_sequence_only_antibody_candidate_records_material_without_tool_calls(
     persisted = local_storage.read_json(
         local_storage.run_key(rec.run_id, "candidate_context_table.json")
     )
-    # Antibody candidate exists with the FASTA material reference.
+    # No antibody candidate should be materialized from unclear sequence role.
     ab_records = [
         c for c in persisted["candidate_records"]
         if c["candidate_type"] == "antibody"
     ]
-    assert ab_records, "antibody-from-sequence candidate should be built"
-    ab = ab_records[0]
+    assert not ab_records, "ambiguous FASTA should not become antibody candidate"
+
+    # Target candidate should retain unresolved-sequence context so Step 5/6
+    # consumers do not see this as executable input.
+    target_records = [
+        c for c in persisted["candidate_records"]
+        if c["candidate_type"] == "target_antigen"
+    ]
+    assert target_records
+    target = target_records[0]
     assert any(
-        m["material_type"] == "antibody_sequence_reference"
-        for m in ab["materials"]
+        "sequence_file_unassigned_for_target_skipped" in note
+        for note in target["context_notes"]
     )
-    # No tool call should have been recorded for this candidate.
-    audit = persisted["enrichment_selection_audit"]
-    entry = audit[ab["candidate_id"]]
-    assert entry["eligible_tools"] == []
-    assert entry["selected_tools"] == []
-    assert entry["skipped_eligible_tools"] == []
 
 
 # ── Cache-stable catalog ordering (no semantic change) ─────────────────

@@ -18,6 +18,24 @@ from app.schemas.step_02_structured_query import (
     StructuredQuery,
     TaskIntent,
 )
+
+
+def _make_slot(
+    slot_name: str,
+    slot_category: str,
+    severity: str,
+    reason: str,
+    *,
+    suggested_question: str | None = None,
+) -> MissingSlot:
+    return MissingSlot(
+        slot_name=slot_name,
+        slot_category=slot_category,
+        severity=severity,
+        reason=reason,
+        suggested_question=suggested_question,
+        required_for=["developability_assessment"],
+    )
 from app.services.input_readiness_service import InputReadinessService
 from app.services.intake_service import IntakeService
 from app.utils.ids import new_artifact_id
@@ -76,13 +94,14 @@ def test_step3_consumes_blocking_missing_slot(
         workflow_state_service,
         run_id,
         missing_slots=[
-            MissingSlot(
-                slot_name="structure_or_sequence",
-                slot_category="structure",
-                severity="blocking",
-                required_for=["structure_analysis"],
-                reason="No structure or sequence input provided.",
-                suggested_question="Please provide a PDB/CIF file, PDB ID, UniProt ID, or sequence.",
+            _make_slot(
+                "structure_or_sequence",
+                "structure",
+                "blocking",
+                "No structure or sequence input provided.",
+                suggested_question=(
+                    "Please provide a PDB/CIF file, PDB ID, UniProt ID, or sequence."
+                ),
             )
         ],
     )
@@ -103,6 +122,124 @@ def test_step3_consumes_blocking_missing_slot(
     assert any("structure" in r.lower() for r in out.blocking_reasons)
 
 
+def test_step3_consumes_blocking_sequence_role_slot(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _full_context_run(local_storage, registry_service, workflow_state_service)
+    _bootstrap_step_2(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        run_id,
+        missing_slots=[
+            _make_slot(
+                "sequence_role",
+                "sequence",
+                "blocking",
+                "Need FASTA role before proceeding.",
+                suggested_question="Please confirm whether sequence is heavy chain, light chain, or target antigen.",
+            )
+        ],
+    )
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+
+    assert out.input_readiness_status == "blocked"
+    seq_items = [
+        m
+        for m in out.missing_input_checklist
+        if m.field.startswith("structured_query.missing_slots")
+        and m.category == "structure_or_sequence"
+    ]
+    assert seq_items, "sequence_role blocking slot must map to structure/sequence checklist"
+    requests = [
+        r for r in out.clarification_requests if r.slot_name == "sequence_role"
+    ]
+    assert requests and requests[0].severity == "blocking"
+    assert requests[0].source == "step2_missing_slots"
+
+
+def test_step3_does_not_block_on_warning_sequence_role_slot(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _full_context_run(local_storage, registry_service, workflow_state_service)
+    _bootstrap_step_2(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        run_id,
+        missing_slots=[
+            _make_slot(
+                "sequence_role",
+                "sequence",
+                "warning",
+                "Sequence role is ambiguous but can be inferred later.",
+                suggested_question="Please confirm sequence role.",
+            )
+        ],
+    )
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+
+    assert out.input_readiness_status == "needs_user_input"
+    assert not out.blocking_reasons
+    assert any(
+        m.field.startswith("structured_query.missing_slots")
+        for m in out.missing_input_checklist
+    )
+
+
+def test_step3_does_not_block_on_optional_sequence_role_slot(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _full_context_run(local_storage, registry_service, workflow_state_service)
+    _bootstrap_step_2(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        run_id,
+        missing_slots=[
+            _make_slot(
+                "sequence_role",
+                "sequence",
+                "optional",
+                "Sequence role hint is optional.",
+                suggested_question="Optional hint.",
+            )
+        ],
+    )
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+
+    assert out.input_readiness_status == "ready"
+    assert not any(r.slot_name == "sequence_role" for r in out.clarification_requests)
+    # Optional sequence-role hints should remain checklist-only and never
+    # block; whether they appear as a separate checklist line is
+    # implementation-defined when the same warning is already present
+    # deterministically.
+
+
+def test_step3_no_sequence_role_item_when_missing_slot_absent(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _full_context_run(local_storage, registry_service, workflow_state_service)
+    _bootstrap_step_2(
+        local_storage, registry_service, workflow_state_service, run_id
+    )
+    out = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+    assert out.input_readiness_status == "ready"
+    assert not any(
+        m.field.startswith("structured_query.missing_slots")
+        and "slot_name=sequence_role" in m.field
+        for m in out.missing_input_checklist
+    )
+
+
 def test_step3_does_not_block_on_warning_only_missing_slot(
     local_storage, registry_service, workflow_state_service
 ):
@@ -113,13 +250,7 @@ def test_step3_does_not_block_on_warning_only_missing_slot(
         workflow_state_service,
         run_id,
         missing_slots=[
-            MissingSlot(
-                slot_name="linker",
-                slot_category="linker",
-                severity="warning",
-                required_for=["new_adc_design"],
-                reason="No linker chemistry specified.",
-            )
+            _make_slot("linker", "linker", "warning", "No linker chemistry specified.")
         ],
     )
     out = InputReadinessService(
@@ -141,12 +272,7 @@ def test_step3_optional_missing_slot_is_informational_only(
         workflow_state_service,
         run_id,
         missing_slots=[
-            MissingSlot(
-                slot_name="constraint",
-                slot_category="constraint",
-                severity="optional",
-                reason="No explicit constraints.",
-            )
+            _make_slot("constraint", "constraint", "optional", "No explicit constraints.")
         ],
     )
     out = InputReadinessService(
@@ -195,12 +321,7 @@ def test_step3_blocking_slot_does_not_duplicate_existing_category(
         workflow_state_service,
         run_id,
         missing_slots=[
-            MissingSlot(
-                slot_name="target_or_antigen",
-                slot_category="target",
-                severity="blocking",
-                reason="No target.",
-            )
+            _make_slot("target_or_antigen", "target", "blocking", "No target.")
         ],
     )
     out = InputReadinessService(
@@ -226,13 +347,14 @@ def test_step3_blocking_slot_generates_clarification_request(
         workflow_state_service,
         run_id,
         missing_slots=[
-            MissingSlot(
-                slot_name="structure_or_sequence",
-                slot_category="structure",
-                severity="blocking",
-                required_for=["structure_analysis"],
-                reason="No structure or sequence input provided.",
-                suggested_question="Please provide a PDB/CIF file, PDB ID, UniProt ID, or sequence.",
+            _make_slot(
+                "structure_or_sequence",
+                "structure",
+                "blocking",
+                "No structure or sequence input provided.",
+                suggested_question=(
+                    "Please provide a PDB/CIF file, PDB ID, UniProt ID, or sequence."
+                ),
             )
         ],
     )
@@ -261,11 +383,11 @@ def test_step3_warning_slot_generates_request_without_blocking(
         workflow_state_service,
         run_id,
         missing_slots=[
-            MissingSlot(
-                slot_name="linker",
-                slot_category="linker",
-                severity="warning",
-                reason="No linker chemistry specified.",
+            _make_slot(
+                "linker",
+                "linker",
+                "warning",
+                "No linker chemistry specified.",
                 suggested_question="Which linker chemistry should we use?",
             )
         ],
@@ -293,11 +415,11 @@ def test_step3_optional_slot_stays_checklist_only_no_request(
         workflow_state_service,
         run_id,
         missing_slots=[
-            MissingSlot(
-                slot_name="constraint",
-                slot_category="constraint",
-                severity="optional",
-                reason="No explicit constraints.",
+            _make_slot(
+                "constraint",
+                "constraint",
+                "optional",
+                "No explicit constraints.",
                 suggested_question="Any constraints?",
             )
         ],
@@ -328,11 +450,11 @@ def test_step3_clarification_preserves_step2_question_when_checklist_dedupes(
         workflow_state_service,
         run_id,
         missing_slots=[
-            MissingSlot(
-                slot_name="target_or_antigen",
-                slot_category="target",
-                severity="blocking",
-                reason="No target.",
+            _make_slot(
+                "target_or_antigen",
+                "target",
+                "blocking",
+                "No target.",
                 suggested_question=step2_question,
             )
         ],

@@ -120,6 +120,17 @@ _MISSING_SLOT_CATEGORY_TO_GAP = {
 }
 
 
+def _missing_slot_gap_category(slot: dict) -> str:
+    """Map a Step 2 `missing_slot` to a Step 3 checklist category."""
+    slot_name = str(slot.get("slot_name") or "").strip()
+    slot_category = str(slot.get("slot_category") or "").strip()
+    return (
+        _MISSING_SLOT_CATEGORY_TO_GAP.get(slot_category, "structure_or_sequence")
+        if slot_name == "sequence_role"
+        else _MISSING_SLOT_CATEGORY_TO_GAP.get(slot_category, "other")
+    )
+
+
 # `referenced_inputs` id_types that count as a protein/antibody SEQUENCE
 # input (alongside FASTA uploads and an inline chain on a Step 2 entity).
 _ANTIBODY_SEQUENCE_REF_ID_TYPES = {
@@ -694,9 +705,7 @@ class InputReadinessService:
             if severity not in severity_rank:
                 severity = "warning"
             slot_name = slot.get("slot_name") or "other"
-            category = _MISSING_SLOT_CATEGORY_TO_GAP.get(
-                slot.get("slot_category"), "other"
-            )
+            category = _missing_slot_gap_category(slot)
             slot_rank = severity_rank[severity]
             if existing.get(category, -1) >= slot_rank:
                 # Already represented at >= severity by a deterministic check.
@@ -771,7 +780,7 @@ class InputReadinessService:
                 continue  # optional → checklist-only, no question
             slot_name = slot.get("slot_name") or "other"
             slot_category = slot.get("slot_category") or "other"
-            gap_category = _MISSING_SLOT_CATEGORY_TO_GAP.get(slot_category, "other")
+            gap_category = _missing_slot_gap_category(slot)
             reason = (slot.get("reason") or "").strip()
             suggested = slot.get("suggested_question")
             question = (

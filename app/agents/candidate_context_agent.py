@@ -613,7 +613,7 @@ class CandidateContextAgent:
         ]
         ab_cand = self._build_antibody_candidate(
             antibody_text=antibody_text,
-            sequence_files=[*antibody_sequence_files, *unassigned_sequence_files],
+            sequence_files=antibody_sequence_files,
             inline_sequence_refs=inline_antibody_sequence_refs,
             sq_artifact_id=sq_artifact_id,
         )

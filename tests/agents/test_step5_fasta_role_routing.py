@@ -196,9 +196,15 @@ def test_step5_ambiguous_fasta_keeps_unassigned_notes_not_target_sequence(
     table = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
 
     target = _record_by_type(table, "target_antigen")
+    antibody = _record_by_type(table, "antibody")
     assert not any(
         m.material_type == "target_sequence" and m.value == ambiguous["storage_path"]
         for m in target.materials
+    )
+    assert not any(
+        m.material_type == "antibody_sequence_reference"
+        and m.value == ambiguous["storage_path"]
+        for m in antibody.materials
     )
     assert any(
         (ambiguous["storage_path"] in gap) or (ambiguous["file_id"] in gap)
@@ -271,6 +277,11 @@ def test_sequence_fasta_query_antibody_cue_routes_to_antibody_sequence_reference
         m.material_type == "target_sequence" and m.value == ambiguous["storage_path"]
         for m in target.materials
     )
+    assert not any(
+        m.material_type in {"antibody_heavy_chain_sequence", "antibody_light_chain_sequence"}
+        and m.value == ambiguous["storage_path"]
+        for m in antibody.materials
+    )
 
 
 def test_sequence_fasta_query_contains_target_antibody_without_file_binding_keeps_unassigned(
@@ -298,6 +309,11 @@ def test_sequence_fasta_query_contains_target_antibody_without_file_binding_keep
     assert not any(
         m.material_type == "target_sequence" and m.value == ambiguous["storage_path"]
         for m in target.materials
+    )
+    assert not any(
+        m.material_type == "antibody_sequence_reference"
+        and m.value == ambiguous["storage_path"]
+        for m in antibody.materials
     )
     assert any(
         (ambiguous["storage_path"] in gap) or (ambiguous["file_id"] in gap)
@@ -330,6 +346,11 @@ def test_sequence_fasta_query_conflict_target_and_antibody_stays_unassigned(
     assert not any(
         m.material_type == "target_sequence" and m.value == ambiguous["storage_path"]
         for m in target.materials
+    )
+    assert not any(
+        m.material_type == "antibody_sequence_reference"
+        and m.value == ambiguous["storage_path"]
+        for m in antibody.materials
     )
     assert any(
         (ambiguous["storage_path"] in gap) or (ambiguous["file_id"] in gap)
