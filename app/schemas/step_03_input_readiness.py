@@ -80,6 +80,31 @@ class MissingInputItem(BaseModel):
     evidence_field: Optional[str] = None
 
 
+class ClarificationRequest(BaseModel):
+    """A user-facing question derived from a required-slot gap.
+
+    This is the minimal backend skeleton of the Step 3 clarification loop:
+    Step 3 turns gaps (Step 2 `missing_slots` and its own deterministic
+    checks) into structured, stable, machine-readable questions. There is
+    NO UI and NO multi-turn graph here — `resolved` always starts False and
+    nothing in Step 3 resolves it yet.
+
+    `request_id` is deterministic (slot identity + a short content hash) so
+    re-running Step 3 on the same input yields the same id, which lets a
+    store dedupe answers without random UUID churn.
+    """
+
+    request_id: str
+    slot_name: str
+    slot_category: str
+    severity: Literal["blocking", "warning", "optional"]
+    question: str
+    reason: str = ""
+    source: str = "step2_missing_slots"
+    evidence_field: Optional[str] = None
+    resolved: bool = False
+
+
 class InputReadinessStatus(BaseModel):
     run_id: str
     step_id: str = "step_03_input_readiness"
@@ -91,3 +116,11 @@ class InputReadinessStatus(BaseModel):
     uploaded_file_checks: list[UploadedFileCheck] = Field(default_factory=list)
     missing_input_checklist: list[MissingInputItem] = Field(default_factory=list)
     blocking_reasons: list[str] = Field(default_factory=list)
+    # Additive (Step 3 clarification-loop skeleton). Defaults to [] so old
+    # artifacts that predate the field still validate.
+    clarification_requests: list[ClarificationRequest] = Field(default_factory=list)
+    # User-facing follow-up message. Passed through from Step 2's
+    # `structured_query.response` when readiness is not `ready`; falls back
+    # to a deterministic join of clarification questions when Step 2 left it
+    # empty. Step 3 NEVER calls an LLM to produce this. None when ready.
+    response: Optional[str] = None

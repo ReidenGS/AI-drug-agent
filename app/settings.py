@@ -67,9 +67,16 @@ class Settings(BaseSettings):
     max_upload_bytes_per_file: int = 50 * 1024 * 1024  # 50 MiB
 
     # MCP wrapper live-mode policy. Default OFF — tests and pipeline smokes
-    # MUST NOT touch the network unless explicitly enabled. Even when ON, only
-    # tools listed in `mcp_live_tool_allowlist` (comma-separated) get
-    # `_live=True`; everything else stays on the deterministic mock envelope.
+    # MUST NOT touch the network unless explicitly enabled.
+    #
+    # Policy (see `should_use_live`):
+    #   - `mcp_live_tools=False`            -> never inject `_live` (default).
+    #   - `mcp_live_tools=True`, allowlist NON-EMPTY -> constrained smoke/debug
+    #     mode: ONLY the listed tools (comma-separated) get `_live=True`.
+    #   - `mcp_live_tools=True`, allowlist EMPTY -> production all-live mode:
+    #     EVERY scoped registered tool call gets `_live=True`. Wrappers that
+    #     do not support live must surface dependency_unavailable /
+    #     upstream_error honestly — they must never mock a fake success.
     mcp_live_tools: bool = False
     mcp_live_tool_allowlist: str = ""
     # Timeout (seconds) for outbound live HTTP requests in tool wrappers
@@ -83,9 +90,20 @@ class Settings(BaseSettings):
         return frozenset(name.strip() for name in raw.split(",") if name.strip())
 
     def should_use_live(self, tool_name: str) -> bool:
+        """Decide whether `_live=True` should be injected for `tool_name`.
+
+        - live OFF -> False.
+        - live ON + non-empty allowlist -> only listed tools (smoke/debug).
+        - live ON + empty allowlist -> True for every scoped tool (production
+          all-live; non-live wrappers surface dependency_unavailable /
+          upstream_error honestly, never a mocked success).
+        """
         if not self.mcp_live_tools:
             return False
-        return tool_name in self.live_tool_allowlist_set()
+        allowlist = self.live_tool_allowlist_set()
+        if not allowlist:
+            return True
+        return tool_name in allowlist
 
     @field_validator("llm_provider", mode="before")
     @classmethod

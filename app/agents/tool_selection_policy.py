@@ -614,7 +614,29 @@ def signature_schema_for(tool_name: str) -> Optional[dict]:
     official = _normalize_official_schema(tool_name, spec)
     if official is not None:
         return official
-    return _signature_schema_from_binding(tool_name)
+    fallback = _signature_schema_from_binding(tool_name)
+    return _apply_known_official_literal_contract(tool_name, fallback)
+
+
+def _apply_known_official_literal_contract(tool_name: str, schema: Optional[dict]) -> Optional[dict]:
+    if schema is None:
+        return None
+    operation_by_tool = {
+        "SwissADME_calculate_adme": "calculate_adme",
+        "SwissADME_check_druglikeness": "check_druglikeness",
+    }
+    operation = operation_by_tool.get(tool_name)
+    if not operation:
+        return schema
+    out = {
+        "type": schema.get("type", "object"),
+        "properties": dict(schema.get("properties") or {}),
+        "required": list(schema.get("required") or []),
+    }
+    out["properties"]["operation"] = {"type": "string", "enum": [operation]}
+    if "operation" not in out["required"]:
+        out["required"].insert(0, "operation")
+    return out
 
 
 def _binding_for(tool_name: str) -> Optional[Callable[..., Any]]:
@@ -648,7 +670,13 @@ def validate_arguments(args: dict[str, Any], schema: dict) -> tuple[dict[str, An
             if name in required:
                 continue
         else:
-            cleaned[name] = coerced
+            enum_values = spec.get("enum")
+            if isinstance(enum_values, list) and enum_values and coerced not in enum_values:
+                warnings.append(f"argument `{name}` not in allowed enum values")
+                if name in required:
+                    continue
+            else:
+                cleaned[name] = coerced
     for extra in (set(args) - set(properties)):
         warnings.append(f"argument `{extra}` not in schema; dropping")
     return cleaned, warnings

@@ -30,10 +30,16 @@ from typing import Any, Optional
 
 from ..llm.provider import LLMProvider
 from ..schemas.step_01_raw_request_record import RawRequestRecord
+from ..llm.json_task_validation import (
+    normalize_canonical_query,
+    normalize_missing_slots,
+    normalize_response,
+)
 from ..schemas.step_02_structured_query import (
     EntityComponent,
     EntityDecomposition,
     MentionedEntities,
+    MissingSlot,
     NormalizedEntity,
     SourceRawRequestRef,
     StructuredQuery,
@@ -84,8 +90,8 @@ Input-to-output mapping:
 - Heavy chain / VH / HC / IGH / IGHV / H chain sequence or FASTA ->
   `antibody_heavy_chain_sequence`. Light chain / VL / LC / kappa /
   lambda / IGK / IGL / IGKV / IGLV / L chain -> `antibody_light_chain_sequence`.
-  If the user only says antibody/protein sequence or FASTA with no chain
-  hint, use `antibody_sequence_reference`; do not default to heavy.
+  If an antibody FASTA/sequence lacks heavy/light role, do not use
+  `antibody_sequence_reference`; report blocking `sequence_role`.
 - Do not infer heavy vs light from sequence content. Do not extract CDR3
   from a full sequence. Preserve only an explicitly supplied CDR3 as
   `antibody_cdr3_sequence`; downstream runtime extracts CDR3 when needed.
@@ -152,6 +158,86 @@ Output essentials:
      "source": "antibody_light_chain_sequence"}
   ]
 }
+
+Missing-slot reporting (`missing_slots`):
+After extracting the structured_query fields, judge which REQUIRED slots
+for the inferred `task_intent.primary_intent` are NOT satisfied by the
+user's query, user_provided_context, or uploaded-file metadata, and list
+only those in `missing_slots`. This is a structured gap channel for the
+downstream readiness check; `parse_warnings` stays for internal parse
+problems. Rules: do not mark a slot missing when an equivalent typed input
+already satisfies it; never make an optional slot `blocking`;
+`suggested_question` must be a single sentence the user can answer
+directly; one entry per missing slot.
+
+required_slot_schema (satisfied_by = any one is enough):
+- new_adc_design:
+  - blocking target_or_antigen <- mentioned_entities.target_or_antigen_text
+    OR normalized_entities[entity_type=target_or_antigen] OR
+    referenced_inputs[id_type=uniprot_id] OR an uploaded file whose
+    role/source indicates a target/antigen.
+    question: "What target or antigen should the ADC be designed against?"
+  - warning antibody <- antibody_candidate_text OR antibody entity OR an
+    antibody heavy/light/sequence reference.
+  - warning payload <- payload_text OR payload entity OR a payload SMILES.
+  - warning linker <- linker_text OR linker entity OR a linker SMILES OR a
+    linker_payload entity.
+- structure_analysis:
+  - blocking structure_or_sequence <- referenced_inputs[id_type=pdb_id] OR
+    an uploaded PDB/CIF file OR referenced_inputs[id_type=uniprot_id] OR a
+    heavy/light/protein sequence reference.
+    question: "Please provide a PDB/CIF file, PDB ID, UniProt ID, or protein sequence."
+- developability_assessment:
+  - blocking structure_or_sequence ONLY when no analyzable molecule/protein
+    input exists at all (no payload/linker name or SMILES, no antibody/
+    protein sequence, no UniProt/accession, no PDB/CIF/PDB ID).
+- conditional uploaded FASTA role:
+  - blocking sequence_role ONLY when an uploaded FASTA/sequence file exists
+    and its role is unclear from filename, metadata, query, or context.
+    Do not emit it when no FASTA exists or the role is clear.
+    question: "Is the uploaded FASTA heavy chain, light chain, target/antigen, or another protein?"
+- literature_review / patent_ip_review:
+  - focus on a searchable entity (target/drug/compound) if none is present;
+    do NOT demand full ADC-design completeness. Use warning unless there is
+    no searchable entity at all (then blocking other/task_intent).
+You only REPORT missing_slots here; the readiness check decides the final stop.
+
+User-facing message (`response`):
+If `missing_slots` is non-empty, ALSO write `response`: one concise,
+natural, user-facing message that asks for the missing information.
+Prioritize blocking slots; combine multiple warning slots compactly into
+the same message. Phrase it for an end user and do not expose internal
+schema field names unless they help. Keep it short (a sentence or two), do
+not write a long explanation. If `missing_slots` is empty, set `response`
+to null or "". Never put prompts, API keys, raw file content, or full
+sequences in `response`.
+
+Clarification follow-up turns:
+`user_provided_context` may contain `previous_task_intent`,
+`previous_missing_slots`, `previous_clarification_requests`, and
+`clarification_answers` from an earlier clarification turn. When present:
+- Treat `clarification_answers` as the user's answers to the previous
+  turn's questions; use each `answer_text` to satisfy the matching previous
+  missing slot (by `slot_name` / `slot_category`).
+- Preserve `previous_task_intent` (keep the same primary_intent) unless an
+  answer explicitly changes the task; do NOT treat a short answer like
+  "HER2" as a new standalone task when `previous_task_intent` is present.
+- Re-emit `missing_slots` for what is STILL missing after applying the
+  answers; a slot answered this turn should no longer be missing.
+
+Canonical query (`canonical_query`):
+Always write `canonical_query`: a concise (<= 800 chars) normalized
+natural-language description of the CURRENT task. First turn: normalize the
+user's request (summarize known info; if slots are missing, note them as
+unspecified — do NOT invent values). On a clarification turn, UPDATE it from
+`user_provided_context.previous_canonical_query` plus `clarification_answers`
+(e.g. fill the target with the answer "HER2"), keeping the previous intent.
+This is the stable downstream working query; the original user text stays in
+`raw_user_query`. Use ONLY the field name `canonical_query` — never
+`working_query`, `normalized_query`, `final_query`, `rewritten_query`,
+`user_query_summary`, `query_for_downstream`, `canonical_task`,
+`task_summary`, `query_summary`, or any other query-like field. Never put
+prompts, keys, raw payloads, or full sequences in `canonical_query`.
 
 Return exactly one JSON object matching the schema. Keep `parse_warnings`
 as a string array and `user_constraints` as an object array with
@@ -780,6 +866,20 @@ def normalize_llm_payload_for_step2(
     _normalize_normalized_entity_types(out)
     _normalize_typed_smiles_fields(out, raw_request_record)
     _normalize_antibody_chain_references(out)
+    # missing_slots drift: absent -> [], dict -> [dict], string ->
+    # [{slot_name:"other", reason:string}], malformed list entries dropped /
+    # compacted with a parse_warning. Shares the provider validator's logic
+    # so OpenAI/Gemini/Qwen/Mock all agree on the cleaned shape.
+    normalize_missing_slots(out)
+    # response drift: absent -> None, non-string scalar -> str, list/dict ->
+    # compact string or None, over-long -> trimmed. Same shared logic as the
+    # provider validator so every provider/mock agrees on the cleaned shape.
+    normalize_response(out)
+    # canonical_query drift + alias promotion: absent -> None, scalar -> str,
+    # list/dict -> compact, over-long -> trimmed, and wrong query-like aliases
+    # (working_query/normalized_query/...) promoted into canonical_query then
+    # removed so they never reach the artifact.
+    normalize_canonical_query(out)
 
     return out
 
@@ -888,6 +988,13 @@ class SupervisorAgent:
             normalized_entities=normalized_entities,
             entity_decompositions=entity_decompositions,
             clarification_questions=llm_payload.get("clarification_questions") or [],
+            missing_slots=[
+                MissingSlot(**ms)
+                for ms in (llm_payload.get("missing_slots") or [])
+                if isinstance(ms, dict)
+            ],
+            response=llm_payload.get("response"),
+            canonical_query=llm_payload.get("canonical_query"),
         )
         return sq
 

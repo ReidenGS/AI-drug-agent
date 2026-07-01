@@ -542,9 +542,18 @@ def test_step2_prompt_lists_light_chain_signal_keywords():
 
 def test_step2_prompt_forbids_default_to_heavy_when_chain_silent():
     sp = SUPERVISOR_SYSTEM_PROMPT
-    assert "If the user only says antibody/protein sequence or FASTA" in sp
-    assert "do not default to heavy" in sp
-    assert "`antibody_sequence_reference`" in sp
+    assert "If an antibody FASTA/sequence lacks heavy/light role" in sp
+    assert "do not use\n  `antibody_sequence_reference`" in sp
+    assert "report blocking `sequence_role`" in sp
+
+
+def test_step2_prompt_reports_sequence_role_only_for_ambiguous_uploaded_fasta():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "blocking `sequence_role`" in sp
+    assert "uploaded FASTA/sequence file exists" in sp
+    assert "role is unclear from filename, metadata, query, or context" in sp
+    assert "Do not emit it when no FASTA exists" in sp
+    assert "or the role is clear" in sp
 
 
 def test_step2_prompt_forbids_inferring_chain_from_sequence_content():

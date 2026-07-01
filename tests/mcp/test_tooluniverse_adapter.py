@@ -233,3 +233,121 @@ def test_hydrate_env_bridges_model_to_tu_compatible_names(monkeypatch):
     _hydrate_env_from_settings()
     assert os.environ.get("GEMINI_MODEL_ID") == "gemini-3.5-flash"
     assert os.environ.get("TOOLUNIVERSE_LLM_MODEL_DEFAULT") == "gemini-3.5-flash"
+
+
+# ── transient-failure retry policy ─────────────────────────────────────────
+
+
+class _FlakyHandler:
+    """Fail `fail_times` with a given error, then return `ok_payload`.
+
+    `mode="raise"` raises an exception (network-style); `mode="error"`
+    returns a TU structured `{"status": "error", ...}` envelope.
+    """
+
+    def __init__(self, *, fail_times, error_text, ok_payload, mode="raise"):
+        self.fail_times = fail_times
+        self.error_text = error_text
+        self.ok_payload = ok_payload
+        self.mode = mode
+        self.calls = 0
+
+    def __call__(self, args):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            if self.mode == "raise":
+                raise ConnectionError(self.error_text)
+            return {"status": "error", "error": self.error_text}
+        return self.ok_payload
+
+
+@pytest.fixture(autouse=True)
+def _no_backoff_sleep(monkeypatch):
+    """Keep retry tests fast — no real backoff sleeping."""
+    monkeypatch.setattr(tooluniverse_adapter, "_sleep_backoff", lambda attempt: None)
+
+
+def test_retry_transient_then_success(install_universe):
+    handler = _FlakyHandler(
+        fail_times=1,
+        error_text="ProxyError: Max retries exceeded (RemoteDisconnected)",
+        ok_payload={"results": [{"id": "1"}]},
+    )
+    install_universe(tools={"EuropePMC_search_articles": handler})
+    out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
+    assert out["status"] == "ok"
+    assert out["retry_count"] == 1
+    assert out["recovered_after_transient_error"] is True
+    assert out["final_error_type"] == "ConnectionError"
+    assert handler.calls == 2
+
+
+def test_retry_transient_exhausted_keeps_upstream_error(install_universe):
+    handler = _FlakyHandler(
+        fail_times=99,
+        error_text="HTTPSConnectionPool: Max retries exceeded (RemoteDisconnected)",
+        ok_payload={"results": []},
+    )
+    install_universe(tools={"EuropePMC_search_articles": handler})
+    out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
+    assert out["status"] == "upstream_error"
+    assert out["retry_count"] == tooluniverse_adapter._MAX_LIVE_RETRIES
+    assert out["retry_count"] > 0
+    assert out["retryable"] is True
+    assert out["final_error_type"] == "ConnectionError"
+    # total attempts = 1 + max retries; never mocked a fake success.
+    assert handler.calls == tooluniverse_adapter._MAX_LIVE_RETRIES + 1
+    assert "payload" not in out
+
+
+def test_retry_transient_5xx_structured_error(install_universe):
+    handler = _FlakyHandler(
+        fail_times=1,
+        error_text="503 Server Error: Service Unavailable",
+        ok_payload={"results": [{"id": "ok"}]},
+        mode="error",
+    )
+    install_universe(tools={"EuropePMC_search_articles": handler})
+    out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
+    assert out["status"] == "ok"
+    assert out["retry_count"] == 1
+
+
+def test_no_retry_for_validation_error(install_universe):
+    handler = _FlakyHandler(
+        fail_times=99,
+        error_text="ToolValidationError: missing required field 'query'",
+        ok_payload={"results": []},
+        mode="error",
+    )
+    install_universe(tools={"EuropePMC_search_articles": handler})
+    out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {})
+    assert out["status"] == "upstream_error"
+    assert out["retry_count"] == 0
+    assert out["retryable"] is False
+    assert handler.calls == 1  # deterministic error → no retry
+
+
+def test_no_retry_for_missing_input_error(install_universe):
+    handler = _FlakyHandler(
+        fail_times=99,
+        error_text="missing-input: smiles is required",
+        ok_payload={},
+        mode="error",
+    )
+    install_universe(tools={"EuropePMC_search_articles": handler})
+    out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {})
+    assert out["status"] == "upstream_error"
+    assert out["retry_count"] == 0
+    assert out["retryable"] is False
+    assert handler.calls == 1
+
+
+def test_success_first_try_reports_zero_retries(install_universe):
+    install_universe(
+        tools={"EuropePMC_search_articles": lambda args: {"results": [{"id": "1"}]}}
+    )
+    out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
+    assert out["retry_count"] == 0
+    assert out["retryable"] is False
+    assert "recovered_after_transient_error" not in out

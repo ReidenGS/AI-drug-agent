@@ -284,7 +284,7 @@ def test_modality_summary_for_pdb_only_and_mixed_inputs():
     } <= tags
 
 
-def test_ambiguous_sequence_reference_is_marked_unknown_not_false_certainty():
+def test_ambiguous_antibody_sequence_reference_is_not_executable_chain_input():
     projection = project_candidate_available_fields(
         _candidate(
             materials=[
@@ -298,11 +298,18 @@ def test_ambiguous_sequence_reference_is_marked_unknown_not_false_certainty():
             ]
         )
     )
+    assert not any(f.material_type == "antibody_sequence_reference" and f.field_type == "protein_sequence" for f in projection.available_fields)
+    assert not any("use_sequence" in f.allowed_transforms for f in projection.available_fields)
+
     summary = projection.modality_summary
     assert summary.has_uploaded_fasta_ref is True
-    assert summary.has_antibody_sequence is True
+    assert summary.has_antibody_heavy_sequence is False
+    assert summary.has_antibody_light_sequence is False
+    assert summary.has_antibody_sequence is False
     assert summary.ambiguous_or_unknown is True
     assert summary.unknown_notes
+    notes = " ".join(summary.unknown_notes)
+    assert "generic_antibody_sequence_reference_not_executable" in notes
 
 
 def test_candidate_context_projection_keys_by_candidate_id():

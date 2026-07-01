@@ -50,6 +50,28 @@ def test_smoke_uses_full_production_developability_scope(smoke_module):
     assert "SwissADME_check_druglikeness" in smoke_module.LIVE_ALLOWLIST
 
 
+def test_live_allowlist_includes_step5_bcr_sequence_lookup(smoke_module):
+    """The Step 1→6 smoke also exercises Step 5 CDR3/BCR enrichment.
+
+    The allowlist only controls `_live=True` injection. It must include
+    iedb_search_bcr_sequences so sequence-only smokes do not report the
+    BCR lookup as not_live while still leaving the Step 5 catalog scope
+    untouched.
+    """
+    from app.mcp.client import LocalMCPClient
+    from app.services.tool_inventory_service import ToolInventoryService
+
+    xlsx = Path(__file__).resolve().parents[3] / "项目文件" / "ToolUniversity_inventory_v0.2.xlsx"
+    if not xlsx.exists():
+        pytest.skip(f"Inventory xlsx not at {xlsx}")
+    mcp = LocalMCPClient(inventory=ToolInventoryService(str(xlsx)))
+    step5_scope = set(mcp.list_tools(agent_name="candidate_context_agent", step_id="step_05"))
+
+    assert "iedb_search_bcr_sequences" in step5_scope
+    assert "iedb_search_bcr_sequences" in smoke_module.LIVE_ALLOWLIST
+    assert set(smoke_module.LIVE_ALLOWLIST) & step5_scope < step5_scope
+
+
 def test_live_allowlist_does_not_narrow_step6_catalog(smoke_module):
     from app.mcp.client import LocalMCPClient
     from app.services.tool_inventory_service import ToolInventoryService

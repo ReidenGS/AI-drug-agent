@@ -281,6 +281,48 @@ def test_uploaded_heavy_fasta_path_routes_iedb_without_artifact_patch(
     assert "ARGGYDFWSGYYTFDY" not in blob
 
 
+def test_iedb_bcr_default_path_reports_not_live_not_mocked(
+    local_storage, registry_service, workflow_state_service, monkeypatch,
+):
+    run_id = _seed_run_with_antibody_sequence_material(
+        local_storage, registry_service, workflow_state_service,
+        sequence_text=_FULL_HEAVY, chain_role="antibody_heavy",
+        filename="heavy_chain.fasta",
+    )
+    _mock_cdr3_success(
+        monkeypatch, chain_type=CHAIN_TYPE_HEAVY,
+        cdr3="ARGGYDFWSGYYTFDY", backend="fake_abnumber",
+    )
+
+    CandidateContextAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(),
+    ).run(run_id)
+
+    cct = local_storage.read_json(
+        local_storage.run_key(run_id, "candidate_context_table.json")
+    )
+    calls = [
+        tc for tc in cct.get("tool_call_records", [])
+        if tc.get("tool_name") == "iedb_search_bcr_sequences"
+    ]
+    assert calls
+    assert all(tc["run_status"] == "dependency_unavailable" for tc in calls)
+    assert all(
+        tc["tool_input_summary"].get("execution_semantics") == "not_live_mcp_execution"
+        for tc in calls
+    )
+    for tc in calls:
+        output = local_storage.read_json(tc["tool_output_ref"])["output"]
+        assert output["status"] == "not_live"
+        assert output["status"] != "mocked"
+    blob = json.dumps(cct)
+    assert _FULL_HEAVY not in blob
+    assert "ARGGYDFWSGYYTFDY" not in blob
+
+
 def test_uploaded_light_fasta_path_routes_iedb_without_artifact_patch(
     local_storage, registry_service, workflow_state_service, monkeypatch,
 ):

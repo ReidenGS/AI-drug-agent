@@ -39,10 +39,12 @@ Severity policy:
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import PurePosixPath
 
 from ..schemas.step_03_input_readiness import (
     BasicADCInputPresence,
+    ClarificationRequest,
     InputReadinessStatus,
     MissingInputItem,
     SourceRefs,
@@ -56,6 +58,99 @@ from .workflow_state_service import WorkflowStateService
 
 
 _ARTIFACT_KEY = "inputs/input_readiness_status.json"
+
+
+# Deterministic, non-LLM fallback questions keyed by gap category / slot.
+# Used only when a Step 2 `missing_slot` carried no `suggested_question`.
+_CLARIFICATION_FALLBACK_QUESTIONS = {
+    "target": "What target or antigen should the ADC be designed against?",
+    "antibody": "Which antibody candidate should we use, or should we run discovery?",
+    "payload_or_linker": "Which payload and linker should the ADC use?",
+    "payload": "Which payload should the ADC carry?",
+    "linker": "Which linker chemistry should we use?",
+    "structure_or_sequence": "Please provide a PDB/CIF file, PDB ID, UniProt ID, or protein sequence.",
+    "structure": "Please provide a PDB/CIF file, PDB ID, UniProt ID, or protein sequence.",
+    "sequence": "Please provide a protein or antibody sequence, or a UniProt ID.",
+    "identifier": "Could you provide the relevant identifier (PDB ID, UniProt ID, or SMILES)?",
+    "task_intent": "What workflow should we run (design, evaluate, screen, or review)?",
+    "constraint": "Are there any constraints we should respect (e.g. DAR or affinity)?",
+    "constraints": "Are there any constraints we should respect (e.g. DAR or affinity)?",
+    "raw_user_query": "Could you describe what you'd like the pipeline to do?",
+    "uploaded_file": "Could you re-check or re-upload the referenced file?",
+    "other": "Could you provide more detail for this requirement?",
+}
+
+
+def _fallback_question(category: str, slot_name: str, reason: str) -> str:
+    q = _CLARIFICATION_FALLBACK_QUESTIONS.get(category) or _CLARIFICATION_FALLBACK_QUESTIONS.get(
+        slot_name
+    )
+    if q:
+        return q
+    reason = (reason or "").strip()
+    if reason:
+        return f"Could you clarify: {reason}"
+    return _CLARIFICATION_FALLBACK_QUESTIONS["other"]
+
+
+def _clarification_request_id(slot_name: str, slot_category: str, severity: str, question: str) -> str:
+    """Stable id from slot identity + a short hash of the question content.
+
+    Deterministic (no UUID / timestamp) so the same gap yields the same id
+    across runs, which lets an answer store dedupe without churn.
+    """
+    raw = "|".join([slot_name, slot_category, severity, question])
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+    return f"clr_{slot_name}_{digest}"
+
+
+# Step 2 `missing_slots` slot_category -> Step 3 `GapCategory`. Keeps the
+# structured Step 2 gap channel aligned with Step 3's checklist taxonomy.
+_MISSING_SLOT_CATEGORY_TO_GAP = {
+    "target": "target",
+    "antibody": "antibody",
+    "payload": "payload_or_linker",
+    "linker": "payload_or_linker",
+    "structure": "structure_or_sequence",
+    "sequence": "structure_or_sequence",
+    "identifier": "structure_or_sequence",
+    "task_intent": "task_intent",
+    "constraint": "constraints",
+    "other": "other",
+}
+
+
+def _missing_slot_gap_category(slot: dict) -> str:
+    """Map a Step 2 `missing_slot` to a Step 3 checklist category."""
+    slot_name = str(slot.get("slot_name") or "").strip()
+    slot_category = str(slot.get("slot_category") or "").strip()
+    return (
+        _MISSING_SLOT_CATEGORY_TO_GAP.get(slot_category, "structure_or_sequence")
+        if slot_name == "sequence_role"
+        else _MISSING_SLOT_CATEGORY_TO_GAP.get(slot_category, "other")
+    )
+
+
+# `referenced_inputs` id_types that count as a protein/antibody SEQUENCE
+# input (alongside FASTA uploads and an inline chain on a Step 2 entity).
+_ANTIBODY_SEQUENCE_REF_ID_TYPES = {
+    "antibody_heavy_chain_sequence",
+    "antibody_light_chain_sequence",
+    "antibody_sequence_reference",
+}
+_SEQUENCE_REF_ID_TYPES = {"uniprot_id", *_ANTIBODY_SEQUENCE_REF_ID_TYPES}
+
+# Intents where Step 2's `missing_slots` (per its required_slot_schema) owns
+# the gap assessment, so Step 3 must NOT re-impose the legacy new-ADC-design
+# checklist (target / antibody / payload / linker). For these the readiness
+# floor comes from `missing_slots` + presence signals only.
+_NON_DESIGN_INTENTS = {
+    "developability_assessment",
+    "structure_analysis",
+    "compound_screening",
+    "literature_review",
+    "patent_ip_review",
+}
 
 
 _PDB_EXTS = {".pdb", ".cif", ".mmcif", ".ent"}
@@ -295,11 +390,14 @@ class InputReadinessService:
         )
 
         # Split structure / sequence signals (the combined field stays for
-        # downstream agents that already read it).
+        # downstream agents that already read it). Heavy/light/generic
+        # antibody chain references in `referenced_inputs` are sequence input.
+        antibody_seq_ref_types = sorted(ref_id_types & _ANTIBODY_SEQUENCE_REF_ID_TYPES)
+        has_antibody_seq_ref = bool(antibody_seq_ref_types)
         structure_present = any_structure_file or "pdb_id" in ref_id_types
         sequence_present = (
             any_sequence_file
-            or "uniprot_id" in ref_id_types
+            or bool(ref_id_types & _SEQUENCE_REF_ID_TYPES)
             or _has_explicit_chain_sequence(entities)
         )
         structure_or_sequence_present = structure_present or sequence_present
@@ -313,6 +411,11 @@ class InputReadinessService:
         sequence_input_ev = None
         if any_sequence_file:
             sequence_input_ev = sequence_file_evidence
+        elif has_antibody_seq_ref:
+            sequence_input_ev = (
+                "structured_query.referenced_inputs[id_type="
+                f"{antibody_seq_ref_types[0]}]"
+            )
         elif "uniprot_id" in ref_id_types:
             sequence_input_ev = "structured_query.referenced_inputs[id_type=uniprot_id]"
         elif _has_explicit_chain_sequence(entities):
@@ -329,6 +432,11 @@ class InputReadinessService:
             structure_ev = "structured_query.referenced_inputs[id_type=pdb_id]"
         elif any_sequence_file:
             structure_ev = "raw_request_record.uploaded_files[*].inferred_role=fasta_sequence"
+        elif has_antibody_seq_ref:
+            structure_ev = (
+                "structured_query.referenced_inputs[id_type="
+                f"{antibody_seq_ref_types[0]}]"
+            )
         elif "uniprot_id" in ref_id_types:
             structure_ev = "structured_query.referenced_inputs[id_type=uniprot_id]"
 
@@ -339,9 +447,18 @@ class InputReadinessService:
             else ("structured_query.user_constraints" if sq.get("user_constraints") else None)
         )
 
+        antibody_present = (
+            bool(candidate_text) or any_sequence_file or has_antibody_seq_ref
+        )
+        antibody_ref_evidence = (
+            "structured_query.referenced_inputs[id_type="
+            f"{antibody_seq_ref_types[0]}]"
+            if has_antibody_seq_ref
+            else None
+        )
         presence = BasicADCInputPresence(
             target_or_antigen_present=bool(target_text),
-            antibody_candidate_present=bool(candidate_text) or any_sequence_file,
+            antibody_candidate_present=antibody_present,
             payload_present=bool(payload_text),
             linker_present=bool(linker_text),
             structure_or_sequence_present=structure_or_sequence_present,
@@ -352,7 +469,8 @@ class InputReadinessService:
             candidate_file_present=any_candidate_file,
             target_evidence=target_ev,
             antibody_evidence=candidate_ev
-            or (sequence_file_evidence if any_sequence_file else None),
+            or (sequence_file_evidence if any_sequence_file else None)
+            or antibody_ref_evidence,
             payload_evidence=payload_ev,
             linker_evidence=linker_ev,
             structure_or_sequence_evidence=structure_ev,
@@ -404,43 +522,56 @@ class InputReadinessService:
                     evidence_field=None,
                 )
             )
-        if not presence.target_or_antigen_present:
-            missing.append(
-                MissingInputItem(
-                    field="user_provided_context.target_or_antigen_text",
-                    severity="blocking",
-                    message="Target / antigen not provided (neither raw context nor structured_query)",
-                    category="target",
-                    evidence_field=None,
+        # The legacy new-ADC-design checklist (target blocking + antibody /
+        # payload / linker gaps) only applies when the task is a design-style
+        # request. For non-design intents (e.g. developability_assessment on
+        # antibody heavy/light sequences) Step 2's `missing_slots` owns the
+        # gap assessment, so Step 3 must NOT fabricate a target/payload/linker
+        # requirement. `canonical_query`'s "unspecified" wording is never
+        # parsed as a real entity here.
+        primary_intent = str(
+            ((sq or {}).get("task_intent") or {}).get("primary_intent") or ""
+        ).strip().lower()
+        apply_legacy_adc_checklist = primary_intent not in _NON_DESIGN_INTENTS
+
+        if apply_legacy_adc_checklist:
+            if not presence.target_or_antigen_present:
+                missing.append(
+                    MissingInputItem(
+                        field="user_provided_context.target_or_antigen_text",
+                        severity="blocking",
+                        message="Target / antigen not provided (neither raw context nor structured_query)",
+                        category="target",
+                        evidence_field=None,
+                    )
                 )
-            )
-        if not presence.antibody_candidate_present:
-            missing.append(
-                MissingInputItem(
-                    field="user_provided_context.candidate_text",
-                    severity="warning",
-                    message="No explicit antibody candidate; Step 5 will rely on discovery",
-                    category="antibody",
+            if not presence.antibody_candidate_present:
+                missing.append(
+                    MissingInputItem(
+                        field="user_provided_context.candidate_text",
+                        severity="warning",
+                        message="No explicit antibody candidate; Step 5 will rely on discovery",
+                        category="antibody",
+                    )
                 )
-            )
-        if not presence.payload_present:
-            missing.append(
-                MissingInputItem(
-                    field="user_provided_context.payload_linker_text",
-                    severity="warning",
-                    message="Payload not detected; Step 6 compound lanes will be partial/skipped",
-                    category="payload_or_linker",
+            if not presence.payload_present:
+                missing.append(
+                    MissingInputItem(
+                        field="user_provided_context.payload_linker_text",
+                        severity="warning",
+                        message="Payload not detected; Step 6 compound lanes will be partial/skipped",
+                        category="payload_or_linker",
+                    )
                 )
-            )
-        if not presence.linker_present:
-            missing.append(
-                MissingInputItem(
-                    field="user_provided_context.payload_linker_text",
-                    severity="optional",
-                    message="Linker not specified; defaults may be assumed downstream",
-                    category="payload_or_linker",
+            if not presence.linker_present:
+                missing.append(
+                    MissingInputItem(
+                        field="user_provided_context.payload_linker_text",
+                        severity="optional",
+                        message="Linker not specified; defaults may be assumed downstream",
+                        category="payload_or_linker",
+                    )
                 )
-            )
         if not presence.structure_or_sequence_present:
             missing.append(
                 MissingInputItem(
@@ -492,6 +623,16 @@ class InputReadinessService:
                     )
                 )
 
+        # ── Step 2 structured missing_slots consumption (minimal) ───────────
+        # Step 3 reflects the LLM-judged required-slot gaps reported by
+        # Step 2: a `blocking` slot floors readiness to `blocked` and shows
+        # up in the checklist; `warning` / `optional` slots are informational
+        # gaps that never block on their own. We dedupe a slot against an
+        # existing deterministic item only when that item already covers the
+        # same category at the same-or-higher severity, so a genuinely new
+        # blocking slot is always surfaced.
+        self._consume_missing_slots(sq, missing)
+
         blocking = [m.message for m in missing if m.severity == "blocking"]
         if blocking:
             status_val: str = "blocked"
@@ -499,6 +640,17 @@ class InputReadinessService:
             status_val = "needs_user_input"
         else:
             status_val = "ready"
+
+        # Clarification requests are built from the SAME gaps but are NOT
+        # subject to the checklist dedupe, so a Step 2 `suggested_question`
+        # survives even when its category was deduped from the checklist.
+        clarification_requests = self._build_clarification_requests(sq, missing)
+
+        # User-facing response is a pure passthrough of Step 2's LLM-written
+        # `structured_query.response` when readiness is not `ready`. Step 3
+        # NEVER calls an LLM; if Step 2 left it empty we deterministically
+        # join the clarification questions as a fallback.
+        response = self._resolve_response(sq, status_val, clarification_requests)
 
         summary = self._readiness_summary(status_val, missing, presence)
         status = InputReadinessStatus(
@@ -511,6 +663,8 @@ class InputReadinessService:
             uploaded_file_checks=file_checks,
             missing_input_checklist=missing,
             blocking_reasons=blocking,
+            clarification_requests=clarification_requests,
+            response=response,
         )
 
         artifact_id = new_artifact_id("input_readiness_status")
@@ -521,6 +675,165 @@ class InputReadinessService:
         self.registry.update_active(run_id, input_readiness_status_id=artifact_id)
         self.workflow_state.mark(run_id, "step_03", "completed")
         return status
+
+    @staticmethod
+    def _consume_missing_slots(
+        structured_query: dict, missing: list[MissingInputItem]
+    ) -> None:
+        """Append Step 2 `missing_slots` to the Step 3 checklist (in place).
+
+        Deterministic, additive, and backward compatible: when Step 2 did
+        not populate `missing_slots` (old artifacts) this is a no-op. A slot
+        is skipped only when an existing deterministic item already covers
+        the same category at the same-or-higher severity, avoiding duplicate
+        lines while always surfacing a new/stronger gap.
+        """
+        slots = structured_query.get("missing_slots") or []
+        if not isinstance(slots, list):
+            return
+        severity_rank = {"optional": 0, "warning": 1, "blocking": 2}
+        existing: dict[str, int] = {}
+        for item in missing:
+            rank = severity_rank.get(item.severity, 1)
+            if rank > existing.get(item.category, -1):
+                existing[item.category] = rank
+
+        for slot in slots:
+            if not isinstance(slot, dict):
+                continue
+            severity = slot.get("severity")
+            if severity not in severity_rank:
+                severity = "warning"
+            slot_name = slot.get("slot_name") or "other"
+            category = _missing_slot_gap_category(slot)
+            slot_rank = severity_rank[severity]
+            if existing.get(category, -1) >= slot_rank:
+                # Already represented at >= severity by a deterministic check.
+                continue
+            reason = slot.get("reason") or (
+                f"Step 2 reported a missing required slot: {slot_name}"
+            )
+            question = slot.get("suggested_question")
+            message = reason
+            if isinstance(question, str) and question.strip():
+                message = f"{reason} Suggested question: {question.strip()}"
+            evidence = slot.get("evidence")
+            missing.append(
+                MissingInputItem(
+                    field=f"structured_query.missing_slots[slot_name={slot_name}]",
+                    severity=severity,  # type: ignore[arg-type]
+                    message=message,
+                    category=category,  # type: ignore[arg-type]
+                    evidence_field=evidence if isinstance(evidence, str) else None,
+                )
+            )
+            existing[category] = slot_rank
+
+    @staticmethod
+    def _build_clarification_requests(
+        structured_query: dict, missing: list[MissingInputItem]
+    ) -> list[ClarificationRequest]:
+        """Turn required-slot gaps into stable, user-facing questions.
+
+        Deterministic and additive. Step 2 `missing_slots` are the primary
+        source and are read DIRECTLY (not via the deduped checklist) so a
+        Step 2 `suggested_question` is never lost to checklist dedupe. A
+        deterministic gap only becomes a request when its category was not
+        already covered by a Step 2 slot. `blocking` / `warning` gaps yield
+        requests; `optional` gaps stay checklist-only (less noise — see the
+        dedicated test). Nothing here calls an LLM.
+        """
+        severity_with_question = {"blocking", "warning"}
+        requests: list[ClarificationRequest] = []
+        seen_ids: set[str] = set()
+        covered_categories: set[str] = set()
+
+        def _add(slot_name, slot_category, gap_category, severity, question, reason, source, evidence):
+            request_id = _clarification_request_id(
+                slot_name, slot_category, severity, question
+            )
+            if request_id in seen_ids:
+                return
+            seen_ids.add(request_id)
+            covered_categories.add(gap_category)
+            requests.append(
+                ClarificationRequest(
+                    request_id=request_id,
+                    slot_name=slot_name,
+                    slot_category=slot_category,
+                    severity=severity,  # type: ignore[arg-type]
+                    question=question,
+                    reason=reason,
+                    source=source,
+                    evidence_field=evidence if isinstance(evidence, str) else None,
+                )
+            )
+
+        # 1. Step 2 missing_slots — preserve the LLM's suggested_question.
+        for slot in structured_query.get("missing_slots") or []:
+            if not isinstance(slot, dict):
+                continue
+            severity = slot.get("severity")
+            if severity not in {"blocking", "warning", "optional"}:
+                severity = "warning"
+            if severity not in severity_with_question:
+                continue  # optional → checklist-only, no question
+            slot_name = slot.get("slot_name") or "other"
+            slot_category = slot.get("slot_category") or "other"
+            gap_category = _missing_slot_gap_category(slot)
+            reason = (slot.get("reason") or "").strip()
+            suggested = slot.get("suggested_question")
+            question = (
+                suggested.strip()
+                if isinstance(suggested, str) and suggested.strip()
+                else _fallback_question(gap_category, slot_name, reason)
+            )
+            _add(
+                slot_name, slot_category, gap_category, severity, question, reason,
+                "step2_missing_slots", slot.get("evidence"),
+            )
+
+        # 2. Deterministic gaps not already covered by a Step 2 slot category.
+        for item in missing:
+            if item.field.startswith("structured_query.missing_slots"):
+                continue  # already represented via the Step 2 loop above
+            if item.severity not in severity_with_question:
+                continue
+            if item.category in covered_categories:
+                continue
+            question = _fallback_question(item.category, item.category, item.message)
+            _add(
+                item.category, item.category, item.category, item.severity,
+                question, item.message, "deterministic_readiness", item.evidence_field,
+            )
+
+        return requests
+
+    @staticmethod
+    def _resolve_response(
+        structured_query: dict,
+        status_val: str,
+        clarification_requests: list[ClarificationRequest],
+    ) -> str | None:
+        """Pass through Step 2's user-facing `response`, or fall back.
+
+        Pure passthrough + deterministic fallback — NO LLM call. When
+        readiness is `ready` there is nothing to ask, so `None`. Otherwise
+        prefer Step 2's `structured_query.response`; if Step 2 left it empty,
+        join the clarification questions (blocking first) as a fallback.
+        """
+        if status_val == "ready":
+            return None
+        step2_response = structured_query.get("response")
+        if isinstance(step2_response, str) and step2_response.strip():
+            return step2_response.strip()
+        if not clarification_requests:
+            return None
+        ordered = sorted(
+            clarification_requests,
+            key=lambda c: 0 if c.severity == "blocking" else 1,
+        )
+        return " ".join(c.question for c in ordered if c.question)
 
     @staticmethod
     def _readiness_summary(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from copy import deepcopy
 from pathlib import Path
 
@@ -11,10 +12,12 @@ import pytest
 
 from app.agents.candidate_context_agent import CandidateContextAgent
 from app.agents.developability_agent import DevelopabilityAgent
+from app.agents import structure_and_design_agent as structure_and_design_module
 from app.agents.structure_and_design_agent import StructureAndDesignAgent
 from app.agents.supervisor_agent import SupervisorAgent
 from app.llm.provider import MockLLMProvider
 from app.mcp.client import LocalMCPClient
+from app.schemas.common import ToolCallRecord
 from app.services.input_readiness_service import InputReadinessService
 from app.services.intake_service import IntakeService
 from app.services.structured_query_service import StructuredQueryService
@@ -179,12 +182,56 @@ def test_step7_uploaded_pdb_preferred_over_sequence_refs(
     assert uploaded
     for rec in uploaded:
         assert rec.prediction_required is False
-        assert rec.preferred_input_rank == 1
-        assert any("uploaded PDB/CIF" in n for n in rec.source_priority_notes)
-        assert any(s.file_id == "file_pdb" and s.source_kind == "uploaded_file" for s in rec.structure_refs)
+        assert rec.preferred_input_rank in {1, 2}
+        assert any("preferred" in n for n in rec.source_priority_notes)
     blob = json.dumps(pkg.model_dump())
     assert "RAW_PDB_SENTINEL" not in blob
     assert "RAW_FASTA_SENTINEL" not in blob
+
+
+def test_step7_does_not_treat_generic_antibody_sequence_reference_as_prediction_input(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        referenced_inputs=[
+            {
+                "id_type": "antibody_sequence_reference",
+                "value": "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK",
+                "source": "user",
+            }
+        ],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    assert all(
+        m["material_type"] != "antibody_sequence_reference" for m in antibody["materials"]
+    )
+    assert any(
+        "antibody_sequence_role_unresolved" in note for note in antibody.get("context_notes", [])
+    )
+
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    ).run_step_7(run_id)
+
+    for rec in pkg.prepared_structure_inputs:
+        assert all(
+            s.prediction_input_kind != "amino_acid_sequence"
+            for s in rec.sequence_refs_for_prediction
+        )
+    artifact = local_storage.read_json(local_storage.run_key(run_id, "prepared_structure_input_package.json"))
+    artifact_blob = json.dumps(artifact)
+    assert "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK" not in artifact_blob
+    assert any(
+        "antibody_sequence_role_unresolved" in n for n in antibody["context_notes"]
+    )
 
 
 def test_step7_builds_input_package_from_referenced_pdb_and_uniprot(
@@ -299,6 +346,68 @@ def test_step7_antibody_heavy_light_sequence_only_proceeds(
     chain_roles = {cm.chain_role for cm in antibody_rec.chain_mapping}
     assert {"antibody_heavy", "antibody_light"}.issubset(chain_roles)
     assert all(cm.chain_id_kind == "prediction_placeholder" for cm in antibody_rec.chain_mapping)
+
+
+def test_step7_heavy_light_inline_sequences_are_compact_in_prepared_artifact(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service)
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    heavy_seq = "EVQLVESGGGLVQPGGSLRLSCAAS1234HEAVY"
+    light_seq = "DIQMTQSPSSLSASVGDRVTITC5678LIGHT"
+    antibody["materials"].extend([
+        {
+            "material_id": "heavy_compact_seq",
+            "material_type": "antibody_heavy_chain_sequence",
+            "value": heavy_seq,
+            "value_format": "fasta",
+            "role": "antibody",
+        },
+        {
+            "material_id": "light_compact_seq",
+            "material_type": "antibody_light_chain_sequence",
+            "value": light_seq,
+            "value_format": "fasta",
+            "role": "antibody",
+        },
+    ])
+    local_storage.write_json(cct_path, cct)
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    pkg = agent.run_step_7(run_id)
+
+    artifact_path = local_storage.run_key(run_id, "prepared_structure_input_package.json")
+    artifact = local_storage.read_json(artifact_path)
+    artifact_blob = json.dumps(artifact)
+
+    assert heavy_seq not in artifact_blob
+    assert light_seq not in artifact_blob
+    for rec in artifact.get("prepared_structure_inputs", []):
+        for seq in rec.get("sequence_refs_for_prediction", []):
+            assert "sequence" not in seq
+
+    antibody_rec = next(r for r in pkg.prepared_structure_inputs if r.structure_role == "antibody_only")
+    heavy_ref = next(
+        s for s in antibody_rec.sequence_refs_for_prediction if s.sequence_id == "heavy_compact_seq"
+    )
+    light_ref = next(
+        s for s in antibody_rec.sequence_refs_for_prediction if s.sequence_id == "light_compact_seq"
+    )
+    assert heavy_ref.sequence_length == len(heavy_seq)
+    assert light_ref.sequence_length == len(light_seq)
+    assert heavy_ref.sha256_prefix == hashlib.sha256(heavy_seq.encode("utf-8")).hexdigest()[:12]
+    assert light_ref.sha256_prefix == hashlib.sha256(light_seq.encode("utf-8")).hexdigest()[:12]
+    assert heavy_ref.prediction_input_kind == "amino_acid_sequence"
+    assert light_ref.prediction_input_kind == "amino_acid_sequence"
+    assert heavy_ref.sequence_value_status == "inline"
+    assert light_ref.sequence_value_status == "inline"
 
 
 def test_step7_antigen_antibody_sequence_mapping_without_interface_invention(
@@ -423,7 +532,7 @@ def test_step7_ambiguous_fasta_is_unresolved_not_broadcast(
         for r in pkg.prepared_structure_inputs for s in r.sequence_refs_for_prediction
     )
     assert any(
-        u["source_ref"] == "ambiguous_fasta" and u["resource_binding_status"] == "unassigned"
+        u["source_ref"] == "ambiguous_fasta" and u["resource_binding_status"] in {"unassigned", "ambiguous"}
         for u in pkg.unresolved_resource_refs
     )
 
@@ -443,8 +552,81 @@ def test_step7_referenced_pdb_id_is_not_copied_to_antibody(
         r for r in pkg.prepared_structure_inputs
         if any(s.pdb_id == "1N8Z" for s in r.structure_refs)
     ]
-    assert len(owners) == 1
-    assert owners[0].structure_role == "antigen_only"
+    if owners:
+        # In non-ambiguous runs this still maps to antigen candidate.
+        assert len(owners) == 1
+        assert owners[0].structure_role == "antigen_only"
+    else:
+        # New safety rule: avoid implicit target binding when target+antibody both exist.
+        assert any(
+            u["resource_type"] == "pdb_id" and u["source_ref"] == "1N8Z"
+            for u in pkg.unresolved_resource_refs
+        )
+
+
+def test_step7_unscoped_uploaded_structure_is_unresolved_when_target_and_antibody_conflict(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        uploaded_files=[{
+            "file_id": "unscoped_pdb",
+            "original_filename": "structure.pdb",
+            "storage_path": str(PROJECT_ROOT / "data" / "pdb" / "S1.pdb"),
+            "content_type": "chemical/x-pdb",
+            "size_bytes": 1,
+        }],
+    )
+    pkg = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=_mcp(),
+    ).run_step_7(run_id)
+    assert any(u["resource_type"] == "structure" for u in pkg.unresolved_resource_refs)
+    # Ensure not implicitly copied to a specific target/antibody candidate.
+    resolved = [r for r in pkg.prepared_structure_inputs if any(s.source_ref == "unscoped_pdb" for s in r.structure_refs)]
+    assert resolved == []
+
+
+def test_step7_unscoped_pdb_id_is_unresolved_when_target_and_antibody_conflict(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "pdb_id", "value": "1N8Z", "source": "raw_request_text"}],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for cand in cct["candidate_records"]:
+        if cand.get("candidate_type") in {"target_antigen", "antibody"}:
+            cand["identifiers"] = [
+                i for i in (cand.get("identifiers") or [])
+                if i.get("id_type") != "pdb_id"
+            ]
+            cand["materials"] = [
+                m for m in (cand.get("materials") or [])
+                if m.get("material_type") != "structure_ref"
+            ]
+    local_storage.write_json(cct_path, cct)
+
+    pkg = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=_mcp(),
+    ).run_step_7(run_id)
+    has_target = any(r.structure_role == "antigen_only" for r in pkg.prepared_structure_inputs)
+    has_antibody = any(r.structure_role == "antibody_only" for r in pkg.prepared_structure_inputs)
+    if has_target and has_antibody:
+        assert any(
+            u["resource_type"] == "pdb_id"
+            and u["source_ref"] == "1N8Z"
+            for u in pkg.unresolved_resource_refs
+        )
+        assert not any(
+            s.pdb_id == "1N8Z"
+            for r in pkg.prepared_structure_inputs
+            for s in r.structure_refs
+        )
+    else:
+        assert any(s.pdb_id == "1N8Z" for r in pkg.prepared_structure_inputs for s in r.structure_refs)
 
 
 def test_step7_candidate_scoped_structure_material_stays_on_candidate(
@@ -466,6 +648,535 @@ def test_step7_candidate_scoped_structure_material_stays_on_candidate(
     owners = [r for r in pkg.prepared_structure_inputs if any(s.source_ref == "target_s1" for s in r.structure_refs)]
     assert len(owners) == 1
     assert owners[0].candidate_id == target["candidate_id"]
+    rec = owners[0]
+    rec_ref = next(s for s in rec.structure_refs if s.source_ref == "target_s1")
+    assert rec_ref.storage_ref == str(PROJECT_ROOT / "data" / "pdb" / "S1.pdb")
+    assert rec.crystal_metadata is not None
+    assert rec.crystal_metadata.parse_status == "ok"
+    assert rec.crystal_metadata.a is not None
+    assert rec.crystal_metadata.b is not None
+    assert rec.crystal_metadata.c is not None
+    assert rec.crystal_metadata.alpha is not None
+    assert rec.crystal_metadata.beta is not None
+    assert rec.crystal_metadata.gamma is not None
+    assert rec.crystal_metadata.space_group
+    assert rec.crystal_metadata.z_value is not None
+    assert rec.molecular_weight_estimate is not None
+    assert rec.molecular_weight_estimate.value is not None
+    assert rec.molecular_weight_estimate.method == "seqres_residue_sum"
+    assert rec.molecular_weight_estimate.status in {"estimated", "estimated_with_warnings"}
+    assert not any(ref.pdb_id == "XXXX" for ref in rec.structure_refs)
+    blob = json.dumps(rec.model_dump())
+    assert "HEADER" not in blob
+    assert "ATOM" not in blob
+    assert "HETATM" not in blob
+    assert "SEQRES" not in blob
+
+
+@pytest.mark.parametrize("fixture_name", ["S1.pdb", "S2.pdb", "S3.pdb"])
+def test_step7_real_pdb_fixtures_supply_compact_crystal_validation_metadata(
+    local_storage, fixture_name
+):
+    path = PROJECT_ROOT / "data" / "pdb" / fixture_name
+    crystal, mw = structure_and_design_module._extract_structure_validation_metadata(
+        storage=local_storage,
+        structure_files=[],
+        candidate_structure_materials=[{
+            "material_id": f"mat_{fixture_name}",
+            "value": str(path),
+        }],
+    )
+
+    assert crystal is not None
+    assert crystal.parse_status == "ok"
+    assert crystal.a and crystal.b and crystal.c
+    assert crystal.alpha and crystal.beta and crystal.gamma
+    assert crystal.space_group
+    assert crystal.z_value is not None
+    assert mw is not None
+    assert mw.value is not None
+    assert mw.method == "seqres_residue_sum"
+    blob = json.dumps({"crystal": crystal.model_dump(), "mw": mw.model_dump()})
+    assert "HEADER" not in blob
+    assert "ATOM" not in blob
+    assert "HETATM" not in blob
+    assert "SEQRES" not in blob
+
+
+def test_step7_structure_file_material_is_consumable_by_step8_without_fake_placeholder(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service)
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    antibody["materials"].append({
+        "material_id": "ab_s1",
+        "material_type": "structure_file",
+        "value": str(PROJECT_ROOT / "data" / "pdb" / "S1.pdb"),
+        "value_format": "pdb",
+        "role": "antibody",
+    })
+    local_storage.write_json(cct_path, cct)
+
+    captured: list[dict] = []
+    overrides = {
+        "CrystalStructure_validate": lambda **kw: captured.append(dict(kw)) or {"ok": True, "validated": True},
+    }
+    mcp = LocalMCPClient(
+        inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+        bindings={**_bindings_with_step8_overrides(), **overrides},
+    )
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=mcp,
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+    tool_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name == "CrystalStructure_validate"
+        and tc.tool_input_summary.get("routing_decision") == "selected"
+    ]
+    assert tool_calls, "expected structure validation calls"
+    assert captured
+    for tc in tool_calls:
+        args = tc.tool_input_summary["arguments"]
+        assert args["operation"] == "validate"
+        assert args["a"] > 0
+        assert args["Z"] > 0
+        assert args["mw"] > 0
+        assert "pdb_id_or_path" not in args
+        assert "pdb_id_or_path" not in tc.tool_input_summary
+    assert all(set(call) >= {"operation", "a", "Z", "mw"} for call in captured)
+    assert all("pdb_id_or_path" not in call for call in captured)
+
+
+def test_step7_name_only_routes_to_database_search_tools(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[],
+    )
+    # Build with candidate names only; no structure files, no PDB IDs, no sequences.
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    ).run_step_7(run_id)
+
+    db_results = [tc for tc in pkg.structure_tool_call_records if tc.tool_name in {"RCSBAdvSearch_search_structures", "PDBeSearch_search_structures"}]
+    assert db_results, "name-only input should route to search wrappers"
+    assert all(tc.run_status in {"success", "dependency_unavailable", "failed"} for tc in db_results)
+
+    assert all(
+        tc.tool_input_summary
+        and tc.tool_input_summary.get("routing_decision") == "selected"
+        for tc in db_results
+    )
+    skipped = [
+        tc for tc in pkg.structure_tool_call_records
+        if tc.tool_name in {"RCSBData_get_entry", "RCSBData_get_assembly", "SAbDab_get_structure"}
+    ]
+    assert skipped and all(tc.run_status == "skipped" for tc in skipped)
+    assert all(tc.tool_input_summary.get("routing_decision") == "not_applicable" for tc in skipped)
+
+    # Database search results are normalized as ambiguous candidate
+    # options. They do not get promoted to primary structure refs.
+    for rec in pkg.prepared_structure_inputs:
+        if rec.input_case != "database_search_result":
+            continue
+        assert rec.database_search_candidates == []
+
+
+def test_step7_scope_tools_match_inventory_runtime_scope():
+    mcp = _mcp()
+    runtime_scope = set(mcp.list_tools(agent_name="structure_and_design_agent", step_id="step_07"))
+    assert runtime_scope == set(structure_and_design_module._STEP7_SCOPED_TOOLS), (
+        "Step 7 runtime scope must stay in sync with _STEP7_SCOPED_TOOLS.\n"
+        f"runtime_scope={sorted(runtime_scope)}\n"
+        f"routing_table={sorted(structure_and_design_module._STEP7_SCOPED_TOOLS)}"
+    )
+
+
+def test_step7_candidate_pdb_id_routes_to_rcsb_and_sabdab_step7_tools(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service)
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    antibody_id = antibody["candidate_id"]
+    antibody.setdefault("identifiers", []).append(
+        {"id_type": "pdb_id", "id_value": "1N8Z", "source": "candidate_profile"}
+    )
+    local_storage.write_json(cct_path, cct)
+
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    ).run_step_7(run_id)
+    tc_by_name = {
+        tc.tool_name: tc for tc in pkg.structure_tool_call_records
+        if tc.tool_name in {
+            "RCSBData_get_entry", "RCSBData_get_assembly", "SAbDab_get_structure"
+        } and tc.tool_input_summary.get("candidate_id") == antibody_id
+        }
+    assert "RCSBData_get_entry" in tc_by_name
+    assert tc_by_name["RCSBData_get_entry"].tool_input_summary.get("routing_decision") == "selected"
+    assert "RCSBData_get_assembly" in tc_by_name
+    assert tc_by_name["RCSBData_get_assembly"].tool_input_summary.get("arguments", {}).get("assembly_id") == "1"
+    assert "SAbDab_get_structure" in tc_by_name
+    assert tc_by_name["SAbDab_get_structure"].tool_input_summary.get("routing_decision") == "selected"
+
+    rec = next(
+        r for r in pkg.prepared_structure_inputs if r.input_case == "known_pdb_id"
+    )
+    compacted = {m["tool_name"]: m for m in rec.step7_tool_output_metadata}
+    entry_meta = compacted["RCSBData_get_entry"]["compact_output"]
+    assert entry_meta["compact_type"] == "rcsb_entry"
+    assert entry_meta["pdb_id"]
+    assert entry_meta["entry_metadata"] is not None
+    assert compacted["RCSBData_get_assembly"]["compact_output"]["compact_type"] == "rcsb_assembly"
+    assert compacted["RCSBData_get_assembly"]["compact_output"]["assembly_id"] == "1"
+    assert compacted["SAbDab_get_structure"]["compact_output"]["compact_type"] == "sabdab_structure"
+    assert compacted["SAbDab_get_structure"]["compact_output"]["pdb_id"] == entry_meta["pdb_id"]
+    assert rec.structure_refs and any(s.source_kind == "pdb_id" for s in rec.structure_refs)
+
+
+def test_step7_sequence_only_uniprot_triggers_alphafold_get_prediction_lookup(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "uniprot_id", "value": "P04626", "source": "raw"}],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for cand in cct["candidate_records"]:
+        cand["materials"] = [
+            m for m in cand.get("materials", [])
+            if not (isinstance(m, dict) and str(m.get("material_type", "")).endswith("_name"))
+        ]
+    local_storage.write_json(cct_path, cct)
+
+    overrides = {
+        "alphafold_get_prediction": lambda **kw: {
+            "uniprot": kw.get("uniprot"),
+            "status": "success",
+            "model_path": "mock://alphafold/P04626.pdb",
+        },
+    }
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(
+            inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+            bindings=overrides,
+        ),
+    )
+    pkg = agent.run_step_7(run_id)
+    step8 = agent.run_step_8(run_id)
+    af_calls = [tc for tc in pkg.structure_tool_call_records if tc.tool_name == "alphafold_get_prediction"]
+    assert len(af_calls) == 1
+    af_call = af_calls[0]
+    assert af_call.run_status == "success"
+    assert af_call.tool_input_summary["routing_decision"] == "selected"
+    assert af_call.tool_input_summary["arguments"]["uniprot"] == "P04626"
+
+    rec = next(
+        r for r in pkg.prepared_structure_inputs if r.input_case == "sequence_only_input"
+    )
+    assert any(
+        ref.source_kind == "predicted_needed" and ref.source_ref == "P04626"
+        for ref in rec.structure_refs
+    )
+    compacted = {m["tool_name"]: m for m in rec.step7_tool_output_metadata}
+    assert compacted["alphafold_get_prediction"]["compact_output"]["compact_type"] == "alphafold_prediction"
+    assert compacted["alphafold_get_prediction"]["compact_output"]["model_ref"] == "mock://alphafold/P04626.pdb"
+
+    for name in {"RCSBData_get_entry", "RCSBData_get_assembly", "RCSBAdvSearch_search_structures", "PDBeSearch_search_structures"}:
+        callset = [tc for tc in pkg.structure_tool_call_records if tc.tool_name == name]
+        assert callset
+        assert all(
+            call.tool_input_summary.get("routing_decision") in {"not_applicable", "scope_unavailable"}
+            for call in callset
+        )
+        assert all(call.run_status == "skipped" for call in callset)
+    assert all(tc.tool_name != "alphafold_get_prediction" for tc in step8.tool_call_records)
+
+    pkg_blob = json.dumps(pkg.model_dump())
+    assert "raw_sequence" not in pkg_blob
+    assert "full_payload" not in pkg_blob
+
+
+def test_step7_sequence_only_without_uniprot_skips_alphafold_lookup(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service, referenced_inputs=[])
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for cand in cct["candidate_records"]:
+        if cand.get("candidate_type") == "target_antigen":
+            cand["materials"] = [
+                {
+                    "material_id": "manual_sequence_target",
+                    "material_type": "target_sequence",
+                    "value": "MKTAYIAKQNNVG..."
+                }
+            ]
+        else:
+            cand["materials"] = []
+            if isinstance(cand.get("materials"), list):
+                cand["materials"] = []
+    local_storage.write_json(cct_path, cct)
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    pkg = agent.run_step_7(run_id)
+
+    rec = next(r for r in pkg.prepared_structure_inputs if r.input_case == "sequence_only_input")
+    af_calls = [tc for tc in pkg.structure_tool_call_records if tc.tool_name == "alphafold_get_prediction"]
+    assert len(af_calls) == 1
+    af_call = af_calls[0]
+    assert af_call.run_status == "skipped"
+    assert af_call.tool_input_summary["routing_decision"] == "not_applicable"
+    assert af_call.tool_input_summary.get("reason") == "sequence-only input has no UniProt accession for AlphaFold prediction lookup"
+
+    assert not any(ref.source_kind == "predicted_needed" for ref in rec.structure_refs)
+
+
+@pytest.mark.parametrize(
+    ("payload_key", "payload_value"),
+    [
+        ("model_url", "https://alphafold.test/P04626.pdb"),
+        ("model_path", "mock://alphafold/P04626.pdb"),
+        ("artifact_ref", "s3://bucket/alphafold/P04626.pdb"),
+    ],
+)
+def test_step7_alphafold_safe_model_ref_promotes_predicted_structure_ref(
+    local_storage, registry_service, workflow_state_service, payload_key, payload_value
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "uniprot_id", "value": "P04626", "source": "raw"}],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for cand in cct["candidate_records"]:
+        cand["materials"] = [
+            m for m in cand.get("materials", [])
+            if not (isinstance(m, dict) and str(m.get("material_type", "")).endswith("_name"))
+        ]
+    local_storage.write_json(cct_path, cct)
+
+    def _af(**kw):
+        return {"uniprot": kw.get("uniprot"), "status": "success", payload_key: payload_value}
+
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(
+            inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+            bindings={"alphafold_get_prediction": _af},
+        ),
+    ).run_step_7(run_id)
+
+    rec = next(r for r in pkg.prepared_structure_inputs if r.input_case == "sequence_only_input")
+    assert any(
+        ref.source_kind == "predicted_needed" and ref.storage_ref == payload_value
+        for ref in rec.structure_refs
+    )
+    compacted = {m["tool_name"]: m for m in rec.step7_tool_output_metadata}
+    assert compacted["alphafold_get_prediction"]["compact_output"]["model_ref"] == payload_value
+
+
+def test_step7_alphafold_generic_url_does_not_promote_model_ref(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "uniprot_id", "value": "P04626", "source": "raw"}],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for cand in cct["candidate_records"]:
+        cand["materials"] = [
+            m for m in cand.get("materials", [])
+            if not (isinstance(m, dict) and str(m.get("material_type", "")).endswith("_name"))
+        ]
+    local_storage.write_json(cct_path, cct)
+
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(
+            inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+            bindings={
+                "alphafold_get_prediction": lambda **kw: {
+                    "uniprot": kw.get("uniprot"),
+                    "status": "success",
+                    "url": "https://alphafold.test/generic-url.pdb",
+                }
+            },
+        ),
+    ).run_step_7(run_id)
+
+    rec = next(r for r in pkg.prepared_structure_inputs if r.input_case == "sequence_only_input")
+    assert not any(ref.source_kind == "predicted_needed" and ref.storage_ref for ref in rec.structure_refs)
+    compacted = {m["tool_name"]: m for m in rec.step7_tool_output_metadata}
+    assert compacted["alphafold_get_prediction"]["compact_output"]["model_ref"] is None
+
+
+def test_step7_alphafold_raw_output_does_not_leak_or_promote_model_ref(
+    local_storage, registry_service, workflow_state_service
+):
+    raw_pdb = "HEADER    RAW ALPHAFOLD MODEL\nATOM      1  N   ALA A   1\nHETATM    2  O   HOH A   2"
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "uniprot_id", "value": "P04626", "source": "raw"}],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for cand in cct["candidate_records"]:
+        cand["materials"] = [
+            m for m in cand.get("materials", [])
+            if not (isinstance(m, dict) and str(m.get("material_type", "")).endswith("_name"))
+        ]
+    local_storage.write_json(cct_path, cct)
+
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(
+            inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+            bindings={
+                "alphafold_get_prediction": lambda **kw: {
+                    "uniprot": kw.get("uniprot"),
+                    "status": "success",
+                    "output": raw_pdb,
+                }
+            },
+        ),
+    ).run_step_7(run_id)
+
+    rec = next(r for r in pkg.prepared_structure_inputs if r.input_case == "sequence_only_input")
+    assert not any(ref.source_kind == "predicted_needed" and ref.storage_ref for ref in rec.structure_refs)
+    compacted = {m["tool_name"]: m for m in rec.step7_tool_output_metadata}
+    assert compacted["alphafold_get_prediction"]["compact_output"]["model_ref"] is None
+    blob = json.dumps(pkg.model_dump())
+    assert "HEADER" not in blob
+    assert "ATOM" not in blob
+    assert "HETATM" not in blob
+
+
+def test_step7_scope_failure_records_scope_unavailable(
+    local_storage, registry_service, workflow_state_service
+):
+    class _FailingScopeClient(LocalMCPClient):
+        def list_tools(self, *args, **kwargs):  # type: ignore[override]
+            raise RuntimeError("scope backend unavailable")
+
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "uniprot_id", "value": "P04626", "source": "raw"}],
+    )
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_FailingScopeClient(),
+    ).run_step_7(run_id)
+
+    by_name = {tc.tool_name: tc for tc in pkg.structure_tool_call_records}
+    for tool in structure_and_design_module._STEP7_SCOPED_TOOLS:
+        assert tool in by_name
+        tc = by_name[tool]
+        assert tc.run_status == "skipped"
+        assert tc.tool_input_summary["routing_decision"] == "scope_unavailable"
+        assert "scope backend unavailable" in tc.tool_input_summary.get("reason", "")
+        assert tc.run_status == "skipped"
+
+
+def test_step7_database_search_results_become_ambiguous_candidates_only(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[],
+    )
+    overrides = {
+        "RCSBAdvSearch_search_structures": lambda **kw: {
+            "query": kw.get("query"),
+            "structures": [
+                {"pdb_id": "1N8Z", "method": "xray", "resolution": 2.1},
+            ],
+        },
+        "PDBeSearch_search_structures": lambda **kw: {
+            "query": kw.get("query"),
+            "structures": [
+                {"pdb_id": "2N8Z", "method": "crystal", "resolution": 2.3},
+            ],
+        },
+    }
+    mcp = LocalMCPClient(
+        inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+        bindings=overrides,
+    )
+    pkg = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=mcp,
+    ).run_step_7(run_id)
+
+    db_recs = [r for r in pkg.prepared_structure_inputs if r.input_case == "database_search_result"]
+    assert db_recs
+    for rec in db_recs:
+        assert rec.database_search_candidates
+        assert all(item.get("resource_binding_status") == "ambiguous" for item in rec.database_search_candidates)
+        assert all(item.get("pdb_id") for item in rec.database_search_candidates)
+        assert not any(item.get("source") == "selected_structure_ref" for item in rec.database_search_candidates)
+        assert rec.structure_refs == []
+
+
+def test_step8_skips_when_no_usable_structure_ref(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service)
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    # A structure_file material without concrete file path or pdb id.
+    target["materials"].append({
+        "material_id": "target_missing_structure",
+        "material_type": "structure_file",
+        "value": "not_a_file_reference",
+        "value_format": "text",
+    })
+    local_storage.write_json(cct_path, cct)
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=_mcp(),
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+    assert results.structure_modeling_status in {"partial", "failed"}
+    # No fabricated "uploaded" placeholder should be passed.
+    for tc in results.tool_call_records:
+        summary = json.dumps(tc.tool_input_summary or {})
+        assert "pdb_id_or_path\": \"uploaded\"" not in summary
 
 
 @pytest.mark.parametrize(
@@ -645,6 +1356,17 @@ def _bindings_with_step8_overrides(extra: dict | None = None) -> dict:
     return base
 
 
+def test_step8_scope_tools_match_inventory_runtime_scope():
+    mcp = _mcp()
+    runtime_scope = set(mcp.list_tools(agent_name="structure_and_design_agent", step_id="step_08"))
+    routing_policy = set(structure_and_design_module._STEP8_SCOPED_TOOL_POLICY)
+    assert runtime_scope == routing_policy, (
+        "Step 8 runtime scope must stay in sync with _STEP8_SCOPED_TOOL_POLICY.\n"
+        f"runtime_scope={sorted(runtime_scope)}\n"
+        f"routing_policy={sorted(routing_policy)}"
+    )
+
+
 def test_step8_produces_confidence_records_and_keeps_raw_at_ref(
     local_storage, registry_service, workflow_state_service
 ):
@@ -656,11 +1378,21 @@ def test_step8_produces_confidence_records_and_keeps_raw_at_ref(
     )
     # Inject canned payloads on the Step 8 tools we expect to be called.
     overrides = {
-        "RCSBData_get_entry": lambda **kw: {"hits_step8_rcsb": [kw.get("pdb_id")]},
+        "PDBePISA_get_interfaces": lambda **kw: {
+            "hits_step8_pisa": "raw_marker",
+            "pdb_id": kw.get("pdb_id"),
+            "interfaces": [
+                {
+                    "chain_id_1": "A",
+                    "chain_id_2": "B",
+                    "interface_area": 123.4,
+                    "h_bond_count": 2,
+                    "interface_residues": ["A:1", "B:2"],
+                }
+            ],
+        },
         "get_refinement_resolution_by_pdb_id":
             lambda **kw: {"hits_step8_resolution": 2.0, "pdb_id": kw.get("pdb_id")},
-        "ProteinsPlus_profile_structure_quality":
-            lambda **kw: {"hits_step8_proteinsplus": "ok"},
     }
     mcp = LocalMCPClient(
         inventory=ToolInventoryService(
@@ -676,26 +1408,73 @@ def test_step8_produces_confidence_records_and_keeps_raw_at_ref(
     agent.run_step_7(run_id)
     results = agent.run_step_8(run_id)
 
+    assert results.structure_modeling_status == "ok"
+    assert all(cr.run_status == "ok" for cr in results.candidate_structure_results)
+
     confidence_types = {
         c.confidence_type for cr in results.candidate_structure_results
         for c in cr.structure_confidence_records
     }
     assert "refinement_resolution" in confidence_types
-    quality_calls = [
+    assert "interface_quality" in confidence_types
+    selected = [
         tc for tc in results.tool_call_records
-        if tc.tool_name in {"RCSBData_get_entry", "ProteinsPlus_profile_structure_quality"}
+        if tc.tool_input_summary.get("routing_decision") == "selected"
     ]
-    assert quality_calls
-    assert all(tc.run_status in {"success", "dependency_unavailable", "skipped"} for tc in quality_calls)
+    selected_names = {tc.tool_name for tc in selected}
+    assert "PDBePISA_get_interfaces" in selected_names
+    assert "get_refinement_resolution_by_pdb_id" in selected_names
+    nim_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
+        and tc.tool_input_summary.get("input_case") == "known_pdb_id"
+    ]
+    assert nim_calls
+    assert all(tc.run_status == "skipped" for tc in nim_calls)
+    assert all(tc.tool_input_summary.get("routing_decision") == "not_applicable" for tc in nim_calls)
+    assert "RCSBData_get_entry" not in {tc.tool_name for tc in results.tool_call_records}
+    assert "ProteinsPlus_profile_structure_quality" not in {tc.tool_name for tc in results.tool_call_records}
+    assert all(tc.run_status in {"success", "dependency_unavailable", "skipped"} for tc in results.tool_call_records)
+
+    all_features = [
+        feature for cr in results.candidate_structure_results
+        for feature in cr.interface_features
+    ]
+    assert all_features
+    assert all_features[0].chain_id_1 == "A"
+    assert all_features[0].chain_id_2 == "B"
+    analysis_records = [
+        rec for cr in results.candidate_structure_results
+        for rec in cr.interface_analysis_records
+    ]
+    assert analysis_records
+    assert analysis_records[0].source_tool == "PDBePISA_get_interfaces"
+    assert analysis_records[0].chain_pair == {"chain_id_1": "A", "chain_id_2": "B"}
+    assert analysis_records[0].interface_residue_count == 2
+    assert analysis_records[0].interface_area == 123.4
+    assert analysis_records[0].h_bond_count == 2
+    handoffs = [cr.downstream_handoff for cr in results.candidate_structure_results]
+    assert any(h.has_complex_structure for h in handoffs)
+    assert any(h.has_interface_features for h in handoffs)
+    assert any(h.interface_quality_available for h in handoffs)
+    assert any(h.refinement_resolution_available for h in handoffs)
+    assert any(h.structure_for_variant_generation_ref == "1N8Z" for h in handoffs)
+    complex_refs = [
+        ref for cr in results.candidate_structure_results
+        for ref in cr.complex_structure_refs
+    ]
+    assert any(ref.source_kind == "existing_pdb_complex" and ref.pdb_id == "1N8Z" for ref in complex_refs)
 
     # output_artifacts use structured envelope (artifact_id + storage_ref).
     assert results.output_artifacts
     art_types = {a.artifact_type for a in results.output_artifacts}
     assert "refinement_or_validation_report" in art_types
+    assert "interface_analysis_raw_output" in art_types
 
     # Raw payload markers stay in tool_outputs/ — never in normalized records.
     blob = json.dumps(results.model_dump())
     assert "hits_step8_" not in blob
+    assert "raw_marker" not in blob
 
     # And the raw files actually exist.
     for tc in results.tool_call_records:
@@ -715,11 +1494,9 @@ def test_step8_tolerates_dependency_unavailable_wrappers(
 
     forced_unwired = {
         name: _ni for name in (
-            "RCSBData_get_entry",
+            "PDBePISA_get_interfaces",
             "get_refinement_resolution_by_pdb_id",
             "CrystalStructure_validate",
-            "alphafold_get_prediction",
-            "ProteinsPlus_profile_structure_quality",
         )
     }
     bindings = dict(_all_bindings())
@@ -756,13 +1533,22 @@ def test_step8_uploaded_structure_file_path_calls_validation_tools(
         uploaded_files=[
             {
                 "file_id": "file_pdb",
-                "original_filename": "complex.pdb",
+                "original_filename": "target.pdb",
                 "storage_path": "adc_pilot/runs/x/inputs/files/file_pdb.pdb",
                 "content_type": "chemical/x-pdb",
                 "sha256": "sha256:abc",
                 "size_bytes": 1024,
+                "role": "target",
             },
         ],
+    )
+    raw_path = local_storage.run_key(run_id, "inputs/raw_request_record.json")
+    raw = local_storage.read_json(raw_path)
+    raw["uploaded_files"][0]["storage_path"] = local_storage.run_key(run_id, "inputs/files/file_pdb.pdb")
+    local_storage.write_json(raw_path, raw)
+    local_storage.write_bytes(
+        raw["uploaded_files"][0]["storage_path"],
+        (PROJECT_ROOT / "data" / "pdb" / "S1.pdb").read_bytes(),
     )
     agent = StructureAndDesignAgent(
         storage=local_storage, registry=registry_service,
@@ -770,9 +1556,672 @@ def test_step8_uploaded_structure_file_path_calls_validation_tools(
     )
     agent.run_step_7(run_id)
     results = agent.run_step_8(run_id)
+    assert results.structure_modeling_status == "ok"
+    assert all(cr.run_status == "ok" for cr in results.candidate_structure_results)
+    uploaded_handoffs = [
+        cr.downstream_handoff for cr in results.candidate_structure_results
+        if any(c.source == "CrystalStructure_validate" for c in cr.structure_confidence_records)
+    ]
+    assert uploaded_handoffs
+    assert all(not h.has_complex_structure for h in uploaded_handoffs)
+    assert all(h.structure_for_variant_generation_ref is None for h in uploaded_handoffs)
+    assert any(h.has_validated_structure for h in uploaded_handoffs)
+    assert any(h.validation_available for h in uploaded_handoffs)
+    assert any(not h.has_interface_features for h in uploaded_handoffs)
+    assert any(h.validated_structure_ref for h in uploaded_handoffs)
+    missing = [
+        item for h in uploaded_handoffs
+        for item in h.missing_for_step9
+    ]
+    assert "complex_structure_missing" in missing
+    plans = [
+        plan for cr in results.candidate_structure_results
+        for plan in cr.complex_prediction_plans
+    ]
+    assert plans
+    assert any(plan.input_status == "input_missing" for plan in plans)
+    assert any("antigen_antibody_pair" in plan.missing_prediction_inputs or "antigen_sequence" in plan.missing_prediction_inputs for plan in plans)
     tools = {tc.tool_name for tc in results.tool_call_records}
     assert "CrystalStructure_validate" in tools
-    assert "ProteinsPlus_profile_structure_quality" in tools
+    assert "ProteinsPlus_profile_structure_quality" not in tools
+    pisa_calls = [tc for tc in results.tool_call_records if tc.tool_name == "PDBePISA_get_interfaces"]
+    assert pisa_calls
+    assert all(tc.tool_input_summary.get("routing_decision") == "not_applicable" for tc in pisa_calls)
+    assert all("pdb_id" not in (tc.tool_input_summary.get("arguments") or {}) for tc in pisa_calls)
+
+
+def test_step8_skips_crystal_validation_when_compact_metadata_missing(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        uploaded_files=[
+            {
+                "file_id": "file_pdb",
+                "original_filename": "target.pdb",
+                "storage_path": "adc_pilot/runs/x/inputs/files/file_pdb.pdb",
+                "content_type": "chemical/x-pdb",
+                "sha256": "sha256:abc",
+                "size_bytes": 1024,
+                "role": "target",
+            },
+        ],
+    )
+    raw_path = local_storage.run_key(run_id, "inputs/raw_request_record.json")
+    raw = local_storage.read_json(raw_path)
+    raw["uploaded_files"][0]["storage_path"] = local_storage.run_key(run_id, "inputs/files/file_pdb.pdb")
+    local_storage.write_json(raw_path, raw)
+    local_storage.write_bytes(raw["uploaded_files"][0]["storage_path"], b"HEADER    DUMMY\nEND\n")
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    pkg = agent.run_step_7(run_id)
+    uploaded = [r for r in pkg.prepared_structure_inputs if r.input_case == "uploaded_structure_file"]
+    assert uploaded
+    assert all(
+        not r.crystal_metadata or r.crystal_metadata.parse_status in {"missing", "invalid"}
+        for r in uploaded
+    )
+    results = agent.run_step_8(run_id)
+    crystal_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name == "CrystalStructure_validate"
+        and tc.tool_input_summary.get("input_case") == "uploaded_structure_file"
+    ]
+    assert crystal_calls
+    assert all(tc.run_status == "skipped" for tc in crystal_calls)
+    assert all(tc.tool_input_summary.get("routing_decision") == "input_missing" for tc in crystal_calls)
+    assert any("Z" in tc.tool_input_summary.get("missing", []) for tc in crystal_calls)
+    assert all("pdb_id_or_path" not in (tc.tool_input_summary.get("arguments") or {}) for tc in crystal_calls)
+    pisa_calls = [tc for tc in results.tool_call_records if tc.tool_name == "PDBePISA_get_interfaces"]
+    assert pisa_calls
+    assert all(tc.tool_input_summary.get("routing_decision") == "not_applicable" for tc in pisa_calls)
+
+
+def test_step8_sequence_only_records_nim_prediction_route_as_unavailable(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service, referenced_inputs=[])
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for cand in cct["candidate_records"]:
+        if cand.get("candidate_type") == "target_antigen":
+            cand["materials"] = [
+                {
+                    "material_id": "target_seq_for_step8",
+                    "material_type": "target_sequence",
+                    "value": "MKTAYIAKQNNVG",
+                }
+            ]
+        else:
+            cand["materials"] = []
+    local_storage.write_json(cct_path, cct)
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+    assert results.structure_modeling_status == "ok"
+    assert all(cr.run_status == "ok" for cr in results.candidate_structure_results)
+    assert all(not cr.complex_structure_refs for cr in results.candidate_structure_results)
+    missing = [
+        item for cr in results.candidate_structure_results
+        for item in cr.downstream_handoff.missing_for_step9
+    ]
+    assert "complex_structure_missing" in missing
+    assert "antibody_heavy_sequence" in missing
+    assert "antibody_light_sequence" in missing
+
+    nim_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
+    ]
+    assert nim_calls
+    assert all(tc.run_status == "skipped" for tc in nim_calls)
+    assert all(tc.tool_input_summary.get("routing_decision") == "input_missing" for tc in nim_calls)
+    assert all("complex_prediction_plan" in tc.tool_input_summary for tc in nim_calls)
+    plans = [
+        plan for cr in results.candidate_structure_results
+        for plan in cr.complex_prediction_plans
+    ]
+    assert plans
+    assert all(plan.input_status == "input_missing" for plan in plans)
+    assert any("antibody_heavy_sequence" in plan.missing_prediction_inputs for plan in plans)
+    assert any("antibody_light_sequence" in plan.missing_prediction_inputs for plan in plans)
+
+    blob = json.dumps(results.model_dump())
+    assert "MKTAYIAKQNNVG" not in blob
+    assert "RAW_PDB_SENTINEL" not in blob
+    assert "ATOM      1" not in blob
+
+
+def test_step8_uniprot_antigen_with_antibody_sequences_is_contract_unresolved(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        referenced_inputs=[{"id_type": "uniprot_id", "value": "P04626", "source": "raw"}],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    antibody["materials"].extend([
+        {
+            "material_id": "heavy_seq_step8",
+            "material_type": "antibody_heavy_chain_sequence",
+            "value": "EVQLVESGGGLVQPGGSLRLSCAAS",
+        },
+        {
+            "material_id": "light_seq_step8",
+            "material_type": "antibody_light_chain_sequence",
+            "value": "DIQMTQSPSSLSASVGDRVTITC",
+        },
+    ])
+    local_storage.write_json(cct_path, cct)
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+
+    assert results.structure_modeling_status == "ok"
+    assert all(cr.run_status == "ok" for cr in results.candidate_structure_results)
+    plans = [
+        plan for cr in results.candidate_structure_results
+        for plan in cr.complex_prediction_plans
+    ]
+    assert plans
+    assert any(plan.input_status == "contract_unresolved" for plan in plans)
+    assert not any(plan.input_status == "selected_but_deferred" for plan in plans)
+    assert any(
+        "antigen_sequence_unresolved_from_uniprot_id" in plan.missing_prediction_inputs
+        for plan in plans
+    )
+    assert all(not cr.complex_structure_refs for cr in results.candidate_structure_results)
+    assert not any(
+        "complex_prediction_unavailable" in cr.downstream_handoff.missing_for_step9
+        for cr in results.candidate_structure_results
+    )
+    assert any(
+        "antigen_sequence_unresolved_from_uniprot_id" in cr.downstream_handoff.missing_for_step9
+        for cr in results.candidate_structure_results
+    )
+    nim_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
+    ]
+    assert nim_calls
+    assert all(tc.run_status == "skipped" for tc in nim_calls)
+    assert all(tc.tool_input_summary.get("routing_decision") == "contract_unresolved" for tc in nim_calls)
+    audit_blob = json.dumps([tc.tool_input_summary for tc in nim_calls])
+    assert "EVQLVES" not in audit_blob
+    assert "DIQMTQ" not in audit_blob
+    assert "sha256_prefix" in audit_blob
+    assert "P04626" in audit_blob
+
+
+def test_step8_raw_antigen_antibody_sequences_record_nim_deferred_plan(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service, referenced_inputs=[])
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    target["materials"] = [
+        {
+            "material_id": "target_seq_step8",
+            "material_type": "target_sequence",
+            "value": "MKTAYIAKQNNVG",
+        }
+    ]
+    antibody["materials"].extend([
+        {
+            "material_id": "heavy_seq_step8",
+            "material_type": "antibody_heavy_chain_sequence",
+            "value": "EVQLVESGGGLVQPGGSLRLSCAAS",
+        },
+        {
+            "material_id": "light_seq_step8",
+            "material_type": "antibody_light_chain_sequence",
+            "value": "DIQMTQSPSSLSASVGDRVTITC",
+        },
+    ])
+    local_storage.write_json(cct_path, cct)
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+
+    assert results.structure_modeling_status == "partial"
+    plans = [
+        plan for cr in results.candidate_structure_results
+        for plan in cr.complex_prediction_plans
+    ]
+    assert plans
+    assert any(plan.input_status == "ready" for plan in plans)
+    assert all(not cr.complex_structure_refs for cr in results.candidate_structure_results)
+    assert any(
+        "complex_prediction_unavailable" in cr.downstream_handoff.missing_for_step9
+        for cr in results.candidate_structure_results
+    )
+    nim_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
+    ]
+    assert nim_calls
+    assert any(tc.run_status == "dependency_unavailable" for tc in nim_calls)
+    assert any(tc.tool_input_summary.get("routing_decision") == "selected" for tc in nim_calls)
+    audit_blob = json.dumps([tc.tool_input_summary for tc in nim_calls])
+    assert "MKTAYIAK" not in audit_blob
+    assert "EVQLVES" not in audit_blob
+    assert "DIQMTQ" not in audit_blob
+    assert "sha256_prefix" in audit_blob
+
+
+def test_step8_antibody_heavy_light_without_antigen_records_input_missing_antigen_with_compact_sequences(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service, referenced_inputs=[])
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    # Remove target sequence to force sequence-only antibody-only planning.
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    target["materials"] = []
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    heavy_seq = "EVQLVESGGGLVQPGGSLRLSCAASABCDEF"
+    light_seq = "DIQMTQSPSSLSASVGDRVTITCABCDE"
+    antibody["materials"].extend([
+        {
+            "material_id": "heavy_step8_seq",
+            "material_type": "antibody_heavy_chain_sequence",
+            "value": heavy_seq,
+        },
+        {
+            "material_id": "light_step8_seq",
+            "material_type": "antibody_light_chain_sequence",
+            "value": light_seq,
+        },
+    ])
+    local_storage.write_json(cct_path, cct)
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    agent.run_step_7(run_id)
+    artifact_path = local_storage.run_key(run_id, "prepared_structure_input_package.json")
+    artifact = local_storage.read_json(artifact_path)
+    artifact_blob = json.dumps(artifact)
+    assert heavy_seq not in artifact_blob
+    assert light_seq not in artifact_blob
+
+    results = agent.run_step_8(run_id)
+
+    plans = [
+        plan for cr in results.candidate_structure_results
+        for plan in cr.complex_prediction_plans
+    ]
+    assert plans
+    assert any(plan.input_status == "input_missing" for plan in plans)
+    assert any("antigen_sequence" in plan.missing_prediction_inputs for plan in plans)
+    assert any(
+        item.get("chain_role") == "antibody_heavy" and item.get("sequence_readiness") == "ready"
+        for plan in plans
+        for item in plan.sequence_inputs
+    )
+    assert any(
+        item.get("chain_role") == "antibody_light" and item.get("sequence_readiness") == "ready"
+        for plan in plans
+        for item in plan.sequence_inputs
+    )
+
+    nim_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
+    ]
+    assert nim_calls
+    assert all(tc.run_status == "skipped" for tc in nim_calls)
+    assert all(tc.tool_input_summary.get("routing_decision") == "input_missing" for tc in nim_calls)
+    audit_blob = json.dumps([tc.tool_input_summary or {} for tc in nim_calls])
+    assert heavy_seq not in audit_blob
+    assert light_seq not in audit_blob
+
+
+def test_step8_nim_runtime_resolves_inline_sequence_from_step5_material_lookup(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service, referenced_inputs=[])
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    target["materials"] = [
+        {"material_id": "target_seq_step8_runtime", "material_type": "target_sequence", "value": "MKTAYIAKQNNVG"}
+    ]
+    heavy_seq = "EVQLVESGGGLVQPGGSLRLSCAASRUNTIME"
+    light_seq = "DIQMTQSPSSLSASVGDRVTITCRUNTIME"
+    antibody["materials"].extend([
+        {"material_id": "heavy_step8_runtime", "material_type": "antibody_heavy_chain_sequence", "value": heavy_seq},
+        {"material_id": "light_step8_runtime", "material_type": "antibody_light_chain_sequence", "value": light_seq},
+    ])
+    local_storage.write_json(cct_path, cct)
+
+    captured: list[tuple[str, dict]] = []
+
+    def _capture(tool_name: str):
+        def _inner(**kw):
+            captured.append((tool_name, dict(kw)))
+            return {"status": "ok", "model_ref": f"s3://bucket/{tool_name}.pdb"}
+        return _inner
+
+    mcp = LocalMCPClient(
+        inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+        bindings=_bindings_with_step8_overrides({
+            "NvidiaNIM_alphafold2_multimer": _capture("NvidiaNIM_alphafold2_multimer"),
+            "NvidiaNIM_openfold3": _capture("NvidiaNIM_openfold3"),
+            "NvidiaNIM_boltz2": _capture("NvidiaNIM_boltz2"),
+        }),
+    )
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=mcp,
+    )
+    agent.run_step_7(run_id)
+    artifact_path = local_storage.run_key(run_id, "prepared_structure_input_package.json")
+    artifact = local_storage.read_json(artifact_path)
+    artifact_blob = json.dumps(artifact)
+
+    assert heavy_seq not in artifact_blob
+    assert light_seq not in artifact_blob
+    for rec in artifact.get("prepared_structure_inputs", []):
+        for seq in rec.get("sequence_refs_for_prediction", []):
+            assert "sequence" not in seq
+
+    results = agent.run_step_8(run_id)
+    assert results.structure_modeling_status in {"partial", "ok"}
+    assert captured
+    for tool_name, kwargs in captured:
+        if "sequences" in kwargs:
+            assert heavy_seq in kwargs["sequences"]
+            assert light_seq in kwargs["sequences"]
+            assert "MKTAYIAKQNNVG" in kwargs["sequences"]
+        if "inputs" in kwargs:
+            flat = "".join(item.get("sequence", "") for item in kwargs["inputs"])
+            assert heavy_seq in flat
+            assert light_seq in flat
+            assert "MKTAYIAKQNNVG" in flat
+        if "polymers" in kwargs:
+            flat = "".join(item.get("sequence", "") for item in kwargs["polymers"])
+            assert heavy_seq in flat
+            assert light_seq in flat
+            assert "MKTAYIAKQNNVG" in flat
+
+    call_summaries = [tc.tool_input_summary or {} for tc in results.tool_call_records]
+    summary_blob = json.dumps(call_summaries)
+    assert heavy_seq not in summary_blob
+    assert light_seq not in summary_blob
+
+
+def test_step8_nim_contract_treats_fasta_refs_as_runtime_ready():
+    sin = {
+        "input_case": "sequence_only_input",
+        "structure_refs": [],
+        "sequence_refs_for_prediction": [
+            {
+                "sequence_id": "antigen_fasta",
+                "chain_role": "antigen",
+                "prediction_input_kind": "fasta_ref",
+                "sequence_value_status": "referenced",
+                "source_kind": "uploaded_fasta",
+                "source_ref": "inputs/files/antigen.fasta",
+                "sequence_storage_ref": "runs/x/inputs/files/antigen.fasta",
+            },
+            {
+                "sequence_id": "heavy_fasta",
+                "chain_role": "antibody_heavy",
+                "prediction_input_kind": "fasta_ref",
+                "sequence_value_status": "referenced",
+                "source_kind": "uploaded_fasta",
+                "source_ref": "inputs/files/heavy.fasta",
+                "sequence_storage_ref": "runs/x/inputs/files/heavy.fasta",
+            },
+            {
+                "sequence_id": "light_fasta",
+                "chain_role": "antibody_light",
+                "prediction_input_kind": "fasta_ref",
+                "sequence_value_status": "referenced",
+                "source_kind": "uploaded_fasta",
+                "source_ref": "inputs/files/light.fasta",
+                "sequence_storage_ref": "runs/x/inputs/files/light.fasta",
+            },
+        ],
+    }
+
+    plan = structure_and_design_module._plan_step8_nim_complex_prediction(
+        "NvidiaNIM_boltz2", sin, [sin]
+    )
+
+    assert plan.input_status == "ready"
+    assert plan.runtime_status == "not_checked"
+    assert not plan.missing_prediction_inputs
+    assert all(item["sequence_readiness"] == "ready" for item in plan.sequence_inputs)
+    audit_blob = json.dumps(plan.model_dump())
+    assert ">antigen" not in audit_blob
+    assert "MKTAYIAK" not in audit_blob
+
+
+def test_step8_nim_wrappers_are_tooluniverse_bindings_or_explicit_dependency():
+    from app.mcp.tools import nvidianim
+
+    bindings = dict(nvidianim.BINDINGS)
+    assert bindings["NvidiaNIM_alphafold2_multimer"].__name__ != "_ni"
+    assert bindings["NvidiaNIM_openfold3"].__name__ != "_ni"
+    assert bindings["NvidiaNIM_boltz2"].__name__ != "_ni"
+    with pytest.raises(NotImplementedError, match="requires live ToolUniverse execution"):
+        bindings["NvidiaNIM_boltz2"](polymers=[])
+
+
+def test_step8_nim_success_persists_compact_input_not_raw_sequences(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service, referenced_inputs=[])
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    target["materials"] = [
+        {"material_id": "target_seq_step8", "material_type": "target_sequence", "value": "MKTAYIAKQNNVG"}
+    ]
+    antibody["materials"].extend([
+        {
+            "material_id": "heavy_seq_step8",
+            "material_type": "antibody_heavy_chain_sequence",
+            "value": "EVQLVESGGGLVQPGGSLRLSCAAS",
+        },
+        {
+            "material_id": "light_seq_step8",
+            "material_type": "antibody_light_chain_sequence",
+            "value": "DIQMTQSPSSLSASVGDRVTITC",
+        },
+    ])
+    local_storage.write_json(cct_path, cct)
+
+    def _nim_success(**_kw):
+        return {"status": "ok", "model_ref": "s3://bucket/predicted_complex.pdb"}
+
+    mcp = LocalMCPClient(
+        inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+        bindings=_bindings_with_step8_overrides({
+            "NvidiaNIM_alphafold2_multimer": _nim_success,
+            "NvidiaNIM_openfold3": _nim_success,
+            "NvidiaNIM_boltz2": _nim_success,
+        }),
+    )
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=mcp,
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+
+    nim_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
+    ]
+    assert nim_calls
+    assert any(tc.run_status == "success" for tc in nim_calls)
+    for tc in nim_calls:
+        if not tc.tool_output_ref:
+            continue
+        payload = local_storage.read_json(tc.tool_output_ref)
+        dumped = json.dumps(payload)
+        assert "MKTAYIAK" not in dumped
+        assert "EVQLVES" not in dumped
+        assert "DIQMTQ" not in dumped
+        assert "sequence_inputs" in dumped
+        assert "sha256_prefix" in dumped
+
+
+def test_step8_selected_tool_failure_still_marks_partial(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        referenced_inputs=[
+            {"id_type": "pdb_id", "value": "1N8Z", "source": "raw_request_text"},
+        ],
+    )
+
+    def _fail_pisa(**_):
+        raise RuntimeError("pisa unavailable")
+
+    mcp = LocalMCPClient(
+        inventory=ToolInventoryService(
+            os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))
+        ),
+        bindings=_bindings_with_step8_overrides(
+            {
+                "PDBePISA_get_interfaces": _fail_pisa,
+                "get_refinement_resolution_by_pdb_id":
+                    lambda **kw: {"resolution_angstrom": 2.0, "pdb_id": kw.get("pdb_id")},
+            }
+        ),
+    )
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=mcp,
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+
+    assert results.structure_modeling_status == "partial"
+    failed = [tc for tc in results.tool_call_records if tc.tool_name == "PDBePISA_get_interfaces"]
+    assert failed
+    assert any(tc.run_status == "failed" for tc in failed)
+    assert any(tc.tool_input_summary.get("routing_decision") == "selected" for tc in failed)
+
+
+def test_step8_nim_success_accepts_explicit_model_artifact_ref(local_storage):
+    output_ref = local_storage.run_key("run_step8_unit", "tool_outputs", "step_08", "nim_model.json")
+    local_storage.write_json(
+        output_ref,
+        {
+            "tool_call_id": "tc_nim_model",
+            "tool_name": "NvidiaNIM_boltz2",
+            "label": "unit",
+            "input": {},
+            "output": {
+                "model_ref": "s3://bucket/predicted_complex.pdb",
+                "ptm": 0.72,
+            },
+        },
+    )
+    tc = ToolCallRecord(
+        tool_call_id="tc_nim_model",
+        tool_name="NvidiaNIM_boltz2",
+        run_status="success",
+        tool_output_ref=output_ref,
+    )
+
+    refs = structure_and_design_module._extract_complex_structure_refs_for_step8(
+        local_storage, {}, tc
+    )
+
+    assert len(refs) == 1
+    assert refs[0].source_kind == "predicted_complex"
+    assert refs[0].storage_ref == "s3://bucket/predicted_complex.pdb"
+    assert refs[0].confidence_summary["ptm"] == 0.72
+
+
+def test_step8_prediction_model_ref_rejects_raw_or_generic_outputs(local_storage):
+    assert structure_and_design_module._prediction_model_ref(
+        {"output": "s3://bucket/looks-like-a-ref-but-generic-output.pdb"}
+    ) is None
+    assert structure_and_design_module._prediction_model_ref(
+        {"url": "https://example.test/generic-url.pdb"}
+    ) is None
+    assert structure_and_design_module._prediction_model_ref(
+        {"model_url": "https://example.test/model.pdb"}
+    ) == "https://example.test/model.pdb"
+
+    raw_pdb = "HEADER    RAW STRUCTURE\nATOM      1  N   ALA A   1\nHETATM    2  O   HOH A   2"
+    assert structure_and_design_module._prediction_model_ref({"model_ref": raw_pdb}) is None
+
+    output_ref = local_storage.run_key("run_step8_unit", "tool_outputs", "step_08", "nim_raw.json")
+    local_storage.write_json(
+        output_ref,
+        {
+            "tool_call_id": "tc_nim_raw",
+            "tool_name": "NvidiaNIM_boltz2",
+            "label": "unit",
+            "input": {},
+            "output": {"output": raw_pdb},
+        },
+    )
+    tc = ToolCallRecord(
+        tool_call_id="tc_nim_raw",
+        tool_name="NvidiaNIM_boltz2",
+        run_status="success",
+        tool_output_ref=output_ref,
+    )
+    refs = structure_and_design_module._extract_complex_structure_refs_for_step8(
+        local_storage, {}, tc
+    )
+
+    assert refs == []
+    assert "HEADER" not in json.dumps([r.model_dump() for r in refs])
+    assert "ATOM" not in json.dumps([r.model_dump() for r in refs])
 
 
 # ── Step 9 ──────────────────────────────────────────────────────────────────

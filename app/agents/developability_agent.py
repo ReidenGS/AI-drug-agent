@@ -23,6 +23,9 @@ from ..agents.step_06_capability_registry import (
 )
 from ..agents.step_06_interpretation import (
     aggregate_lane_risk,
+    derive_candidate_interpretation,
+    derive_lane_assessment,
+    derive_missing_lane_assessment,
     interpret_tool_payload,
     lane_summary as build_lane_summary,
 )
@@ -142,6 +145,7 @@ class DevelopabilityAgent:
             active_lanes: list[LaneType] = []
             for lane_type in _LANE_TYPES:
                 if not force_fail_open and not _lane_active_from_modality(lane_type, modality_summary):
+                    missing_assessment = derive_missing_lane_assessment(lane_type)
                     lane_results.append(
                         LaneResult(
                             lane_type=lane_type,
@@ -152,6 +156,7 @@ class DevelopabilityAgent:
                             liability_flags=[],
                             lane_risk_category="unknown",
                             lane_summary=_lane_missing_summary(lane_type),
+                            **missing_assessment,
                         )
                     )
                     continue
@@ -266,9 +271,13 @@ class DevelopabilityAgent:
                             lane_input_status = "sufficient"
                         if tc.run_status not in {"skipped", "not_run"}:
                             any_lane_ran = True
-                        if tc.run_status in {"failed", "dependency_unavailable"}:
+                        if tc.run_status in {"failed", "dependency_unavailable"} or _tool_call_output_envelope_status(tc) == "upstream_error":
                             any_lane_failed_or_dep = True
-                        if tc.run_status == "success" and payload is not None:
+                        if (
+                            tc.run_status == "success"
+                            and payload is not None
+                            and not _payload_is_upstream_error(payload)
+                        ):
                             lane_flags.extend(
                                 interpret_tool_payload(
                                     tc.tool_name,
@@ -278,7 +287,11 @@ class DevelopabilityAgent:
                                 )
                             )
 
-                any_success = any(r.run_status == "success" for r in tool_records)
+                any_success = any(
+                    r.run_status == "success"
+                    and _tool_call_output_envelope_status(r) != "upstream_error"
+                    for r in tool_records
+                )
                 all_dep_unavail = bool(tool_records) and all(
                     r.run_status == "dependency_unavailable" for r in tool_records
                 )
@@ -290,7 +303,11 @@ class DevelopabilityAgent:
                 runtime_status = (
                     "skipped" if not plans
                     else "timeout" if any_timeout
-                    else "error" if any(r.run_status in {"failed", "dependency_unavailable"} for r in tool_records)
+                    else "error" if any(
+                        r.run_status in {"failed", "dependency_unavailable"}
+                        or _tool_call_output_envelope_status(r) == "upstream_error"
+                        for r in tool_records
+                    )
                     else "ok"
                 )
                 selection_audit["step_06_selection_progress"].append({
@@ -300,6 +317,25 @@ class DevelopabilityAgent:
                     "status": runtime_status,
                     "selected_tool_names": [plan.tool_name for plan in plans],
                 })
+                lane_risk_category = aggregate_lane_risk(
+                    lane_flags,
+                    any_success=any_success,
+                    all_dependency_unavailable=all_dep_unavail,
+                )
+                lane_assessment = derive_lane_assessment(
+                    lane_type=lane_type,
+                    plans_present=bool(plans),
+                    flags=lane_flags,
+                    lane_risk_category=lane_risk_category,
+                    any_success=any_success,
+                    all_dependency_unavailable=all_dep_unavail,
+                    has_upstream_error=any(
+                        _tool_call_output_envelope_status(r) == "upstream_error"
+                        for r in tool_records
+                    ),
+                    any_failed=any(r.run_status == "failed" for r in tool_records),
+                    tool_records=tool_records,
+                )
                 lane_results.append(
                     LaneResult(
                         lane_type=lane_type,
@@ -309,11 +345,7 @@ class DevelopabilityAgent:
                         tool_call_records=tool_records,
                         argument_mapping_audit=argument_mapping_audit,
                         liability_flags=lane_flags,
-                        lane_risk_category=aggregate_lane_risk(
-                            lane_flags,
-                            any_success=any_success,
-                            all_dependency_unavailable=all_dep_unavail,
-                        ),
+                        lane_risk_category=lane_risk_category,
                         lane_summary=_compose_lane_summary(
                             lane_type=lane_type,
                             candidate=candidate,
@@ -324,17 +356,26 @@ class DevelopabilityAgent:
                                 lane_type=lane_type,
                             ),
                         ),
+                        **lane_assessment,
                     )
                 )
 
             cand_status = _candidate_status(lane_results)
+            cand_interp = derive_candidate_interpretation(lane_results)
             candidate_liabilities.append(
                 CandidateLiability(
                     candidate_id=candidate.get("candidate_id", "unknown"),
                     candidate_prefilter_status=cand_status,
                     lane_results=lane_results,
-                    candidate_overall_liability_label="unknown",
-                    recommended_action="insufficient_data",
+                    candidate_overall_liability_label=cand_interp[
+                        "candidate_overall_liability_label"
+                    ],
+                    recommended_action=cand_interp["recommended_action"],
+                    context_completeness=cand_interp["context_completeness"],
+                    assessed_lane_count=cand_interp["assessed_lane_count"],
+                    not_assessed_lane_count=cand_interp["not_assessed_lane_count"],
+                    interpretation_summary=cand_interp["interpretation_summary"],
+                    missing_or_unassessed_items=cand_interp["missing_or_unassessed_items"],
                 )
             )
 
@@ -385,7 +426,7 @@ class DevelopabilityAgent:
     ) -> tuple[ToolCallRecord, str, Any]:
         tc_id = new_tool_call_id()
         started = now_iso()
-        runtime_arguments: dict[str, Any] = {}
+        runtime_arguments: dict[str, Any] = dict(plan.arguments)
         resolver_audit: list[dict] = []
         unresolved: list[str] = []
         for arg_name, field_ref in sorted((plan.argument_field_refs or {}).items()):
@@ -405,9 +446,11 @@ class DevelopabilityAgent:
                 runtime_arguments[arg_name] = resolved.raw_value
             else:
                 unresolved.append(arg_name)
-        if not plan.argument_field_refs:
-            runtime_arguments = dict(plan.arguments)
-        input_status = "sufficient" if runtime_arguments else "insufficient"
+        input_status = (
+            "sufficient"
+            if runtime_arguments and plan.validation_status != "skipped" and not unresolved
+            else "insufficient"
+        )
 
         if plan.validation_status == "skipped" or unresolved:
             finished = now_iso()
@@ -440,8 +483,16 @@ class DevelopabilityAgent:
         )
         finished = now_iso()
 
+        envelope_status = result.get("payload", {}).get("status") if isinstance(result.get("payload"), dict) else None
         output_ref = None
         output_artifact_id = None
+        tool_input_summary = _tool_input_summary(
+            plan,
+            candidate_id,
+            resolver_audit=resolver_audit,
+            chain_expansion=chain_expansion,
+            output_envelope_status=envelope_status,
+        )
         if "payload" in result:
             output_artifact_id = new_artifact_id("tool_output")
             output_key = self.storage.run_key(
@@ -453,12 +504,7 @@ class DevelopabilityAgent:
                     "tool_call_id": tc_id,
                     "candidate_id": candidate_id,
                     "tool_name": plan.tool_name,
-                    "input": _tool_input_summary(
-                        plan,
-                        candidate_id,
-                        resolver_audit=resolver_audit,
-                        chain_expansion=chain_expansion,
-                    ),
+                    "input": tool_input_summary,
                     "output": result["payload"],
                 },
             )
@@ -472,15 +518,16 @@ class DevelopabilityAgent:
             run_status=result.get("run_status", "pending"),
             started_at=started,
             finished_at=finished,
-            tool_input_summary=_tool_input_summary(
-                plan,
-                candidate_id,
-                resolver_audit=resolver_audit,
-                chain_expansion=chain_expansion,
-            ),
+            tool_input_summary=tool_input_summary,
             tool_output_artifact_id=output_artifact_id,
             tool_output_ref=output_ref,
-            error_message=result.get("error_message"),
+            error_message=result.get("error_message")
+            or (
+                result.get("payload", {}).get("error_message")
+                if isinstance(result.get("payload"), dict)
+                and result.get("payload", {}).get("status") == "upstream_error"
+                else None
+            ),
         ), input_status, result.get("payload")
 
 
@@ -616,6 +663,7 @@ def _tool_input_summary(
     *,
     resolver_audit: list[dict] | None = None,
     chain_expansion: dict[str, Any] | None = None,
+    output_envelope_status: str | None = None,
 ) -> dict[str, Any]:
     summary = {
         **{k: _short(v) for k, v in plan.arguments.items()},
@@ -634,6 +682,8 @@ def _tool_input_summary(
         "missing_required_fields": list(plan.missing_required_fields),
         "runtime_resolver_audit": resolver_audit or [],
     }
+    if output_envelope_status:
+        summary["output_envelope_status"] = output_envelope_status
     if chain_expansion:
         summary.update({
             "runtime_chain_expansion": True,
@@ -818,6 +868,9 @@ def _aggregate_lane_run_status(records: list[ToolCallRecord]) -> str:
     if not records:
         return "skipped"
     statuses = {r.run_status for r in records}
+    envelope_statuses = {_tool_call_output_envelope_status(r) for r in records}
+    if "upstream_error" in envelope_statuses:
+        return "partial" if "success" in statuses else "failed"
     if "success" in statuses:
         return "partial" if len(statuses - {"success"}) else "ok"
     if statuses <= {"skipped", "not_run"}:
@@ -832,7 +885,36 @@ def _aggregate_lane_summary(records: list[ToolCallRecord]) -> str:
         return "no tool invocation planned"
     names = ", ".join(r.tool_name for r in records)
     statuses = ", ".join(sorted({r.run_status for r in records}))
-    return f"selected tools [{names}] finished with statuses [{statuses}]; raw outputs stored by reference"
+    envelope_statuses = sorted({
+        status for status in (_tool_call_output_envelope_status(r) for r in records)
+        if status
+    })
+    envelope_part = (
+        f"; output envelope statuses [{', '.join(envelope_statuses)}]"
+        if envelope_statuses else ""
+    )
+    upstream_tools = sorted({
+        r.tool_name for r in records
+        if _tool_call_output_envelope_status(r) == "upstream_error"
+    })
+    upstream_part = (
+        f"; upstream_error tools [{', '.join(upstream_tools)}]"
+        if upstream_tools else ""
+    )
+    return (
+        f"selected tools [{names}] finished with outer run_statuses [{statuses}]"
+        f"{envelope_part}{upstream_part}; raw outputs stored by reference"
+    )
+
+
+def _tool_call_output_envelope_status(record: ToolCallRecord) -> str | None:
+    summary = record.tool_input_summary or {}
+    status = summary.get("output_envelope_status")
+    return str(status) if status else None
+
+
+def _payload_is_upstream_error(payload: Any) -> bool:
+    return isinstance(payload, dict) and payload.get("status") == "upstream_error"
 
 
 def _candidate_status(lane_results: list[LaneResult]) -> str:

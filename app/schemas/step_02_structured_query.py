@@ -14,6 +14,11 @@ Schema additions in batch 5 (professor feedback):
   inferred components with `inferred=True`.
 - `clarification_questions[]`: user-facing questions distinct from the
   internal `parse_warnings` channel.
+- `missing_slots[]`: structured required-slot gaps the LLM judged against
+  the inferred task intent + the user's query / file metadata. This is the
+  machine-readable channel Step 3 consumes to decide blocked vs partial;
+  it is distinct from `parse_warnings` (internal parse problems) and
+  `clarification_questions` (free-text user prompts).
 
 All fields are additive with safe defaults so existing artifacts and
 existing downstream code (Step 3, Step 4) keep working without changes.
@@ -115,6 +120,57 @@ class TaskIntent(BaseModel):
     secondary_intents: list[SecondaryIntent] = Field(default_factory=list)
 
 
+# ── Required-slot gap (Step 2 missing_slots channel). ────────────────────────
+#
+# The LLM reports which required slots for the inferred task intent are NOT
+# satisfied by the user's query / context / uploaded-file metadata. Step 3
+# consumes this: a `blocking` slot floors readiness to `blocked`; `warning`
+# / `optional` slots stay informational (partial / gap) and never block.
+
+
+MissingSlotName = Literal[
+    "target_or_antigen",
+    "antibody",
+    "payload",
+    "linker",
+    "structure_or_sequence",
+    "sequence_role",
+    "pdb_id",
+    "uniprot_id",
+    "smiles",
+    "task_intent",
+    "constraint",
+    "other",
+]
+
+
+MissingSlotCategory = Literal[
+    "target",
+    "antibody",
+    "payload",
+    "linker",
+    "structure",
+    "sequence",
+    "identifier",
+    "task_intent",
+    "constraint",
+    "other",
+]
+
+
+MissingSlotSeverity = Literal["blocking", "warning", "optional"]
+
+
+class MissingSlot(BaseModel):
+    slot_name: MissingSlotName
+    slot_category: MissingSlotCategory = "other"
+    severity: MissingSlotSeverity = "warning"
+    required_for: list[str] = Field(default_factory=list)
+    reason: str = ""
+    suggested_question: Optional[str] = None
+    evidence: Optional[str] = None
+
+
 class SourceRawRequestRef(BaseModel):
     raw_request_record_id: str
 
@@ -143,3 +199,21 @@ class StructuredQuery(BaseModel):
     normalized_entities: list[NormalizedEntity] = Field(default_factory=list)
     entity_decompositions: list[EntityDecomposition] = Field(default_factory=list)
     clarification_questions: list[str] = Field(default_factory=list)
+    # Structured required-slot gaps (additive; defaults to [] so old
+    # artifacts without this field still validate).
+    missing_slots: list[MissingSlot] = Field(default_factory=list)
+    # User-facing follow-up message the Step 2 LLM writes when missing_slots
+    # is non-empty (additive; None/"" when nothing is missing). The program
+    # only passes this through — it never re-phrases it. Must never carry raw
+    # prompts, keys, file content, or full sequences.
+    response: Optional[str] = None
+    # LLM-generated canonical (normalized) natural-language description of the
+    # CURRENT task. This is the stable working query downstream steps read;
+    # `raw_user_query` (Step 1) stays the original, auditable user input and is
+    # never overwritten. On a clarification turn the LLM updates this from
+    # `previous_canonical_query` + `clarification_answers`. Stable field name —
+    # NO query-like aliases (working_query / normalized_query / final_query /
+    # rewritten_query / user_query_summary / query_for_downstream /
+    # canonical_task / task_summary / query_summary). Never carries prompts,
+    # keys, raw payloads, or full sequences; capped at ~800 chars.
+    canonical_query: Optional[str] = None

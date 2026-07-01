@@ -106,8 +106,10 @@ class LocalMCPClient:
             }
         fn = self._bindings[tool_name]
         call_kwargs = dict(kwargs)
-        # Live-mode injection: only when settings opt in AND tool is on the
-        # explicit allowlist. Callers who pass `_live` themselves keep control.
+        # Live-mode injection per `settings.should_use_live`: live ON + a
+        # non-empty allowlist limits `_live=True` to listed tools, while live
+        # ON + an empty allowlist injects `_live=True` for every scoped tool
+        # (production all-live). Callers who pass `_live` themselves keep control.
         if "_live" not in call_kwargs:
             try:
                 from ..settings import get_settings

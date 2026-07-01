@@ -12,6 +12,7 @@ dist/
 # Test artifacts
 .pytest_cache/
 manual_tests/
+.snapshots/
 
 # Local dev storage (used when STORAGE_MODE=local)
 .localstore/

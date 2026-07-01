@@ -236,6 +236,29 @@ def test_local_client_does_not_inject_live_when_not_on_allowlist(monkeypatch):
     assert "_live" not in captured
 
 
+def test_local_client_injects_live_for_all_tools_with_empty_allowlist(monkeypatch):
+    """Production all-live: live ON + empty allowlist injects `_live=True`
+    for an arbitrary scoped tool, not just allowlisted ones."""
+    monkeypatch.setenv("MCP_LIVE_TOOLS", "true")
+    monkeypatch.delenv("MCP_LIVE_TOOL_ALLOWLIST", raising=False)
+    get_settings.cache_clear()
+
+    captured: dict[str, Any] = {}
+
+    def _spy(**kwargs: Any) -> dict:
+        captured.update(kwargs)
+        return {"status": "mocked"}
+
+    client = LocalMCPClient(bindings={"EuropePMC_search_articles": _spy})
+    client.call_tool(
+        agent_name="evidence_agent",
+        step_id="step_13",
+        tool_name="EuropePMC_search_articles",
+        query="HER2",
+    )
+    assert captured.get("_live") is True
+
+
 def test_local_client_caller_live_kwarg_takes_precedence(monkeypatch):
     monkeypatch.setenv("MCP_LIVE_TOOLS", "true")
     monkeypatch.setenv("MCP_LIVE_TOOL_ALLOWLIST", "EuropePMC_search_articles")

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 from .common import ToolCallRecord
@@ -17,6 +17,7 @@ class StructureRef(BaseModel):
         "uploaded_file", "pdb_id", "candidate_material", "predicted_needed", "unknown"
     ] = "unknown"
     source_ref: Optional[str] = None
+    storage_ref: Optional[str] = None
     related_candidate_ids: list[str] = Field(default_factory=list)
     resource_binding_status: Literal["explicit", "inferred", "ambiguous", "unassigned"] = "unassigned"
     binding_confidence: float = 0.0
@@ -25,7 +26,9 @@ class StructureRef(BaseModel):
 class SequenceRef(BaseModel):
     sequence_id: str
     chain_role: Optional[str] = None
-    sequence: Optional[str] = None
+    sequence: Optional[str] = Field(default=None, exclude=True)
+    sequence_length: Optional[int] = None
+    sha256_prefix: Optional[str] = None
     source_kind: Literal[
         "uploaded_fasta", "material_sequence", "uniprot_id", "unknown"
     ] = "unknown"
@@ -52,6 +55,31 @@ class ChainMapping(BaseModel):
     chain_id_kind: Literal["observed", "prediction_placeholder", "unknown"] = "unknown"
 
 
+class CrystalMetadata(BaseModel):
+    a: Optional[float] = None
+    b: Optional[float] = None
+    c: Optional[float] = None
+    alpha: Optional[float] = None
+    beta: Optional[float] = None
+    gamma: Optional[float] = None
+    space_group: Optional[str] = None
+    z_value: Optional[int] = None
+    source_kind: Optional[str] = None
+    source_ref: Optional[str] = None
+    parse_status: Literal["ok", "missing", "invalid", "unsupported"] = "missing"
+    warnings: list[str] = Field(default_factory=list)
+
+
+class MolecularWeightEstimate(BaseModel):
+    value: Optional[float] = None
+    unit: Literal["Da"] = "Da"
+    method: Optional[str] = None
+    status: Literal["estimated", "estimated_with_warnings", "missing", "unreliable"] = "missing"
+    warnings: list[str] = Field(default_factory=list)
+    source_kind: Optional[str] = None
+    source_ref: Optional[str] = None
+
+
 class StructureInputRecord(BaseModel):
     structure_input_id: str
     candidate_id: str
@@ -70,11 +98,17 @@ class StructureInputRecord(BaseModel):
     chain_pair_candidates: list[dict] = Field(default_factory=list)
     antigen_antibody_mapping: Optional[dict] = None
     residue_ranges: list[dict] = Field(default_factory=list)
+    crystal_metadata: Optional[CrystalMetadata] = None
+    molecular_weight_estimate: Optional[MolecularWeightEstimate] = None
     missing_metadata_flags: list[str] = Field(default_factory=list)
     preferred_input_rank: int = 0
     preferred_input_reason: Optional[str] = None
     prediction_required: bool = False
     source_priority_notes: list[str] = Field(default_factory=list)
+    # Step 7 tool-call compact metadata for Step 8 consumer convenience.
+    step7_tool_output_metadata: list[dict[str, Any]] = Field(default_factory=list)
+    # Search tooling for ambiguous name-derived candidates should stay compact.
+    database_search_candidates: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class PreparedStructureInputPackage(BaseModel):

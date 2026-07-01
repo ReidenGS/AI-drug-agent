@@ -114,8 +114,12 @@ def iedb_search_bcr_sequences(
     """
     if not _live:
         return {
-            "status": "mocked",
+            "status": "not_live",
             "source": "iedb_search_bcr_sequences",
+            "reason": (
+                "iedb_search_bcr_sequences requires live ToolUniverse execution; "
+                "mock BCR envelopes are disabled for Step 5 CDR3 lookup"
+            ),
             "sequences": [],
         }
     args: dict[str, Any] = {
