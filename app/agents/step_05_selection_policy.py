@@ -197,6 +197,28 @@ Output:
 """.strip()
 
 
+# Full Step 5 Stage-1 system prompt: the shared selection contract plus the
+# Step 5 addendum, combined once so the stable text is byte-identical across
+# every candidate and inspectable by cache-layout tests. This is the exact
+# string passed as ``system=`` to ``llm.generate_json`` below.
+STEP_05_SELECTION_SYSTEM_PROMPT = (
+    SELECTION_STAGE1_SYSTEM_PROMPT
+    + "\n\n"
+    + STEP_05_SELECTION_SYSTEM_ADDENDUM
+)
+
+
+# Fixed English note that scopes the Step 5 selection to context enrichment.
+# Stable across candidates/runs; kept as a module constant so the payload
+# builder and cache-layout tests share one source of truth.
+STEP_05_SELECTION_CONTEXT_NOTE = (
+    "Step 5 material/context enrichment only. No ADC candidate "
+    "generation, no pose, no ranking, no DAR/conjugation, no "
+    "hypotheses. Choose only tools that fill downstream "
+    "Step 6/7-needed fields."
+)
+
+
 @dataclass(frozen=True)
 class Step5ToolDecision:
     """One per eligible / synthetic-dependency plan.
@@ -659,6 +681,37 @@ def _compact_candidate_context(
     }
 
 
+def build_step5_stage1_payload(
+    *,
+    catalog: list[dict],
+    signals: dict[str, bool],
+    record_context: dict,
+) -> dict:
+    """Assemble the Step 5 Stage-1 ``schema=`` payload for ``generate_json``.
+
+    Ordering note (cache-friendly layout): the stable tool catalog + rules
+    metadata (``task`` / ``agent_name`` / ``step_id`` / ``compact_catalog``
+    / ``context.note``) is what the prompt renderer places in the cacheable
+    stable prefix, and the candidate/run-specific portion
+    (``context.candidate`` + ``context.signals``) is what it places in the
+    trailing dynamic block. The payload dict itself carries every field the
+    MockLLMProvider / selection policy read from ``schema`` — no field is
+    dropped, only re-ordered at render time by
+    ``json_task_validation.build_json_prompt_sections``.
+    """
+    return {
+        "task": "tool_selection_stage_1",
+        "agent_name": "candidate_context_agent",
+        "step_id": "step_05",
+        "compact_catalog": catalog,
+        "context": {
+            "signals": signals,
+            "note": STEP_05_SELECTION_CONTEXT_NOTE,
+            "candidate": record_context,
+        },
+    }
+
+
 def select_step5_enrichment_plans(
     *,
     record,
@@ -795,31 +848,16 @@ def _ask_llm_for_selection(
             FALLBACK_REASON_LLM_NOT_CALLED,
         )
 
-    stage1_payload: dict = {
-        "task": "tool_selection_stage_1",
-        "agent_name": "candidate_context_agent",
-        "step_id": "step_05",
-        "compact_catalog": catalog,
-        "context": {
-            "signals": signals,
-            "note": (
-                "Step 5 material/context enrichment only. No ADC candidate "
-                "generation, no pose, no ranking, no DAR/conjugation, no "
-                "hypotheses. Choose only tools that fill downstream "
-                "Step 6/7-needed fields."
-            ),
-            "candidate": record_context,
-        },
-    }
+    stage1_payload: dict = build_step5_stage1_payload(
+        catalog=catalog,
+        signals=signals,
+        record_context=record_context,
+    )
     try:
         resp = llm.generate_json(
             SELECTION_STAGE1_USER_PROMPT,
             schema=stage1_payload,
-            system=(
-                SELECTION_STAGE1_SYSTEM_PROMPT
-                + "\n\n"
-                + STEP_05_SELECTION_SYSTEM_ADDENDUM
-            ),
+            system=STEP_05_SELECTION_SYSTEM_PROMPT,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(

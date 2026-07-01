@@ -26,18 +26,128 @@ ErrorFactory = Callable[[str], BaseException]
 
 def build_json_prompt(*, prompt: str, schema: dict, system: str | None) -> str:
     """Compose the user/system prompt body sent to the JSON-only LLM call."""
-    task = (schema or {}).get("task") or "structured_query"
+    stable_prefix, dynamic_suffix = build_json_prompt_sections(
+        prompt=prompt, schema=schema, system=system,
+    )
+    return stable_prefix + dynamic_suffix
+
+
+def build_json_prompt_sections(
+    *, prompt: str, schema: dict, system: str | None,
+) -> tuple[str, str]:
+    """Split ``build_json_prompt``'s output into a stable prefix and a
+    run-specific dynamic suffix (prompt-cache-friendly layout).
+
+    Stable prefix: the system block (if any), the fixed JSON-only
+    instruction, the per-task shape hint, and the task/developer
+    instruction text. All of these are constant for a given
+    ``(system, task, prompt)`` triple and never depend on run data — for
+    the Step 2 ``structured_query`` task both ``system``
+    (``SUPERVISOR_SYSTEM_PROMPT``) and ``prompt``
+    (``build_supervisor_user_prompt``'s fixed instruction text) are
+    themselves constant across runs, so the whole prefix is byte-identical
+    across different queries / uploaded files / clarification turns for the
+    same code version.
+
+    Dynamic suffix: for most tasks this is the "Input schema/context JSON"
+    block. For the Step 2 ``structured_query`` task it renders ONLY
+    ``schema["task"]`` and ``schema["prompt_inputs"]`` — never
+    ``schema["raw_request_record"]``. ``SupervisorAgent`` keeps
+    ``raw_request_record`` on the schema dict solely for
+    ``MockLLMProvider``'s in-process rule-based path (that provider reads
+    the Python dict directly and never renders it to text); dumping it
+    into a real provider's prompt text would leak ``storage_path`` /
+    ``run_id`` / timestamps.
+
+    Step 5 split: for the Step 5 ``tool_selection_stage_1`` payload (a
+    ``tool_selection_stage_1`` task carrying ``context.candidate``), the
+    stable tool catalog + rules metadata (``task`` / ``agent_name`` /
+    ``step_id`` / ``compact_catalog`` / ``context.note``) is rendered into
+    the stable prefix's "Input schema/context JSON" block, and only the
+    candidate/run-specific portion (``context.candidate`` +
+    ``context.signals``) is rendered into a trailing
+    "Candidate/run-specific context JSON" block. The MockLLMProvider /
+    selection policy read ``schema`` from the Python dict, so this text-only
+    relocation changes nothing about selection. Non-Step-5
+    ``tool_selection_stage_1`` payloads (Step 9/13/14 single-lane, which
+    carry no ``context.candidate``) and all other tasks keep dumping the
+    full ``schema`` dict unchanged.
+    """
+    schema = schema or {}
+    task = schema.get("task") or "structured_query"
     shape = shape_instruction(task)
-    payload = json.dumps(schema, ensure_ascii=False, sort_keys=True, default=str)
     system_block = f"System instructions:\n{system}\n\n" if system else ""
-    return (
+    header = (
         f"{system_block}"
         "Return exactly one valid JSON object. Do not include markdown fences, "
         "comments, prose, or tool calls.\n"
         f"Expected top-level shape:\n{shape}\n\n"
         f"User/developer task:\n{prompt}\n\n"
-        f"Input schema/context JSON:\n{payload}"
     )
+    stable_schema, dynamic_schema = _split_prompt_schema(schema, task)
+    if stable_schema is None:
+        # Whole schema is dynamic (Step 2 structured_query + every
+        # non-split task): keep the single "Input schema/context JSON"
+        # block in the dynamic suffix exactly as before.
+        payload = json.dumps(dynamic_schema, ensure_ascii=False, sort_keys=True, default=str)
+        return header, f"Input schema/context JSON:\n{payload}"
+    # Split layout (Step 5): stable catalog/rules block lives in the
+    # prefix; candidate/run-specific block trails in the suffix.
+    stable_payload = json.dumps(stable_schema, ensure_ascii=False, sort_keys=True, default=str)
+    stable_prefix = f"{header}Input schema/context JSON:\n{stable_payload}"
+    dynamic_payload = json.dumps(dynamic_schema, ensure_ascii=False, sort_keys=True, default=str)
+    dynamic_suffix = f"\n\nCandidate/run-specific context JSON:\n{dynamic_payload}"
+    return stable_prefix, dynamic_suffix
+
+
+# Keys inside a Step 5 ``tool_selection_stage_1`` ``context`` block that are
+# candidate/run-specific and therefore belong in the dynamic suffix. Every
+# other ``context`` key (currently only ``note``, a fixed English string)
+# is stable and stays in the prefix.
+_STEP5_DYNAMIC_CONTEXT_KEYS: tuple[str, ...] = ("candidate", "signals")
+
+
+def _split_prompt_schema(schema: dict, task: str) -> tuple[dict | None, dict]:
+    """Return ``(stable_schema, dynamic_schema)`` for prompt rendering.
+
+    ``stable_schema is None`` means "no split — the whole
+    ``dynamic_schema`` goes into the single dynamic-suffix block" (Step 2
+    and every non-split task). A non-None ``stable_schema`` means the
+    caller renders ``stable_schema`` into the prefix and ``dynamic_schema``
+    into a trailing candidate block (Step 5).
+    """
+    # Step 5 stage-1 selection: split stable catalog/rules from the
+    # candidate/run-specific context. Keyed on the Step-5-specific
+    # ``context.candidate`` shape so Step 9/13/14 single-lane
+    # ``tool_selection_stage_1`` payloads (no ``context.candidate``) are
+    # untouched.
+    if task == "tool_selection_stage_1":
+        context = schema.get("context")
+        if isinstance(context, dict) and "candidate" in context:
+            dynamic_context = {
+                k: context[k]
+                for k in _STEP5_DYNAMIC_CONTEXT_KEYS
+                if k in context
+            }
+            stable_context = {
+                k: v
+                for k, v in context.items()
+                if k not in _STEP5_DYNAMIC_CONTEXT_KEYS
+            }
+            stable_schema = {k: v for k, v in schema.items() if k != "context"}
+            if stable_context:
+                stable_schema["context"] = stable_context
+            return stable_schema, {"context": dynamic_context}
+
+    # Step 2 structured_query: trim ``raw_request_record`` out of the
+    # dynamic dump so it never reaches a real provider's prompt text.
+    if task == "structured_query" and "prompt_inputs" in schema:
+        return None, {
+            "task": schema.get("task", "structured_query"),
+            "prompt_inputs": schema.get("prompt_inputs"),
+        }
+
+    return None, schema
 
 
 def shape_instruction(task: str) -> str:
