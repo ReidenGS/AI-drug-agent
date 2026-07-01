@@ -444,6 +444,7 @@ def main() -> int:
                 registry=registry,
                 workflow_state=workflow_state,
                 mcp_client=get_mcp_client(),
+                llm=llm,
             ).run,
             run_id,
         )
