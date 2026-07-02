@@ -189,6 +189,83 @@ def disclose_step6_tools(
     )
 
 
+def build_step6_stage1_catalog(
+    *,
+    mcp_client: MCPClient,
+    agent_name: str,
+    step_id: str,
+    disclosure: DisclosureResult,
+) -> list[dict]:
+    """Build the disclosed Step 6 Stage-1 compact catalog.
+
+    Deterministic and candidate-free: entries are the progressively
+    disclosed tools (``disclosure.disclosed_tool_names``) enriched with
+    their registry ``runtime_policy`` / ``runtime_status``, sorted by
+    ``(runtime_policy_rank, tool_name)``. This is exactly the catalog block
+    the prompt renderer keeps in the cacheable stable prefix — it carries no
+    candidate/run fields, so it is byte-identical for the same disclosed
+    category catalog across candidates.
+    """
+    disclosed = set(disclosure.disclosed_tool_names)
+    runtime_policy_for_tool = {
+        name: cap.runtime_policy for name, cap in STEP_06_CAPABILITY_BY_TOOL.items()
+    }
+    catalog = [
+        {
+            **entry.model_dump(),
+            "runtime_policy": runtime_policy_for_tool.get(entry.tool_name, "unknown"),
+            "runtime_status": runtime_policy_for_tool.get(entry.tool_name, "unknown"),
+        }
+        for entry in build_compact_catalog(
+            mcp_client=mcp_client, agent_name=agent_name, step_id=step_id
+        )
+        if entry.tool_name in disclosed
+    ]
+    catalog.sort(
+        key=lambda item: (
+            _runtime_sort_key(item.get("runtime_policy", "unknown")),
+            item["tool_name"],
+        )
+    )
+    return catalog
+
+
+def build_step6_stage1_payload(
+    *,
+    agent_name: str,
+    step_id: str,
+    candidate_id: str,
+    catalog: list[dict],
+    modality_summary: CandidateModalitySummary,
+    available_fields: list[AvailableField],
+    user_query_summary: str,
+    disclosure_tags: list[str],
+) -> dict:
+    """Assemble the Step 6 Stage-1 ``schema=`` payload for ``generate_json``.
+
+    Cache-layout note: the stable disclosed catalog + scope tags (``task`` /
+    ``agent_name`` / ``step_id`` / ``compact_catalog``) is what the prompt
+    renderer places in the cacheable stable prefix, and the
+    candidate/run-specific portion (``candidate_id`` /
+    ``candidate_modality_summary`` / ``candidate_available_fields`` /
+    ``user_query_summary`` / ``disclosure_tags``) is what it places in the
+    trailing dynamic block. Every field the selector/mock reads from
+    ``schema`` is still present — only re-ordered at render time by
+    ``json_task_validation.build_json_prompt_sections``.
+    """
+    return {
+        "task": "step6_schema_mapping_stage_1",
+        "agent_name": agent_name,
+        "step_id": step_id,
+        "candidate_id": candidate_id,
+        "compact_catalog": list(catalog),
+        "candidate_modality_summary": modality_summary.model_dump(),
+        "candidate_available_fields": [field.model_dump() for field in available_fields],
+        "user_query_summary": user_query_summary,
+        "disclosure_tags": disclosure_tags,
+    }
+
+
 def select_step6_schema_mapped_invocations(
     *,
     agent_name: str,
@@ -236,37 +313,22 @@ def select_step6_schema_mapped_invocations(
         })
         return {}, disclosure, audit
 
-    runtime_policy_for_tool = {
-        name: cap.runtime_policy for name, cap in STEP_06_CAPABILITY_BY_TOOL.items()
-    }
-    catalog = [
-        {
-            **entry.model_dump(),
-            "runtime_policy": runtime_policy_for_tool.get(entry.tool_name, "unknown"),
-            "runtime_status": runtime_policy_for_tool.get(entry.tool_name, "unknown"),
-        }
-        for entry in build_compact_catalog(
-            mcp_client=mcp_client, agent_name=agent_name, step_id=step_id
-        )
-        if entry.tool_name in set(disclosure.disclosed_tool_names)
-    ]
-    catalog.sort(
-        key=lambda item: (
-            _runtime_sort_key(item.get("runtime_policy", "unknown")),
-            item["tool_name"],
-        )
+    catalog = build_step6_stage1_catalog(
+        mcp_client=mcp_client,
+        agent_name=agent_name,
+        step_id=step_id,
+        disclosure=disclosure,
     )
-    stage1_payload = {
-        "task": "step6_schema_mapping_stage_1",
-        "agent_name": agent_name,
-        "step_id": step_id,
-        "candidate_id": candidate_id,
-        "compact_catalog": list(catalog),
-        "candidate_modality_summary": modality_summary.model_dump(),
-        "candidate_available_fields": [field.model_dump() for field in available_fields],
-        "user_query_summary": user_query_summary,
-        "disclosure_tags": disclosure.disclosure_tags,
-    }
+    stage1_payload = build_step6_stage1_payload(
+        agent_name=agent_name,
+        step_id=step_id,
+        candidate_id=candidate_id,
+        catalog=catalog,
+        modality_summary=modality_summary,
+        available_fields=available_fields,
+        user_query_summary=user_query_summary,
+        disclosure_tags=disclosure.disclosure_tags,
+    )
     audit["selection_progress"].append({
         "candidate_id": candidate_id,
         "lane_type": None,

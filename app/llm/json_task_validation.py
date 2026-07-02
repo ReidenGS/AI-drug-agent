@@ -72,6 +72,20 @@ def build_json_prompt_sections(
     ``tool_selection_stage_1`` payloads (Step 9/13/14 single-lane, which
     carry no ``context.candidate``) and all other tasks keep dumping the
     full ``schema`` dict unchanged.
+
+    Step 6 Stage 1 split: for the Step 6 ``step6_schema_mapping_stage_1``
+    payload, the stable disclosed catalog + scope tags (``task`` /
+    ``agent_name`` / ``step_id`` / ``compact_catalog``) is rendered into
+    the stable prefix's "Input schema/context JSON" block, and only the
+    candidate/run-specific portion (``candidate_id`` /
+    ``candidate_modality_summary`` / ``candidate_available_fields`` /
+    ``user_query_summary`` / ``disclosure_tags``) is rendered into the
+    trailing "Candidate/run-specific context JSON" block. This is a
+    text-only relocation of the exact same payload — the disclosed catalog
+    is chosen by the program's progressive disclosure BEFORE this call, so
+    the stable prefix is byte-identical for the same disclosed category
+    catalog across candidates. Only Step 6 Stage 1 is affected; Stage 2
+    (``step6_schema_mapping_stage_2``) is untouched.
     """
     schema = schema or {}
     task = schema.get("task") or "structured_query"
@@ -107,6 +121,20 @@ def build_json_prompt_sections(
 _STEP5_DYNAMIC_CONTEXT_KEYS: tuple[str, ...] = ("candidate", "signals")
 
 
+# Top-level keys of a Step 6 ``step6_schema_mapping_stage_1`` payload that are
+# candidate/run-specific and therefore belong in the dynamic suffix. Every
+# other top-level key (``task`` / ``agent_name`` / ``step_id`` /
+# ``compact_catalog``) is the stable, program-disclosed catalog block and
+# stays in the prefix.
+_STEP6_STAGE1_DYNAMIC_KEYS: tuple[str, ...] = (
+    "candidate_id",
+    "candidate_modality_summary",
+    "candidate_available_fields",
+    "user_query_summary",
+    "disclosure_tags",
+)
+
+
 def _split_prompt_schema(schema: dict, task: str) -> tuple[dict | None, dict]:
     """Return ``(stable_schema, dynamic_schema)`` for prompt rendering.
 
@@ -138,6 +166,24 @@ def _split_prompt_schema(schema: dict, task: str) -> tuple[dict | None, dict]:
             if stable_context:
                 stable_schema["context"] = stable_context
             return stable_schema, {"context": dynamic_context}
+
+    # Step 6 Stage 1 selection: split the stable disclosed catalog block
+    # from the candidate/run-specific portion. Keyed on the presence of at
+    # least one candidate/run key so the provider unit tests (which call
+    # this task with only ``{"task": ...}``) stay unaffected.
+    if task == "step6_schema_mapping_stage_1":
+        if any(k in schema for k in _STEP6_STAGE1_DYNAMIC_KEYS):
+            stable_schema = {
+                k: v
+                for k, v in schema.items()
+                if k not in _STEP6_STAGE1_DYNAMIC_KEYS
+            }
+            dynamic_schema = {
+                k: schema[k]
+                for k in _STEP6_STAGE1_DYNAMIC_KEYS
+                if k in schema
+            }
+            return stable_schema, dynamic_schema
 
     # Step 2 structured_query: trim ``raw_request_record`` out of the
     # dynamic dump so it never reaches a real provider's prompt text.
