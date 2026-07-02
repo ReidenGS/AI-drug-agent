@@ -266,6 +266,46 @@ def build_step6_stage1_payload(
     }
 
 
+def build_step6_stage2_payload(
+    *,
+    agent_name: str,
+    step_id: str,
+    candidate_id: str,
+    stage2_items: list[tuple[dict, dict]],
+    available_fields: list[AvailableField],
+) -> dict:
+    """Assemble the Step 6 Stage-2 ``schema=`` payload for ``generate_json``.
+
+    ``stage2_items`` is the list of ``(stage1_entry, official_schema)`` pairs
+    for the tools that survived Stage 1 selection + schema resolution — i.e.
+    ONLY the selected tools, never the full catalog.
+
+    Cache-layout note: the stable selected-tool official-schema block
+    (``task`` / ``agent_name`` / ``step_id`` / ``tools[tool_name +
+    full_schema]``) is what the prompt renderer places in the cacheable
+    stable prefix, and the candidate/run-specific portion (``candidate_id`` /
+    ``candidate_available_fields`` / per-tool Stage-1 ``selection_reason``) is
+    what it places in the trailing dynamic block. Every field the
+    selector/mock reads from ``schema`` is still present — only re-ordered at
+    render time by ``json_task_validation.build_json_prompt_sections``.
+    """
+    return {
+        "task": "step6_schema_mapping_stage_2",
+        "agent_name": agent_name,
+        "step_id": step_id,
+        "candidate_id": candidate_id,
+        "candidate_available_fields": [field.model_dump() for field in available_fields],
+        "tools": [
+            {
+                "tool_name": entry["tool_name"],
+                "full_schema": schema,
+                "selection_reason": entry.get("selection_reason") or "",
+            }
+            for entry, schema in stage2_items
+        ],
+    }
+
+
 def select_step6_schema_mapped_invocations(
     *,
     agent_name: str,
@@ -407,21 +447,13 @@ def select_step6_schema_mapped_invocations(
             "status": "started",
             "selected_tool_names": selected_tool_names,
         })
-        stage2_payload = {
-            "task": "step6_schema_mapping_stage_2",
-            "agent_name": agent_name,
-            "step_id": step_id,
-            "candidate_id": candidate_id,
-            "candidate_available_fields": [field.model_dump() for field in available_fields],
-            "tools": [
-                {
-                    "tool_name": entry["tool_name"],
-                    "full_schema": schema,
-                    "selection_reason": entry.get("selection_reason") or "",
-                }
-                for entry, schema in stage2_items
-            ],
-        }
+        stage2_payload = build_step6_stage2_payload(
+            agent_name=agent_name,
+            step_id=step_id,
+            candidate_id=candidate_id,
+            stage2_items=stage2_items,
+            available_fields=available_fields,
+        )
         try:
             stage2 = llm.generate_json(
                 STEP6_STAGE2_SCHEMA_MAPPING_USER_PROMPT,

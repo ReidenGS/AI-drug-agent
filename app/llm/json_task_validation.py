@@ -84,8 +84,17 @@ def build_json_prompt_sections(
     text-only relocation of the exact same payload — the disclosed catalog
     is chosen by the program's progressive disclosure BEFORE this call, so
     the stable prefix is byte-identical for the same disclosed category
-    catalog across candidates. Only Step 6 Stage 1 is affected; Stage 2
-    (``step6_schema_mapping_stage_2``) is untouched.
+    catalog across candidates.
+
+    Step 6 Stage 2 split: for the Step 6 ``step6_schema_mapping_stage_2``
+    payload, the stable selected-tool official-schema block (``task`` /
+    ``agent_name`` / ``step_id`` / ``tools`` as ``tool_name`` +
+    ``full_schema``, sorted by ``tool_name``) is rendered into the stable
+    prefix, and the candidate/run-specific portion (``candidate_id`` /
+    ``candidate_available_fields`` / per-tool Stage-1 ``selection_reason``)
+    is rendered into the trailing dynamic block. Only the SELECTED tools are
+    rendered — never the full catalog — so the stable prefix is byte-identical
+    for the same selected tool schema set across candidates.
     """
     schema = schema or {}
     task = schema.get("task") or "structured_query"
@@ -132,6 +141,17 @@ _STEP6_STAGE1_DYNAMIC_KEYS: tuple[str, ...] = (
     "candidate_available_fields",
     "user_query_summary",
     "disclosure_tags",
+)
+
+
+# Top-level keys of a Step 6 ``step6_schema_mapping_stage_2`` payload that are
+# candidate/run-specific and belong in the dynamic suffix. ``tools`` is split
+# separately: each selected tool's stable ``tool_name`` + official
+# ``full_schema`` goes to the prefix, and the per-tool ``selection_reason``
+# (Stage-1 free text) goes to the dynamic suffix.
+_STEP6_STAGE2_DYNAMIC_KEYS: tuple[str, ...] = (
+    "candidate_id",
+    "candidate_available_fields",
 )
 
 
@@ -183,6 +203,49 @@ def _split_prompt_schema(schema: dict, task: str) -> tuple[dict | None, dict]:
                 for k in _STEP6_STAGE1_DYNAMIC_KEYS
                 if k in schema
             }
+            return stable_schema, dynamic_schema
+
+    # Step 6 Stage 2 mapping: keep the stable selected-tool official-schema
+    # block (task / agent_name / step_id / tools[tool_name+full_schema],
+    # sorted deterministically) in the prefix, and the candidate/run-specific
+    # portion (candidate_id / candidate_available_fields / per-tool Stage-1
+    # selection_reason) in the trailing dynamic block. Only the SELECTED
+    # tools are ever rendered — never the full catalog. Keyed on the presence
+    # of a candidate key so the provider unit tests (``{"task": ...}`` only)
+    # stay unaffected.
+    if task == "step6_schema_mapping_stage_2":
+        if any(k in schema for k in _STEP6_STAGE2_DYNAMIC_KEYS):
+            raw_tools = schema.get("tools")
+            tools = [t for t in raw_tools if isinstance(t, dict)] if isinstance(raw_tools, list) else []
+            stable_tools = sorted(
+                (
+                    {"tool_name": t.get("tool_name"), "full_schema": t.get("full_schema")}
+                    for t in tools
+                ),
+                key=lambda t: str(t.get("tool_name") or ""),
+            )
+            selection_reasons = sorted(
+                (
+                    {
+                        "tool_name": t.get("tool_name"),
+                        "selection_reason": t.get("selection_reason", ""),
+                    }
+                    for t in tools
+                ),
+                key=lambda t: str(t.get("tool_name") or ""),
+            )
+            stable_schema = {
+                k: v
+                for k, v in schema.items()
+                if k not in _STEP6_STAGE2_DYNAMIC_KEYS and k != "tools"
+            }
+            stable_schema["tools"] = stable_tools
+            dynamic_schema = {
+                k: schema[k]
+                for k in _STEP6_STAGE2_DYNAMIC_KEYS
+                if k in schema
+            }
+            dynamic_schema["tool_selection_reasons"] = selection_reasons
             return stable_schema, dynamic_schema
 
     # Step 2 structured_query: trim ``raw_request_record`` out of the
