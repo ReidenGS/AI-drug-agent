@@ -1739,7 +1739,57 @@ def test_step8_openfold3_plan_requires_msa_artifact_before_ready():
     assert "OpenFold3 requires MSA for protein molecules; no MSA artifact is available" in plan.contract_notes
 
 
-def test_step8_openfold3_plan_ready_when_msa_artifact_ref_is_present():
+# Inline a3m MSA content in the official OpenFold3 shape. Real Step 7 output
+# does not yet emit this (MSA generation is out of scope), so the fixtures
+# below inject it directly to exercise the runtime-contract path.
+_A3M_ANTIGEN = ">antigen\nMKTAYIAKQNNVG\n>hit1\nMKTAYIAKQNNVG"
+_A3M_HEAVY = ">heavy\nEVQLVESGGGLVQPGG\n>hit1\nEVQLVESGGGLVQPGG"
+_A3M_LIGHT = ">light\nDIQMTQSPSSLSASVG\n>hit1\nDIQMTQSPSSLSASVG"
+
+
+def _openfold3_msa_inline(alignment: str) -> dict:
+    return {"main": {"a3m": {"alignment": alignment, "format": "a3m"}}}
+
+
+def _openfold3_sin_with_inline_msa() -> dict:
+    return {
+        "input_case": "sequence_only_input",
+        "sequence_refs_for_prediction": [
+            {
+                "sequence_id": "antigen_seq",
+                "chain_role": "antigen",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+                "sequence": "MKTAYIAKQNNVG",
+                "msa": _openfold3_msa_inline(_A3M_ANTIGEN),
+            },
+            {
+                "sequence_id": "heavy_seq",
+                "chain_role": "antibody_heavy",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+                "sequence": "EVQLVESGGGLVQPGG",
+                "msa": _openfold3_msa_inline(_A3M_HEAVY),
+            },
+            {
+                "sequence_id": "light_seq",
+                "chain_role": "antibody_light",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+                "sequence": "DIQMTQSPSSLSASVG",
+                "msa": _openfold3_msa_inline(_A3M_LIGHT),
+            },
+        ],
+    }
+
+
+def test_step8_openfold3_plan_gated_when_only_msa_reference_is_present():
+    """A bare MSA reference (path / storage / artifact ref) cannot be mapped
+    to the OpenFold3 a3m contract without reading files, so the plan must be
+    contract_unresolved (openfold3_msa_runtime_mapping_missing) — NOT ready."""
     sin = {
         "input_case": "sequence_only_input",
         "sequence_refs_for_prediction": [
@@ -1773,8 +1823,89 @@ def test_step8_openfold3_plan_ready_when_msa_artifact_ref_is_present():
     plan = structure_and_design_module._plan_step8_nim_complex_prediction(
         "NvidiaNIM_openfold3", sin, [sin]
     )
+    assert plan.input_status == "contract_unresolved"
+    assert "openfold3_msa_runtime_mapping_missing" in plan.missing_prediction_inputs
+    # The plan carries only the MSA REFERENCE, never a mappable a3m marker.
+    assert not any(
+        item.get("msa_a3m_runtime_mappable") for item in plan.sequence_inputs
+    )
+
+
+def test_step8_openfold3_plan_ready_with_inline_a3m_msa_content():
+    sin = _openfold3_sin_with_inline_msa()
+    plan = structure_and_design_module._plan_step8_nim_complex_prediction(
+        "NvidiaNIM_openfold3", sin, [sin]
+    )
     assert plan.input_status == "ready"
     assert "openfold3_msa_required" not in plan.missing_prediction_inputs
+    assert "openfold3_msa_runtime_mapping_missing" not in plan.missing_prediction_inputs
+    # Every protein role is marked runtime-mappable; raw alignment never
+    # persisted in the compact plan (only a boolean + digest).
+    assert all(item.get("msa_a3m_runtime_mappable") for item in plan.sequence_inputs)
+    plan_blob = json.dumps(plan.model_dump())
+    for raw in (_A3M_ANTIGEN, _A3M_HEAVY, _A3M_LIGHT, "MKTAYIAK", "EVQLVES", "DIQMTQ"):
+        assert raw not in plan_blob
+
+
+def test_step8_openfold3_runtime_kwargs_inject_msa_per_protein_molecule(
+    local_storage,
+):
+    sin = _openfold3_sin_with_inline_msa()
+    plan = structure_and_design_module._plan_step8_nim_complex_prediction(
+        "NvidiaNIM_openfold3", sin, [sin]
+    )
+    assert plan.input_status == "ready"
+    runtime = structure_and_design_module._build_nim_runtime_invocation(
+        tool_name="NvidiaNIM_openfold3",
+        plan=plan,
+        all_inputs=[sin],
+        storage=local_storage,
+    )
+    assert runtime["status"] == "ok"
+    molecules = runtime["kwargs"]["inputs"][0]["molecules"]
+    assert len(molecules) == 3
+    # Every protein molecule carries an MSA in the official OpenFold3 shape.
+    for molecule in molecules:
+        assert molecule["type"] == "protein"
+        assert "msa" in molecule
+        msa = molecule["msa"]
+        assert isinstance(msa, dict) and msa
+        a3m = next(iter(msa.values()))["a3m"]
+        assert a3m["format"] == "a3m"
+        assert isinstance(a3m["alignment"], str) and a3m["alignment"]
+    # The compact arguments (persisted into tool_input_summary) carry only
+    # digests / markers, never the raw alignment or raw sequence.
+    compact_blob = json.dumps(runtime["compact_arguments"])
+    for raw in (_A3M_ANTIGEN, _A3M_HEAVY, _A3M_LIGHT, "MKTAYIAK", "EVQLVES", "DIQMTQ"):
+        assert raw not in compact_blob
+    assert "msa_a3m_present" in compact_blob
+
+
+def test_step8_inline_msa_does_not_change_alphafold_or_boltz_kwargs(
+    local_storage,
+):
+    sin = _openfold3_sin_with_inline_msa()
+    for tool_name, schema_key in (
+        ("NvidiaNIM_alphafold2_multimer", "sequences"),
+        ("NvidiaNIM_boltz2", "polymers"),
+    ):
+        plan = structure_and_design_module._plan_step8_nim_complex_prediction(
+            tool_name, sin, [sin]
+        )
+        assert plan.input_status == "ready"
+        runtime = structure_and_design_module._build_nim_runtime_invocation(
+            tool_name=tool_name,
+            plan=plan,
+            all_inputs=[sin],
+            storage=local_storage,
+        )
+        assert runtime["status"] == "ok"
+        kwargs = runtime["kwargs"]
+        assert schema_key in kwargs
+        # No MSA is injected into AlphaFold2-Multimer / Boltz2 kwargs.
+        assert "msa" not in json.dumps(kwargs)
+
+
 def test_step8_produces_confidence_records_and_keeps_raw_at_ref(
     local_storage, registry_service, workflow_state_service
 ):
