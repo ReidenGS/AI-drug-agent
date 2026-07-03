@@ -107,8 +107,8 @@ def _sleep_backoff(attempt: int) -> None:
 
 # ── env hydration ──────────────────────────────────────────────────────────
 #
-# ToolUniverse's `AgenticTool` instances read LLM credentials directly from
-# `os.environ` (e.g. `GEMINI_API_KEY`). Our codebase loads `.env` via
+# ToolUniverse's tools read selected credentials directly from
+# `os.environ` (e.g. `GEMINI_API_KEY`, `NVIDIA_API_KEY`). Our codebase loads `.env` via
 # `pydantic-settings`, which populates the `Settings` object but does NOT
 # write to `os.environ`. Without bridging, TU sees no key and silently
 # fails to load the agentic sub-tools (`IntentAnalyzerAgent`,
@@ -134,6 +134,7 @@ def _hydrate_env_from_settings() -> None:
         ("gemini_api_key", "GEMINI_API_KEY"),
         ("gemini_model", "GEMINI_MODEL_ID"),
         ("gemini_model", "TOOLUNIVERSE_LLM_MODEL_DEFAULT"),
+        ("nvidia_api_key", "NVIDIA_API_KEY"),
     )
     for attr, env_name in bridges:
         if os.environ.get(env_name):

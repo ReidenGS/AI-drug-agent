@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     # bounded when Step 6 Stage 2 schema mapping stalls.
     qwen_timeout: float = 90.0
 
+    # NVIDIA NIM credentials used only by ToolUniverse-backed MCP wrappers
+    # (for example Step 8 complex prediction tools). This is bridged into
+    # os.environ as NVIDIA_API_KEY immediately before ToolUniverse is built.
+    nvidia_api_key: str = ""
+
     api_key: str = "dev-key"
 
     tool_inventory_xlsx: str = "../\u9879\u76ee\u6587\u4ef6/ToolUniversity_inventory_v0.2.xlsx"

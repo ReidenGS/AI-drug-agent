@@ -235,6 +235,30 @@ def test_hydrate_env_bridges_model_to_tu_compatible_names(monkeypatch):
     assert os.environ.get("TOOLUNIVERSE_LLM_MODEL_DEFAULT") == "gemini-3.5-flash"
 
 
+def test_hydrate_env_bridges_nvidia_key_for_nim_tools(monkeypatch):
+    from app.mcp.tooluniverse_adapter import _hydrate_env_from_settings
+    from app.settings import get_settings
+
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "nvidia_api_key", "nvidia-sentinel-key")
+    _hydrate_env_from_settings()
+    assert os.environ.get("NVIDIA_API_KEY") == "nvidia-sentinel-key"
+
+
+def test_hydrate_env_does_not_overwrite_operator_nvidia_key(monkeypatch):
+    from app.mcp.tooluniverse_adapter import _hydrate_env_from_settings
+    from app.settings import get_settings
+
+    monkeypatch.setenv("NVIDIA_API_KEY", "operator-nvidia-key")
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "nvidia_api_key", "dotenv-nvidia-key")
+    _hydrate_env_from_settings()
+    assert os.environ["NVIDIA_API_KEY"] == "operator-nvidia-key"
+
+
 # ── transient-failure retry policy ─────────────────────────────────────────
 
 
