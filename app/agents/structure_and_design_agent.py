@@ -677,6 +677,7 @@ class StructureAndDesignAgent:
         tool_calls: list[ToolCallRecord] = []
         output_artifacts: list[StructureOutputArtifact] = []
         candidate_results: list[CandidateStructureResult] = []
+        seen_nim_mapping_calls: set[tuple[str, str]] = set()
 
         any_partial = False
         any_failed = False
@@ -700,6 +701,7 @@ class StructureAndDesignAgent:
                 sin,
                 inputs,
                 sequence_material_lookup=sequence_material_lookup,
+                seen_nim_mapping_calls=seen_nim_mapping_calls,
             )
             selected_calls = [
                 tc for tc in routed_calls
@@ -854,6 +856,7 @@ class StructureAndDesignAgent:
         all_inputs: list[dict] | None = None,
         *,
         sequence_material_lookup: dict[str, str] | None = None,
+        seen_nim_mapping_calls: set[tuple[str, str]] | None = None,
     ) -> list[ToolCallRecord]:
         input_case = sin.get("input_case")
         structure_input_id = sin.get("structure_input_id")
@@ -944,6 +947,22 @@ class StructureAndDesignAgent:
                 )
             )
 
+        def _skip_duplicate_mapping(tool_name: str, mapping_key: str) -> None:
+            calls.append(
+                _nonexecuted_tool_record(
+                    tool_name=tool_name,
+                    agent_name=_AGENT_NAME,
+                    step_id=_STEP_08,
+                    run_status="skipped",
+                    summary={
+                        **_summary_base(),
+                        "routing_decision": "duplicate_complex_prediction_mapping",
+                        "reason": "NvidiaNIM complex prediction already planned for this antigen-antibody mapping",
+                        "mapping_key": mapping_key,
+                    },
+                )
+            )
+
         pdb_id = _step8_pdb_id(sin.get("structure_refs") or [])
         if "CrystalStructure_validate" in scoped_tools:
             crystal_args, missing_crystal_args = _step8_crystal_validation_args(sin)
@@ -1005,6 +1024,14 @@ class StructureAndDesignAgent:
                 continue
             plan = _plan_step8_nim_complex_prediction(tool_name, sin, all_inputs)
             if plan.input_status in {"ready", "selected_but_deferred"}:
+                mapping_key = _step8_nim_mapping_key(sin)
+                if mapping_key:
+                    pair_key = (mapping_key, tool_name)
+                    if seen_nim_mapping_calls is not None and pair_key in seen_nim_mapping_calls:
+                        _skip_duplicate_mapping(tool_name, mapping_key)
+                        continue
+                    if seen_nim_mapping_calls is not None:
+                        seen_nim_mapping_calls.add(pair_key)
                 runtime = _build_nim_runtime_invocation(
                     tool_name=tool_name,
                     plan=plan,
@@ -2259,6 +2286,19 @@ def _step8_tool_call_affects_partial(tc: ToolCallRecord) -> bool:
     return False
 
 
+def _step8_nim_mapping_key(sin: dict) -> str | None:
+    mapping = sin.get("antigen_antibody_mapping")
+    if not isinstance(mapping, dict):
+        return None
+    target_id = mapping.get("target_candidate_id")
+    antibody_id = mapping.get("antibody_candidate_id")
+    if not isinstance(target_id, str) or not target_id:
+        return None
+    if not isinstance(antibody_id, str) or not antibody_id:
+        return None
+    return f"{target_id}:{antibody_id}"
+
+
 def _plan_step8_nim_complex_prediction(
     tool_name: str,
     sin: dict,
@@ -2287,17 +2327,18 @@ def _plan_step8_nim_complex_prediction(
 
     sequence_lookup = _prediction_sequence_lookup(all_inputs or [sin])
     sequence_inputs = _compact_prediction_sequence_inputs(sin)
+    deduped_inputs = _dedupe_step8_prediction_sequence_inputs(sequence_inputs)
     mapping = sin.get("antigen_antibody_mapping") or {}
     antigen_ids = list(mapping.get("antigen_sequence_ids") or [])
     heavy_ids = list(mapping.get("antibody_heavy_sequence_ids") or [])
     light_ids = list(mapping.get("antibody_light_sequence_ids") or [])
 
     if not antigen_ids:
-        antigen_ids = [entry["sequence_id"] for entry in sequence_inputs if entry.get("chain_role") == "antigen"]
+        antigen_ids = [entry["sequence_id"] for entry in deduped_inputs if entry.get("chain_role") == "antigen"]
     if not heavy_ids:
-        heavy_ids = [entry["sequence_id"] for entry in sequence_inputs if entry.get("chain_role") == "antibody_heavy"]
+        heavy_ids = [entry["sequence_id"] for entry in deduped_inputs if entry.get("chain_role") == "antibody_heavy"]
     if not light_ids:
-        light_ids = [entry["sequence_id"] for entry in sequence_inputs if entry.get("chain_role") == "antibody_light"]
+        light_ids = [entry["sequence_id"] for entry in deduped_inputs if entry.get("chain_role") == "antibody_light"]
 
     missing: list[str] = []
     unresolved: list[str] = []
@@ -2342,10 +2383,12 @@ def _plan_step8_nim_complex_prediction(
             runtime_status="not_checked",
             can_invoke=False,
             missing_prediction_inputs=list(dict.fromkeys([*unresolved, *missing])),
-            sequence_inputs=_compact_prediction_sequence_inputs_for_ids(
-                sequence_lookup,
-                [*antigen_ids, *heavy_ids, *light_ids],
-                fallback=sequence_inputs,
+            sequence_inputs=_dedupe_step8_prediction_sequence_inputs(
+                _compact_prediction_sequence_inputs_for_ids(
+                    sequence_lookup,
+                    [*antigen_ids, *heavy_ids, *light_ids],
+                    fallback=deduped_inputs,
+                )
             ),
             structure_inputs=_compact_prediction_structure_inputs(sin),
             contract_notes=[
@@ -2360,10 +2403,12 @@ def _plan_step8_nim_complex_prediction(
             runtime_status="not_checked",
             can_invoke=False,
             missing_prediction_inputs=missing,
-            sequence_inputs=_compact_prediction_sequence_inputs_for_ids(
-                sequence_lookup,
-                [*antigen_ids, *heavy_ids, *light_ids],
-                fallback=sequence_inputs,
+            sequence_inputs=_dedupe_step8_prediction_sequence_inputs(
+                _compact_prediction_sequence_inputs_for_ids(
+                    sequence_lookup,
+                    [*antigen_ids, *heavy_ids, *light_ids],
+                    fallback=deduped_inputs,
+                )
             ),
             structure_inputs=_compact_prediction_structure_inputs(sin),
             contract_notes=["missing antigen-antibody pair sequence input for complex prediction"],
@@ -2374,10 +2419,12 @@ def _plan_step8_nim_complex_prediction(
         input_status="ready",
         runtime_status="not_checked",
         can_invoke=False,
-        sequence_inputs=_compact_prediction_sequence_inputs_for_ids(
-            sequence_lookup,
-            [*antigen_ids, *heavy_ids, *light_ids],
-            fallback=sequence_inputs,
+        sequence_inputs=_dedupe_step8_prediction_sequence_inputs(
+            _compact_prediction_sequence_inputs_for_ids(
+                sequence_lookup,
+                [*antigen_ids, *heavy_ids, *light_ids],
+                fallback=deduped_inputs,
+            )
         ),
         structure_inputs=_compact_prediction_structure_inputs(sin),
         contract_notes=[
@@ -2385,6 +2432,62 @@ def _plan_step8_nim_complex_prediction(
             "NvidiaNIM ToolUniverse wrapper can be attempted; upstream credentials/runtime may still be unavailable",
         ],
     )
+
+
+def _dedupe_step8_prediction_sequence_inputs(
+    sequence_inputs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Deduplicate sequence inputs for a single antigen-antibody NIM plan.
+
+    If two entries point at the same concrete sequence source for the same role,
+    keep one.  Prefer runtime-ready entries over identifier-only entries when
+    they target the same role/source identity.
+    """
+    by_role: dict[str, list[dict[str, Any]]] = {
+        "antigen": [],
+        "antibody_heavy": [],
+        "antibody_light": [],
+    }
+    other_entries: list[dict[str, Any]] = []
+    for entry in sequence_inputs:
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("chain_role")
+        if role not in by_role:
+            other_entries.append(entry)
+            continue
+
+        by_role[role].append(entry)
+
+    deduped: list[dict[str, Any]] = []
+    for role in ("antigen", "antibody_heavy", "antibody_light"):
+        role_entries = by_role[role]
+        if not role_entries:
+            continue
+        role_seen: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        role_seen_ready: dict[tuple[str, str, str, str], bool] = {}
+        for entry in role_entries:
+            sequence_storage_ref = str(entry.get("sequence_storage_ref") or "")
+            source_ref = str(entry.get("source_ref") or "")
+            sha_prefix = str(entry.get("sha256_prefix") or "")
+            sequence_id = str(entry.get("sequence_id") or "")
+            if sequence_storage_ref or source_ref or sha_prefix:
+                key = (role, sequence_storage_ref, source_ref, sha_prefix)
+            else:
+                key = (role, "", "", sequence_id)
+            is_ready = entry.get("sequence_readiness") == "ready"
+            if key not in role_seen or (is_ready and not role_seen_ready.get(key)):
+                role_seen[key] = entry
+                role_seen_ready[key] = is_ready
+        role_items = list(role_seen.values())
+        ready_entries = [entry for entry in role_items if entry.get("sequence_readiness") == "ready"]
+        if ready_entries:
+            deduped.extend(ready_entries)
+        else:
+            deduped.extend(role_items)
+
+    ordered: list[dict[str, Any]] = deduped + other_entries
+    return ordered
 
 
 def _build_nim_runtime_invocation(

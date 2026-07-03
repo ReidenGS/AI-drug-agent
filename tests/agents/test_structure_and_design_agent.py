@@ -7,6 +7,7 @@ import os
 import hashlib
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1427,6 +1428,17 @@ def _bindings_with_step8_overrides(extra: dict | None = None) -> dict:
     return base
 
 
+def _collect_nim_calls(results, tool_name: str, mapping: str | None = None):
+    calls = []
+    for tc in results.tool_call_records:
+        if tc.tool_name != tool_name:
+            continue
+        if mapping is not None and tc.tool_input_summary.get("mapping_key") != mapping:
+            continue
+        calls.append(tc)
+    return calls
+
+
 def test_step8_scope_tools_match_inventory_runtime_scope():
     mcp = _mcp()
     runtime_scope = set(mcp.list_tools(agent_name="structure_and_design_agent", step_id="step_08"))
@@ -1436,6 +1448,168 @@ def test_step8_scope_tools_match_inventory_runtime_scope():
         f"runtime_scope={sorted(runtime_scope)}\n"
         f"routing_policy={sorted(routing_policy)}"
     )
+
+
+def test_step8_nim_mapping_duplicate_calls_are_deduplicated_across_prepared_inputs(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        referenced_inputs=[],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    target["materials"] = [
+        {"material_id": "target_step8_map_antigen", "material_type": "target_sequence", "value": "MKTAYIAKQNNVG"},
+    ]
+    antibody["materials"] = [
+        {"material_id": "heavy_step8_map", "material_type": "antibody_heavy_chain_sequence", "value": "EVQLVESGGGLVQPGGSLRLSCAAS"},
+        {"material_id": "light_step8_map", "material_type": "antibody_light_chain_sequence", "value": "DIQMTQSPSSLSASVGDRVTITC"},
+    ]
+    local_storage.write_json(cct_path, cct)
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _capture(tool_name: str):
+        def _inner(**kw):
+            captured.append((tool_name, dict(kw)))
+            return {"status": "ok", "model_ref": f"s3://bucket/{tool_name}.pdb"}
+        return _inner
+
+    overrides = {
+        "NvidiaNIM_alphafold2_multimer": _capture("NvidiaNIM_alphafold2_multimer"),
+        "NvidiaNIM_openfold3": _capture("NvidiaNIM_openfold3"),
+        "NvidiaNIM_boltz2": _capture("NvidiaNIM_boltz2"),
+    }
+    mcp = LocalMCPClient(
+        inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+        bindings=_bindings_with_step8_overrides(overrides),
+    )
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=mcp,
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+
+    prepared = local_storage.read_json(local_storage.run_key(run_id, "prepared_structure_input_package.json"))
+    mappings = {
+        rec["candidate_id"]: (
+            rec["antigen_antibody_mapping"]["target_candidate_id"],
+            rec["antigen_antibody_mapping"]["antibody_candidate_id"],
+        )
+        for rec in prepared["prepared_structure_inputs"]
+        if isinstance(rec.get("antigen_antibody_mapping"), dict)
+    }
+    assert mappings
+
+    first_mapping = set(mappings.values())
+    assert len(first_mapping) == 1
+    target_candidate_id, antibody_candidate_id = next(iter(first_mapping))
+    mapping_key = f"{target_candidate_id}:{antibody_candidate_id}"
+
+    selected = _collect_nim_calls(results, "NvidiaNIM_alphafold2_multimer")
+    duplicate = [
+        tc for tc in selected
+        if tc.tool_input_summary.get("routing_decision") == "duplicate_complex_prediction_mapping"
+    ]
+    success = [
+        tc for tc in selected
+        if tc.tool_input_summary.get("routing_decision") == "selected"
+    ]
+    assert len(success) == 1
+    assert len(duplicate) == 1
+    assert duplicate[0].tool_input_summary["mapping_key"] == mapping_key
+    assert results.structure_modeling_status == "ok"
+
+    capture_counts = {
+        tool: len([name for name, _ in captured if name == tool])
+        for tool in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
+    }
+    assert set(capture_counts.values()) == {1}
+
+
+def test_step8_nim_plan_dedupes_duplicate_sequence_refs_and_filters_uniprot_like_identifiers(
+    local_storage, registry_service, workflow_state_service
+):
+    fasta_key = local_storage.run_key("run_step8_plan_dedup", "inputs", "shared_antigen.fasta")
+    local_storage.write_bytes(
+        fasta_key,
+        b">antigen\nMKTAYIAKQNNVG\n",
+    )
+    sin = {
+        "input_case": "sequence_only_input",
+        "sequence_refs_for_prediction": [
+            {
+                "sequence_id": "antigen_a",
+                "chain_role": "antigen",
+                "prediction_input_kind": "fasta_ref",
+                "sequence_value_status": "referenced",
+                "sequence_storage_ref": fasta_key,
+                "source_ref": fasta_key,
+            },
+            {
+                "sequence_id": "antigen_b",
+                "chain_role": "antigen",
+                "prediction_input_kind": "fasta_ref",
+                "sequence_value_status": "referenced",
+                "sequence_storage_ref": fasta_key,
+                "source_ref": fasta_key,
+            },
+            {
+                "sequence_id": "heavy_seq",
+                "chain_role": "antibody_heavy",
+                "prediction_input_kind": "fasta_ref",
+                "sequence_value_status": "referenced",
+                "sequence_storage_ref": fasta_key,
+                "source_ref": fasta_key,
+            },
+            {
+                "sequence_id": "light_seq",
+                "chain_role": "antibody_light",
+                "prediction_input_kind": "fasta_ref",
+                "sequence_value_status": "referenced",
+                "sequence_storage_ref": fasta_key,
+                "source_ref": fasta_key,
+            },
+            {
+                "sequence_id": "antigen_uniprot",
+                "chain_role": "antigen",
+                "prediction_input_kind": "uniprot_id",
+                "sequence_value_status": "identifier_only",
+                "source_ref": "P12345",
+                "source_kind": "external_database",
+            },
+        ],
+    }
+
+    plan = structure_and_design_module._plan_step8_nim_complex_prediction(
+        "NvidiaNIM_boltz2",
+        sin,
+        [sin],
+    )
+    assert plan.input_status == "ready"
+    assert len([item for item in plan.sequence_inputs if item.get("chain_role") == "antigen"]) == 1
+    assert [item for item in plan.sequence_inputs if item.get("chain_role") == "antigen"][0]["sequence_id"] == "antigen_a"
+    assert all(item.get("sequence_readiness") == "ready" for item in plan.sequence_inputs if item.get("chain_role") in {"antigen", "antibody_heavy", "antibody_light"})
+    assert not any(item.get("sequence_id") == "antigen_uniprot" for item in plan.sequence_inputs)
+
+    runtime = structure_and_design_module._build_nim_runtime_invocation(
+        tool_name="NvidiaNIM_boltz2",
+        plan=plan,
+        all_inputs=[sin],
+        storage=local_storage,
+    )
+    assert runtime["status"] == "ok"
+    assert runtime["compact_arguments"]["sequence_count"] == 3
+    artifact_blob = json.dumps(runtime["audit"] + runtime["compact_arguments"].get("sequence_inputs", []))
+    assert "MKTAYIAKQNNVG" not in artifact_blob
 
 
 def test_step8_produces_confidence_records_and_keeps_raw_at_ref(
