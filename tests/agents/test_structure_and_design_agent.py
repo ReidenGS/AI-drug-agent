@@ -510,6 +510,40 @@ def test_step7_filename_scoped_fasta_binds_only_compatible_candidate(
     assert refs[0][1].prediction_input_kind == "fasta_ref"
 
 
+def test_step7_target_sequence_role_binds_uploaded_fasta_to_antigen_candidate(
+    local_storage, registry_service, workflow_state_service,
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        uploaded_files=[{
+            "file_id": "role_target_fasta",
+            "original_filename": "sequence.fasta",
+            "storage_path": "adc_pilot/runs/x/inputs/files/sequence.fasta",
+            "content_type": "text/x-fasta",
+            "size_bytes": 64,
+            "role": "target_sequence",
+        }],
+    )
+    pkg = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=_mcp(),
+    ).run_step_7(run_id)
+
+    refs = [
+        (r.structure_role, s) for r in pkg.prepared_structure_inputs
+        for s in r.sequence_refs_for_prediction if s.sequence_id == "role_target_fasta"
+    ]
+    assert len(refs) == 1
+    assert refs[0][0] == "antigen_only"
+    assert refs[0][1].chain_role == "antigen"
+    assert refs[0][1].prediction_input_kind == "fasta_ref"
+    assert refs[0][1].sequence_storage_ref.endswith("sequence.fasta")
+    assert not any(
+        u["source_ref"] == "role_target_fasta"
+        for u in pkg.unresolved_resource_refs
+    )
+
+
 def test_step7_ambiguous_fasta_is_unresolved_not_broadcast(
     local_storage, registry_service, workflow_state_service
 ):

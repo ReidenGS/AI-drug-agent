@@ -1538,7 +1538,16 @@ def _explicit_resource_candidate_ids(resource: dict, valid_ids: set[str]) -> lis
 def _resource_role(resource: dict, resource_kind: str) -> str | None:
     for key in ("chain_role", "role", "source_role"):
         if isinstance(resource.get(key), str) and resource[key].strip():
-            return resource[key].strip().lower()
+            role = resource[key].strip().lower()
+            if role in {"target_sequence", "antigen_sequence", "target_or_antigen", "target_antigen"}:
+                return "antigen"
+            if role in {"antibody_sequence", "antibody_sequence_reference"}:
+                return "antibody"
+            if role in {"heavy_chain", "vh", "antibody_heavy_chain_sequence"}:
+                return "antibody_heavy"
+            if role in {"light_chain", "vl", "antibody_light_chain_sequence"}:
+                return "antibody_light"
+            return role
     filename = (resource.get("original_filename") or "").lower()
     if any(marker in filename for marker in ("heavy", "_vh", "-vh", "_hc", "-hc")):
         return "antibody_heavy"
