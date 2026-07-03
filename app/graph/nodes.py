@@ -41,7 +41,14 @@ from ..mcp.client import MCPClient
 from ..services.artifact_registry_service import ArtifactRegistryService
 from ..services.input_readiness_service import InputReadinessService
 from ..services.intake_service import IntakeService
+from ..services.design_review_service import DesignReviewService
+from ..services.final_output_package_service import FinalOutputPackageService
+from ..services.human_review_service import HumanReviewService
+from ..services.ip_risk_integration_service import IPRiskIntegrationService
+from ..services.pipeline_rerun_service import PipelineRerunService
 from ..services.ranking_service import RankingService
+from ..services.redesign_trigger_service import RedesignTriggerService
+from ..services.run_tracking_service import RunTrackingService
 from ..services.scoring_handoff_service import ScoringHandoffService
 from ..services.scoring_validation_service import ScoringValidationService
 from ..services.storage_service import Storage
@@ -568,6 +575,148 @@ def make_node_step_14(
             "patent_review_status": table.patent_review_status,
             "patent_record_count": len(table.patent_records),
             "tool_call_count": len(table.tool_call_records),
+        }
+        return out
+
+    return node
+
+
+def make_node_step_15(
+    storage: Storage,
+    registry: ArtifactRegistryService,
+    workflow_state: WorkflowStateService,
+):
+    svc = IPRiskIntegrationService(storage=storage, registry=registry, workflow_state=workflow_state)
+    return _make_gated_service_node(
+        step_key="step_15",
+        step_id_for_decision="step_15_ip_risk_integration",
+        artifact_attr="ip_risk_integrated_shortlist_id",
+        artifact_state_key="ip_risk_integrated_shortlist",
+        status_field="ip_integration_status",
+        storage=storage, registry=registry, workflow_state=workflow_state,
+        runner=lambda run_id: svc.integrate(run_id),
+    )
+
+
+def make_node_step_16(
+    storage: Storage,
+    registry: ArtifactRegistryService,
+    workflow_state: WorkflowStateService,
+):
+    svc = DesignReviewService(storage=storage, registry=registry, workflow_state=workflow_state)
+    return _make_gated_service_node(
+        step_key="step_16",
+        step_id_for_decision="step_16_design_review",
+        artifact_attr="llm_design_review_report_id",
+        artifact_state_key="llm_design_review_report",
+        status_field="design_review_status",
+        storage=storage, registry=registry, workflow_state=workflow_state,
+        runner=lambda run_id: svc.create_report(run_id),
+    )
+
+
+def make_node_step_17(
+    storage: Storage,
+    registry: ArtifactRegistryService,
+    workflow_state: WorkflowStateService,
+):
+    svc = HumanReviewService(storage=storage, registry=registry, workflow_state=workflow_state)
+    return _make_gated_service_node(
+        step_key="step_17",
+        step_id_for_decision="step_17_human_review",
+        artifact_attr="human_review_decision_record_id",
+        artifact_state_key="human_review_decision_record",
+        status_field="review_status",
+        storage=storage, registry=registry, workflow_state=workflow_state,
+        runner=lambda run_id: svc.record(run_id),
+    )
+
+
+def make_node_step_18(
+    storage: Storage,
+    registry: ArtifactRegistryService,
+    workflow_state: WorkflowStateService,
+):
+    svc = RedesignTriggerService(storage=storage, registry=registry, workflow_state=workflow_state)
+    return _make_gated_service_node(
+        step_key="step_18",
+        step_id_for_decision="step_18_redesign_trigger",
+        artifact_attr="redesign_optimization_task_record_id",
+        artifact_state_key="redesign_optimization_task_record",
+        status_field="redesign_trigger_status",
+        storage=storage, registry=registry, workflow_state=workflow_state,
+        runner=lambda run_id: svc.build_tasks(run_id),
+    )
+
+
+def make_node_step_19(
+    storage: Storage,
+    registry: ArtifactRegistryService,
+    workflow_state: WorkflowStateService,
+):
+    svc = PipelineRerunService(storage=storage, registry=registry, workflow_state=workflow_state)
+    return _make_gated_service_node(
+        step_key="step_19",
+        step_id_for_decision="step_19_pipeline_rerun",
+        artifact_attr="pipeline_rerun_result_record_id",
+        artifact_state_key="pipeline_rerun_result_record",
+        status_field="rerun_status",
+        storage=storage, registry=registry, workflow_state=workflow_state,
+        runner=lambda run_id: svc.record_rerun_status(run_id),
+    )
+
+
+def make_node_step_20(
+    storage: Storage,
+    registry: ArtifactRegistryService,
+    workflow_state: WorkflowStateService,
+):
+    svc = FinalOutputPackageService(storage=storage, registry=registry, workflow_state=workflow_state)
+    return _make_gated_service_node(
+        step_key="step_20",
+        step_id_for_decision="step_20_output_package",
+        artifact_attr="final_output_package_record_id",
+        artifact_state_key="final_output_package_record",
+        status_field="package_status",
+        storage=storage, registry=registry, workflow_state=workflow_state,
+        runner=lambda run_id: svc.build_package(run_id),
+    )
+
+
+def make_node_step_21(
+    storage: Storage,
+    registry: ArtifactRegistryService,
+    workflow_state: WorkflowStateService,
+):
+    svc = RunTrackingService(storage=storage, registry=registry, workflow_state=workflow_state)
+
+    def node(state: PipelineState) -> PipelineState:
+        run_id = state["run_id"]
+        plan = _load_plan(storage, run_id)
+        decision = execution_decision(plan, "step_21_run_tracking")
+        if not decision.allow:
+            workflow_state.mark(run_id, "step_21", "skipped")
+            out = dict(state)
+            out.setdefault("results", {})
+            out["results"]["step_21"] = {
+                "executed": False,
+                "plan_status": decision.plan_status,
+                "planned_status": decision.planned_status,
+                "reason": decision.reason,
+            }
+            return out
+        result = svc.record_tracking(run_id)
+        out = dict(state)
+        out.setdefault("artifacts", {})
+        out["artifacts"]["run_tracking_memory_update_record"] = (
+            storage.run_key(run_id, "run_tracking_memory_update_record.json")
+        )
+        out.setdefault("results", {})
+        out["results"]["step_21"] = {
+            "executed": True,
+            "plan_status": decision.plan_status,
+            "planned_status": decision.planned_status,
+            "tracking_status": result.tracking_status,
         }
         return out
 

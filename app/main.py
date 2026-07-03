@@ -28,6 +28,13 @@ from .api import (
     step_12_ranking_api,
     step_13_evidence_api,
     step_14_patent_ip_api,
+    step_15_ip_risk_integration_api,
+    step_16_design_review_api,
+    step_17_human_review_api,
+    step_18_redesign_trigger_api,
+    step_19_pipeline_rerun_api,
+    step_20_output_package_api,
+    step_21_run_tracking_api,
 )
 
 
@@ -52,6 +59,13 @@ def create_app() -> FastAPI:
     app.include_router(step_12_ranking_api.router)
     app.include_router(step_13_evidence_api.router)
     app.include_router(step_14_patent_ip_api.router)
+    app.include_router(step_15_ip_risk_integration_api.router)
+    app.include_router(step_16_design_review_api.router)
+    app.include_router(step_17_human_review_api.router)
+    app.include_router(step_18_redesign_trigger_api.router)
+    app.include_router(step_19_pipeline_rerun_api.router)
+    app.include_router(step_20_output_package_api.router)
+    app.include_router(step_21_run_tracking_api.router)
 
     return app
 

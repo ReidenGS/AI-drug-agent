@@ -1,6 +1,6 @@
 """LangGraph wiring for ADC.
 
-Five builders:
+Six builders:
 
 - `build_minimal_graph(...)` — Step 1→2→3→4 only. Deterministic services +
   LLM Supervisor; no MCP client required.
@@ -11,6 +11,8 @@ Five builders:
   (Step 12).
 - `build_step1_14_graph(...)` — Step 1→…→14. Adds Step 13 (`EvidenceAgent`)
   and Step 14 (`PatentIPAgent`).
+- `build_step1_21_graph(...)` — Step 1→…→21. Adds downstream scaffold
+  services only; no LLM or ToolUniverse live calls.
 
 Step 13/14 topology: architecture v0.1 wants Step 13 ∥ Step 14 in parallel
 after Step 12. The MVP graph runs them **sequentially** (Step 12 → 13 → 14
@@ -239,6 +241,63 @@ def build_step1_14_graph(
     ):
         graph.add_edge(src, dst)
     graph.add_edge("step_14", END)
+    return graph.compile()
+
+
+def build_step1_21_graph(
+    *,
+    storage: Storage,
+    registry: ArtifactRegistryService,
+    workflow_state: WorkflowStateService,
+    mcp_client: MCPClient,
+    llm: LLMProvider | None = None,
+) -> Any:
+    """Compile the Step 1→…→21 pipeline with scaffold-only downstream steps.
+
+    Existing Step 1-14 graph semantics are left unchanged. Step 15-21 nodes
+    are deterministic services that write placeholder/scaffold artifacts from
+    existing registry refs; they do not call a real LLM, ToolUniverse, or
+    external biomedical API.
+    """
+    _require_inventory_scoped(mcp_client)
+    llm = llm or MockLLMProvider()
+    supervisor = SupervisorAgent(llm=llm)
+
+    graph = StateGraph(N.PipelineState)
+    graph.add_node("step_01", N.make_node_step_01(storage, registry, workflow_state))
+    graph.add_node("step_02", N.make_node_step_02(storage, registry, workflow_state, supervisor))
+    graph.add_node("step_03", N.make_node_step_03(storage, registry, workflow_state))
+    graph.add_node("step_04", N.make_node_step_04(storage, registry, workflow_state))
+    graph.add_node("step_05", N.make_node_step_05(storage, registry, workflow_state, mcp_client, llm=llm))
+    graph.add_node("step_06", N.make_node_step_06(storage, registry, workflow_state, mcp_client, llm=llm))
+    graph.add_node("step_07", N.make_node_step_07(storage, registry, workflow_state, mcp_client))
+    graph.add_node("step_08", N.make_node_step_08(storage, registry, workflow_state, mcp_client))
+    graph.add_node("step_09", N.make_node_step_09(storage, registry, workflow_state, mcp_client, llm=llm))
+    graph.add_node("step_10", N.make_node_step_10(storage, registry, workflow_state))
+    graph.add_node("step_11", N.make_node_step_11(storage, registry, workflow_state))
+    graph.add_node("step_12", N.make_node_step_12(storage, registry, workflow_state))
+    graph.add_node("step_13", N.make_node_step_13(storage, registry, workflow_state, mcp_client, llm=llm))
+    graph.add_node("step_14", N.make_node_step_14(storage, registry, workflow_state, mcp_client, llm=llm))
+    graph.add_node("step_15", N.make_node_step_15(storage, registry, workflow_state))
+    graph.add_node("step_16", N.make_node_step_16(storage, registry, workflow_state))
+    graph.add_node("step_17", N.make_node_step_17(storage, registry, workflow_state))
+    graph.add_node("step_18", N.make_node_step_18(storage, registry, workflow_state))
+    graph.add_node("step_19", N.make_node_step_19(storage, registry, workflow_state))
+    graph.add_node("step_20", N.make_node_step_20(storage, registry, workflow_state))
+    graph.add_node("step_21", N.make_node_step_21(storage, registry, workflow_state))
+
+    graph.add_edge(START, "step_01")
+    for src, dst in (
+        ("step_01", "step_02"), ("step_02", "step_03"), ("step_03", "step_04"),
+        ("step_04", "step_05"), ("step_05", "step_06"), ("step_06", "step_07"),
+        ("step_07", "step_08"), ("step_08", "step_09"), ("step_09", "step_10"),
+        ("step_10", "step_11"), ("step_11", "step_12"), ("step_12", "step_13"),
+        ("step_13", "step_14"), ("step_14", "step_15"), ("step_15", "step_16"),
+        ("step_16", "step_17"), ("step_17", "step_18"), ("step_18", "step_19"),
+        ("step_19", "step_20"), ("step_20", "step_21"),
+    ):
+        graph.add_edge(src, dst)
+    graph.add_edge("step_21", END)
     return graph.compile()
 
 

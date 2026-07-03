@@ -21,6 +21,12 @@ class ActiveArtifacts(BaseModel):
     ranking_table_id: Optional[str] = None
     scientific_evidence_table_id: Optional[str] = None
     patent_prior_art_table_id: Optional[str] = None
+    ip_risk_integrated_shortlist_id: Optional[str] = None
+    llm_design_review_report_id: Optional[str] = None
+    human_review_decision_record_id: Optional[str] = None
+    redesign_optimization_task_record_id: Optional[str] = None
+    pipeline_rerun_result_record_id: Optional[str] = None
+    final_output_package_record_id: Optional[str] = None
 
 
 class RunArtifactRegistry(BaseModel):
