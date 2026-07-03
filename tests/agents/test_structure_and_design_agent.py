@@ -1532,7 +1532,97 @@ def test_step8_nim_mapping_duplicate_calls_are_deduplicated_across_prepared_inpu
         tool: len([name for name, _ in captured if name == tool])
         for tool in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
     }
-    assert set(capture_counts.values()) == {1}
+    assert capture_counts["NvidiaNIM_alphafold2_multimer"] == 1
+    assert capture_counts["NvidiaNIM_boltz2"] == 1
+    assert capture_counts["NvidiaNIM_openfold3"] == 0
+
+
+def test_step8_openfold3_skips_without_msa_inputs_contract_unresolved(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service, referenced_inputs=[])
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    target["materials"] = [
+        {
+            "material_id": "target_seq_openfold",
+            "material_type": "target_sequence",
+            "value": "MKTAYIAKQNNVG",
+        }
+    ]
+    antibody["materials"].extend([
+        {
+            "material_id": "heavy_seq_openfold",
+            "material_type": "antibody_heavy_chain_sequence",
+            "value": "EVQLVESGGGLVQPGGSLRLSCAAS",
+        },
+        {
+            "material_id": "light_seq_openfold",
+            "material_type": "antibody_light_chain_sequence",
+            "value": "DIQMTQSPSSLSASVGDRVTITC",
+        },
+    ])
+    local_storage.write_json(cct_path, cct)
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _capture(tool_name: str):
+        def _inner(**kw):
+            captured.append((tool_name, dict(kw)))
+            return {"status": "ok", "model_ref": f"s3://bucket/{tool_name}.pdb"}
+
+        return _inner
+
+    overrides = {
+        "NvidiaNIM_alphafold2_multimer": _capture("NvidiaNIM_alphafold2_multimer"),
+        "NvidiaNIM_openfold3": _capture("NvidiaNIM_openfold3"),
+        "NvidiaNIM_boltz2": _capture("NvidiaNIM_boltz2"),
+    }
+    mcp = LocalMCPClient(
+        inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+        bindings=_bindings_with_step8_overrides(overrides),
+    )
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=mcp,
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+
+    openfold_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name == "NvidiaNIM_openfold3"
+    ]
+    assert openfold_calls
+    assert len(openfold_calls) == 2
+    assert all((tc.tool_input_summary or {}).get("routing_decision") == "contract_unresolved" for tc in openfold_calls)
+    assert all(tc.run_status == "skipped" for tc in openfold_calls)
+    assert any(
+        "openfold3_msa_required" in ((tc.tool_input_summary or {}).get("complex_prediction_plan", {}) or {}).get("missing_prediction_inputs", [])
+        for tc in openfold_calls
+        if (tc.tool_input_summary or {}).get("routing_decision") != "duplicate_complex_prediction_mapping"
+    )
+    assert results.structure_modeling_status in {"partial", "ok"}
+
+    nim_capture_counts = {
+        tool: len([name for name, _ in captured if name == tool])
+        for tool in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
+    }
+    assert nim_capture_counts["NvidiaNIM_alphafold2_multimer"] == 1
+    assert nim_capture_counts["NvidiaNIM_boltz2"] == 1
+    assert nim_capture_counts["NvidiaNIM_openfold3"] == 0
+
+    missing = [item for cr in results.candidate_structure_results for item in cr.missing_prediction_inputs]
+    assert "openfold3_msa_required" in missing
+
+    audit_blob = json.dumps(
+        [tc.tool_input_summary for tc in results.tool_call_records if tc.tool_name == "NvidiaNIM_openfold3"]
+    )
+    assert "OpenFold3 requires MSA" in audit_blob
 
 
 def test_step8_nim_plan_dedupes_duplicate_sequence_refs_and_filters_uniprot_like_identifiers(
@@ -1612,6 +1702,79 @@ def test_step8_nim_plan_dedupes_duplicate_sequence_refs_and_filters_uniprot_like
     assert "MKTAYIAKQNNVG" not in artifact_blob
 
 
+def test_step8_openfold3_plan_requires_msa_artifact_before_ready():
+    sin = {
+        "input_case": "sequence_only_input",
+        "sequence_refs_for_prediction": [
+            {
+                "sequence_id": "antigen_seq",
+                "chain_role": "antigen",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+                "sequence_storage_ref": None,
+            },
+            {
+                "sequence_id": "heavy_seq",
+                "chain_role": "antibody_heavy",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+            },
+            {
+                "sequence_id": "light_seq",
+                "chain_role": "antibody_light",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+            },
+        ],
+    }
+
+    plan = structure_and_design_module._plan_step8_nim_complex_prediction(
+        "NvidiaNIM_openfold3", sin, [sin]
+    )
+    assert plan.input_status == "contract_unresolved"
+    assert plan.missing_prediction_inputs == ["openfold3_msa_required"]
+    assert "OpenFold3 requires MSA for protein molecules; no MSA artifact is available" in plan.contract_notes
+
+
+def test_step8_openfold3_plan_ready_when_msa_artifact_ref_is_present():
+    sin = {
+        "input_case": "sequence_only_input",
+        "sequence_refs_for_prediction": [
+            {
+                "sequence_id": "antigen_seq",
+                "chain_role": "antigen",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+                "msa_ref": "s3://bucket/antigen.msa",
+            },
+            {
+                "sequence_id": "heavy_seq",
+                "chain_role": "antibody_heavy",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+                "msa_storage_ref": "runs/x/msa/heavy.a3m",
+            },
+            {
+                "sequence_id": "light_seq",
+                "chain_role": "antibody_light",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+                "msa": {"artifact_ref": "s3://bucket/light.msa"},
+            },
+        ],
+    }
+
+    plan = structure_and_design_module._plan_step8_nim_complex_prediction(
+        "NvidiaNIM_openfold3", sin, [sin]
+    )
+    assert plan.input_status == "ready"
+    assert "openfold3_msa_required" not in plan.missing_prediction_inputs
 def test_step8_produces_confidence_records_and_keeps_raw_at_ref(
     local_storage, registry_service, workflow_state_service
 ):
@@ -1932,14 +2095,15 @@ def test_step8_sequence_only_records_nim_prediction_route_as_unavailable(
     ]
     assert nim_calls
     assert all(tc.run_status == "skipped" for tc in nim_calls)
-    assert all(tc.tool_input_summary.get("routing_decision") == "input_missing" for tc in nim_calls)
+    assert all((tc.tool_input_summary or {}).get("routing_decision") in {"input_missing", "contract_unresolved"} for tc in nim_calls)
     assert all("complex_prediction_plan" in tc.tool_input_summary for tc in nim_calls)
     plans = [
         plan for cr in results.candidate_structure_results
         for plan in cr.complex_prediction_plans
     ]
     assert plans
-    assert all(plan.input_status == "input_missing" for plan in plans)
+    assert any(plan.input_status == "input_missing" for plan in plans)
+    assert any(plan.input_status in {"input_missing", "contract_unresolved"} for plan in plans)
     assert any("antibody_heavy_sequence" in plan.missing_prediction_inputs for plan in plans)
     assert any("antibody_light_sequence" in plan.missing_prediction_inputs for plan in plans)
 
@@ -2149,7 +2313,7 @@ def test_step8_antibody_heavy_light_without_antigen_records_input_missing_antige
     ]
     assert nim_calls
     assert all(tc.run_status == "skipped" for tc in nim_calls)
-    assert all(tc.tool_input_summary.get("routing_decision") == "input_missing" for tc in nim_calls)
+    assert all((tc.tool_input_summary or {}).get("routing_decision") in {"input_missing", "contract_unresolved"} for tc in nim_calls)
     audit_blob = json.dumps([tc.tool_input_summary or {} for tc in nim_calls])
     assert heavy_seq not in audit_blob
     assert light_seq not in audit_blob
@@ -2382,9 +2546,33 @@ def test_step8_nim_success_persists_compact_input_not_raw_sequences(
         tc for tc in results.tool_call_records
         if tc.tool_name in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
     ]
-    assert nim_calls
-    assert any(tc.run_status == "success" for tc in nim_calls)
-    for tc in nim_calls:
+    alphafold_calls = [tc for tc in nim_calls if tc.tool_name == "NvidiaNIM_alphafold2_multimer"]
+    boltz_calls = [tc for tc in nim_calls if tc.tool_name == "NvidiaNIM_boltz2"]
+    openfold_calls = [tc for tc in nim_calls if tc.tool_name == "NvidiaNIM_openfold3"]
+    assert alphafold_calls
+    assert boltz_calls
+    assert openfold_calls
+    assert all(
+        tc.run_status in {"pending", "success", "skipped"}
+        for tc in alphafold_calls
+    )
+    assert all(
+        tc.run_status in {"pending", "success", "skipped"}
+        for tc in boltz_calls
+    )
+    assert any(tc.run_status in {"pending", "success"} for tc in alphafold_calls)
+    assert any(tc.run_status in {"pending", "success"} for tc in boltz_calls)
+    assert all(tc.run_status == "skipped" for tc in openfold_calls)
+    assert all(
+        tc.tool_input_summary.get("routing_decision") == "contract_unresolved"
+        for tc in openfold_calls
+    )
+    assert all(
+        "openfold3_msa_required" in ((tc.tool_input_summary or {}).get("complex_prediction_plan", {}) or {}).get("missing_prediction_inputs", [])
+        for tc in openfold_calls
+    )
+
+    for tc in [*alphafold_calls, *boltz_calls]:
         if not tc.tool_output_ref:
             continue
         payload = local_storage.read_json(tc.tool_output_ref)

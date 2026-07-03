@@ -41,6 +41,7 @@ from __future__ import annotations
 import os
 import signal
 import socket
+import hashlib
 import threading
 import time
 from contextlib import contextmanager
@@ -105,6 +106,84 @@ def _compact_error(message: str | None, *, limit: int = 200) -> str:
     """One-line, length-capped error string (never a raw payload/sequence)."""
     text = " ".join((message or "").split())
     return text[:limit]
+
+
+_BIO_SEQUENCE_CHARS = set("ACDEFGHIKLMNPQRSTVWYBZXUO*")
+
+
+def _looks_like_amino_acid_sequence(value: str) -> bool:
+    """Best-effort heuristic for raw AA sequences.
+
+    Used only for envelope redaction of persisted arguments, not for runtime
+    execution.
+    """
+    cleaned = "".join(ch for ch in value.upper() if ch.isalpha())
+    if len(cleaned) < 12:
+        return False
+    if len(cleaned) > 40_000:
+        return True
+    return (len(cleaned) / max(1, len(value)) >= 0.70 and set(cleaned) <= _BIO_SEQUENCE_CHARS)
+
+
+def _looks_like_raw_structural_payload(value: str) -> bool:
+    lowered = value.lower()
+    if "header" in lowered or "atom" in lowered or "hetatm" in lowered or "data_" in lowered or "loop_" in lowered:
+        return True
+    if ">" in value and ("\n" in value or "\\n" in value):
+        return True
+    return False
+
+
+def _safely_redact_argument_string(value: str, *, key: str | None = None) -> str | dict[str, Any]:
+    keep_short_literals = {
+        "operation",
+        "pdb_id",
+        "output_format",
+        "tool",
+        "tool_name",
+        "agent",
+        "task",
+    }
+    if key and key.lower() in keep_short_literals and len(value) <= 200:
+        return value
+    lowered_key = (key or "").lower()
+    if any(secret in lowered_key for secret in ("key", "token", "secret", "password", "api")):
+        return {
+            "redacted": True,
+            "length": len(value),
+            "reason": "sensitive credential-like key",
+        }
+    if _looks_like_raw_structural_payload(value) or _looks_like_amino_acid_sequence(value) or len(value) > 120:
+        sha = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+        return {
+            "redacted": True,
+            "length": len(value),
+            "sha256_prefix": sha,
+            "reason": "argument value omitted for compact audit",
+        }
+    return value
+
+
+def _compact_argument_value(value: Any, *, key: str | None = None) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _safely_redact_argument_string(value, key=key)
+    if isinstance(value, list):
+        return [_compact_argument_value(v) for v in value]
+    if isinstance(value, tuple):
+        return [_compact_argument_value(v) for v in value]
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for child_key, child_value in value.items():
+            if child_key == "arguments" and isinstance(child_value, dict):
+                out[child_key] = _compact_argument_value(child_value)
+            else:
+                out[child_key] = _compact_argument_value(
+                    child_value, key=str(child_key)
+                )
+        return out
+    return value
 
 
 def _sleep_backoff(attempt: int) -> None:
@@ -397,10 +476,11 @@ def call_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> dict[s
     `tool_output_ref` rather than embed it into normalized artifacts.
     """
     args = dict(arguments or {})
+    redacted_args = _compact_argument_value(args)
     envelope_base = {
         "source": tool_name,
         "executor": "tooluniverse",
-        "arguments": args,
+        "arguments": redacted_args,
     }
     try:
         universe = _get_universe()

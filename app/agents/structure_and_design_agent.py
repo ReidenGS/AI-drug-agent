@@ -2396,6 +2396,33 @@ def _plan_step8_nim_complex_prediction(
             ],
         )
 
+    compact_inputs = _dedupe_step8_prediction_sequence_inputs(
+        _compact_prediction_sequence_inputs_for_ids(
+            sequence_lookup,
+            [*antigen_ids, *heavy_ids, *light_ids],
+            fallback=deduped_inputs,
+        )
+    )
+
+    if tool_name == "NvidiaNIM_openfold3":
+        missing_msa = _missing_openfold3_msa_requirements(compact_inputs)
+        if missing_msa:
+            return ComplexPredictionPlan(
+                tool_name=tool_name,
+                input_status="contract_unresolved",
+                runtime_status="not_checked",
+                can_invoke=False,
+                missing_prediction_inputs=list(
+                    dict.fromkeys(["openfold3_msa_required", *missing])
+                ),
+                sequence_inputs=compact_inputs,
+                structure_inputs=_compact_prediction_structure_inputs(sin),
+                contract_notes=[
+                    "OpenFold3 requires MSA for protein molecules; no MSA artifact is available",
+                    f"openfold3_msa_missing_for={','.join(sorted(missing_msa))}",
+                ],
+            )
+
     if missing:
         return ComplexPredictionPlan(
             tool_name=tool_name,
@@ -2403,13 +2430,7 @@ def _plan_step8_nim_complex_prediction(
             runtime_status="not_checked",
             can_invoke=False,
             missing_prediction_inputs=missing,
-            sequence_inputs=_dedupe_step8_prediction_sequence_inputs(
-                _compact_prediction_sequence_inputs_for_ids(
-                    sequence_lookup,
-                    [*antigen_ids, *heavy_ids, *light_ids],
-                    fallback=deduped_inputs,
-                )
-            ),
+            sequence_inputs=compact_inputs,
             structure_inputs=_compact_prediction_structure_inputs(sin),
             contract_notes=["missing antigen-antibody pair sequence input for complex prediction"],
         )
@@ -2419,19 +2440,59 @@ def _plan_step8_nim_complex_prediction(
         input_status="ready",
         runtime_status="not_checked",
         can_invoke=False,
-        sequence_inputs=_dedupe_step8_prediction_sequence_inputs(
-            _compact_prediction_sequence_inputs_for_ids(
-                sequence_lookup,
-                [*antigen_ids, *heavy_ids, *light_ids],
-                fallback=deduped_inputs,
-            )
-        ),
+        sequence_inputs=compact_inputs,
         structure_inputs=_compact_prediction_structure_inputs(sin),
         contract_notes=[
             "antigen and antibody raw/fasta-resolvable sequence refs are available",
             "NvidiaNIM ToolUniverse wrapper can be attempted; upstream credentials/runtime may still be unavailable",
         ],
     )
+
+
+def _has_openfold3_msa(item: dict[str, Any]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    for key in (
+        "msa_ref",
+        "msa_source_ref",
+        "msa_storage_ref",
+        "msa_path",
+        "msa_url",
+        "msa_artifact_ref",
+        "msa_file_ref",
+        "msa_content_ref",
+    ):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+
+    msa = item.get("msa")
+    if isinstance(msa, dict):
+        if isinstance(msa.get("artifact_ref"), str) and msa.get("artifact_ref"):
+            return True
+        if isinstance(msa.get("storage_ref"), str) and msa.get("storage_ref"):
+            return True
+        if isinstance(msa.get("path"), str) and msa.get("path"):
+            return True
+        if isinstance(msa.get("source_ref"), str) and msa.get("source_ref"):
+            return True
+
+    return False
+
+
+def _missing_openfold3_msa_requirements(sequence_inputs: list[dict[str, Any]]) -> list[str]:
+    if not sequence_inputs:
+        return []
+    missing: list[str] = []
+    for item in sequence_inputs:
+        if not isinstance(item, dict):
+            continue
+        chain_role = item.get("chain_role")
+        if chain_role not in {"antigen", "antibody_heavy", "antibody_light"}:
+            continue
+        if not _has_openfold3_msa(item):
+            missing.append(str(chain_role))
+    return sorted(set(missing))
 
 
 def _dedupe_step8_prediction_sequence_inputs(
@@ -2694,6 +2755,26 @@ def _compact_prediction_sequence_inputs(sin: dict) -> list[dict[str, Any]]:
             "sha256_prefix": seq.get("sha256_prefix"),
             "resource_binding_status": seq.get("resource_binding_status"),
         }
+        for key in (
+            "msa_ref",
+            "msa_source_ref",
+            "msa_storage_ref",
+            "msa_path",
+            "msa_url",
+            "msa_artifact_ref",
+            "msa_file_ref",
+            "msa_content_ref",
+        ):
+            if key in seq and seq.get(key):
+                item[key] = seq.get(key)
+
+        msa = seq.get("msa")
+        if isinstance(msa, dict):
+            for key in ("artifact_ref", "storage_ref", "path", "source_ref"):
+                msa_value = msa.get(key)
+                if msa_value:
+                    item[f"msa_{key}"] = msa_value
+            # Do not persist raw MSA sequences/an alignment payloads.
         storage_ref = seq.get("sequence_storage_ref")
         if storage_ref:
             item["sequence_storage_ref"] = _short(str(storage_ref))

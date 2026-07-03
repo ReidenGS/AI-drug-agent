@@ -37,6 +37,82 @@ def test_adapter_success_payload(install_universe):
     assert out["payload"] == {"results": [{"id": "1"}]}
 
 
+def test_adapter_redacts_long_sequence_argument_in_envelope(install_universe):
+    install_universe(
+        tools={
+            "EuropePMC_search_articles": lambda args: {"results": [{"id": "1"}]}
+        }
+    )
+    seq = "M" * 250
+    out = tooluniverse_adapter.call_tool(
+        "EuropePMC_search_articles", {"query": "x", "sequence": seq, "operation": "search"}
+    )
+    assert out["status"] == "ok"
+    seq_arg = out["arguments"]["sequence"]
+    assert isinstance(seq_arg, dict)
+    assert seq_arg.get("redacted") is True
+    assert seq_arg["length"] == len(seq)
+    assert "operation" in out["arguments"]
+    assert out["arguments"]["operation"] == "search"
+    fake = tooluniverse_adapter._get_universe()
+    calls = fake.calls if hasattr(fake, "calls") else []
+    assert calls and calls[0]["arguments"]["sequence"] == seq
+
+
+def test_adapter_redacts_raw_pdb_like_argument_in_envelope(install_universe):
+    install_universe(
+        tools={"EuropePMC_search_articles": lambda args: {"results": [{"id": "1"}]}}
+    )
+    raw = "HEADER    TEST\nATOM      1  N   ASN A   1"
+    out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": raw})
+    arg = out["arguments"]["query"]
+    assert isinstance(arg, dict)
+    assert arg["redacted"] is True
+    fake = tooluniverse_adapter._get_universe()
+    assert fake.calls[0]["arguments"]["query"] == raw
+
+
+def test_adapter_redacts_nested_openfold_style_sequence_input(install_universe):
+    install_universe(
+        tools={
+            "NvidiaNIM_openfold3": lambda args: {"status": "ok", "model_ref": "ok"}
+        }
+    )
+    protein_seq = "G" * 300
+    args = {
+        "inputs": [
+            {
+                "input_id": "adc_antigen_antibody_complex",
+                "molecules": [
+                    {"type": "protein", "sequence": protein_seq, "msa": {"main": {"a3m": {"alignment": ">query\nAAA"}}}},
+                    {"type": "protein", "sequence": "ABCDE"},
+                ],
+                "output_format": "pdb",
+            }
+        ],
+        "operation": "predict",
+    }
+    out = tooluniverse_adapter.call_tool("NvidiaNIM_openfold3", args)
+    assert out["status"] == "ok"
+    redacted_sequence = out["arguments"]["inputs"][0]["molecules"][0]["sequence"]
+    assert isinstance(redacted_sequence, dict)
+    assert redacted_sequence.get("redacted") is True
+    assert redacted_sequence["length"] == len(protein_seq)
+    fake = tooluniverse_adapter._get_universe()
+    calls = fake.calls if hasattr(fake, "calls") else []
+    assert calls
+    assert calls[0]["arguments"]["inputs"][0]["molecules"][0]["sequence"] == protein_seq
+
+
+def test_adapter_keeps_short_scalar_values_in_argument_envelope(install_universe):
+    install_universe(
+        tools={"EuropePMC_search_articles": lambda args: {"results": [{"id": "1"}]}}
+    )
+    out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x", "pdb_id": "1N8Z"})
+    assert out["arguments"]["query"] == "x"
+    assert out["arguments"]["pdb_id"] == "1N8Z"
+
+
 def test_adapter_empty_list_payload(install_universe):
     install_universe(tools={"EuropePMC_search_articles": lambda args: {"results": []}})
     out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
