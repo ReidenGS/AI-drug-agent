@@ -2623,15 +2623,21 @@ def _nim_kwargs(tool_name: str, resolved: list[dict[str, Any]]) -> dict[str, Any
     if tool_name == "NvidiaNIM_openfold3":
         return {
             "inputs": [
-                {"id": item.get("chain_role") or item["sequence_id"], "sequence": item["sequence"]}
-                for item in resolved
+                {
+                    "input_id": "adc_antigen_antibody_complex",
+                    "molecules": [
+                        {"type": "protein", "sequence": item["sequence"]}
+                        for item in resolved
+                    ],
+                    "output_format": "pdb",
+                }
             ]
         }
     if tool_name == "NvidiaNIM_boltz2":
         return {
             "polymers": [
                 {
-                    "id": item.get("chain_role") or item["sequence_id"],
+                    "id": _nim_chain_id(item.get("chain_role"), item["sequence_id"]),
                     "molecule_type": "protein",
                     "sequence": item["sequence"],
                 }
@@ -2640,6 +2646,18 @@ def _nim_kwargs(tool_name: str, resolved: list[dict[str, Any]]) -> dict[str, Any
             "output_format": "mmcif",
         }
     return {}
+
+
+def _nim_chain_id(chain_role: Any, sequence_id: str) -> str:
+    mapping = {
+        "antigen": "A",
+        "antibody_heavy": "H",
+        "antibody_light": "L",
+    }
+    if isinstance(chain_role, str) and chain_role in mapping:
+        return mapping[chain_role]
+    digest = hashlib.sha256(str(sequence_id).encode("utf-8")).hexdigest()
+    return chr(ord("B") + (int(digest[:2], 16) % 24))
 
 
 def _nim_argument_schema_name(tool_name: str) -> str:

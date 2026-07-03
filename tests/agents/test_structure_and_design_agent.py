@@ -2216,11 +2216,18 @@ def test_step8_nim_runtime_resolves_inline_sequence_from_step5_material_lookup(
             assert light_seq in kwargs["sequences"]
             assert "MKTAYIAKQNNVG" in kwargs["sequences"]
         if "inputs" in kwargs:
-            flat = "".join(item.get("sequence", "") for item in kwargs["inputs"])
+            assert len(kwargs["inputs"]) == 1
+            assert kwargs["inputs"][0]["input_id"] == "adc_antigen_antibody_complex"
+            assert kwargs["inputs"][0]["output_format"] == "pdb"
+            molecules = kwargs["inputs"][0]["molecules"]
+            assert all(item["type"] == "protein" for item in molecules)
+            flat = "".join(item.get("sequence", "") for item in molecules)
             assert heavy_seq in flat
             assert light_seq in flat
             assert "MKTAYIAKQNNVG" in flat
         if "polymers" in kwargs:
+            assert [item["id"] for item in kwargs["polymers"]] == ["A", "H", "L"]
+            assert all(item["molecule_type"] == "protein" for item in kwargs["polymers"])
             flat = "".join(item.get("sequence", "") for item in kwargs["polymers"])
             assert heavy_seq in flat
             assert light_seq in flat
@@ -2278,6 +2285,41 @@ def test_step8_nim_contract_treats_fasta_refs_as_runtime_ready():
     audit_blob = json.dumps(plan.model_dump())
     assert ">antigen" not in audit_blob
     assert "MKTAYIAK" not in audit_blob
+
+
+def test_step8_nim_runtime_kwargs_match_tooluniverse_official_schema():
+    resolved = [
+        {"sequence_id": "antigen_seq", "chain_role": "antigen", "sequence": "MKTAYIAKQNNVG"},
+        {"sequence_id": "heavy_seq", "chain_role": "antibody_heavy", "sequence": "EVQLVESGGGLVQPGG"},
+        {"sequence_id": "light_seq", "chain_role": "antibody_light", "sequence": "DIQMTQSPSSLSASVG"},
+    ]
+
+    alphafold = structure_and_design_module._nim_kwargs(
+        "NvidiaNIM_alphafold2_multimer", resolved
+    )
+    assert alphafold == {
+        "sequences": ["MKTAYIAKQNNVG", "EVQLVESGGGLVQPGG", "DIQMTQSPSSLSASVG"]
+    }
+
+    openfold = structure_and_design_module._nim_kwargs("NvidiaNIM_openfold3", resolved)
+    assert set(openfold) == {"inputs"}
+    assert len(openfold["inputs"]) == 1
+    assert openfold["inputs"][0]["input_id"] == "adc_antigen_antibody_complex"
+    assert openfold["inputs"][0]["output_format"] == "pdb"
+    assert openfold["inputs"][0]["molecules"] == [
+        {"type": "protein", "sequence": "MKTAYIAKQNNVG"},
+        {"type": "protein", "sequence": "EVQLVESGGGLVQPGG"},
+        {"type": "protein", "sequence": "DIQMTQSPSSLSASVG"},
+    ]
+
+    boltz = structure_and_design_module._nim_kwargs("NvidiaNIM_boltz2", resolved)
+    assert set(boltz) == {"polymers", "output_format"}
+    assert boltz["output_format"] == "mmcif"
+    assert boltz["polymers"] == [
+        {"id": "A", "molecule_type": "protein", "sequence": "MKTAYIAKQNNVG"},
+        {"id": "H", "molecule_type": "protein", "sequence": "EVQLVESGGGLVQPGG"},
+        {"id": "L", "molecule_type": "protein", "sequence": "DIQMTQSPSSLSASVG"},
+    ]
 
 
 def test_step8_nim_wrappers_are_tooluniverse_bindings_or_explicit_dependency():
