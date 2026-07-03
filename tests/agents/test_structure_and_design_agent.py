@@ -1281,6 +1281,43 @@ def test_step7_uniprot_and_inline_sequence_semantics(
     assert pkg.structure_preparation_status == "ok"
 
 
+def test_step7_file_backed_target_sequence_material_is_fasta_ref_not_inline_path(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "uniprot_id", "value": "P04626", "source": "raw"}],
+    )
+    fasta_key = local_storage.run_key(run_id, "inputs/files/target_her2_p04626.fasta")
+    local_storage.write_bytes(fasta_key, b">target\nMELAAHERSEQ\n")
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    target["materials"].append({
+        "material_id": "target_fasta_material",
+        "material_type": "target_sequence",
+        "value": fasta_key,
+        "value_format": "fasta",
+    })
+    local_storage.write_json(cct_path, cct)
+
+    pkg = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=_mcp(),
+    ).run_step_7(run_id)
+
+    rec = next(r for r in pkg.prepared_structure_inputs if r.structure_role == "antigen_only")
+    ref = next(s for s in rec.sequence_refs_for_prediction if s.sequence_id == "target_fasta_material")
+    assert ref.chain_role == "antigen"
+    assert ref.sequence is None
+    assert ref.sequence_storage_ref == fasta_key
+    assert ref.prediction_input_kind == "fasta_ref"
+    assert ref.sequence_value_status == "referenced"
+    assert ref.sequence_length == len("MELAAHERSEQ")
+    blob = json.dumps(pkg.model_dump())
+    assert "MELAAHERSEQ" not in blob
+
+
 def test_step7_multiple_candidates_do_not_receive_shared_first_pair_mapping(
     local_storage, registry_service, workflow_state_service
 ):

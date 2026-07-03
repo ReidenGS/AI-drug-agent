@@ -336,6 +336,7 @@ class StructureAndDesignAgent:
             m for m in cand_sequence_mats
             if not _looks_like_file_backed_sequence(m.get("value"))
             or m.get("value") in bound_sequence_paths
+            or _sequence_from_file(self.storage, m.get("value")) is not None
         ]
 
         # Top-level uploads. For target/antibody we accept any uploaded structure
@@ -487,6 +488,30 @@ class StructureAndDesignAgent:
         for m in cand_sequence_mats:
             material_id = m.get("material_id", new_artifact_id("seq"))
             raw_sequence = m.get("value")
+            if _looks_like_file_backed_sequence(raw_sequence):
+                seq_file_length, seq_file_hash = _sequence_stats_from_file(
+                    self.storage,
+                    raw_sequence,
+                )
+                sequence_refs.append(
+                    SequenceRef(
+                        sequence_id=material_id,
+                        chain_role=_chain_role_from_material(m.get("material_type", "")),
+                        sequence=None,
+                        sequence_length=seq_file_length,
+                        sha256_prefix=seq_file_hash,
+                        source_kind="uploaded_fasta",
+                        source_ref=str(raw_sequence),
+                        prediction_needed=prediction_required,
+                        sequence_storage_ref=str(raw_sequence),
+                        sequence_value_status="referenced",
+                        prediction_input_kind="fasta_ref",
+                        related_candidate_ids=[candidate_id],
+                        resource_binding_status="explicit",
+                        binding_confidence=1.0,
+                    )
+                )
+                continue
             sequence_length, sha256_prefix = _sequence_stats(raw_sequence)
             sequence_refs.append(
                 SequenceRef(
@@ -2018,9 +2043,9 @@ def _chain_role_from_material(material_type: str) -> Optional[str]:
 
 def _chain_role_from_fasta_file(file_record: dict, candidate_type: str | None) -> str:
     name = (file_record.get("original_filename") or "").lower()
-    if any(marker in name for marker in ("light", "_l", "-l", "vl", "lc")):
+    if any(marker in name for marker in ("light", "vl", "lc")):
         return "antibody_light"
-    if any(marker in name for marker in ("heavy", "_h", "-h", "vh", "hc")):
+    if any(marker in name for marker in ("heavy", "vh", "hc")):
         return "antibody_heavy"
     if candidate_type == "target_antigen":
         return "antigen"
