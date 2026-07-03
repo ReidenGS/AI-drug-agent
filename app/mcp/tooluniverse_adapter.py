@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import os
 import signal
+import socket
 import threading
 import time
 from contextlib import contextmanager
@@ -139,15 +140,18 @@ def _bounded_live_call(timeout_seconds: float):
 
     previous_handler = signal.getsignal(signal.SIGALRM)
     previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    previous_socket_timeout = socket.getdefaulttimeout()
 
     def _raise_timeout(_signum, _frame):
         raise TimeoutError(f"ToolUniverse live call exceeded {timeout_seconds:g}s")
 
     signal.signal(signal.SIGALRM, _raise_timeout)
     signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    socket.setdefaulttimeout(timeout_seconds)
     try:
         yield
     finally:
+        socket.setdefaulttimeout(previous_socket_timeout)
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_handler)
         if previous_timer and previous_timer[0] > 0:

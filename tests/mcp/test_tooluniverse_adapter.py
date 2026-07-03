@@ -14,6 +14,7 @@ here cover the adapter contract; per-wrapper routing tests live in
 from __future__ import annotations
 
 import time
+import socket
 from typing import Any
 
 import pytest
@@ -397,3 +398,23 @@ def test_live_call_outer_timeout_surfaces_upstream_error(install_universe, monke
     assert out["final_error_type"] == "TimeoutError"
     assert "exceeded" in out["error_message"]
     assert "payload" not in out
+
+
+def test_live_call_timeout_sets_and_restores_socket_default(install_universe, monkeypatch):
+    from app.settings import get_settings
+
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "tooluniverse_live_call_timeout", 3.5)
+    monkeypatch.setattr(socket, "getdefaulttimeout", lambda: None)
+    seen: list[float | None] = []
+
+    def _capture(timeout):
+        seen.append(timeout)
+
+    monkeypatch.setattr(socket, "setdefaulttimeout", _capture)
+    install_universe(tools={"EuropePMC_search_articles": lambda args: {"results": [{"id": "ok"}]}})
+    out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
+    assert out["status"] == "ok"
+    assert seen[0] == 3.5
+    assert seen[-1] is None
