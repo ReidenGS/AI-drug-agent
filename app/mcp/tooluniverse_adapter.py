@@ -39,7 +39,10 @@ Design rules:
 from __future__ import annotations
 
 import os
+import signal
+import threading
 import time
+from contextlib import contextmanager
 from typing import Any
 
 from ..services.tool_inventory_service import ToolInventoryService
@@ -103,6 +106,52 @@ def _compact_error(message: str | None, *, limit: int = 200) -> str:
 def _sleep_backoff(attempt: int) -> None:
     # `attempt` is 1-based for the retry just completed.
     time.sleep(_RETRY_BACKOFF_BASE_SECONDS * attempt)
+
+
+def _live_call_timeout_seconds() -> float:
+    """Return the configured outer timeout for one TU live call."""
+    try:
+        from ..settings import get_settings
+
+        return float(get_settings().tooluniverse_live_call_timeout or 0)
+    except Exception:  # noqa: BLE001 — timeout lookup must not break dispatch
+        return 0.0
+
+
+@contextmanager
+def _bounded_live_call(timeout_seconds: float):
+    """Raise TimeoutError if a ToolUniverse call blocks past the outer limit.
+
+    ToolUniverse wraps many upstream clients. Some of those clients use
+    `requests` without a timeout, so our normal retry loop never sees an
+    exception. On the main thread, a short SIGALRM guard turns that socket
+    hang into a normal transient `TimeoutError`. Off the main thread, signal
+    alarms are unavailable, so we degrade to no outer timeout rather than
+    changing thread semantics.
+    """
+    if (
+        timeout_seconds <= 0
+        or threading.current_thread() is not threading.main_thread()
+        or not hasattr(signal, "setitimer")
+    ):
+        yield
+        return
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+
+    def _raise_timeout(_signum, _frame):
+        raise TimeoutError(f"ToolUniverse live call exceeded {timeout_seconds:g}s")
+
+    signal.signal(signal.SIGALRM, _raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer and previous_timer[0] > 0:
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
 
 
 # ── env hydration ──────────────────────────────────────────────────────────
@@ -347,11 +396,12 @@ def call_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> dict[s
 
     while True:
         try:
-            raw = universe.run_one_function(
-                {"name": tool_name, "arguments": args},
-                validate=True,
-                use_cache=False,
-            )
+            with _bounded_live_call(_live_call_timeout_seconds()):
+                raw = universe.run_one_function(
+                    {"name": tool_name, "arguments": args},
+                    validate=True,
+                    use_cache=False,
+                )
             error_message: str | None = None
             error_type: str | None = None
             error_details: Any = None

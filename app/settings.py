@@ -89,6 +89,11 @@ class Settings(BaseSettings):
     # ToolUniverse adapter). Migrated wrappers ignore this — TU owns its
     # own timeout policy.
     mcp_live_http_timeout: float = 15.0
+    # Outer wall-clock timeout for one ToolUniverse-backed live tool call.
+    # This protects the pipeline from TU tools that use requests without a
+    # per-request timeout. Long-running tools such as NvidiaNIM can override
+    # via TOOLUNIVERSE_LIVE_CALL_TIMEOUT in the environment.
+    tooluniverse_live_call_timeout: float = 60.0
 
     def live_tool_allowlist_set(self) -> frozenset[str]:
         raw = self.mcp_live_tool_allowlist or ""

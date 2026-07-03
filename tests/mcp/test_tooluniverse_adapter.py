@@ -13,6 +13,7 @@ here cover the adapter contract; per-wrapper routing tests live in
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pytest
@@ -375,3 +376,24 @@ def test_success_first_try_reports_zero_retries(install_universe):
     assert out["retry_count"] == 0
     assert out["retryable"] is False
     assert "recovered_after_transient_error" not in out
+
+
+def test_live_call_outer_timeout_surfaces_upstream_error(install_universe, monkeypatch):
+    from app.settings import get_settings
+
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "tooluniverse_live_call_timeout", 0.01)
+
+    def _hang(_args):
+        time.sleep(2)
+        return {"results": [{"id": "late"}]}
+
+    install_universe(tools={"EuropePMC_search_articles": _hang})
+    out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
+    assert out["status"] == "upstream_error"
+    assert out["retry_count"] == tooluniverse_adapter._MAX_LIVE_RETRIES
+    assert out["retryable"] is True
+    assert out["final_error_type"] == "TimeoutError"
+    assert "exceeded" in out["error_message"]
+    assert "payload" not in out
