@@ -18,6 +18,7 @@ import socket
 from typing import Any
 
 import pytest
+import requests
 
 from app.mcp import tooluniverse_adapter
 from app.mcp.tools.alphafold import alphafold_get_prediction
@@ -413,8 +414,140 @@ def test_live_call_timeout_sets_and_restores_socket_default(install_universe, mo
         seen.append(timeout)
 
     monkeypatch.setattr(socket, "setdefaulttimeout", _capture)
-    install_universe(tools={"EuropePMC_search_articles": lambda args: {"results": [{"id": "ok"}]}})
+    install_universe(
+        tools={"EuropePMC_search_articles": lambda args: {"results": [{"id": "ok"}]}}
+    )
     out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
     assert out["status"] == "ok"
     assert seen[0] == 3.5
     assert seen[-1] is None
+
+
+def test_live_call_uses_tooluniverse_timeout_for_non_nvidia_tool(install_universe, monkeypatch):
+    from app.settings import get_settings
+
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "tooluniverse_live_call_timeout", 2.25)
+    monkeypatch.setattr(settings, "nvidia_nim_live_call_timeout", 999.0)
+    seen: list[float | None] = []
+
+    def _capture(timeout):
+        seen.append(timeout)
+
+    monkeypatch.setattr(socket, "setdefaulttimeout", _capture)
+    install_universe(
+        tools={"EuropePMC_search_articles": lambda args: {"results": [{"id": "ok"}]}}
+    )
+    out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
+    assert out["status"] == "ok"
+    assert seen[0] == 2.25
+    assert seen[-1] is None
+
+
+def test_live_call_uses_nvidia_timeout_for_nvidia_tool(install_universe, monkeypatch):
+    from app.settings import get_settings
+
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "tooluniverse_live_call_timeout", 2.25)
+    monkeypatch.setattr(settings, "nvidia_nim_live_call_timeout", 33.0)
+    seen: list[float | None] = []
+
+    def _capture(timeout):
+        seen.append(timeout)
+
+    monkeypatch.setattr(socket, "setdefaulttimeout", _capture)
+    install_universe(
+        tools={"NvidiaNIM_alphafold2_multimer": lambda args: {"predictions": []}}
+    )
+    out = tooluniverse_adapter.call_tool("NvidiaNIM_alphafold2_multimer", {"antigen_fasta": "x"})
+    assert out["status"] == "ok"
+    assert seen[0] == 33.0
+    assert seen[-1] is None
+
+
+def test_live_call_injects_requests_timeout_when_missing(install_universe, monkeypatch):
+    captured: dict[str, Any] = {}
+    timeout_during_bound_call: list[float | None] = []
+
+    def _fake_request(self, method, url, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        timeout_during_bound_call.append(kwargs.get("timeout"))
+        return type("Resp", (), {"json": lambda self: {"status": "ok"}})()
+
+    monkeypatch.setattr(requests.sessions.Session, "request", _fake_request)
+
+    class _RequestTool:
+        def __call__(self, args):
+            session = requests.Session()
+            session.request("GET", "https://example.org/ping")
+            return {"ok": True}
+
+    install_universe(tools={"EuropePMC_search_articles": _RequestTool()})
+    tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
+    assert captured["timeout"] == 60.0
+    assert timeout_during_bound_call == [60.0]
+
+
+def test_live_call_respects_explicit_requests_timeout(install_universe, monkeypatch):
+    captured: dict[str, Any] = {}
+    timeout_during_bound_call: list[float | None] = []
+
+    def _fake_request(self, method, url, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        timeout_during_bound_call.append(kwargs.get("timeout"))
+        return type("Resp", (), {"json": lambda self: {"status": "ok"}})()
+
+    monkeypatch.setattr(requests.sessions.Session, "request", _fake_request)
+
+    class _RequestTool:
+        def __call__(self, args):
+            session = requests.Session()
+            session.request("GET", "https://example.org/ping", timeout=7.25)
+            return {"ok": True}
+
+    install_universe(tools={"EuropePMC_search_articles": _RequestTool()})
+    tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
+    assert captured["timeout"] == 7.25
+    assert timeout_during_bound_call == [7.25]
+
+
+def test_live_call_restores_session_request_after_timeout_context(install_universe, monkeypatch):
+    captured_request_methods: list[Any] = []
+
+    def _fake_request(self, method, url, **kwargs):
+        captured_request_methods.append(requests.sessions.Session.request)
+        return type("Resp", (), {"json": lambda self: {"status": "ok"}})()
+
+    class _RequestTool:
+        def __call__(self, args):
+            session = requests.Session()
+            session.request("GET", "https://example.org/ping")
+            return {"ok": True}
+
+    monkeypatch.setattr(requests.sessions.Session, "request", _fake_request)
+    entry_request = requests.sessions.Session.request
+    install_universe(tools={"EuropePMC_search_articles": _RequestTool()})
+    tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
+    assert captured_request_methods and captured_request_methods[0] is not entry_request
+    assert requests.sessions.Session.request is entry_request
+
+
+def test_nvidia_tool_timeout_still_surfaces_upstream_error_on_retries(install_universe, monkeypatch):
+    from app.settings import get_settings
+
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "nvidia_nim_live_call_timeout", 0.01)
+
+    def _hang(_args):
+        time.sleep(0.1)
+        return {"predictions": ["late"]}
+
+    install_universe(tools={"NvidiaNIM_alphafold2_multimer": _hang})
+    out = tooluniverse_adapter.call_tool("NvidiaNIM_alphafold2_multimer", {"antigen": "x"})
+    assert out["status"] == "upstream_error"
+    assert out["retry_count"] == tooluniverse_adapter._MAX_LIVE_RETRIES
+    assert out["retryable"] is True
+    assert out["final_error_type"] == "TimeoutError"

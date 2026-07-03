@@ -94,6 +94,10 @@ class Settings(BaseSettings):
     # per-request timeout. Long-running tools such as NvidiaNIM can override
     # via TOOLUNIVERSE_LIVE_CALL_TIMEOUT in the environment.
     tooluniverse_live_call_timeout: float = 60.0
+    # Separate outer timeout for ToolUniverse-backed NvidiaNIM live tools.
+    # Use this for Step 8 complex prediction calls that can exceed the
+    # normal ToolUniverse timeout budget.
+    nvidia_nim_live_call_timeout: float = 1800.0
 
     def live_tool_allowlist_set(self) -> frozenset[str]:
         raw = self.mcp_live_tool_allowlist or ""

@@ -45,6 +45,9 @@ import threading
 import time
 from contextlib import contextmanager
 from typing import Any
+from typing import Callable
+
+import requests
 
 from ..services.tool_inventory_service import ToolInventoryService
 
@@ -109,14 +112,33 @@ def _sleep_backoff(attempt: int) -> None:
     time.sleep(_RETRY_BACKOFF_BASE_SECONDS * attempt)
 
 
-def _live_call_timeout_seconds() -> float:
+def _live_call_timeout_seconds(tool_name: str | None = None) -> float:
     """Return the configured outer timeout for one TU live call."""
     try:
         from ..settings import get_settings
 
-        return float(get_settings().tooluniverse_live_call_timeout or 0)
+        settings = get_settings()
+        if str(tool_name or "").startswith("NvidiaNIM_"):
+            return float(settings.nvidia_nim_live_call_timeout or 0)
+        return float(settings.tooluniverse_live_call_timeout or 0)
     except Exception:  # noqa: BLE001 — timeout lookup must not break dispatch
         return 0.0
+
+
+def _inject_session_request_timeout(
+    timeout_seconds: float,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Patch `Session.request` to inject a default timeout if caller omitted one."""
+
+    def _patch_request(original: Callable[..., Any]) -> Callable[..., Any]:
+        def _wrapped(session: Any, method: str, url: str, *args: Any, **kwargs: Any) -> Any:
+            if "timeout" not in kwargs:
+                kwargs["timeout"] = timeout_seconds
+            return original(session, method, url, *args, **kwargs)
+
+        return _wrapped
+
+    return _patch_request
 
 
 @contextmanager
@@ -141,6 +163,7 @@ def _bounded_live_call(timeout_seconds: float):
     previous_handler = signal.getsignal(signal.SIGALRM)
     previous_timer = signal.getitimer(signal.ITIMER_REAL)
     previous_socket_timeout = socket.getdefaulttimeout()
+    previous_request = requests.sessions.Session.request
 
     def _raise_timeout(_signum, _frame):
         raise TimeoutError(f"ToolUniverse live call exceeded {timeout_seconds:g}s")
@@ -148,9 +171,13 @@ def _bounded_live_call(timeout_seconds: float):
     signal.signal(signal.SIGALRM, _raise_timeout)
     signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
     socket.setdefaulttimeout(timeout_seconds)
+    requests.sessions.Session.request = _inject_session_request_timeout(timeout_seconds)(
+        previous_request
+    )
     try:
         yield
     finally:
+        requests.sessions.Session.request = previous_request
         socket.setdefaulttimeout(previous_socket_timeout)
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_handler)
@@ -400,7 +427,7 @@ def call_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> dict[s
 
     while True:
         try:
-            with _bounded_live_call(_live_call_timeout_seconds()):
+            with _bounded_live_call(_live_call_timeout_seconds(tool_name)):
                 raw = universe.run_one_function(
                     {"name": tool_name, "arguments": args},
                     validate=True,
