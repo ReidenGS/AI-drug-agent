@@ -26,6 +26,65 @@ from app.mcp.tools.developability_compounds import DrugProps_calculate_qed
 from app.mcp.tools.evidence import EuropePMC_search_articles
 
 
+# ── include_tools resolution (sanctioned extras must be loadable) ──────────
+
+def test_include_tool_names_contain_sanctioned_extras():
+    """`include_tools` must union the git-tracked sanctioned extras so a live
+    call to NvidiaNIM_msa_search does not report 'not found even after loading
+    tools'."""
+    from app.mcp.scope_filter import ARCHITECTURE_SANCTIONED_EXTRA_TOOLS
+
+    tooluniverse_adapter._reset_for_tests()
+    include = tooluniverse_adapter._resolve_include_tool_names()
+    extras: set[str] = set()
+    for tools in ARCHITECTURE_SANCTIONED_EXTRA_TOOLS.values():
+        extras |= set(tools)
+    assert "NvidiaNIM_msa_search" in include
+    assert extras <= include
+
+
+def test_include_tool_names_do_not_widen_to_full_tooluniverse():
+    """Sanctioned extras are added on top of the inventory only — not a full
+    ToolUniverse load."""
+    tooluniverse_adapter._reset_for_tests()
+    inventory = tooluniverse_adapter._resolve_inventory_names()
+    extras = tooluniverse_adapter._sanctioned_extra_tool_names()
+    include = tooluniverse_adapter._resolve_include_tool_names()
+    assert include == frozenset(inventory | extras)
+    # The extra surface stays tiny (guards against accidental full load).
+    assert len(extras) <= 5
+    assert "NvidiaNIM_msa_search" in extras
+
+
+def test_get_universe_passes_include_tools_with_msa_search(monkeypatch):
+    """`_get_universe` forwards an `include_tools` list containing the
+    sanctioned extra to `ToolUniverse.load_tools`."""
+    import sys
+    import types
+
+    captured: dict[str, Any] = {}
+
+    class _FakeTU:
+        def load_tools(self, quiet: bool = True, include_tools=None) -> None:
+            captured["include_tools"] = include_tools
+
+        def get_available_tools(self, name_only: bool = True):
+            return list(captured.get("include_tools") or [])
+
+    fake_module = types.ModuleType("tooluniverse")
+    fake_module.ToolUniverse = _FakeTU  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "tooluniverse", fake_module)
+
+    tooluniverse_adapter._reset_for_tests()
+    try:
+        tooluniverse_adapter._get_universe()
+        include = captured.get("include_tools")
+        assert include is not None
+        assert "NvidiaNIM_msa_search" in include
+    finally:
+        tooluniverse_adapter._reset_for_tests()
+
+
 # ── adapter envelope normalization ─────────────────────────────────────────
 
 def test_adapter_success_payload(install_universe):

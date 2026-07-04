@@ -2220,6 +2220,149 @@ def test_step8_openfold3_contract_unresolved_when_msa_has_no_a3m(
     assert [kw for (n, kw) in captured if n == "NvidiaNIM_alphafold2_multimer"]
 
 
+def _seq_ref(sequence_id, chain_role, value, *, source_kind, source_ref,
+             prediction_input_kind="amino_acid_sequence",
+             sequence_value_status="inline", sequence=None,
+             sequence_storage_ref=None):
+    from app.schemas.step_07_prepared_structure_input_package import SequenceRef
+
+    return SequenceRef(
+        sequence_id=sequence_id,
+        chain_role=chain_role,
+        sequence=sequence,
+        sequence_length=len(value),
+        sha256_prefix=__import__("hashlib").sha256(value.encode()).hexdigest()[:12],
+        source_kind=source_kind,
+        source_ref=source_ref,
+        sequence_value_status=sequence_value_status,
+        prediction_input_kind=prediction_input_kind,
+        sequence_storage_ref=sequence_storage_ref,
+    )
+
+
+def test_step7_msa_search_dedupes_same_antigen_by_sha_across_material_and_file(
+    local_storage, registry_service, workflow_state_service
+):
+    from app.schemas.step_07_prepared_structure_input_package import StructureInputRecord
+
+    run_id = _seed_sequence_only_antigen_antibody(
+        local_storage, registry_service, workflow_state_service
+    )
+    # Same antigen sequence bound twice: once inline material, once uploaded
+    # FASTA file with identical content (same sha256).
+    fasta_key = local_storage.run_key(run_id, "inputs", "files", "her2.fasta")
+    local_storage.write_bytes(fasta_key, f">her2\n{_MSA_ANTIGEN}\n".encode("utf-8"))
+
+    record = StructureInputRecord(
+        structure_input_id="sin_dedup",
+        candidate_id="cand_dedup",
+        input_case="sequence_only_input",
+        structure_source="material_sequence",
+        assessment_intent="complex_prediction",
+        structure_role="complex",
+        sequence_refs_for_prediction=[
+            _seq_ref("antigen_material", "antigen", _MSA_ANTIGEN,
+                     source_kind="material_sequence", source_ref="antigen_material",
+                     sequence=_MSA_ANTIGEN),
+            _seq_ref("antigen_upload", "antigen", _MSA_ANTIGEN,
+                     source_kind="uploaded_fasta", source_ref=fasta_key,
+                     prediction_input_kind="fasta_ref",
+                     sequence_value_status="referenced",
+                     sequence_storage_ref=fasta_key),
+            _seq_ref("heavy_material", "antibody_heavy", _MSA_HEAVY,
+                     source_kind="material_sequence", source_ref="heavy_material",
+                     sequence=_MSA_HEAVY),
+            _seq_ref("light_material", "antibody_light", _MSA_LIGHT,
+                     source_kind="material_sequence", source_ref="light_material",
+                     sequence=_MSA_LIGHT),
+        ],
+    )
+
+    captured: list[dict[str, Any]] = []
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp_with_bindings({"NvidiaNIM_msa_search": _msa_capture_binding(captured)}),
+    )
+    calls = agent._route_step7_msa_search(
+        run_id=run_id, record=record,
+        scoped_tools={"NvidiaNIM_msa_search"},
+        summary_base={"label": "step07:sin_dedup", "candidate_id": "cand_dedup"},
+    )
+    # Antigen searched once (dedup), heavy once, light once = 3 calls, not 4.
+    assert len(calls) == 3
+    assert len(captured) == 3
+    antigen_searches = [c for c in captured if c["sequence"] == _MSA_ANTIGEN]
+    assert len(antigen_searches) == 1
+    # Both antigen refs point at the SAME single MSA output.
+    antigen_refs = [r for r in record.sequence_refs_for_prediction if r.chain_role == "antigen"]
+    assert len(antigen_refs) == 2
+    refs_out = {r.msa_tool_output_ref for r in antigen_refs}
+    assert len(refs_out) == 1 and next(iter(refs_out))
+    assert all(r.msa_status == "available" for r in antigen_refs)
+    # Heavy and light kept separate (distinct sequences → distinct searches).
+    assert any(c["sequence"] == _MSA_HEAVY for c in captured)
+    assert any(c["sequence"] == _MSA_LIGHT for c in captured)
+
+
+def test_step7_status_is_partial_when_selected_msa_call_fails(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_only_antigen_antibody(
+        local_storage, registry_service, workflow_state_service
+    )
+
+    def _msa_error(sequence=None, **kw):
+        return {"status": "upstream_error", "error_message": "NVIDIA_API_KEY missing"}
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp_with_bindings({"NvidiaNIM_msa_search": _msa_error}),
+    )
+    pkg = agent.run_step_7(run_id)
+    # A selected MSA preparation failure must not be reported as a clean ok.
+    assert pkg.structure_preparation_status == "partial"
+    assert pkg.preparation_warnings
+    warned_tools = {w["tool_name"] for w in pkg.preparation_warnings}
+    assert warned_tools == {"NvidiaNIM_msa_search"}
+    for w in pkg.preparation_warnings:
+        assert w["run_status"] in {"failed", "upstream_error"}
+        assert w.get("chain_role") in {"antigen", "antibody_heavy", "antibody_light"}
+        # Compact reason only — never a raw sequence or a3m.
+        assert _MSA_ANTIGEN not in json.dumps(w)
+        assert ">query" not in json.dumps(w)
+
+
+def test_step7_status_stays_ok_when_only_not_applicable_skips(
+    local_storage, registry_service, workflow_state_service
+):
+    # PDB-only input: MSA search is not applicable and structure tools may be
+    # skipped; those non-fatal skips must NOT downgrade status.
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "pdb_id", "value": "1N8Z", "source": "raw_request_text"}],
+    )
+
+    def _ok(**kw):
+        return {"status": "ok", "payload": {"ok": True}}
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp_with_bindings({
+            "RCSBData_get_entry": _ok,
+            "RCSBData_get_assembly": _ok,
+            "SAbDab_get_structure": _ok,
+        }),
+    )
+    pkg = agent.run_step_7(run_id)
+    assert pkg.preparation_warnings == []
+    assert pkg.structure_preparation_status in {"ok", "partial"}
+    # No warning should ever come from a not_applicable skip.
+    assert all(w["run_status"] in {"failed", "upstream_error"} for w in pkg.preparation_warnings)
+
+
 def test_step8_produces_confidence_records_and_keeps_raw_at_ref(
     local_storage, registry_service, workflow_state_service
 ):

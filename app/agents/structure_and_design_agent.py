@@ -274,10 +274,19 @@ class StructureAndDesignAgent:
             candidates,
         )
 
+        # Selected (not not_applicable-skipped) tool calls that failed must be
+        # visible: a failed MSA/structure preparation call cannot be reported
+        # as a clean `ok`. Skips (routing_decision != "selected") stay non-fatal.
+        preparation_warnings = _step7_selected_failure_warnings(tool_call_records)
+
         prep_status: str
         if not prepared:
             prep_status = "failed"
-        elif unresolved_resource_refs or any(r.missing_metadata_flags for r in prepared):
+        elif (
+            unresolved_resource_refs
+            or any(r.missing_metadata_flags for r in prepared)
+            or preparation_warnings
+        ):
             prep_status = "partial"
         else:
             prep_status = "ok"
@@ -292,6 +301,7 @@ class StructureAndDesignAgent:
                 tc.tool_output_artifact_id for tc in tool_call_records if tc.tool_output_artifact_id
             ],
             unresolved_resource_refs=unresolved_resource_refs,
+            preparation_warnings=preparation_warnings,
         )
 
         artifact_id = new_artifact_id("prepared_structure_input_package")
@@ -1355,10 +1365,18 @@ class StructureAndDesignAgent:
         chain role OpenFold3 does not need. Raw sequence is injected into the
         tool call kwargs only; the persisted input + normalized metadata carry
         digests / refs only.
+
+        Deduplicated per ``(chain_role, sequence-content sha256)``: the same
+        antigen sequence bound as both a material ref and an uploaded-file ref
+        (same content, same sha) produces exactly one MSA call. Heavy and light
+        stay separate, and distinct antigen/heavy/light sequences are never
+        collapsed. Duplicate refs reuse the single MSA output so Step 8 can
+        still resolve MSA for each of them.
         """
         if _STEP7_MSA_SEARCH_TOOL not in scoped_tools:
             return []
         calls: list[ToolCallRecord] = []
+        seen_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
         for ref in record.sequence_refs_for_prediction:
             if ref.chain_role not in _MSA_SEARCH_CHAIN_ROLES:
                 continue
@@ -1378,11 +1396,18 @@ class StructureAndDesignAgent:
             if not raw_sequence:
                 ref.msa_status = "skipped"
                 continue
+            content_sha = hashlib.sha256(raw_sequence.encode("utf-8")).hexdigest()[:12]
+            identity = (str(ref.chain_role), content_sha)
+            if identity in seen_by_identity:
+                # Same role + same sequence content already searched this record.
+                # Reuse the single MSA result; do NOT call the tool again.
+                _apply_step7_msa_metadata(ref, seen_by_identity[identity])
+                continue
             compact_input = {
                 "sequence_id": ref.sequence_id,
                 "chain_role": ref.chain_role,
                 "sequence_length": len(raw_sequence),
-                "sha256_prefix": hashlib.sha256(raw_sequence.encode("utf-8")).hexdigest()[:12],
+                "sha256_prefix": content_sha,
                 "output_alignment_formats": ["a3m"],
                 "e_value": 0.0001,
                 "iterations": 1,
@@ -1408,27 +1433,31 @@ class StructureAndDesignAgent:
                 persisted_input=compact_input,
             )
             calls.append(tc)
-            ref.msa_source_tool = _STEP7_MSA_SEARCH_TOOL
-            ref.msa_tool_call_id = tc.tool_call_id
+            meta: dict[str, Any] = {
+                "msa_source_tool": _STEP7_MSA_SEARCH_TOOL,
+                "msa_tool_call_id": tc.tool_call_id,
+            }
             if tc.run_status in {"success", "pending"} and tc.tool_output_ref:
-                ref.msa_tool_output_ref = tc.tool_output_ref
+                meta["msa_tool_output_ref"] = tc.tool_output_ref
                 msa_object = _resolve_stored_msa_a3m_object(
                     tc.tool_output_ref, storage=self.storage
                 )
                 alignment = _openfold3_primary_alignment(msa_object)
                 if alignment:
-                    ref.msa_status = "available"
-                    ref.msa_alignment_format = "a3m"
-                    ref.msa_alignment_length = len(alignment)
-                    ref.msa_alignment_sha256_prefix = hashlib.sha256(
+                    meta["msa_status"] = "available"
+                    meta["msa_alignment_format"] = "a3m"
+                    meta["msa_alignment_length"] = len(alignment)
+                    meta["msa_alignment_sha256_prefix"] = hashlib.sha256(
                         alignment.encode("utf-8")
                     ).hexdigest()[:12]
                 else:
-                    ref.msa_status = "a3m_not_found"
+                    meta["msa_status"] = "a3m_not_found"
             elif tc.run_status == "failed":
-                ref.msa_status = "upstream_error"
+                meta["msa_status"] = "upstream_error"
             else:
-                ref.msa_status = "not_run"
+                meta["msa_status"] = "not_run"
+            seen_by_identity[identity] = meta
+            _apply_step7_msa_metadata(ref, meta)
         return calls
 
     # ── Step 9 ──────────────────────────────────────────────────────────────
@@ -3009,6 +3038,60 @@ def _compact_runtime_sequence_summary(item: dict[str, Any]) -> dict[str, Any]:
                 alignment.encode("utf-8")
             ).hexdigest()[:12]
     return summary
+
+
+_STEP7_SELECTED_FAILURE_STATUSES = {"failed", "upstream_error"}
+
+
+def _step7_selected_failure_warnings(
+    tool_call_records: list[ToolCallRecord],
+) -> list[dict[str, Any]]:
+    """Compact warnings for SELECTED Step 7 tool calls that failed.
+
+    Only ``routing_decision == "selected"`` calls count (not_applicable /
+    scope_unavailable skips are non-fatal). Each warning carries the tool
+    name, chain role (if any), run status, and a short adapter-compacted
+    reason — never a raw payload, sequence, or alignment.
+    """
+    out: list[dict[str, Any]] = []
+    for tc in tool_call_records:
+        summary = tc.tool_input_summary or {}
+        if summary.get("routing_decision") != "selected":
+            continue
+        if tc.run_status not in _STEP7_SELECTED_FAILURE_STATUSES:
+            continue
+        warning: dict[str, Any] = {
+            "tool_name": tc.tool_name,
+            "run_status": tc.run_status,
+            "reason": _short(str(tc.error_message or "selected tool preparation failed")),
+        }
+        chain_role = summary.get("msa_chain_role")
+        if chain_role:
+            warning["chain_role"] = chain_role
+        label = summary.get("label")
+        if label:
+            warning["label"] = _short(str(label))
+        out.append(warning)
+    return out
+
+
+def _apply_step7_msa_metadata(ref: Any, meta: dict[str, Any]) -> None:
+    """Copy compact MSA metadata (refs + digests only) onto a SequenceRef.
+
+    Shared by the first-occurrence writer and the duplicate-ref reuse path so
+    every ref for the same (role, sequence) points at the single MSA output.
+    """
+    for attr in (
+        "msa_source_tool",
+        "msa_tool_call_id",
+        "msa_tool_output_ref",
+        "msa_status",
+        "msa_alignment_format",
+        "msa_alignment_length",
+        "msa_alignment_sha256_prefix",
+    ):
+        if attr in meta:
+            setattr(ref, attr, meta[attr])
 
 
 def _step7_runtime_protein_sequence(ref: Any, *, storage: Storage) -> str | None:

@@ -134,3 +134,9 @@ class PreparedStructureInputPackage(BaseModel):
     structure_tool_call_records: list[ToolCallRecord] = Field(default_factory=list)
     structure_output_artifacts: list[str] = Field(default_factory=list)
     unresolved_resource_refs: list[dict] = Field(default_factory=list)
+    # Compact, non-fatal warnings for SELECTED Step 7 tool calls that failed
+    # (e.g. upstream_error MSA preparation). Never carries raw payloads/errors
+    # beyond a short, adapter-compacted reason. Its presence downgrades
+    # `structure_preparation_status` from `ok` to `partial` so a failed
+    # preparation is never reported as a clean `ok`.
+    preparation_warnings: list[dict] = Field(default_factory=list)

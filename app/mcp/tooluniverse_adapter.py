@@ -326,6 +326,34 @@ def _resolve_inventory_names() -> frozenset[str]:
     return _inventory_names
 
 
+def _sanctioned_extra_tool_names() -> frozenset[str]:
+    """Flat set of git-tracked architecture-sanctioned extra tool names.
+
+    These tools (e.g. NvidiaNIM_msa_search) are intentionally NOT in the
+    external v0.2 workbook — they are routed to a specific agent/step via
+    `scope_filter.ARCHITECTURE_SANCTIONED_EXTRA_TOOLS`. They must still be part
+    of ToolUniverse's `include_tools`, otherwise TU loads without them and a
+    live call reports "Tool '<name>' not found even after loading tools".
+    """
+    try:
+        from .scope_filter import ARCHITECTURE_SANCTIONED_EXTRA_TOOLS
+    except Exception:  # noqa: BLE001 - never break dispatch on import issues
+        return frozenset()
+    names: set[str] = set()
+    for tools in ARCHITECTURE_SANCTIONED_EXTRA_TOOLS.values():
+        names.update(t for t in tools if t)
+    return frozenset(names)
+
+
+def _resolve_include_tool_names() -> frozenset[str]:
+    """ToolUniverse `include_tools` set: inventory names + sanctioned extras.
+
+    Never widens to the full ToolUniverse registry — only the explicitly
+    listed sanctioned extras are added on top of the inventory-scoped names.
+    """
+    return frozenset(_resolve_inventory_names() | _sanctioned_extra_tool_names())
+
+
 def _get_universe() -> Any:
     """Lazy-build the ToolUniverse instance filtered to inventory names."""
     global _universe
@@ -343,9 +371,9 @@ def _get_universe() -> Any:
     # `AgenticTool` sub-tools can see `GEMINI_API_KEY` etc.
     _hydrate_env_from_settings()
 
-    inventory_names = _resolve_inventory_names()
+    include_names = _resolve_include_tool_names()
     inst = ToolUniverse()
-    include = sorted(inventory_names) or None
+    include = sorted(include_names) or None
     inst.load_tools(quiet=True, include_tools=include)
     _universe = inst
     return _universe
