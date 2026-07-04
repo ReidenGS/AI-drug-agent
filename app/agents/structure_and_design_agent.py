@@ -45,7 +45,6 @@ from ..agents.step_09_selection_policy import (
     select_step9_stage1_tools,
     select_step9_stage2_mappings,
 )
-from ..agents.step_09_runtime_resolver import build_step9_dry_run_execution_plan
 from ..llm.provider import LLMProvider, MockLLMProvider
 from ..mcp.client import MCPClient
 from ..schemas.common import ToolCallRecord
@@ -1540,10 +1539,6 @@ class StructureAndDesignAgent:
             raw_user_query=str(raw_request.get("raw_user_query") or ""),
             step8_downstream_handoff_status=_step9_compact_handoff_status(step8_artifact),
         )
-        dry_run_plan = build_step9_dry_run_execution_plan(
-            mapped_tools=stage2_mapping.mapped_tools,
-            available_fields=readiness_projection["step9_available_fields"],
-        )
 
         tool_calls: list[ToolCallRecord] = []
         hits: list[CompoundHit] = []
@@ -1640,11 +1635,6 @@ class StructureAndDesignAgent:
             step9_stage2_uninvokable_tool_details=stage2_mapping.uninvokable_tool_details,
             step9_stage2_argument_mapping_audit=stage2_mapping.argument_mapping_audit,
             step9_stage2_prompt_cache_layout_version=stage2_mapping.prompt_cache_layout_version,
-            step9_dry_run_execution_plan=dry_run_plan.execution_plan,
-            step9_dry_run_resolved_tools=dry_run_plan.resolved_tools,
-            step9_dry_run_unresolved_tools=dry_run_plan.unresolved_tools,
-            step9_dry_run_resolver_audit=dry_run_plan.resolver_audit,
-            step9_dry_run_execution_mode=dry_run_plan.execution_mode,
             step9_missing_inputs=readiness_projection["step9_missing_inputs"],
         )
 
