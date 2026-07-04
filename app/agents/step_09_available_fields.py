@@ -1143,6 +1143,12 @@ def _aggregate_readiness_profile(
             blocked_tool_count=0,
         )
 
+    ready_tool_count = len(
+        list(dict.fromkeys(tool for lane in lanes for tool in lane.allowed_tools))
+    )
+    blocked_tool_count = len(
+        list(dict.fromkeys(tool for lane in lanes for tool in lane.blocked_tools))
+    )
     ready = len([lane for lane in lanes if lane.status == "ready"])
     blocked = len([lane for lane in lanes if lane.status == "blocked"])
     not_applicable = len([lane for lane in lanes if lane.status == "not_applicable"])
@@ -1168,8 +1174,8 @@ def _aggregate_readiness_profile(
 
     return Step9LaneReadinessProfile(
         status=status,
-        ready_tool_count=ready,
-        blocked_tool_count=blocked,
+        ready_tool_count=ready_tool_count,
+        blocked_tool_count=blocked_tool_count,
         missing_requirements=missing_requirements,
         allowed_tools=allowed_tools,
         blocked_tools=blocked_tools,

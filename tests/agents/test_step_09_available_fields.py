@@ -516,3 +516,108 @@ def test_step9_schema_requirements_are_compact_no_raw_payload_leak(monkeypatch):
         assert "s3://tests/structure.pdb" not in flattened
         assert "a3m" not in flattened.lower()
         assert "fasta" not in flattened.lower()
+
+
+def test_step9_aggregate_readiness_profile_counts_tools_in_protein_design_lane(monkeypatch):
+    candidate_context = _seed_target_candidate_with_antigen_context()
+    _configure_contract_schemas(monkeypatch)
+
+    readiness = step9.project_step9_readiness(
+        candidate_context_table=candidate_context,
+        prepared_structure_input_package={},
+        structure_prediction_and_interface_results=_seed_step8_complex_result(),
+        compound_context_text="Please generate protein sequence",
+    )
+
+    profile = readiness["protein_design_readiness"]
+    assert profile.ready_tool_count == 2
+    assert profile.blocked_tool_count == 1
+    assert profile.ready_tool_count == len(profile.allowed_tools)
+    assert profile.blocked_tool_count == len(profile.blocked_tools)
+    assert set(profile.allowed_tools) == {
+        "NvidiaNIM_proteinmpnn",
+        "ESM_generate_protein_sequence",
+    }
+    assert set(profile.blocked_tools) == {"NvidiaNIM_rfdiffusion"}
+
+    requirement_tools = {entry.tool_name for entry in readiness["step9_tool_schema_requirements"]}
+    assert requirement_tools >= {
+        "NvidiaNIM_proteinmpnn",
+        "NvidiaNIM_rfdiffusion",
+        "ESM_generate_protein_sequence",
+    }
+
+
+def test_step9_aggregate_readiness_profile_counts_tools_in_variant_evaluation_lane(monkeypatch):
+    candidate_context = _seed_target_candidate_with_antigen_context()
+    candidate_context["candidate_records"][0]["identifiers"].extend(
+        [
+            {"id_type": "pdb_id", "id_value": "1ABC"},
+            {"id_type": "chain", "id_value": "A"},
+        ]
+    )
+    _configure_contract_schemas(monkeypatch)
+
+    readiness = step9.project_step9_readiness(
+        candidate_context_table=candidate_context,
+        prepared_structure_input_package={},
+        structure_prediction_and_interface_results={},
+        compound_context_text="generate protein sequence",
+    )
+    profile = readiness["variant_evaluation_readiness"]
+    assert profile.ready_tool_count == 3
+    assert profile.blocked_tool_count == 0
+    assert profile.ready_tool_count == len(profile.allowed_tools)
+    assert profile.blocked_tool_count == len(profile.blocked_tools)
+    assert set(profile.allowed_tools) == {
+        "AlphaMissense_get_variant_score",
+        "DynaMut2_predict_stability",
+        "ESM_score_variant_sae_batch",
+    }
+
+
+def test_step9_aggregate_readiness_profile_counts_tools_in_compound_screening_lane(monkeypatch):
+    candidate_context = {
+        "candidate_records": [
+            {
+                "candidate_id": "cand_c1",
+                "candidate_type": "compound_component",
+                "materials": [
+                    {
+                        "material_id": "cmp_smiles",
+                        "material_type": "payload_smiles",
+                        "value": "CCO",
+                    },
+                    {
+                        "material_id": "cmp_name",
+                        "material_type": "payload_name",
+                        "value": "aspirin",
+                    },
+                ],
+                "identifiers": [
+                    {"id_type": "zinc_id", "id_value": "ZINC000123"},
+                ],
+            }
+        ]
+    }
+    _configure_contract_schemas(monkeypatch)
+
+    readiness = step9.project_step9_readiness(
+        candidate_context_table=candidate_context,
+        prepared_structure_input_package={},
+        structure_prediction_and_interface_results={},
+        compound_context_text="find compound for screening",
+    )
+
+    profile = readiness["compound_screening_readiness"]
+    assert profile.ready_tool_count == len(profile.allowed_tools)
+    assert profile.blocked_tool_count == len(profile.blocked_tools)
+    assert profile.ready_tool_count >= 1
+    assert profile.blocked_tool_count >= 1
+
+    profile_entries = readiness["step9_lane_statuses"]
+    compound_lanes = [entry for entry in profile_entries if entry.lane_type == "compound_screening"]
+    assert len(compound_lanes) == 1
+    lane = compound_lanes[0]
+    assert len(lane.allowed_tools) == profile.ready_tool_count
+    assert len(lane.blocked_tools) == profile.blocked_tool_count
