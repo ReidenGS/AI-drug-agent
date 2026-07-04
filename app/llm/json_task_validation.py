@@ -95,6 +95,13 @@ def build_json_prompt_sections(
     is rendered into the trailing dynamic block. Only the SELECTED tools are
     rendered — never the full catalog — so the stable prefix is byte-identical
     for the same selected tool schema set across candidates.
+
+    Step 9 Stage 1 split: for ``step9_tool_selection_stage_1``, the stable
+    prefix contains only the fixed English selector rules, JSON shape
+    instruction, fixed user task text, and deterministic hard-gate-allowed
+    catalog. Candidate/run context, readiness projection, allowed-name audit,
+    blocked-count summary, and user intent summary are rendered only in the
+    trailing dynamic block.
     """
     schema = schema or {}
     task = schema.get("task") or "structured_query"
@@ -152,6 +159,19 @@ _STEP6_STAGE1_DYNAMIC_KEYS: tuple[str, ...] = (
 _STEP6_STAGE2_DYNAMIC_KEYS: tuple[str, ...] = (
     "candidate_id",
     "candidate_available_fields",
+)
+
+
+_STEP9_STAGE1_DYNAMIC_KEYS: tuple[str, ...] = (
+    "candidate_id",
+    "lane_readiness_status",
+    "step9_available_fields",
+    "step9_tool_schema_requirements",
+    "step9_hard_gate_allowed_tool_names",
+    "blocked_summary",
+    "user_intent_summary",
+    "step8_downstream_handoff_status",
+    "candidate_context_refs",
 )
 
 
@@ -248,6 +268,29 @@ def _split_prompt_schema(schema: dict, task: str) -> tuple[dict | None, dict]:
             dynamic_schema["tool_selection_reasons"] = selection_reasons
             return stable_schema, dynamic_schema
 
+    if task == "step9_tool_selection_stage_1":
+        if any(k in schema for k in _STEP9_STAGE1_DYNAMIC_KEYS):
+            stable_schema = {
+                k: v
+                for k, v in schema.items()
+                if k not in _STEP9_STAGE1_DYNAMIC_KEYS
+            }
+            catalog = stable_schema.get("compact_catalog")
+            if isinstance(catalog, list):
+                stable_schema["compact_catalog"] = sorted(
+                    [entry for entry in catalog if isinstance(entry, dict)],
+                    key=lambda e: (
+                        str(e.get("lane_type") or ""),
+                        str(e.get("tool_name") or ""),
+                    ),
+                )
+            dynamic_schema = {
+                k: schema[k]
+                for k in _STEP9_STAGE1_DYNAMIC_KEYS
+                if k in schema
+            }
+            return stable_schema, dynamic_schema
+
     # Step 2 structured_query: trim ``raw_request_record`` out of the
     # dynamic dump so it never reaches a real provider's prompt text.
     if task == "structured_query" and "prompt_inputs" in schema:
@@ -260,6 +303,12 @@ def _split_prompt_schema(schema: dict, task: str) -> tuple[dict | None, dict]:
 
 
 def shape_instruction(task: str) -> str:
+    if task == "step9_tool_selection_stage_1":
+        return (
+            '{"selections":[{"tool_name":"string",'
+            '"lane_type":"protein_design|variant_evaluation|compound_screening",'
+            '"selection_reason":"string"}]}'
+        )
     if task == "tool_selection_stage_1":
         return (
             '{"selections":[{"tool_name":"string","selection_reason":"string",'
@@ -581,6 +630,36 @@ def validate_task_shape(data: dict, task: str, *, error_factory: ErrorFactory) -
             ):
                 raise error_factory(
                     f"step6_schema_mapping_stage_2 tools[{i}] `argument_mapping_reason` must be a string"
+                )
+        return data
+
+    if task == "step9_tool_selection_stage_1":
+        selections = data.get("selections")
+        if not isinstance(selections, list):
+            raise error_factory(
+                "step9_tool_selection_stage_1 response requires list `selections`"
+            )
+        allowed_lanes = {
+            "protein_design",
+            "variant_evaluation",
+            "compound_screening",
+        }
+        for i, entry in enumerate(selections):
+            if not isinstance(entry, dict):
+                raise error_factory(
+                    f"step9_tool_selection_stage_1 selections[{i}] must be an object"
+                )
+            if not isinstance(entry.get("tool_name"), str) or not entry.get("tool_name"):
+                raise error_factory(
+                    f"step9_tool_selection_stage_1 selections[{i}] requires string `tool_name`"
+                )
+            if entry.get("lane_type") not in allowed_lanes:
+                raise error_factory(
+                    f"step9_tool_selection_stage_1 selections[{i}] requires valid `lane_type`"
+                )
+            if "selection_reason" in entry and not isinstance(entry["selection_reason"], str):
+                raise error_factory(
+                    f"step9_tool_selection_stage_1 selections[{i}] `selection_reason` must be a string"
                 )
         return data
 

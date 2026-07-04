@@ -19,6 +19,7 @@ from app.llm.openai_provider import (
     _ToolSelectionStage1Response,
     _Step6SchemaMappingStage1Response,
     _Step6SchemaMappingStage2ParserResponse,
+    _Step9ToolSelectionStage1Response,
 )
 
 
@@ -145,6 +146,20 @@ def test_step6_schema_mapping_stage2_passes_without_task_intent():
         "map", schema={"task": "step6_schema_mapping_stage_2"}
     )
     assert out["tools"][0]["argument_mapping"]["smiles"].startswith("candidate:")
+
+
+def test_step9_tool_selection_stage1_passes_without_task_intent():
+    provider = _provider_with_responses([
+        _chat_response(
+            '{"selections":[{"tool_name":"ZINC_search_by_smiles",'
+            '"lane_type":"compound_screening",'
+            '"selection_reason":"smiles available"}]}'
+        )
+    ])
+    out = provider.generate_json(
+        "pick", schema={"task": "step9_tool_selection_stage_1"}
+    )
+    assert out["selections"][0]["lane_type"] == "compound_screening"
 
 
 # ── error paths ───────────────────────────────────────────────────────────
@@ -550,6 +565,7 @@ def test_parser_models_produce_real_strict_schema():
         "tool_selection_stage_1",
         "step6_schema_mapping_stage_1",
         "step6_schema_mapping_stage_2",
+        "step9_tool_selection_stage_1",
     }
     for task, model in _RESPONSE_MODEL_FOR_TASK.items():
         schema = to_strict_json_schema(model)
@@ -593,6 +609,26 @@ def test_openai_step6_stage1_uses_structured_parser_and_validated():
     assert client._calls["parse"] and not client._calls["create"]
     assert client._calls["parse"][0]["response_format"] is _Step6SchemaMappingStage1Response
     assert out["selections"][0]["tool_name"] == "DrugProps_pains_filter"
+
+
+def test_openai_step9_stage1_uses_structured_parser_and_returns_dict():
+    parsed = _Step9ToolSelectionStage1Response(
+        selections=[{
+            "tool_name": "ZINC_search_by_smiles",
+            "lane_type": "compound_screening",
+            "selection_reason": "smiles available",
+        }]
+    )
+    client = _fake_openai_client(parse=_parsed_response(parsed))
+    provider = _provider_with_client(client)
+    out = provider.generate_json(
+        "pick", schema={"task": "step9_tool_selection_stage_1"}
+    )
+    assert client._calls["parse"] and not client._calls["create"]
+    assert client._calls["parse"][0]["response_format"] is _Step9ToolSelectionStage1Response
+    assert isinstance(out, dict)
+    assert not isinstance(out, _Step9ToolSelectionStage1Response)
+    assert out["selections"][0]["tool_name"] == "ZINC_search_by_smiles"
 
 
 def test_openai_parser_output_flows_through_validate_task_shape():

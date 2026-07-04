@@ -41,6 +41,7 @@ from ..agents.tool_selection_policy import (
     select_and_build_invocations,
 )
 from ..agents.step_09_available_fields import project_step9_readiness
+from ..agents.step_09_selection_policy import select_step9_stage1_tools
 from ..llm.provider import LLMProvider, MockLLMProvider
 from ..mcp.client import MCPClient
 from ..schemas.common import ToolCallRecord
@@ -1518,6 +1519,14 @@ class StructureAndDesignAgent:
             structure_prediction_and_interface_results=step8_artifact,
             compound_context_text=compound_context_text,
         )
+        stage1_selection = select_step9_stage1_tools(
+            llm=self.llm,
+            readiness_projection=readiness_projection,
+            candidate_id="all_candidates",
+            canonical_query=str(structured_query.get("canonical_query") or ""),
+            raw_user_query=str(raw_request.get("raw_user_query") or ""),
+            step8_downstream_handoff_status=_step9_compact_handoff_status(step8_artifact),
+        )
 
         tool_calls: list[ToolCallRecord] = []
         hits: list[CompoundHit] = []
@@ -1599,6 +1608,13 @@ class StructureAndDesignAgent:
             step9_hard_gate_allowed_tools=readiness_projection["step9_hard_gate_allowed_tools"],
             step9_hard_gate_blocked_tools_with_reason=readiness_projection["step9_hard_gate_blocked_tools_with_reason"],
             step9_tool_schema_requirements=readiness_projection["step9_tool_schema_requirements"],
+            step9_stage1_catalog_tool_names=stage1_selection.catalog_tool_names,
+            step9_stage1_selected_tools=[
+                item.model_dump() for item in stage1_selection.selected_tools
+            ],
+            step9_stage1_rejected_tools_with_reason=stage1_selection.rejected_tools_with_reason,
+            step9_stage1_selection_source=stage1_selection.selection_source,
+            step9_stage1_prompt_cache_layout_version=stage1_selection.prompt_cache_layout_version,
             step9_missing_inputs=readiness_projection["step9_missing_inputs"],
         )
 
@@ -4073,6 +4089,40 @@ def _compound_argument_mapping(tool_name: str, arg_hints: dict) -> dict[str, Any
     if tool_name == "ZINC_search_compounds":
         return {"query": arg_hints.get("query") or arg_hints.get("compound_name") or ""}
     return {"query": arg_hints.get("query") or arg_hints.get("compound_name") or arg_hints.get("smiles") or ""}
+
+
+def _step9_compact_handoff_status(step8_artifact: dict | None) -> list[dict[str, Any]]:
+    if not isinstance(step8_artifact, dict):
+        return []
+    out: list[dict[str, Any]] = []
+    for result in step8_artifact.get("candidate_structure_results") or []:
+        if not isinstance(result, dict):
+            continue
+        handoff = result.get("downstream_handoff")
+        refs = result.get("complex_structure_refs")
+        missing = []
+        if isinstance(handoff, dict):
+            missing = [
+                str(item)
+                for item in (handoff.get("missing_for_step9") or [])
+                if isinstance(item, str)
+            ]
+        out.append(
+            {
+                "candidate_id": str(result.get("candidate_id") or ""),
+                "run_status": str(result.get("run_status") or ""),
+                "has_downstream_handoff": isinstance(handoff, dict),
+                "has_complex_structure": bool(
+                    handoff.get("has_complex_structure") if isinstance(handoff, dict) else False
+                ),
+                "has_validated_structure": bool(
+                    handoff.get("has_validated_structure") if isinstance(handoff, dict) else False
+                ),
+                "complex_structure_ref_count": len(refs) if isinstance(refs, list) else 0,
+                "missing_for_step9": missing,
+            }
+        )
+    return out
 
 
 def _selection_summary(plan: ToolInvocationPlan) -> dict[str, Any]:

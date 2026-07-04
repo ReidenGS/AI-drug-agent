@@ -15,7 +15,7 @@ bodies, prompts, or API keys.
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -97,6 +97,22 @@ class _Step6Stage1Selection(BaseModel):
 class _Step6SchemaMappingStage1Response(BaseModel):
     model_config = ConfigDict(extra="forbid")
     selections: list[_Step6Stage1Selection] = Field(default_factory=list)
+
+
+class _Step9Stage1Selection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tool_name: str
+    lane_type: Literal[
+        "protein_design",
+        "variant_evaluation",
+        "compound_screening",
+    ]
+    selection_reason: str
+
+
+class _Step9ToolSelectionStage1Response(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    selections: list[_Step9Stage1Selection] = Field(default_factory=list)
 
 
 # ── Step 6 Stage 2: strict list-of-pairs parser shape ──────────────────────
@@ -189,6 +205,7 @@ _RESPONSE_MODEL_FOR_TASK: dict[str, type[BaseModel]] = {
     "tool_selection_stage_1": _ToolSelectionStage1Response,
     "step6_schema_mapping_stage_1": _Step6SchemaMappingStage1Response,
     "step6_schema_mapping_stage_2": _Step6SchemaMappingStage2ParserResponse,
+    "step9_tool_selection_stage_1": _Step9ToolSelectionStage1Response,
 }
 
 

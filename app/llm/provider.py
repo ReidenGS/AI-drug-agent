@@ -233,6 +233,21 @@ def _mock_step6_schema_mapping_stage2(schema: dict) -> dict:
     return {"tools": out}
 
 
+def _mock_step9_tool_selection_stage1(schema: dict) -> dict:
+    catalog = schema.get("compact_catalog") or []
+    return {
+        "selections": [
+            {
+                "tool_name": entry.get("tool_name"),
+                "lane_type": entry.get("lane_type"),
+                "selection_reason": "mock selected hard-gate allowed Step 9 tool",
+            }
+            for entry in catalog
+            if isinstance(entry, dict) and entry.get("tool_name") and entry.get("lane_type")
+        ]
+    }
+
+
 _TARGET_HINTS = (
     "HER2", "EGFR", "TROP2", "BCMA", "CD19", "CD20", "CD22", "CD33", "CD30", "CD79",
     "Nectin-4", "B7-H3", "FOLR1", "MET", "MUC1", "ROR1", "PSMA", "Claudin18.2",
@@ -347,6 +362,8 @@ class MockLLMProvider:
             return _mock_step6_schema_mapping_stage1(schema)
         if task == "step6_schema_mapping_stage_2":
             return _mock_step6_schema_mapping_stage2(schema)
+        if task == "step9_tool_selection_stage_1":
+            return _mock_step9_tool_selection_stage1(schema)
 
         raw = (schema or {}).get("raw_request_record") or {}
         ctx = raw.get("user_provided_context") or {}

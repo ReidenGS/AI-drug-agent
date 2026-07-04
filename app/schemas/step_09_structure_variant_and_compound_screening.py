@@ -175,6 +175,11 @@ class CompoundScreeningArtifact(BaseModel):
     step9_tool_schema_requirements: list[Step9ToolSchemaRequirement] = Field(
         default_factory=list
     )
+    step9_stage1_catalog_tool_names: list[str] = Field(default_factory=list)
+    step9_stage1_selected_tools: list[dict] = Field(default_factory=list)
+    step9_stage1_rejected_tools_with_reason: list[dict] = Field(default_factory=list)
+    step9_stage1_selection_source: str = "not_run"
+    step9_stage1_prompt_cache_layout_version: str = "not_run"
     step9_missing_inputs: list[str] = Field(default_factory=list)
     protein_design_readiness: Step9LaneReadinessProfile = Field(
         default_factory=Step9LaneReadinessProfile
