@@ -2360,7 +2360,173 @@ def test_step7_status_stays_ok_when_only_not_applicable_skips(
     assert pkg.preparation_warnings == []
     assert pkg.structure_preparation_status in {"ok", "partial"}
     # No warning should ever come from a not_applicable skip.
-    assert all(w["run_status"] in {"failed", "upstream_error"} for w in pkg.preparation_warnings)
+    assert all(
+        w["run_status"] in {"failed", "upstream_error", "a3m_not_found"}
+        for w in pkg.preparation_warnings
+    )
+
+
+# ── Real live ColabFold/MMseqs2 MSA payload shape extraction ───────────────
+
+
+def _msa_real_shape_binding(captured, *, databases=None):
+    """Reproduce the real NvidiaNIM_msa_search live payload shape:
+    ``payload.data.alignments.<db>.a3m.alignment`` (adapter envelope)."""
+    def _inner(sequence=None, **kw):
+        captured.append({"sequence": sequence, **kw})
+        a3m = f">query\n{sequence}\n>hit1\n{sequence}"
+        dbs = databases or {"colabfold": a3m}
+        alignments = {
+            db: {"a3m": {"alignment": text, "format": "a3m"}}
+            for db, text in dbs.items()
+        }
+        return {
+            "status": "ok",
+            "source": "NvidiaNIM_msa_search",
+            "executor": "tooluniverse",
+            "arguments": {},
+            "retry_count": 0,
+            "retryable": False,
+            "payload": {"data": {"alignments": alignments}},
+        }
+    return _inner
+
+
+def test_extract_a3m_from_real_payload_shape_prefers_colabfold_then_sorted():
+    a3m_colab = ">c\nMKTAYIAKQNNVG\n>h\nMKTAYIAKQNNVG"
+    a3m_uni = ">u\nDIFFERENTSEQ\n>h\nDIFFERENTSEQ"
+    a3m_bfd = ">b\nANOTHERSEQ\n>h\nANOTHERSEQ"
+    stored = {
+        "tool_call_id": "tc1", "tool_name": "NvidiaNIM_msa_search", "label": "x",
+        "input": {"sequence_length": 13},
+        "output": {
+            "status": "ok", "source": "NvidiaNIM_msa_search", "executor": "tooluniverse",
+            "arguments": {},
+            "payload": {"data": {"alignments": {
+                "uniref90": {"a3m": {"alignment": a3m_uni, "format": "a3m"}},
+                "colabfold": {"a3m": {"alignment": a3m_colab, "format": "a3m"}},
+                "bfd": {"a3m": {"alignment": a3m_bfd, "format": "a3m"}},
+            }}},
+        },
+    }
+    # ColabFold wins deterministically even though it is not first in dict order.
+    assert structure_and_design_module._extract_a3m_alignment(stored) == a3m_colab
+    # Without colabfold, the sorted-first database wins ("bfd" < "uniref90").
+    del stored["output"]["payload"]["data"]["alignments"]["colabfold"]
+    assert structure_and_design_module._extract_a3m_alignment(stored) == a3m_bfd
+    # A payload that is OK but has no a3m yields None (not a false positive).
+    no_a3m = {"output": {"payload": {"data": {"status": "ok", "note": "no alignment"}}}}
+    assert structure_and_design_module._extract_a3m_alignment(no_a3m) is None
+
+
+def test_step7_8_real_msa_payload_injects_openfold3_msa_and_keeps_artifacts_compact(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_only_antigen_antibody(
+        local_storage, registry_service, workflow_state_service
+    )
+    captured_openfold: list[tuple[str, dict[str, Any]]] = []
+
+    def _capture(tool_name: str):
+        def _inner(**kw):
+            captured_openfold.append((tool_name, dict(kw)))
+            return {"status": "ok", "model_ref": f"s3://bucket/{tool_name}.pdb"}
+        return _inner
+
+    mcp = _mcp_with_bindings({
+        "NvidiaNIM_msa_search": _msa_real_shape_binding([]),
+        "NvidiaNIM_alphafold2_multimer": _capture("NvidiaNIM_alphafold2_multimer"),
+        "NvidiaNIM_openfold3": _capture("NvidiaNIM_openfold3"),
+        "NvidiaNIM_boltz2": _capture("NvidiaNIM_boltz2"),
+    })
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=mcp,
+    )
+    pkg = agent.run_step_7(run_id)
+
+    # Step 7: real payload shape now extracts a3m -> msa_status "available".
+    msa_refs = [
+        s for sin in pkg.model_dump()["prepared_structure_inputs"]
+        for s in sin["sequence_refs_for_prediction"]
+        if s.get("msa_tool_output_ref")
+    ]
+    assert len(msa_refs) == 3
+    for s in msa_refs:
+        assert s["msa_status"] == "available"
+        assert s["msa_alignment_format"] == "a3m"
+        assert isinstance(s["msa_alignment_length"], int) and s["msa_alignment_length"] > 0
+        assert s["msa_alignment_sha256_prefix"]
+    assert pkg.structure_preparation_status in {"ok", "partial"}
+    # Normalized artifact carries only compact metadata — no raw seq / a3m.
+    blob = json.dumps(pkg.model_dump())
+    for raw in (_MSA_ANTIGEN, _MSA_HEAVY, _MSA_LIGHT):
+        assert raw not in blob
+    assert ">query" not in blob and ">hit1" not in blob
+
+    # Step 8: OpenFold3 receives per-protein-molecule MSA at runtime.
+    results = agent.run_step_8(run_id)
+    openfold_calls = [
+        tc for tc in results.tool_call_records if tc.tool_name == "NvidiaNIM_openfold3"
+    ]
+    assert openfold_calls
+    assert any(tc.run_status in {"pending", "success"} for tc in openfold_calls)
+    of_kwargs = [kw for (name, kw) in captured_openfold if name == "NvidiaNIM_openfold3"]
+    assert of_kwargs
+    for kw in of_kwargs:
+        molecules = kw["inputs"][0]["molecules"]
+        assert len(molecules) == 3
+        for mol in molecules:
+            assert "msa" in mol and isinstance(mol["msa"], dict) and mol["msa"]
+            a3m = next(iter(mol["msa"].values()))["a3m"]
+            assert a3m["format"] == "a3m"
+            assert a3m["alignment"].startswith(">")
+    # Step 8 normalized tool_input_summary never carries the raw a3m.
+    for tc in openfold_calls:
+        assert ">query" not in json.dumps(tc.tool_input_summary or {})
+
+
+def test_step7_status_partial_when_msa_ok_but_no_a3m_extracted(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_only_antigen_antibody(
+        local_storage, registry_service, workflow_state_service
+    )
+
+    def _msa_ok_no_a3m(sequence=None, **kw):
+        # Transport OK, but no usable a3m alignment anywhere in the payload.
+        return {"status": "ok", "payload": {"data": {"note": "search done", "count": 0}}}
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp_with_bindings({"NvidiaNIM_msa_search": _msa_ok_no_a3m}),
+    )
+    pkg = agent.run_step_7(run_id)
+    # A semantic a3m-extraction failure must not report clean ok.
+    assert pkg.structure_preparation_status == "partial"
+    semantic = [w for w in pkg.preparation_warnings if w["run_status"] == "a3m_not_found"]
+    assert semantic
+    assert {w["tool_name"] for w in semantic} == {"NvidiaNIM_msa_search"}
+    for w in pkg.preparation_warnings:
+        assert ">query" not in json.dumps(w)
+    statuses = [
+        s.get("msa_status")
+        for sin in pkg.model_dump()["prepared_structure_inputs"]
+        for s in sin["sequence_refs_for_prediction"]
+        if s.get("chain_role") in {"antigen", "antibody_heavy", "antibody_light"}
+    ]
+    assert statuses and all(st == "a3m_not_found" for st in statuses)
+
+
+def test_step8_modeling_notes_do_not_claim_mocked_data():
+    """The stale 'wrappers may return mocked data' note is gone; the note must
+    reflect real live routing without a mock-success path."""
+    import inspect
+
+    src = inspect.getsource(structure_and_design_module.StructureAndDesignAgent.run_step_8)
+    assert "mocked data" not in src
+    assert "status='mocked'" not in src
 
 
 def test_step8_produces_confidence_records_and_keeps_raw_at_ref(

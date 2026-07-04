@@ -277,7 +277,12 @@ class StructureAndDesignAgent:
         # Selected (not not_applicable-skipped) tool calls that failed must be
         # visible: a failed MSA/structure preparation call cannot be reported
         # as a clean `ok`. Skips (routing_decision != "selected") stay non-fatal.
-        preparation_warnings = _step7_selected_failure_warnings(tool_call_records)
+        # Semantic failures (MSA transported OK but no usable a3m extracted) are
+        # surfaced too, so a live a3m-extraction miss never reports clean `ok`.
+        preparation_warnings = (
+            _step7_selected_failure_warnings(tool_call_records)
+            + _step7_msa_semantic_warnings(prepared)
+        )
 
         prep_status: str
         if not prepared:
@@ -840,9 +845,11 @@ class StructureAndDesignAgent:
             tool_call_records=tool_calls,
             output_artifacts=output_artifacts,
             structure_modeling_notes=(
-                "Step 8 ran in MVP mode; tool wrappers may return mocked data "
-                "(`status='mocked'`). Raw payloads are referenced via "
-                "output_artifacts[].storage_ref."
+                "Step 8 routes NvidiaNIM / structure tools through their "
+                "ToolUniverse wrappers. Live calls return real upstream payloads "
+                "or an honest upstream_error/dependency_unavailable; there is no "
+                "mock-success path. Raw payloads are referenced via "
+                "output_artifacts[].storage_ref, never embedded here."
             ),
         )
 
@@ -2732,15 +2739,22 @@ def _openfold3_primary_alignment(msa_object: dict[str, Any] | None) -> str | Non
 
 # ── Storage-backed MSA (a3m) extraction (Step 7 output -> Step 8 kwargs). ──
 #
-# The NvidiaNIM_msa_search return schema is `additionalProperties true`, so the
-# a3m alignment can appear under several plausible keys. The extractor searches
-# conservatively for an a3m-looking string under those keys only, never invents
-# content, and rejects empty / non-a3m text. It is applied ONLY at Step 8
-# runtime to the stored tool output; the extracted alignment is passed to the
-# OpenFold3 runtime kwargs and never written into a normalized artifact.
+# The NvidiaNIM_msa_search return schema is `additionalProperties true`. The
+# real live ColabFold/MMseqs2 payload nests the a3m alignment at
+# `payload.data.alignments.<database>.a3m.alignment` (with the format at
+# `...a3m.format`). Around that the adapter/envelope adds another `payload`
+# wrapper and `_call_tool` stores it under `output`, so the full stored path is
+# `output.payload.data.alignments.<db>.a3m.alignment`. The extractor descends
+# dict/list containers, prefers the plausible alignment keys, orders multiple
+# databases deterministically (ColabFold first, then sorted keys), validates
+# the leaf string with `_looks_like_a3m`, and rejects empty / non-a3m text. It
+# is applied ONLY at Step 8 runtime to the stored tool output; the extracted
+# alignment is passed to the OpenFold3 runtime kwargs and never written into a
+# normalized artifact.
 
 _A3M_ALIGNMENT_KEYS = ("a3m", "alignment", "alignments", "msa")
 _A3M_CONTAINER_KEYS = ("result", "results", "data", "output", "outputs", "payload", "response")
+_A3M_MAX_DEPTH = 12
 _A3M_HEADER_BODY_RE = re.compile(r">[^\n]*\n\s*[A-Za-z][A-Za-z\-\.]*")
 
 
@@ -2752,37 +2766,67 @@ def _looks_like_a3m(text: Any) -> bool:
         return False
     # a3m / fasta-style alignment: at least one '>' header followed by a
     # residue line. Reject anything without a header+body (e.g. status text).
+    # ColabFold a3m may prefix a `#` comment line before the first '>' header.
     if not (s.lstrip().startswith(">") or "\n>" in s):
         return False
     return bool(_A3M_HEADER_BODY_RE.search(s))
 
 
+def _ordered_alignment_databases(alignments: dict[str, Any]) -> list[str]:
+    """Deterministic database order for an ``alignments`` map.
+
+    ColabFold first when present, then the remaining database keys sorted, so
+    the same stored payload always yields the same a3m regardless of dict
+    insertion order.
+    """
+    keys = [k for k in alignments if isinstance(k, str)]
+    colabfold = sorted(k for k in keys if k.lower() == "colabfold")
+    rest = sorted(k for k in keys if k.lower() != "colabfold")
+    return colabfold + rest
+
+
 def _extract_a3m_alignment(payload: Any, _depth: int = 0) -> str | None:
     """Return the first a3m-looking alignment string from a structured payload.
 
-    Conservative recursive search: only descends through dict/list containers,
-    prefers the plausible alignment keys, and validates the leaf string with
-    ``_looks_like_a3m``. Returns ``None`` when no usable a3m is present.
+    Recognizes the real ``…alignments.<db>.a3m.alignment`` shape (with
+    deterministic database ordering) and, more generally, descends dict/list
+    containers under the plausible alignment keys. Returns ``None`` when no
+    usable a3m is present.
     """
-    if _depth > 6:
+    if _depth > _A3M_MAX_DEPTH:
         return None
     if isinstance(payload, str):
         return payload if _looks_like_a3m(payload) else None
     if isinstance(payload, dict):
+        # Leaf a3m block: {"alignment": <a3m str>, "format": ...}.
+        direct = payload.get("alignment")
+        if isinstance(direct, str) and _looks_like_a3m(direct):
+            return direct
+        # Alignment-key values. When the value is a database map
+        # ({<db>: {...}}), iterate databases in deterministic order.
         for key in _A3M_ALIGNMENT_KEYS:
-            if key in payload:
-                found = _extract_a3m_alignment(payload[key], _depth + 1)
+            if key not in payload:
+                continue
+            value = payload[key]
+            if isinstance(value, dict):
+                for db in _ordered_alignment_databases(value):
+                    found = _extract_a3m_alignment(value[db], _depth + 1)
+                    if found:
+                        return found
+            else:
+                found = _extract_a3m_alignment(value, _depth + 1)
                 if found:
                     return found
-        remaining = list(_A3M_CONTAINER_KEYS) + [
+        # Descend container keys, then remaining keys (sorted for determinism).
+        remaining = [k for k in _A3M_CONTAINER_KEYS if k in payload]
+        remaining += sorted(
             k for k in payload
             if k not in _A3M_CONTAINER_KEYS and k not in _A3M_ALIGNMENT_KEYS
-        ]
+        )
         for key in remaining:
-            if key in payload:
-                found = _extract_a3m_alignment(payload[key], _depth + 1)
-                if found:
-                    return found
+            found = _extract_a3m_alignment(payload[key], _depth + 1)
+            if found:
+                return found
         return None
     if isinstance(payload, list):
         for item in payload:
@@ -3072,6 +3116,41 @@ def _step7_selected_failure_warnings(
         if label:
             warning["label"] = _short(str(label))
         out.append(warning)
+    return out
+
+
+def _step7_msa_semantic_warnings(
+    prepared: list[StructureInputRecord],
+) -> list[dict[str, Any]]:
+    """Compact warnings for MSA searches that transported OK but yielded no
+    usable a3m (``msa_status == "a3m_not_found"``).
+
+    A selected MSA call that returns ``ok`` but from which no a3m alignment can
+    be extracted is a semantic preparation failure — it must not be reported as
+    a clean ``ok``. Deduplicated per underlying tool call. Carries only compact
+    metadata (never raw sequence / a3m).
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[Any, Any, Any]] = set()
+    for record in prepared:
+        for ref in getattr(record, "sequence_refs_for_prediction", []) or []:
+            if getattr(ref, "msa_status", None) != "a3m_not_found":
+                continue
+            tool_name = getattr(ref, "msa_source_tool", None)
+            if not tool_name:
+                continue
+            key = (tool_name, ref.chain_role, getattr(ref, "msa_tool_call_id", None))
+            if key in seen:
+                continue
+            seen.add(key)
+            warning: dict[str, Any] = {
+                "tool_name": tool_name,
+                "run_status": "a3m_not_found",
+                "reason": "MSA search returned ok but no usable a3m alignment could be extracted",
+            }
+            if ref.chain_role:
+                warning["chain_role"] = ref.chain_role
+            out.append(warning)
     return out
 
 
