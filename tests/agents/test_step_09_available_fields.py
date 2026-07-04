@@ -472,3 +472,47 @@ def test_step9_variant_lane_readiness_profile_is_not_not_applicable(monkeypatch)
     summary = readiness["step9_readiness_summary"]
     assert summary.variant_evaluation_ready_candidates >= 1
     assert readiness["variant_evaluation_readiness"].status == "ready"
+
+
+def test_step9_schema_requirements_are_compact_no_raw_payload_leak(monkeypatch):
+    candidate_context = _seed_candidate_context_table()
+    # Include representative raw-looking material/token forms; schema audit must stay compact.
+    candidate_context["candidate_records"][0]["materials"].append(
+        {"material_id": "raw_payload_seq", "material_type": "target_sequence", "value": "MKTAYIAKQNNVGX9A"}
+    )
+    candidate_context["candidate_records"][1]["materials"].append(
+        {
+            "material_id": "raw_payload_smiles",
+            "material_type": "payload_smiles",
+            "value": "CCOCH3",
+        }
+    )
+
+    _configure_contract_schemas(monkeypatch)
+    readiness = step9.project_step9_readiness(
+        candidate_context_table=candidate_context,
+        prepared_structure_input_package={},
+        structure_prediction_and_interface_results=_seed_step8_complex_result(),
+        compound_context_text="",
+    )
+    requirements = readiness["step9_tool_schema_requirements"]
+    assert requirements
+
+    for entry in requirements:
+        payload = entry.model_dump()
+        assert set(payload.keys()) == {
+            "candidate_id",
+            "tool_name",
+            "lane_type",
+            "required_fields",
+            "schema_source",
+            "satisfiable_required_fields",
+            "missing_required_fields",
+            "hard_gate_decision",
+            "reason",
+        }
+        flattened = str(payload)
+        assert "MKTAYIAKQNNVGX9A" not in flattened
+        assert "s3://tests/structure.pdb" not in flattened
+        assert "a3m" not in flattened.lower()
+        assert "fasta" not in flattened.lower()
