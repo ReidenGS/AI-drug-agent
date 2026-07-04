@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     # bounded when Step 6 Stage 2 schema mapping stalls.
     qwen_timeout: float = 90.0
 
+    # NVIDIA NIM credentials used only by ToolUniverse-backed MCP wrappers
+    # (for example Step 8 complex prediction tools). This is bridged into
+    # os.environ as NVIDIA_API_KEY immediately before ToolUniverse is built.
+    nvidia_api_key: str = ""
+
     api_key: str = "dev-key"
 
     tool_inventory_xlsx: str = "../\u9879\u76ee\u6587\u4ef6/ToolUniversity_inventory_v0.2.xlsx"
@@ -84,6 +89,15 @@ class Settings(BaseSettings):
     # ToolUniverse adapter). Migrated wrappers ignore this — TU owns its
     # own timeout policy.
     mcp_live_http_timeout: float = 15.0
+    # Outer wall-clock timeout for one ToolUniverse-backed live tool call.
+    # This protects the pipeline from TU tools that use requests without a
+    # per-request timeout. Long-running tools such as NvidiaNIM can override
+    # via TOOLUNIVERSE_LIVE_CALL_TIMEOUT in the environment.
+    tooluniverse_live_call_timeout: float = 60.0
+    # Separate outer timeout for ToolUniverse-backed NvidiaNIM live tools.
+    # Use this for Step 8 complex prediction calls that can exceed the
+    # normal ToolUniverse timeout budget.
+    nvidia_nim_live_call_timeout: float = 1800.0
 
     def live_tool_allowlist_set(self) -> frozenset[str]:
         raw = self.mcp_live_tool_allowlist or ""

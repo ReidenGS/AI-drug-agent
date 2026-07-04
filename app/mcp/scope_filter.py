@@ -38,6 +38,23 @@ AGENT_TOOL_OVERRIDES: dict[tuple[str, str], set[str]] = {
 }
 
 
+# Architecture-sanctioned tools that the v0.2 inventory does not (yet) carry as
+# a row, but that the ADC tool-flow routes to a specific agent/step. Unlike
+# `AGENT_TOOL_OVERRIDES` (which relaxes the step match for tools that already
+# have an inventory row), these have no inventory row, so `filter_inventory`
+# injects a synthetic, runtime-ok entry for the exact (agent, step) pair only.
+# This is the git-tracked scope-extension lever for this repo — the canonical
+# `ToolUniversity_inventory_v0.2.xlsx` lives outside the code repo.
+#
+# Every entry here MUST be a real ToolUniverse tool with a registered binding;
+# we never inject a tool the architecture does not sanction. NvidiaNIM_msa_search
+# is the official ToolUniverse MSA-search wrapper Step 7 uses to prepare the a3m
+# MSA that Step 8 OpenFold3 requires for its protein molecules.
+ARCHITECTURE_SANCTIONED_EXTRA_TOOLS: dict[tuple[str, str], set[str]] = {
+    ("structure_and_design_agent", "step_07"): {"NvidiaNIM_msa_search"},
+}
+
+
 @dataclass(slots=True)
 class ScopeRequest:
     agent_name: str
@@ -73,4 +90,24 @@ def filter_inventory(entries: list[InventoryEntry], req: ScopeRequest) -> list[I
         if req.require_runtime_ok and (e.runtime_status or "").lower() in {"broken", "unstable"}:
             continue
         out.append(e)
+
+    # Inject architecture-sanctioned tools that have no inventory row. Only for
+    # the exact (agent, step) pair, and only when not already present.
+    extras = ARCHITECTURE_SANCTIONED_EXTRA_TOOLS.get((req.agent_name, req.step_id), set())
+    if extras:
+        present = {e.tool_name for e in out}
+        for tool_name in sorted(extras):
+            if tool_name in present:
+                continue
+            out.append(
+                InventoryEntry(
+                    tool_name=tool_name,
+                    step_id=want,
+                    pipeline_stage="Structure Input Preparation",
+                    tool_status="wrapper",
+                    runtime_status=None,
+                    category=None,
+                    notes="architecture-sanctioned extra tool (not in v0.2 inventory row)",
+                )
+            )
     return out

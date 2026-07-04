@@ -7,6 +7,7 @@ import os
 import hashlib
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -510,6 +511,40 @@ def test_step7_filename_scoped_fasta_binds_only_compatible_candidate(
     assert refs[0][1].prediction_input_kind == "fasta_ref"
 
 
+def test_step7_target_sequence_role_binds_uploaded_fasta_to_antigen_candidate(
+    local_storage, registry_service, workflow_state_service,
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        uploaded_files=[{
+            "file_id": "role_target_fasta",
+            "original_filename": "sequence.fasta",
+            "storage_path": "adc_pilot/runs/x/inputs/files/sequence.fasta",
+            "content_type": "text/x-fasta",
+            "size_bytes": 64,
+            "role": "target_sequence",
+        }],
+    )
+    pkg = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=_mcp(),
+    ).run_step_7(run_id)
+
+    refs = [
+        (r.structure_role, s) for r in pkg.prepared_structure_inputs
+        for s in r.sequence_refs_for_prediction if s.sequence_id == "role_target_fasta"
+    ]
+    assert len(refs) == 1
+    assert refs[0][0] == "antigen_only"
+    assert refs[0][1].chain_role == "antigen"
+    assert refs[0][1].prediction_input_kind == "fasta_ref"
+    assert refs[0][1].sequence_storage_ref.endswith("sequence.fasta")
+    assert not any(
+        u["source_ref"] == "role_target_fasta"
+        for u in pkg.unresolved_resource_refs
+    )
+
+
 def test_step7_ambiguous_fasta_is_unresolved_not_broadcast(
     local_storage, registry_service, workflow_state_service
 ):
@@ -794,10 +829,29 @@ def test_step7_name_only_routes_to_database_search_tools(
 def test_step7_scope_tools_match_inventory_runtime_scope():
     mcp = _mcp()
     runtime_scope = set(mcp.list_tools(agent_name="structure_and_design_agent", step_id="step_07"))
-    assert runtime_scope == set(structure_and_design_module._STEP7_SCOPED_TOOLS), (
-        "Step 7 runtime scope must stay in sync with _STEP7_SCOPED_TOOLS.\n"
+    # Structure-retrieval routing table plus the architecture-sanctioned MSA
+    # search tool (Step 7 prepares MSA for Step 8 OpenFold3).
+    expected = set(structure_and_design_module._STEP7_SCOPED_TOOLS) | {
+        structure_and_design_module._STEP7_MSA_SEARCH_TOOL
+    }
+    assert runtime_scope == expected, (
+        "Step 7 runtime scope must stay in sync with _STEP7_SCOPED_TOOLS + MSA tool.\n"
         f"runtime_scope={sorted(runtime_scope)}\n"
-        f"routing_table={sorted(structure_and_design_module._STEP7_SCOPED_TOOLS)}"
+        f"expected={sorted(expected)}"
+    )
+
+
+def test_step7_runtime_scope_includes_msa_search():
+    """Drift fence: NvidiaNIM_msa_search is in Step 7 scope, not Step 8/9."""
+    mcp = _mcp()
+    assert "NvidiaNIM_msa_search" in set(
+        mcp.list_tools(agent_name="structure_and_design_agent", step_id="step_07")
+    )
+    assert "NvidiaNIM_msa_search" not in set(
+        mcp.list_tools(agent_name="structure_and_design_agent", step_id="step_08")
+    )
+    assert "NvidiaNIM_msa_search" not in set(
+        mcp.list_tools(agent_name="structure_and_design_agent", step_id="step_09")
     )
 
 
@@ -1247,6 +1301,43 @@ def test_step7_uniprot_and_inline_sequence_semantics(
     assert pkg.structure_preparation_status == "ok"
 
 
+def test_step7_file_backed_target_sequence_material_is_fasta_ref_not_inline_path(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "uniprot_id", "value": "P04626", "source": "raw"}],
+    )
+    fasta_key = local_storage.run_key(run_id, "inputs/files/target_her2_p04626.fasta")
+    local_storage.write_bytes(fasta_key, b">target\nMELAAHERSEQ\n")
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    target["materials"].append({
+        "material_id": "target_fasta_material",
+        "material_type": "target_sequence",
+        "value": fasta_key,
+        "value_format": "fasta",
+    })
+    local_storage.write_json(cct_path, cct)
+
+    pkg = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=_mcp(),
+    ).run_step_7(run_id)
+
+    rec = next(r for r in pkg.prepared_structure_inputs if r.structure_role == "antigen_only")
+    ref = next(s for s in rec.sequence_refs_for_prediction if s.sequence_id == "target_fasta_material")
+    assert ref.chain_role == "antigen"
+    assert ref.sequence is None
+    assert ref.sequence_storage_ref == fasta_key
+    assert ref.prediction_input_kind == "fasta_ref"
+    assert ref.sequence_value_status == "referenced"
+    assert ref.sequence_length == len("MELAAHERSEQ")
+    blob = json.dumps(pkg.model_dump())
+    assert "MELAAHERSEQ" not in blob
+
+
 def test_step7_multiple_candidates_do_not_receive_shared_first_pair_mapping(
     local_storage, registry_service, workflow_state_service
 ):
@@ -1356,6 +1447,17 @@ def _bindings_with_step8_overrides(extra: dict | None = None) -> dict:
     return base
 
 
+def _collect_nim_calls(results, tool_name: str, mapping: str | None = None):
+    calls = []
+    for tc in results.tool_call_records:
+        if tc.tool_name != tool_name:
+            continue
+        if mapping is not None and tc.tool_input_summary.get("mapping_key") != mapping:
+            continue
+        calls.append(tc)
+    return calls
+
+
 def test_step8_scope_tools_match_inventory_runtime_scope():
     mcp = _mcp()
     runtime_scope = set(mcp.list_tools(agent_name="structure_and_design_agent", step_id="step_08"))
@@ -1365,6 +1467,1066 @@ def test_step8_scope_tools_match_inventory_runtime_scope():
         f"runtime_scope={sorted(runtime_scope)}\n"
         f"routing_policy={sorted(routing_policy)}"
     )
+
+
+def test_step8_nim_mapping_duplicate_calls_are_deduplicated_across_prepared_inputs(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        referenced_inputs=[],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    target["materials"] = [
+        {"material_id": "target_step8_map_antigen", "material_type": "target_sequence", "value": "MKTAYIAKQNNVG"},
+    ]
+    antibody["materials"] = [
+        {"material_id": "heavy_step8_map", "material_type": "antibody_heavy_chain_sequence", "value": "EVQLVESGGGLVQPGGSLRLSCAAS"},
+        {"material_id": "light_step8_map", "material_type": "antibody_light_chain_sequence", "value": "DIQMTQSPSSLSASVGDRVTITC"},
+    ]
+    local_storage.write_json(cct_path, cct)
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _capture(tool_name: str):
+        def _inner(**kw):
+            captured.append((tool_name, dict(kw)))
+            return {"status": "ok", "model_ref": f"s3://bucket/{tool_name}.pdb"}
+        return _inner
+
+    overrides = {
+        "NvidiaNIM_alphafold2_multimer": _capture("NvidiaNIM_alphafold2_multimer"),
+        "NvidiaNIM_openfold3": _capture("NvidiaNIM_openfold3"),
+        "NvidiaNIM_boltz2": _capture("NvidiaNIM_boltz2"),
+    }
+    mcp = LocalMCPClient(
+        inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+        bindings=_bindings_with_step8_overrides(overrides),
+    )
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=mcp,
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+
+    prepared = local_storage.read_json(local_storage.run_key(run_id, "prepared_structure_input_package.json"))
+    mappings = {
+        rec["candidate_id"]: (
+            rec["antigen_antibody_mapping"]["target_candidate_id"],
+            rec["antigen_antibody_mapping"]["antibody_candidate_id"],
+        )
+        for rec in prepared["prepared_structure_inputs"]
+        if isinstance(rec.get("antigen_antibody_mapping"), dict)
+    }
+    assert mappings
+
+    first_mapping = set(mappings.values())
+    assert len(first_mapping) == 1
+    target_candidate_id, antibody_candidate_id = next(iter(first_mapping))
+    mapping_key = f"{target_candidate_id}:{antibody_candidate_id}"
+
+    selected = _collect_nim_calls(results, "NvidiaNIM_alphafold2_multimer")
+    duplicate = [
+        tc for tc in selected
+        if tc.tool_input_summary.get("routing_decision") == "duplicate_complex_prediction_mapping"
+    ]
+    success = [
+        tc for tc in selected
+        if tc.tool_input_summary.get("routing_decision") == "selected"
+    ]
+    assert len(success) == 1
+    assert len(duplicate) == 1
+    assert duplicate[0].tool_input_summary["mapping_key"] == mapping_key
+    assert results.structure_modeling_status == "ok"
+
+    capture_counts = {
+        tool: len([name for name, _ in captured if name == tool])
+        for tool in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
+    }
+    assert capture_counts["NvidiaNIM_alphafold2_multimer"] == 1
+    assert capture_counts["NvidiaNIM_boltz2"] == 1
+    assert capture_counts["NvidiaNIM_openfold3"] == 0
+
+
+def test_step8_openfold3_skips_without_msa_inputs_contract_unresolved(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service, referenced_inputs=[])
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    target["materials"] = [
+        {
+            "material_id": "target_seq_openfold",
+            "material_type": "target_sequence",
+            "value": "MKTAYIAKQNNVG",
+        }
+    ]
+    antibody["materials"].extend([
+        {
+            "material_id": "heavy_seq_openfold",
+            "material_type": "antibody_heavy_chain_sequence",
+            "value": "EVQLVESGGGLVQPGGSLRLSCAAS",
+        },
+        {
+            "material_id": "light_seq_openfold",
+            "material_type": "antibody_light_chain_sequence",
+            "value": "DIQMTQSPSSLSASVGDRVTITC",
+        },
+    ])
+    local_storage.write_json(cct_path, cct)
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _capture(tool_name: str):
+        def _inner(**kw):
+            captured.append((tool_name, dict(kw)))
+            return {"status": "ok", "model_ref": f"s3://bucket/{tool_name}.pdb"}
+
+        return _inner
+
+    overrides = {
+        "NvidiaNIM_alphafold2_multimer": _capture("NvidiaNIM_alphafold2_multimer"),
+        "NvidiaNIM_openfold3": _capture("NvidiaNIM_openfold3"),
+        "NvidiaNIM_boltz2": _capture("NvidiaNIM_boltz2"),
+    }
+    mcp = LocalMCPClient(
+        inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+        bindings=_bindings_with_step8_overrides(overrides),
+    )
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=mcp,
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+
+    openfold_calls = [
+        tc for tc in results.tool_call_records
+        if tc.tool_name == "NvidiaNIM_openfold3"
+    ]
+    assert openfold_calls
+    assert len(openfold_calls) == 2
+    assert all((tc.tool_input_summary or {}).get("routing_decision") == "contract_unresolved" for tc in openfold_calls)
+    assert all(tc.run_status == "skipped" for tc in openfold_calls)
+    assert any(
+        "openfold3_msa_required" in ((tc.tool_input_summary or {}).get("complex_prediction_plan", {}) or {}).get("missing_prediction_inputs", [])
+        for tc in openfold_calls
+        if (tc.tool_input_summary or {}).get("routing_decision") != "duplicate_complex_prediction_mapping"
+    )
+    assert results.structure_modeling_status in {"partial", "ok"}
+
+    nim_capture_counts = {
+        tool: len([name for name, _ in captured if name == tool])
+        for tool in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
+    }
+    assert nim_capture_counts["NvidiaNIM_alphafold2_multimer"] == 1
+    assert nim_capture_counts["NvidiaNIM_boltz2"] == 1
+    assert nim_capture_counts["NvidiaNIM_openfold3"] == 0
+
+    missing = [item for cr in results.candidate_structure_results for item in cr.missing_prediction_inputs]
+    assert "openfold3_msa_required" in missing
+
+    audit_blob = json.dumps(
+        [tc.tool_input_summary for tc in results.tool_call_records if tc.tool_name == "NvidiaNIM_openfold3"]
+    )
+    assert "OpenFold3 requires MSA" in audit_blob
+
+
+def test_step8_nim_plan_dedupes_duplicate_sequence_refs_and_filters_uniprot_like_identifiers(
+    local_storage, registry_service, workflow_state_service
+):
+    fasta_key = local_storage.run_key("run_step8_plan_dedup", "inputs", "shared_antigen.fasta")
+    local_storage.write_bytes(
+        fasta_key,
+        b">antigen\nMKTAYIAKQNNVG\n",
+    )
+    sin = {
+        "input_case": "sequence_only_input",
+        "sequence_refs_for_prediction": [
+            {
+                "sequence_id": "antigen_a",
+                "chain_role": "antigen",
+                "prediction_input_kind": "fasta_ref",
+                "sequence_value_status": "referenced",
+                "sequence_storage_ref": fasta_key,
+                "source_ref": fasta_key,
+            },
+            {
+                "sequence_id": "antigen_b",
+                "chain_role": "antigen",
+                "prediction_input_kind": "fasta_ref",
+                "sequence_value_status": "referenced",
+                "sequence_storage_ref": fasta_key,
+                "source_ref": fasta_key,
+            },
+            {
+                "sequence_id": "heavy_seq",
+                "chain_role": "antibody_heavy",
+                "prediction_input_kind": "fasta_ref",
+                "sequence_value_status": "referenced",
+                "sequence_storage_ref": fasta_key,
+                "source_ref": fasta_key,
+            },
+            {
+                "sequence_id": "light_seq",
+                "chain_role": "antibody_light",
+                "prediction_input_kind": "fasta_ref",
+                "sequence_value_status": "referenced",
+                "sequence_storage_ref": fasta_key,
+                "source_ref": fasta_key,
+            },
+            {
+                "sequence_id": "antigen_uniprot",
+                "chain_role": "antigen",
+                "prediction_input_kind": "uniprot_id",
+                "sequence_value_status": "identifier_only",
+                "source_ref": "P12345",
+                "source_kind": "external_database",
+            },
+        ],
+    }
+
+    plan = structure_and_design_module._plan_step8_nim_complex_prediction(
+        "NvidiaNIM_boltz2",
+        sin,
+        [sin],
+    )
+    assert plan.input_status == "ready"
+    assert len([item for item in plan.sequence_inputs if item.get("chain_role") == "antigen"]) == 1
+    assert [item for item in plan.sequence_inputs if item.get("chain_role") == "antigen"][0]["sequence_id"] == "antigen_a"
+    assert all(item.get("sequence_readiness") == "ready" for item in plan.sequence_inputs if item.get("chain_role") in {"antigen", "antibody_heavy", "antibody_light"})
+    assert not any(item.get("sequence_id") == "antigen_uniprot" for item in plan.sequence_inputs)
+
+    runtime = structure_and_design_module._build_nim_runtime_invocation(
+        tool_name="NvidiaNIM_boltz2",
+        plan=plan,
+        all_inputs=[sin],
+        storage=local_storage,
+    )
+    assert runtime["status"] == "ok"
+    assert runtime["compact_arguments"]["sequence_count"] == 3
+    artifact_blob = json.dumps(runtime["audit"] + runtime["compact_arguments"].get("sequence_inputs", []))
+    assert "MKTAYIAKQNNVG" not in artifact_blob
+
+
+def test_step8_openfold3_plan_requires_msa_artifact_before_ready():
+    sin = {
+        "input_case": "sequence_only_input",
+        "sequence_refs_for_prediction": [
+            {
+                "sequence_id": "antigen_seq",
+                "chain_role": "antigen",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+                "sequence_storage_ref": None,
+            },
+            {
+                "sequence_id": "heavy_seq",
+                "chain_role": "antibody_heavy",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+            },
+            {
+                "sequence_id": "light_seq",
+                "chain_role": "antibody_light",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+            },
+        ],
+    }
+
+    plan = structure_and_design_module._plan_step8_nim_complex_prediction(
+        "NvidiaNIM_openfold3", sin, [sin]
+    )
+    assert plan.input_status == "contract_unresolved"
+    assert plan.missing_prediction_inputs == ["openfold3_msa_required"]
+    assert "OpenFold3 requires MSA for protein molecules; no MSA artifact is available" in plan.contract_notes
+
+
+# Inline a3m MSA content in the official OpenFold3 shape. Real Step 7 output
+# does not yet emit this (MSA generation is out of scope), so the fixtures
+# below inject it directly to exercise the runtime-contract path.
+_A3M_ANTIGEN = ">antigen\nMKTAYIAKQNNVG\n>hit1\nMKTAYIAKQNNVG"
+_A3M_HEAVY = ">heavy\nEVQLVESGGGLVQPGG\n>hit1\nEVQLVESGGGLVQPGG"
+_A3M_LIGHT = ">light\nDIQMTQSPSSLSASVG\n>hit1\nDIQMTQSPSSLSASVG"
+
+
+def _openfold3_msa_inline(alignment: str) -> dict:
+    return {"main": {"a3m": {"alignment": alignment, "format": "a3m"}}}
+
+
+def _openfold3_sin_with_inline_msa() -> dict:
+    return {
+        "input_case": "sequence_only_input",
+        "sequence_refs_for_prediction": [
+            {
+                "sequence_id": "antigen_seq",
+                "chain_role": "antigen",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+                "sequence": "MKTAYIAKQNNVG",
+                "msa": _openfold3_msa_inline(_A3M_ANTIGEN),
+            },
+            {
+                "sequence_id": "heavy_seq",
+                "chain_role": "antibody_heavy",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+                "sequence": "EVQLVESGGGLVQPGG",
+                "msa": _openfold3_msa_inline(_A3M_HEAVY),
+            },
+            {
+                "sequence_id": "light_seq",
+                "chain_role": "antibody_light",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+                "sequence": "DIQMTQSPSSLSASVG",
+                "msa": _openfold3_msa_inline(_A3M_LIGHT),
+            },
+        ],
+    }
+
+
+def test_step8_openfold3_plan_gated_when_only_msa_reference_is_present():
+    """A bare MSA reference (path / storage / artifact ref) cannot be mapped
+    to the OpenFold3 a3m contract without reading files, so the plan must be
+    contract_unresolved (openfold3_msa_runtime_mapping_missing) — NOT ready."""
+    sin = {
+        "input_case": "sequence_only_input",
+        "sequence_refs_for_prediction": [
+            {
+                "sequence_id": "antigen_seq",
+                "chain_role": "antigen",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+                "msa_ref": "s3://bucket/antigen.msa",
+            },
+            {
+                "sequence_id": "heavy_seq",
+                "chain_role": "antibody_heavy",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+                "msa_storage_ref": "runs/x/msa/heavy.a3m",
+            },
+            {
+                "sequence_id": "light_seq",
+                "chain_role": "antibody_light",
+                "prediction_input_kind": "amino_acid_sequence",
+                "source_kind": "material_sequence",
+                "sequence_value_status": "inline",
+                "msa": {"artifact_ref": "s3://bucket/light.msa"},
+            },
+        ],
+    }
+
+    plan = structure_and_design_module._plan_step8_nim_complex_prediction(
+        "NvidiaNIM_openfold3", sin, [sin]
+    )
+    assert plan.input_status == "contract_unresolved"
+    assert "openfold3_msa_runtime_mapping_missing" in plan.missing_prediction_inputs
+    # The plan carries only the MSA REFERENCE, never a mappable a3m marker.
+    assert not any(
+        item.get("msa_a3m_runtime_mappable") for item in plan.sequence_inputs
+    )
+
+
+def test_step8_openfold3_plan_ready_with_inline_a3m_msa_content():
+    sin = _openfold3_sin_with_inline_msa()
+    plan = structure_and_design_module._plan_step8_nim_complex_prediction(
+        "NvidiaNIM_openfold3", sin, [sin]
+    )
+    assert plan.input_status == "ready"
+    assert "openfold3_msa_required" not in plan.missing_prediction_inputs
+    assert "openfold3_msa_runtime_mapping_missing" not in plan.missing_prediction_inputs
+    # Every protein role is marked runtime-mappable; raw alignment never
+    # persisted in the compact plan (only a boolean + digest).
+    assert all(item.get("msa_a3m_runtime_mappable") for item in plan.sequence_inputs)
+    plan_blob = json.dumps(plan.model_dump())
+    for raw in (_A3M_ANTIGEN, _A3M_HEAVY, _A3M_LIGHT, "MKTAYIAK", "EVQLVES", "DIQMTQ"):
+        assert raw not in plan_blob
+
+
+def test_step8_openfold3_runtime_kwargs_inject_msa_per_protein_molecule(
+    local_storage,
+):
+    sin = _openfold3_sin_with_inline_msa()
+    plan = structure_and_design_module._plan_step8_nim_complex_prediction(
+        "NvidiaNIM_openfold3", sin, [sin]
+    )
+    assert plan.input_status == "ready"
+    runtime = structure_and_design_module._build_nim_runtime_invocation(
+        tool_name="NvidiaNIM_openfold3",
+        plan=plan,
+        all_inputs=[sin],
+        storage=local_storage,
+    )
+    assert runtime["status"] == "ok"
+    molecules = runtime["kwargs"]["inputs"][0]["molecules"]
+    assert len(molecules) == 3
+    # Every protein molecule carries an MSA in the official OpenFold3 shape.
+    for molecule in molecules:
+        assert molecule["type"] == "protein"
+        assert "msa" in molecule
+        msa = molecule["msa"]
+        assert isinstance(msa, dict) and msa
+        a3m = next(iter(msa.values()))["a3m"]
+        assert a3m["format"] == "a3m"
+        assert isinstance(a3m["alignment"], str) and a3m["alignment"]
+    # The compact arguments (persisted into tool_input_summary) carry only
+    # digests / markers, never the raw alignment or raw sequence.
+    compact_blob = json.dumps(runtime["compact_arguments"])
+    for raw in (_A3M_ANTIGEN, _A3M_HEAVY, _A3M_LIGHT, "MKTAYIAK", "EVQLVES", "DIQMTQ"):
+        assert raw not in compact_blob
+    assert "msa_a3m_present" in compact_blob
+
+
+def test_step8_inline_msa_does_not_change_alphafold_or_boltz_kwargs(
+    local_storage,
+):
+    sin = _openfold3_sin_with_inline_msa()
+    for tool_name, schema_key in (
+        ("NvidiaNIM_alphafold2_multimer", "sequences"),
+        ("NvidiaNIM_boltz2", "polymers"),
+    ):
+        plan = structure_and_design_module._plan_step8_nim_complex_prediction(
+            tool_name, sin, [sin]
+        )
+        assert plan.input_status == "ready"
+        runtime = structure_and_design_module._build_nim_runtime_invocation(
+            tool_name=tool_name,
+            plan=plan,
+            all_inputs=[sin],
+            storage=local_storage,
+        )
+        assert runtime["status"] == "ok"
+        kwargs = runtime["kwargs"]
+        assert schema_key in kwargs
+        # No MSA is injected into AlphaFold2-Multimer / Boltz2 kwargs.
+        assert "msa" not in json.dumps(kwargs)
+
+
+# ── Step 7 NvidiaNIM_msa_search preparation for Step 8 OpenFold3 ───────────
+
+_MSA_ANTIGEN = "MKTAYIAKQNNVG"
+_MSA_HEAVY = "EVQLVESGGGLVQPGGSLRLSCAAS"
+_MSA_LIGHT = "DIQMTQSPSSLSASVGDRVTITC"
+
+
+def _seed_sequence_only_antigen_antibody(
+    local_storage, registry_service, workflow_state_service,
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service, referenced_inputs=[])
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    antibody = next(c for c in cct["candidate_records"] if c["candidate_type"] == "antibody")
+    target["materials"] = [
+        {"material_id": "antigen_seq_msa", "material_type": "target_sequence", "value": _MSA_ANTIGEN},
+    ]
+    antibody["materials"].extend([
+        {"material_id": "heavy_seq_msa", "material_type": "antibody_heavy_chain_sequence", "value": _MSA_HEAVY},
+        {"material_id": "light_seq_msa", "material_type": "antibody_light_chain_sequence", "value": _MSA_LIGHT},
+    ])
+    local_storage.write_json(cct_path, cct)
+    return run_id
+
+
+def _msa_capture_binding(captured, *, payload=None):
+    """A ToolUniverse-style MSA search stub. Returns an a3m derived from the
+    input sequence unless a fixed `payload` is given."""
+    def _inner(sequence=None, **kw):
+        captured.append({"sequence": sequence, **kw})
+        if payload is not None:
+            return payload
+        return {"alignments": {"main": {"a3m": {"alignment": f">query\n{sequence}", "format": "a3m"}}}}
+    return _inner
+
+
+def _mcp_with_bindings(overrides):
+    return LocalMCPClient(
+        inventory=ToolInventoryService(os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))),
+        bindings=_bindings_with_step8_overrides(overrides),
+    )
+
+
+def test_step7_sequence_only_triggers_one_msa_search_per_chain(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_only_antigen_antibody(
+        local_storage, registry_service, workflow_state_service
+    )
+    captured: list[dict[str, Any]] = []
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp_with_bindings({"NvidiaNIM_msa_search": _msa_capture_binding(captured)}),
+    )
+    pkg = agent.run_step_7(run_id)
+    msa_calls = [tc for tc in pkg.structure_tool_call_records if tc.tool_name == "NvidiaNIM_msa_search"]
+    assert len(msa_calls) == 3
+    assert len(captured) == 3
+    # Official schema: `sequence` is the raw sequence; a3m is requested.
+    for c in captured:
+        assert isinstance(c["sequence"], str) and c["sequence"]
+        assert c["output_alignment_formats"] == ["a3m"]
+        assert c["e_value"] == 0.0001
+        assert c["iterations"] == 1
+    roles = sorted(tc.tool_input_summary.get("msa_chain_role") for tc in msa_calls)
+    assert roles == ["antibody_heavy", "antibody_light", "antigen"]
+
+
+def test_step7_pdb_only_does_not_trigger_msa_search(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "pdb_id", "value": "1N8Z", "source": "raw_request_text"}],
+    )
+    captured: list[dict[str, Any]] = []
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp_with_bindings({"NvidiaNIM_msa_search": _msa_capture_binding(captured)}),
+    )
+    pkg = agent.run_step_7(run_id)
+    assert [tc for tc in pkg.structure_tool_call_records if tc.tool_name == "NvidiaNIM_msa_search"] == []
+    assert captured == []
+
+
+def test_step7_uniprot_only_does_not_trigger_msa_search(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed(local_storage, registry_service, workflow_state_service, referenced_inputs=[])
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c["candidate_type"] == "target_antigen")
+    target["materials"] = []
+    target.setdefault("identifiers", []).append(
+        {"id_type": "uniprot_id", "id_value": "P04626", "source": "candidate_profile"}
+    )
+    local_storage.write_json(cct_path, cct)
+    captured: list[dict[str, Any]] = []
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp_with_bindings({"NvidiaNIM_msa_search": _msa_capture_binding(captured)}),
+    )
+    pkg = agent.run_step_7(run_id)
+    # Identifier-only UniProt is not runtime-ready: no raw sequence resolved,
+    # so no MSA search is attempted.
+    assert captured == []
+    uniprot_refs = [
+        s for sin in pkg.model_dump()["prepared_structure_inputs"]
+        for s in sin["sequence_refs_for_prediction"]
+        if s.get("prediction_input_kind") == "uniprot_id"
+    ]
+    assert uniprot_refs
+    assert all(s.get("msa_status") in (None, "skipped") for s in uniprot_refs)
+
+
+def test_step7_msa_upstream_error_is_recorded_honestly(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_only_antigen_antibody(
+        local_storage, registry_service, workflow_state_service
+    )
+
+    def _msa_error(sequence=None, **kw):
+        return {"status": "upstream_error", "error_message": "NVIDIA_API_KEY missing"}
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp_with_bindings({"NvidiaNIM_msa_search": _msa_error}),
+    )
+    pkg = agent.run_step_7(run_id)
+    msa_calls = [tc for tc in pkg.structure_tool_call_records if tc.tool_name == "NvidiaNIM_msa_search"]
+    assert len(msa_calls) == 3
+    assert all(tc.run_status == "failed" for tc in msa_calls)  # upstream_error surfaced honestly
+    statuses = [
+        s.get("msa_status")
+        for sin in pkg.model_dump()["prepared_structure_inputs"]
+        for s in sin["sequence_refs_for_prediction"]
+        if s.get("chain_role") in {"antigen", "antibody_heavy", "antibody_light"}
+    ]
+    assert statuses and all(st == "upstream_error" for st in statuses)
+
+
+def test_step7_msa_artifact_has_no_raw_sequence_or_alignment(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_only_antigen_antibody(
+        local_storage, registry_service, workflow_state_service
+    )
+    captured: list[dict[str, Any]] = []
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp_with_bindings({"NvidiaNIM_msa_search": _msa_capture_binding(captured)}),
+    )
+    pkg = agent.run_step_7(run_id)
+    dumped = pkg.model_dump()
+    blob = json.dumps(dumped)
+    # No raw protein sequence and no raw a3m alignment in the normalized artifact.
+    for raw in (_MSA_ANTIGEN, _MSA_HEAVY, _MSA_LIGHT):
+        assert raw not in blob
+    assert ">query" not in blob
+    # MSA metadata is present as compact refs/digests only.
+    msa_refs = [
+        s for sin in dumped["prepared_structure_inputs"]
+        for s in sin["sequence_refs_for_prediction"]
+        if s.get("msa_tool_output_ref")
+    ]
+    assert len(msa_refs) == 3
+    for s in msa_refs:
+        assert s["msa_status"] == "available"
+        assert s["msa_source_tool"] == "NvidiaNIM_msa_search"
+        assert s["msa_alignment_format"] == "a3m"
+        assert isinstance(s["msa_alignment_length"], int) and s["msa_alignment_length"] > 0
+        assert s["msa_alignment_sha256_prefix"]
+    # The MSA tool_input_summary carries only compact metadata (no raw seq).
+    for tc in pkg.structure_tool_call_records:
+        if tc.tool_name != "NvidiaNIM_msa_search":
+            continue
+        summ = json.dumps(tc.tool_input_summary or {})
+        for raw in (_MSA_ANTIGEN, _MSA_HEAVY, _MSA_LIGHT):
+            assert raw not in summ
+        assert ">query" not in summ
+        assert "sha256_prefix" in (tc.tool_input_summary or {})
+        assert "sequence_length" in (tc.tool_input_summary or {})
+
+
+def test_step8_openfold3_uses_step7_msa_refs_and_injects_msa(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_only_antigen_antibody(
+        local_storage, registry_service, workflow_state_service
+    )
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _capture(tool_name: str):
+        def _inner(**kw):
+            captured.append((tool_name, dict(kw)))
+            return {"status": "ok", "model_ref": f"s3://bucket/{tool_name}.pdb"}
+        return _inner
+
+    mcp = _mcp_with_bindings({
+        "NvidiaNIM_msa_search": _msa_capture_binding([]),
+        "NvidiaNIM_alphafold2_multimer": _capture("NvidiaNIM_alphafold2_multimer"),
+        "NvidiaNIM_openfold3": _capture("NvidiaNIM_openfold3"),
+        "NvidiaNIM_boltz2": _capture("NvidiaNIM_boltz2"),
+    })
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=mcp,
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+
+    openfold_calls = [
+        tc for tc in results.tool_call_records if tc.tool_name == "NvidiaNIM_openfold3"
+    ]
+    assert openfold_calls
+    assert any(tc.run_status in {"pending", "success"} for tc in openfold_calls)
+
+    openfold_kwargs = [kw for (name, kw) in captured if name == "NvidiaNIM_openfold3"]
+    assert openfold_kwargs
+    for kw in openfold_kwargs:
+        molecules = kw["inputs"][0]["molecules"]
+        assert len(molecules) == 3
+        for mol in molecules:
+            assert mol["type"] == "protein"
+            assert "msa" in mol and isinstance(mol["msa"], dict) and mol["msa"]
+            a3m = next(iter(mol["msa"].values()))["a3m"]
+            assert a3m["format"] == "a3m"
+            assert a3m["alignment"].startswith(">")
+    # AlphaFold2-Multimer / Boltz2 kwargs are unchanged: no msa injected.
+    for name, kw in captured:
+        if name in {"NvidiaNIM_alphafold2_multimer", "NvidiaNIM_boltz2"}:
+            assert "msa" not in json.dumps(kw)
+    # Normalized Step 8 artifact does not carry raw MSA alignment.
+    for tc in openfold_calls:
+        blob = json.dumps(tc.tool_input_summary or {})
+        assert ">query" not in blob
+
+
+def test_step8_openfold3_contract_unresolved_when_msa_has_no_a3m(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_only_antigen_antibody(
+        local_storage, registry_service, workflow_state_service
+    )
+
+    def _msa_no_a3m(sequence=None, **kw):
+        return {"status": "ok", "note": "search completed but no alignment payload", "count": 0}
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _capture(tool_name: str):
+        def _inner(**kw):
+            captured.append((tool_name, dict(kw)))
+            return {"status": "ok", "model_ref": f"s3://bucket/{tool_name}.pdb"}
+        return _inner
+
+    mcp = _mcp_with_bindings({
+        "NvidiaNIM_msa_search": _msa_no_a3m,
+        "NvidiaNIM_alphafold2_multimer": _capture("NvidiaNIM_alphafold2_multimer"),
+        "NvidiaNIM_openfold3": _capture("NvidiaNIM_openfold3"),
+        "NvidiaNIM_boltz2": _capture("NvidiaNIM_boltz2"),
+    })
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=mcp,
+    )
+    agent.run_step_7(run_id)
+    results = agent.run_step_8(run_id)
+
+    openfold_calls = [
+        tc for tc in results.tool_call_records if tc.tool_name == "NvidiaNIM_openfold3"
+    ]
+    assert openfold_calls
+    assert all(tc.run_status == "skipped" for tc in openfold_calls)
+    assert all(
+        (tc.tool_input_summary or {}).get("routing_decision") == "contract_unresolved"
+        for tc in openfold_calls
+    )
+    assert any(
+        "openfold3_msa_a3m_not_found"
+        in ((tc.tool_input_summary or {}).get("complex_prediction_plan", {}) or {}).get("missing_prediction_inputs", [])
+        for tc in openfold_calls
+    )
+    # OpenFold3 wrapper is NOT called; AlphaFold2/Boltz2 still run.
+    assert not [kw for (n, kw) in captured if n == "NvidiaNIM_openfold3"]
+    assert [kw for (n, kw) in captured if n == "NvidiaNIM_alphafold2_multimer"]
+
+
+def _seq_ref(sequence_id, chain_role, value, *, source_kind, source_ref,
+             prediction_input_kind="amino_acid_sequence",
+             sequence_value_status="inline", sequence=None,
+             sequence_storage_ref=None):
+    from app.schemas.step_07_prepared_structure_input_package import SequenceRef
+
+    return SequenceRef(
+        sequence_id=sequence_id,
+        chain_role=chain_role,
+        sequence=sequence,
+        sequence_length=len(value),
+        sha256_prefix=__import__("hashlib").sha256(value.encode()).hexdigest()[:12],
+        source_kind=source_kind,
+        source_ref=source_ref,
+        sequence_value_status=sequence_value_status,
+        prediction_input_kind=prediction_input_kind,
+        sequence_storage_ref=sequence_storage_ref,
+    )
+
+
+def test_step7_msa_search_dedupes_same_antigen_by_sha_across_material_and_file(
+    local_storage, registry_service, workflow_state_service
+):
+    from app.schemas.step_07_prepared_structure_input_package import StructureInputRecord
+
+    run_id = _seed_sequence_only_antigen_antibody(
+        local_storage, registry_service, workflow_state_service
+    )
+    # Same antigen sequence bound twice: once inline material, once uploaded
+    # FASTA file with identical content (same sha256).
+    fasta_key = local_storage.run_key(run_id, "inputs", "files", "her2.fasta")
+    local_storage.write_bytes(fasta_key, f">her2\n{_MSA_ANTIGEN}\n".encode("utf-8"))
+
+    record = StructureInputRecord(
+        structure_input_id="sin_dedup",
+        candidate_id="cand_dedup",
+        input_case="sequence_only_input",
+        structure_source="material_sequence",
+        assessment_intent="complex_prediction",
+        structure_role="complex",
+        sequence_refs_for_prediction=[
+            _seq_ref("antigen_material", "antigen", _MSA_ANTIGEN,
+                     source_kind="material_sequence", source_ref="antigen_material",
+                     sequence=_MSA_ANTIGEN),
+            _seq_ref("antigen_upload", "antigen", _MSA_ANTIGEN,
+                     source_kind="uploaded_fasta", source_ref=fasta_key,
+                     prediction_input_kind="fasta_ref",
+                     sequence_value_status="referenced",
+                     sequence_storage_ref=fasta_key),
+            _seq_ref("heavy_material", "antibody_heavy", _MSA_HEAVY,
+                     source_kind="material_sequence", source_ref="heavy_material",
+                     sequence=_MSA_HEAVY),
+            _seq_ref("light_material", "antibody_light", _MSA_LIGHT,
+                     source_kind="material_sequence", source_ref="light_material",
+                     sequence=_MSA_LIGHT),
+        ],
+    )
+
+    captured: list[dict[str, Any]] = []
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp_with_bindings({"NvidiaNIM_msa_search": _msa_capture_binding(captured)}),
+    )
+    calls = agent._route_step7_msa_search(
+        run_id=run_id, record=record,
+        scoped_tools={"NvidiaNIM_msa_search"},
+        summary_base={"label": "step07:sin_dedup", "candidate_id": "cand_dedup"},
+    )
+    # Antigen searched once (dedup), heavy once, light once = 3 calls, not 4.
+    assert len(calls) == 3
+    assert len(captured) == 3
+    antigen_searches = [c for c in captured if c["sequence"] == _MSA_ANTIGEN]
+    assert len(antigen_searches) == 1
+    # Both antigen refs point at the SAME single MSA output.
+    antigen_refs = [r for r in record.sequence_refs_for_prediction if r.chain_role == "antigen"]
+    assert len(antigen_refs) == 2
+    refs_out = {r.msa_tool_output_ref for r in antigen_refs}
+    assert len(refs_out) == 1 and next(iter(refs_out))
+    assert all(r.msa_status == "available" for r in antigen_refs)
+    # Heavy and light kept separate (distinct sequences → distinct searches).
+    assert any(c["sequence"] == _MSA_HEAVY for c in captured)
+    assert any(c["sequence"] == _MSA_LIGHT for c in captured)
+
+
+def test_step7_status_is_partial_when_selected_msa_call_fails(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_only_antigen_antibody(
+        local_storage, registry_service, workflow_state_service
+    )
+
+    def _msa_error(sequence=None, **kw):
+        return {"status": "upstream_error", "error_message": "NVIDIA_API_KEY missing"}
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp_with_bindings({"NvidiaNIM_msa_search": _msa_error}),
+    )
+    pkg = agent.run_step_7(run_id)
+    # A selected MSA preparation failure must not be reported as a clean ok.
+    assert pkg.structure_preparation_status == "partial"
+    assert pkg.preparation_warnings
+    warned_tools = {w["tool_name"] for w in pkg.preparation_warnings}
+    assert warned_tools == {"NvidiaNIM_msa_search"}
+    for w in pkg.preparation_warnings:
+        assert w["run_status"] in {"failed", "upstream_error"}
+        assert w.get("chain_role") in {"antigen", "antibody_heavy", "antibody_light"}
+        # Compact reason only — never a raw sequence or a3m.
+        assert _MSA_ANTIGEN not in json.dumps(w)
+        assert ">query" not in json.dumps(w)
+
+
+def test_step7_status_stays_ok_when_only_not_applicable_skips(
+    local_storage, registry_service, workflow_state_service
+):
+    # PDB-only input: MSA search is not applicable and structure tools may be
+    # skipped; those non-fatal skips must NOT downgrade status.
+    run_id = _seed(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "pdb_id", "value": "1N8Z", "source": "raw_request_text"}],
+    )
+
+    def _ok(**kw):
+        return {"status": "ok", "payload": {"ok": True}}
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp_with_bindings({
+            "RCSBData_get_entry": _ok,
+            "RCSBData_get_assembly": _ok,
+            "SAbDab_get_structure": _ok,
+        }),
+    )
+    pkg = agent.run_step_7(run_id)
+    assert pkg.preparation_warnings == []
+    assert pkg.structure_preparation_status in {"ok", "partial"}
+    # No warning should ever come from a not_applicable skip.
+    assert all(
+        w["run_status"] in {"failed", "upstream_error", "a3m_not_found"}
+        for w in pkg.preparation_warnings
+    )
+
+
+# ── Real live ColabFold/MMseqs2 MSA payload shape extraction ───────────────
+
+
+def _msa_real_shape_binding(captured, *, databases=None):
+    """Reproduce the real NvidiaNIM_msa_search live payload shape:
+    ``payload.data.alignments.<db>.a3m.alignment`` (adapter envelope)."""
+    def _inner(sequence=None, **kw):
+        captured.append({"sequence": sequence, **kw})
+        a3m = f">query\n{sequence}\n>hit1\n{sequence}"
+        dbs = databases or {"colabfold": a3m}
+        alignments = {
+            db: {"a3m": {"alignment": text, "format": "a3m"}}
+            for db, text in dbs.items()
+        }
+        return {
+            "status": "ok",
+            "source": "NvidiaNIM_msa_search",
+            "executor": "tooluniverse",
+            "arguments": {},
+            "retry_count": 0,
+            "retryable": False,
+            "payload": {"data": {"alignments": alignments}},
+        }
+    return _inner
+
+
+def test_extract_a3m_from_real_payload_shape_prefers_colabfold_then_sorted():
+    a3m_colab = ">c\nMKTAYIAKQNNVG\n>h\nMKTAYIAKQNNVG"
+    a3m_uni = ">u\nDIFFERENTSEQ\n>h\nDIFFERENTSEQ"
+    a3m_bfd = ">b\nANOTHERSEQ\n>h\nANOTHERSEQ"
+    stored = {
+        "tool_call_id": "tc1", "tool_name": "NvidiaNIM_msa_search", "label": "x",
+        "input": {"sequence_length": 13},
+        "output": {
+            "status": "ok", "source": "NvidiaNIM_msa_search", "executor": "tooluniverse",
+            "arguments": {},
+            "payload": {"data": {"alignments": {
+                "uniref90": {"a3m": {"alignment": a3m_uni, "format": "a3m"}},
+                "colabfold": {"a3m": {"alignment": a3m_colab, "format": "a3m"}},
+                "bfd": {"a3m": {"alignment": a3m_bfd, "format": "a3m"}},
+            }}},
+        },
+    }
+    # ColabFold wins deterministically even though it is not first in dict order.
+    assert structure_and_design_module._extract_a3m_alignment(stored) == a3m_colab
+    # Without colabfold, the sorted-first database wins ("bfd" < "uniref90").
+    del stored["output"]["payload"]["data"]["alignments"]["colabfold"]
+    assert structure_and_design_module._extract_a3m_alignment(stored) == a3m_bfd
+    # A payload that is OK but has no a3m yields None (not a false positive).
+    no_a3m = {"output": {"payload": {"data": {"status": "ok", "note": "no alignment"}}}}
+    assert structure_and_design_module._extract_a3m_alignment(no_a3m) is None
+
+
+def test_step7_8_real_msa_payload_injects_openfold3_msa_and_keeps_artifacts_compact(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_only_antigen_antibody(
+        local_storage, registry_service, workflow_state_service
+    )
+    captured_openfold: list[tuple[str, dict[str, Any]]] = []
+
+    def _capture(tool_name: str):
+        def _inner(**kw):
+            captured_openfold.append((tool_name, dict(kw)))
+            return {"status": "ok", "model_ref": f"s3://bucket/{tool_name}.pdb"}
+        return _inner
+
+    mcp = _mcp_with_bindings({
+        "NvidiaNIM_msa_search": _msa_real_shape_binding([]),
+        "NvidiaNIM_alphafold2_multimer": _capture("NvidiaNIM_alphafold2_multimer"),
+        "NvidiaNIM_openfold3": _capture("NvidiaNIM_openfold3"),
+        "NvidiaNIM_boltz2": _capture("NvidiaNIM_boltz2"),
+    })
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service, mcp_client=mcp,
+    )
+    pkg = agent.run_step_7(run_id)
+
+    # Step 7: real payload shape now extracts a3m -> msa_status "available".
+    msa_refs = [
+        s for sin in pkg.model_dump()["prepared_structure_inputs"]
+        for s in sin["sequence_refs_for_prediction"]
+        if s.get("msa_tool_output_ref")
+    ]
+    assert len(msa_refs) == 3
+    for s in msa_refs:
+        assert s["msa_status"] == "available"
+        assert s["msa_alignment_format"] == "a3m"
+        assert isinstance(s["msa_alignment_length"], int) and s["msa_alignment_length"] > 0
+        assert s["msa_alignment_sha256_prefix"]
+    assert pkg.structure_preparation_status in {"ok", "partial"}
+    # Normalized artifact carries only compact metadata — no raw seq / a3m.
+    blob = json.dumps(pkg.model_dump())
+    for raw in (_MSA_ANTIGEN, _MSA_HEAVY, _MSA_LIGHT):
+        assert raw not in blob
+    assert ">query" not in blob and ">hit1" not in blob
+
+    # Step 8: OpenFold3 receives per-protein-molecule MSA at runtime.
+    results = agent.run_step_8(run_id)
+    openfold_calls = [
+        tc for tc in results.tool_call_records if tc.tool_name == "NvidiaNIM_openfold3"
+    ]
+    assert openfold_calls
+    assert any(tc.run_status in {"pending", "success"} for tc in openfold_calls)
+    of_kwargs = [kw for (name, kw) in captured_openfold if name == "NvidiaNIM_openfold3"]
+    assert of_kwargs
+    for kw in of_kwargs:
+        molecules = kw["inputs"][0]["molecules"]
+        assert len(molecules) == 3
+        for mol in molecules:
+            assert "msa" in mol and isinstance(mol["msa"], dict) and mol["msa"]
+            a3m = next(iter(mol["msa"].values()))["a3m"]
+            assert a3m["format"] == "a3m"
+            assert a3m["alignment"].startswith(">")
+    # Step 8 normalized tool_input_summary never carries the raw a3m.
+    for tc in openfold_calls:
+        assert ">query" not in json.dumps(tc.tool_input_summary or {})
+
+
+def test_step7_status_partial_when_msa_ok_but_no_a3m_extracted(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_only_antigen_antibody(
+        local_storage, registry_service, workflow_state_service
+    )
+
+    def _msa_ok_no_a3m(sequence=None, **kw):
+        # Transport OK, but no usable a3m alignment anywhere in the payload.
+        return {"status": "ok", "payload": {"data": {"note": "search done", "count": 0}}}
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage, registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp_with_bindings({"NvidiaNIM_msa_search": _msa_ok_no_a3m}),
+    )
+    pkg = agent.run_step_7(run_id)
+    # A semantic a3m-extraction failure must not report clean ok.
+    assert pkg.structure_preparation_status == "partial"
+    semantic = [w for w in pkg.preparation_warnings if w["run_status"] == "a3m_not_found"]
+    assert semantic
+    assert {w["tool_name"] for w in semantic} == {"NvidiaNIM_msa_search"}
+    for w in pkg.preparation_warnings:
+        assert ">query" not in json.dumps(w)
+    statuses = [
+        s.get("msa_status")
+        for sin in pkg.model_dump()["prepared_structure_inputs"]
+        for s in sin["sequence_refs_for_prediction"]
+        if s.get("chain_role") in {"antigen", "antibody_heavy", "antibody_light"}
+    ]
+    assert statuses and all(st == "a3m_not_found" for st in statuses)
+
+
+def test_step8_modeling_notes_do_not_claim_mocked_data():
+    """The stale 'wrappers may return mocked data' note is gone; the note must
+    reflect real live routing without a mock-success path."""
+    import inspect
+
+    src = inspect.getsource(structure_and_design_module.StructureAndDesignAgent.run_step_8)
+    assert "mocked data" not in src
+    assert "status='mocked'" not in src
 
 
 def test_step8_produces_confidence_records_and_keeps_raw_at_ref(
@@ -1687,14 +2849,15 @@ def test_step8_sequence_only_records_nim_prediction_route_as_unavailable(
     ]
     assert nim_calls
     assert all(tc.run_status == "skipped" for tc in nim_calls)
-    assert all(tc.tool_input_summary.get("routing_decision") == "input_missing" for tc in nim_calls)
+    assert all((tc.tool_input_summary or {}).get("routing_decision") in {"input_missing", "contract_unresolved"} for tc in nim_calls)
     assert all("complex_prediction_plan" in tc.tool_input_summary for tc in nim_calls)
     plans = [
         plan for cr in results.candidate_structure_results
         for plan in cr.complex_prediction_plans
     ]
     assert plans
-    assert all(plan.input_status == "input_missing" for plan in plans)
+    assert any(plan.input_status == "input_missing" for plan in plans)
+    assert any(plan.input_status in {"input_missing", "contract_unresolved"} for plan in plans)
     assert any("antibody_heavy_sequence" in plan.missing_prediction_inputs for plan in plans)
     assert any("antibody_light_sequence" in plan.missing_prediction_inputs for plan in plans)
 
@@ -1904,7 +3067,7 @@ def test_step8_antibody_heavy_light_without_antigen_records_input_missing_antige
     ]
     assert nim_calls
     assert all(tc.run_status == "skipped" for tc in nim_calls)
-    assert all(tc.tool_input_summary.get("routing_decision") == "input_missing" for tc in nim_calls)
+    assert all((tc.tool_input_summary or {}).get("routing_decision") in {"input_missing", "contract_unresolved"} for tc in nim_calls)
     audit_blob = json.dumps([tc.tool_input_summary or {} for tc in nim_calls])
     assert heavy_seq not in audit_blob
     assert light_seq not in audit_blob
@@ -1971,11 +3134,18 @@ def test_step8_nim_runtime_resolves_inline_sequence_from_step5_material_lookup(
             assert light_seq in kwargs["sequences"]
             assert "MKTAYIAKQNNVG" in kwargs["sequences"]
         if "inputs" in kwargs:
-            flat = "".join(item.get("sequence", "") for item in kwargs["inputs"])
+            assert len(kwargs["inputs"]) == 1
+            assert kwargs["inputs"][0]["input_id"] == "adc_antigen_antibody_complex"
+            assert kwargs["inputs"][0]["output_format"] == "pdb"
+            molecules = kwargs["inputs"][0]["molecules"]
+            assert all(item["type"] == "protein" for item in molecules)
+            flat = "".join(item.get("sequence", "") for item in molecules)
             assert heavy_seq in flat
             assert light_seq in flat
             assert "MKTAYIAKQNNVG" in flat
         if "polymers" in kwargs:
+            assert [item["id"] for item in kwargs["polymers"]] == ["A", "H", "L"]
+            assert all(item["molecule_type"] == "protein" for item in kwargs["polymers"])
             flat = "".join(item.get("sequence", "") for item in kwargs["polymers"])
             assert heavy_seq in flat
             assert light_seq in flat
@@ -2033,6 +3203,41 @@ def test_step8_nim_contract_treats_fasta_refs_as_runtime_ready():
     audit_blob = json.dumps(plan.model_dump())
     assert ">antigen" not in audit_blob
     assert "MKTAYIAK" not in audit_blob
+
+
+def test_step8_nim_runtime_kwargs_match_tooluniverse_official_schema():
+    resolved = [
+        {"sequence_id": "antigen_seq", "chain_role": "antigen", "sequence": "MKTAYIAKQNNVG"},
+        {"sequence_id": "heavy_seq", "chain_role": "antibody_heavy", "sequence": "EVQLVESGGGLVQPGG"},
+        {"sequence_id": "light_seq", "chain_role": "antibody_light", "sequence": "DIQMTQSPSSLSASVG"},
+    ]
+
+    alphafold = structure_and_design_module._nim_kwargs(
+        "NvidiaNIM_alphafold2_multimer", resolved
+    )
+    assert alphafold == {
+        "sequences": ["MKTAYIAKQNNVG", "EVQLVESGGGLVQPGG", "DIQMTQSPSSLSASVG"]
+    }
+
+    openfold = structure_and_design_module._nim_kwargs("NvidiaNIM_openfold3", resolved)
+    assert set(openfold) == {"inputs"}
+    assert len(openfold["inputs"]) == 1
+    assert openfold["inputs"][0]["input_id"] == "adc_antigen_antibody_complex"
+    assert openfold["inputs"][0]["output_format"] == "pdb"
+    assert openfold["inputs"][0]["molecules"] == [
+        {"type": "protein", "sequence": "MKTAYIAKQNNVG"},
+        {"type": "protein", "sequence": "EVQLVESGGGLVQPGG"},
+        {"type": "protein", "sequence": "DIQMTQSPSSLSASVG"},
+    ]
+
+    boltz = structure_and_design_module._nim_kwargs("NvidiaNIM_boltz2", resolved)
+    assert set(boltz) == {"polymers", "output_format"}
+    assert boltz["output_format"] == "mmcif"
+    assert boltz["polymers"] == [
+        {"id": "A", "molecule_type": "protein", "sequence": "MKTAYIAKQNNVG"},
+        {"id": "H", "molecule_type": "protein", "sequence": "EVQLVESGGGLVQPGG"},
+        {"id": "L", "molecule_type": "protein", "sequence": "DIQMTQSPSSLSASVG"},
+    ]
 
 
 def test_step8_nim_wrappers_are_tooluniverse_bindings_or_explicit_dependency():
@@ -2095,9 +3300,33 @@ def test_step8_nim_success_persists_compact_input_not_raw_sequences(
         tc for tc in results.tool_call_records
         if tc.tool_name in structure_and_design_module._STEP8_NIM_COMPLEX_TOOLS
     ]
-    assert nim_calls
-    assert any(tc.run_status == "success" for tc in nim_calls)
-    for tc in nim_calls:
+    alphafold_calls = [tc for tc in nim_calls if tc.tool_name == "NvidiaNIM_alphafold2_multimer"]
+    boltz_calls = [tc for tc in nim_calls if tc.tool_name == "NvidiaNIM_boltz2"]
+    openfold_calls = [tc for tc in nim_calls if tc.tool_name == "NvidiaNIM_openfold3"]
+    assert alphafold_calls
+    assert boltz_calls
+    assert openfold_calls
+    assert all(
+        tc.run_status in {"pending", "success", "skipped"}
+        for tc in alphafold_calls
+    )
+    assert all(
+        tc.run_status in {"pending", "success", "skipped"}
+        for tc in boltz_calls
+    )
+    assert any(tc.run_status in {"pending", "success"} for tc in alphafold_calls)
+    assert any(tc.run_status in {"pending", "success"} for tc in boltz_calls)
+    assert all(tc.run_status == "skipped" for tc in openfold_calls)
+    assert all(
+        tc.tool_input_summary.get("routing_decision") == "contract_unresolved"
+        for tc in openfold_calls
+    )
+    assert all(
+        "openfold3_msa_required" in ((tc.tool_input_summary or {}).get("complex_prediction_plan", {}) or {}).get("missing_prediction_inputs", [])
+        for tc in openfold_calls
+    )
+
+    for tc in [*alphafold_calls, *boltz_calls]:
         if not tc.tool_output_ref:
             continue
         payload = local_storage.read_json(tc.tool_output_ref)

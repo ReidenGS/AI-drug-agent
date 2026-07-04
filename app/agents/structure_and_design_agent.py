@@ -110,6 +110,10 @@ _STEP8_NIM_COMPLEX_TOOLS = {
     "NvidiaNIM_openfold3",
     "NvidiaNIM_boltz2",
 }
+# Step 7 MSA-search preparation (feeds Step 8 OpenFold3). One official
+# ToolUniverse wrapper; no local Nvidia client.
+_STEP7_MSA_SEARCH_TOOL = "NvidiaNIM_msa_search"
+_MSA_SEARCH_CHAIN_ROLES = {"antigen", "antibody_heavy", "antibody_light"}
 _NAME_LIKE_MATERIAL_TYPES = {
     "target_antigen_name",
     "antibody_name",
@@ -270,10 +274,24 @@ class StructureAndDesignAgent:
             candidates,
         )
 
+        # Selected (not not_applicable-skipped) tool calls that failed must be
+        # visible: a failed MSA/structure preparation call cannot be reported
+        # as a clean `ok`. Skips (routing_decision != "selected") stay non-fatal.
+        # Semantic failures (MSA transported OK but no usable a3m extracted) are
+        # surfaced too, so a live a3m-extraction miss never reports clean `ok`.
+        preparation_warnings = (
+            _step7_selected_failure_warnings(tool_call_records)
+            + _step7_msa_semantic_warnings(prepared)
+        )
+
         prep_status: str
         if not prepared:
             prep_status = "failed"
-        elif unresolved_resource_refs or any(r.missing_metadata_flags for r in prepared):
+        elif (
+            unresolved_resource_refs
+            or any(r.missing_metadata_flags for r in prepared)
+            or preparation_warnings
+        ):
             prep_status = "partial"
         else:
             prep_status = "ok"
@@ -288,6 +306,7 @@ class StructureAndDesignAgent:
                 tc.tool_output_artifact_id for tc in tool_call_records if tc.tool_output_artifact_id
             ],
             unresolved_resource_refs=unresolved_resource_refs,
+            preparation_warnings=preparation_warnings,
         )
 
         artifact_id = new_artifact_id("prepared_structure_input_package")
@@ -336,6 +355,7 @@ class StructureAndDesignAgent:
             m for m in cand_sequence_mats
             if not _looks_like_file_backed_sequence(m.get("value"))
             or m.get("value") in bound_sequence_paths
+            or _sequence_from_file(self.storage, m.get("value")) is not None
         ]
 
         # Top-level uploads. For target/antibody we accept any uploaded structure
@@ -487,6 +507,30 @@ class StructureAndDesignAgent:
         for m in cand_sequence_mats:
             material_id = m.get("material_id", new_artifact_id("seq"))
             raw_sequence = m.get("value")
+            if _looks_like_file_backed_sequence(raw_sequence):
+                seq_file_length, seq_file_hash = _sequence_stats_from_file(
+                    self.storage,
+                    raw_sequence,
+                )
+                sequence_refs.append(
+                    SequenceRef(
+                        sequence_id=material_id,
+                        chain_role=_chain_role_from_material(m.get("material_type", "")),
+                        sequence=None,
+                        sequence_length=seq_file_length,
+                        sha256_prefix=seq_file_hash,
+                        source_kind="uploaded_fasta",
+                        source_ref=str(raw_sequence),
+                        prediction_needed=prediction_required,
+                        sequence_storage_ref=str(raw_sequence),
+                        sequence_value_status="referenced",
+                        prediction_input_kind="fasta_ref",
+                        related_candidate_ids=[candidate_id],
+                        resource_binding_status="explicit",
+                        binding_confidence=1.0,
+                    )
+                )
+                continue
             sequence_length, sha256_prefix = _sequence_stats(raw_sequence)
             sequence_refs.append(
                 SequenceRef(
@@ -652,6 +696,7 @@ class StructureAndDesignAgent:
         tool_calls: list[ToolCallRecord] = []
         output_artifacts: list[StructureOutputArtifact] = []
         candidate_results: list[CandidateStructureResult] = []
+        seen_nim_mapping_calls: set[tuple[str, str]] = set()
 
         any_partial = False
         any_failed = False
@@ -675,6 +720,7 @@ class StructureAndDesignAgent:
                 sin,
                 inputs,
                 sequence_material_lookup=sequence_material_lookup,
+                seen_nim_mapping_calls=seen_nim_mapping_calls,
             )
             selected_calls = [
                 tc for tc in routed_calls
@@ -799,9 +845,11 @@ class StructureAndDesignAgent:
             tool_call_records=tool_calls,
             output_artifacts=output_artifacts,
             structure_modeling_notes=(
-                "Step 8 ran in MVP mode; tool wrappers may return mocked data "
-                "(`status='mocked'`). Raw payloads are referenced via "
-                "output_artifacts[].storage_ref."
+                "Step 8 routes NvidiaNIM / structure tools through their "
+                "ToolUniverse wrappers. Live calls return real upstream payloads "
+                "or an honest upstream_error/dependency_unavailable; there is no "
+                "mock-success path. Raw payloads are referenced via "
+                "output_artifacts[].storage_ref, never embedded here."
             ),
         )
 
@@ -829,11 +877,17 @@ class StructureAndDesignAgent:
         all_inputs: list[dict] | None = None,
         *,
         sequence_material_lookup: dict[str, str] | None = None,
+        seen_nim_mapping_calls: set[tuple[str, str]] | None = None,
     ) -> list[ToolCallRecord]:
         input_case = sin.get("input_case")
         structure_input_id = sin.get("structure_input_id")
         candidate_id = sin.get("candidate_id")
         calls: list[ToolCallRecord] = []
+
+        # Resolve any Step 7 MSA search outputs into inline a3m objects (in
+        # memory only) before planning, so OpenFold3 is judged ready ONLY when
+        # a usable a3m can actually be extracted for every protein molecule.
+        _resolve_step8_msa_inline(all_inputs if all_inputs is not None else [sin], storage=self.storage)
 
         def _summary_base() -> dict[str, Any]:
             return {
@@ -919,6 +973,22 @@ class StructureAndDesignAgent:
                 )
             )
 
+        def _skip_duplicate_mapping(tool_name: str, mapping_key: str) -> None:
+            calls.append(
+                _nonexecuted_tool_record(
+                    tool_name=tool_name,
+                    agent_name=_AGENT_NAME,
+                    step_id=_STEP_08,
+                    run_status="skipped",
+                    summary={
+                        **_summary_base(),
+                        "routing_decision": "duplicate_complex_prediction_mapping",
+                        "reason": "NvidiaNIM complex prediction already planned for this antigen-antibody mapping",
+                        "mapping_key": mapping_key,
+                    },
+                )
+            )
+
         pdb_id = _step8_pdb_id(sin.get("structure_refs") or [])
         if "CrystalStructure_validate" in scoped_tools:
             crystal_args, missing_crystal_args = _step8_crystal_validation_args(sin)
@@ -980,6 +1050,14 @@ class StructureAndDesignAgent:
                 continue
             plan = _plan_step8_nim_complex_prediction(tool_name, sin, all_inputs)
             if plan.input_status in {"ready", "selected_but_deferred"}:
+                mapping_key = _step8_nim_mapping_key(sin)
+                if mapping_key:
+                    pair_key = (mapping_key, tool_name)
+                    if seen_nim_mapping_calls is not None and pair_key in seen_nim_mapping_calls:
+                        _skip_duplicate_mapping(tool_name, mapping_key)
+                        continue
+                    if seen_nim_mapping_calls is not None:
+                        seen_nim_mapping_calls.add(pair_key)
                 runtime = _build_nim_runtime_invocation(
                     tool_name=tool_name,
                     plan=plan,
@@ -1125,6 +1203,18 @@ class StructureAndDesignAgent:
                 )
             )
 
+        # MSA search preparation for Step 8 OpenFold3. Runs for any input case
+        # that carries runtime-ready protein sequences for antigen / antibody
+        # chain roles (so PDB-only and UniProt-only inputs never trigger it).
+        calls.extend(
+            self._route_step7_msa_search(
+                run_id=run_id,
+                record=record,
+                scoped_tools=scoped_tools,
+                summary_base=_summary_base(),
+            )
+        )
+
         def _run_and_record(tool_name: str, kwargs: dict[str, Any], decision: str) -> None:
             tc = self._call_tool(
                 run_id=run_id,
@@ -1265,6 +1355,118 @@ class StructureAndDesignAgent:
                 continue
             _skip(tool_name, f"unhandled Step 7 input_case={input_case}")
         return calls
+
+    def _route_step7_msa_search(
+        self,
+        *,
+        run_id: str,
+        record: StructureInputRecord,
+        scoped_tools: set[str],
+        summary_base: dict[str, Any],
+    ) -> list[ToolCallRecord]:
+        """Run NvidiaNIM_msa_search once per runtime-ready antigen/antibody
+        protein sequence and attach compact MSA refs to the sequence.
+
+        Only fires when the tool is in Step 7 scope. Skips UniProt-only /
+        identifier-only sequences (no safely-resolved raw sequence) and any
+        chain role OpenFold3 does not need. Raw sequence is injected into the
+        tool call kwargs only; the persisted input + normalized metadata carry
+        digests / refs only.
+
+        Deduplicated per ``(chain_role, sequence-content sha256)``: the same
+        antigen sequence bound as both a material ref and an uploaded-file ref
+        (same content, same sha) produces exactly one MSA call. Heavy and light
+        stay separate, and distinct antigen/heavy/light sequences are never
+        collapsed. Duplicate refs reuse the single MSA output so Step 8 can
+        still resolve MSA for each of them.
+        """
+        if _STEP7_MSA_SEARCH_TOOL not in scoped_tools:
+            return []
+        calls: list[ToolCallRecord] = []
+        seen_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+        for ref in record.sequence_refs_for_prediction:
+            if ref.chain_role not in _MSA_SEARCH_CHAIN_ROLES:
+                continue
+            readiness, _reason = _prediction_sequence_readiness(
+                {
+                    "prediction_input_kind": ref.prediction_input_kind,
+                    "sequence_value_status": ref.sequence_value_status,
+                    "sequence_storage_ref": ref.sequence_storage_ref,
+                    "source_ref": ref.source_ref,
+                }
+            )
+            if readiness != "ready":
+                # UniProt-only / identifier-only / unavailable: do NOT MSA-search.
+                ref.msa_status = "skipped"
+                continue
+            raw_sequence = _step7_runtime_protein_sequence(ref, storage=self.storage)
+            if not raw_sequence:
+                ref.msa_status = "skipped"
+                continue
+            content_sha = hashlib.sha256(raw_sequence.encode("utf-8")).hexdigest()[:12]
+            identity = (str(ref.chain_role), content_sha)
+            if identity in seen_by_identity:
+                # Same role + same sequence content already searched this record.
+                # Reuse the single MSA result; do NOT call the tool again.
+                _apply_step7_msa_metadata(ref, seen_by_identity[identity])
+                continue
+            compact_input = {
+                "sequence_id": ref.sequence_id,
+                "chain_role": ref.chain_role,
+                "sequence_length": len(raw_sequence),
+                "sha256_prefix": content_sha,
+                "output_alignment_formats": ["a3m"],
+                "e_value": 0.0001,
+                "iterations": 1,
+                "argument_schema": "sequence",
+            }
+            tc = self._call_tool(
+                run_id=run_id,
+                step_id=_STEP_07,
+                tool_name=_STEP7_MSA_SEARCH_TOOL,
+                kwargs={
+                    "sequence": raw_sequence,
+                    "output_alignment_formats": ["a3m"],
+                    "e_value": 0.0001,
+                    "iterations": 1,
+                },
+                output_dir="step_07",
+                label=f"msa_search:{record.structure_input_id}:{ref.chain_role}",
+                extra_input_summary={
+                    **summary_base,
+                    "routing_decision": "selected",
+                    "msa_chain_role": ref.chain_role,
+                },
+                persisted_input=compact_input,
+            )
+            calls.append(tc)
+            meta: dict[str, Any] = {
+                "msa_source_tool": _STEP7_MSA_SEARCH_TOOL,
+                "msa_tool_call_id": tc.tool_call_id,
+            }
+            if tc.run_status in {"success", "pending"} and tc.tool_output_ref:
+                meta["msa_tool_output_ref"] = tc.tool_output_ref
+                msa_object = _resolve_stored_msa_a3m_object(
+                    tc.tool_output_ref, storage=self.storage
+                )
+                alignment = _openfold3_primary_alignment(msa_object)
+                if alignment:
+                    meta["msa_status"] = "available"
+                    meta["msa_alignment_format"] = "a3m"
+                    meta["msa_alignment_length"] = len(alignment)
+                    meta["msa_alignment_sha256_prefix"] = hashlib.sha256(
+                        alignment.encode("utf-8")
+                    ).hexdigest()[:12]
+                else:
+                    meta["msa_status"] = "a3m_not_found"
+            elif tc.run_status == "failed":
+                meta["msa_status"] = "upstream_error"
+            else:
+                meta["msa_status"] = "not_run"
+            seen_by_identity[identity] = meta
+            _apply_step7_msa_metadata(ref, meta)
+        return calls
+
     # ── Step 9 ──────────────────────────────────────────────────────────────
     def run_step_9(self, run_id: str) -> CompoundScreeningArtifact:
         reg = self.registry.get(run_id)
@@ -1538,7 +1740,16 @@ def _explicit_resource_candidate_ids(resource: dict, valid_ids: set[str]) -> lis
 def _resource_role(resource: dict, resource_kind: str) -> str | None:
     for key in ("chain_role", "role", "source_role"):
         if isinstance(resource.get(key), str) and resource[key].strip():
-            return resource[key].strip().lower()
+            role = resource[key].strip().lower()
+            if role in {"target_sequence", "antigen_sequence", "target_or_antigen", "target_antigen"}:
+                return "antigen"
+            if role in {"antibody_sequence", "antibody_sequence_reference"}:
+                return "antibody"
+            if role in {"heavy_chain", "vh", "antibody_heavy_chain_sequence"}:
+                return "antibody_heavy"
+            if role in {"light_chain", "vl", "antibody_light_chain_sequence"}:
+                return "antibody_light"
+            return role
     filename = (resource.get("original_filename") or "").lower()
     if any(marker in filename for marker in ("heavy", "_vh", "-vh", "_hc", "-hc")):
         return "antibody_heavy"
@@ -2009,9 +2220,9 @@ def _chain_role_from_material(material_type: str) -> Optional[str]:
 
 def _chain_role_from_fasta_file(file_record: dict, candidate_type: str | None) -> str:
     name = (file_record.get("original_filename") or "").lower()
-    if any(marker in name for marker in ("light", "_l", "-l", "vl", "lc")):
+    if any(marker in name for marker in ("light", "vl", "lc")):
         return "antibody_light"
-    if any(marker in name for marker in ("heavy", "_h", "-h", "vh", "hc")):
+    if any(marker in name for marker in ("heavy", "vh", "hc")):
         return "antibody_heavy"
     if candidate_type == "target_antigen":
         return "antigen"
@@ -2225,6 +2436,19 @@ def _step8_tool_call_affects_partial(tc: ToolCallRecord) -> bool:
     return False
 
 
+def _step8_nim_mapping_key(sin: dict) -> str | None:
+    mapping = sin.get("antigen_antibody_mapping")
+    if not isinstance(mapping, dict):
+        return None
+    target_id = mapping.get("target_candidate_id")
+    antibody_id = mapping.get("antibody_candidate_id")
+    if not isinstance(target_id, str) or not target_id:
+        return None
+    if not isinstance(antibody_id, str) or not antibody_id:
+        return None
+    return f"{target_id}:{antibody_id}"
+
+
 def _plan_step8_nim_complex_prediction(
     tool_name: str,
     sin: dict,
@@ -2253,17 +2477,18 @@ def _plan_step8_nim_complex_prediction(
 
     sequence_lookup = _prediction_sequence_lookup(all_inputs or [sin])
     sequence_inputs = _compact_prediction_sequence_inputs(sin)
+    deduped_inputs = _dedupe_step8_prediction_sequence_inputs(sequence_inputs)
     mapping = sin.get("antigen_antibody_mapping") or {}
     antigen_ids = list(mapping.get("antigen_sequence_ids") or [])
     heavy_ids = list(mapping.get("antibody_heavy_sequence_ids") or [])
     light_ids = list(mapping.get("antibody_light_sequence_ids") or [])
 
     if not antigen_ids:
-        antigen_ids = [entry["sequence_id"] for entry in sequence_inputs if entry.get("chain_role") == "antigen"]
+        antigen_ids = [entry["sequence_id"] for entry in deduped_inputs if entry.get("chain_role") == "antigen"]
     if not heavy_ids:
-        heavy_ids = [entry["sequence_id"] for entry in sequence_inputs if entry.get("chain_role") == "antibody_heavy"]
+        heavy_ids = [entry["sequence_id"] for entry in deduped_inputs if entry.get("chain_role") == "antibody_heavy"]
     if not light_ids:
-        light_ids = [entry["sequence_id"] for entry in sequence_inputs if entry.get("chain_role") == "antibody_light"]
+        light_ids = [entry["sequence_id"] for entry in deduped_inputs if entry.get("chain_role") == "antibody_light"]
 
     missing: list[str] = []
     unresolved: list[str] = []
@@ -2308,16 +2533,87 @@ def _plan_step8_nim_complex_prediction(
             runtime_status="not_checked",
             can_invoke=False,
             missing_prediction_inputs=list(dict.fromkeys([*unresolved, *missing])),
-            sequence_inputs=_compact_prediction_sequence_inputs_for_ids(
-                sequence_lookup,
-                [*antigen_ids, *heavy_ids, *light_ids],
-                fallback=sequence_inputs,
+            sequence_inputs=_dedupe_step8_prediction_sequence_inputs(
+                _compact_prediction_sequence_inputs_for_ids(
+                    sequence_lookup,
+                    [*antigen_ids, *heavy_ids, *light_ids],
+                    fallback=deduped_inputs,
+                )
             ),
             structure_inputs=_compact_prediction_structure_inputs(sin),
             contract_notes=[
                 "identifier-only sequence inputs require explicit runtime sequence resolution before NvidiaNIM complex prediction"
             ],
         )
+
+    compact_inputs = _dedupe_step8_prediction_sequence_inputs(
+        _compact_prediction_sequence_inputs_for_ids(
+            sequence_lookup,
+            [*antigen_ids, *heavy_ids, *light_ids],
+            fallback=deduped_inputs,
+        )
+    )
+
+    if tool_name == "NvidiaNIM_openfold3":
+        no_msa_roles, a3m_not_found_roles, unmappable_msa_roles = _classify_openfold3_msa_roles(
+            compact_inputs
+        )
+        if no_msa_roles:
+            return ComplexPredictionPlan(
+                tool_name=tool_name,
+                input_status="contract_unresolved",
+                runtime_status="not_checked",
+                can_invoke=False,
+                missing_prediction_inputs=list(
+                    dict.fromkeys(["openfold3_msa_required", *missing])
+                ),
+                sequence_inputs=compact_inputs,
+                structure_inputs=_compact_prediction_structure_inputs(sin),
+                contract_notes=[
+                    "OpenFold3 requires MSA for protein molecules; no MSA artifact is available",
+                    f"openfold3_msa_missing_for={','.join(sorted(no_msa_roles))}",
+                ],
+            )
+        if a3m_not_found_roles:
+            # Step 7 MSA search produced an output, but no usable a3m alignment
+            # could be extracted for these protein roles. Keep OpenFold3
+            # contract_unresolved rather than sending molecules without MSA.
+            return ComplexPredictionPlan(
+                tool_name=tool_name,
+                input_status="contract_unresolved",
+                runtime_status="not_checked",
+                can_invoke=False,
+                missing_prediction_inputs=list(
+                    dict.fromkeys(["openfold3_msa_a3m_not_found", *missing])
+                ),
+                sequence_inputs=compact_inputs,
+                structure_inputs=_compact_prediction_structure_inputs(sin),
+                contract_notes=[
+                    "OpenFold3 MSA output exists but no usable a3m alignment could be extracted",
+                    f"openfold3_msa_a3m_not_found_for={','.join(sorted(a3m_not_found_roles))}",
+                ],
+            )
+        if unmappable_msa_roles:
+            # MSA metadata exists but is only a reference (path / storage /
+            # artifact ref) — it cannot be mapped to the OpenFold3 a3m contract
+            # without reading files (no storage-backed MSA resolver contract).
+            # Do NOT mark ready; gate instead of sending unusable kwargs.
+            return ComplexPredictionPlan(
+                tool_name=tool_name,
+                input_status="contract_unresolved",
+                runtime_status="not_checked",
+                can_invoke=False,
+                missing_prediction_inputs=list(
+                    dict.fromkeys(["openfold3_msa_runtime_mapping_missing", *missing])
+                ),
+                sequence_inputs=compact_inputs,
+                structure_inputs=_compact_prediction_structure_inputs(sin),
+                contract_notes=[
+                    "OpenFold3 MSA metadata is a reference only and cannot be mapped to the "
+                    "OpenFold3 a3m contract without a storage-backed MSA resolver",
+                    f"openfold3_msa_runtime_mapping_missing_for={','.join(sorted(unmappable_msa_roles))}",
+                ],
+            )
 
     if missing:
         return ComplexPredictionPlan(
@@ -2326,11 +2622,7 @@ def _plan_step8_nim_complex_prediction(
             runtime_status="not_checked",
             can_invoke=False,
             missing_prediction_inputs=missing,
-            sequence_inputs=_compact_prediction_sequence_inputs_for_ids(
-                sequence_lookup,
-                [*antigen_ids, *heavy_ids, *light_ids],
-                fallback=sequence_inputs,
-            ),
+            sequence_inputs=compact_inputs,
             structure_inputs=_compact_prediction_structure_inputs(sin),
             contract_notes=["missing antigen-antibody pair sequence input for complex prediction"],
         )
@@ -2340,17 +2632,352 @@ def _plan_step8_nim_complex_prediction(
         input_status="ready",
         runtime_status="not_checked",
         can_invoke=False,
-        sequence_inputs=_compact_prediction_sequence_inputs_for_ids(
-            sequence_lookup,
-            [*antigen_ids, *heavy_ids, *light_ids],
-            fallback=sequence_inputs,
-        ),
+        sequence_inputs=compact_inputs,
         structure_inputs=_compact_prediction_structure_inputs(sin),
         contract_notes=[
             "antigen and antibody raw/fasta-resolvable sequence refs are available",
             "NvidiaNIM ToolUniverse wrapper can be attempted; upstream credentials/runtime may still be unavailable",
         ],
     )
+
+
+def _has_openfold3_msa(item: dict[str, Any]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    for key in (
+        "msa_ref",
+        "msa_source_ref",
+        "msa_storage_ref",
+        "msa_path",
+        "msa_url",
+        "msa_artifact_ref",
+        "msa_file_ref",
+        "msa_content_ref",
+    ):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+
+    msa = item.get("msa")
+    if isinstance(msa, dict):
+        if isinstance(msa.get("artifact_ref"), str) and msa.get("artifact_ref"):
+            return True
+        if isinstance(msa.get("storage_ref"), str) and msa.get("storage_ref"):
+            return True
+        if isinstance(msa.get("path"), str) and msa.get("path"):
+            return True
+        if isinstance(msa.get("source_ref"), str) and msa.get("source_ref"):
+            return True
+
+    return False
+
+
+def _openfold3_msa_object(seq: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Build the official OpenFold3 ``msa`` object from a sequence ref that
+    carries INLINE a3m alignment content.
+
+    The OpenFold3 ToolUniverse contract (see the tool's ``test_examples``)
+    accepts a per-molecule ``msa`` object of shape
+    ``{<db>: {"a3m": {"alignment": <a3m content>, "format": "a3m"}}}``. Only
+    an MSA that already carries the actual a3m alignment content can be mapped
+    to this contract. A bare storage/artifact/path reference cannot — we do
+    NOT read files here (no storage-backed MSA resolver contract exists), and
+    a reference is not the OpenFold3-accepted shape. Those return ``None`` so
+    the caller gates the tool instead of sending unusable kwargs.
+
+    Never invents a shape: an already-official nested block is preserved; a
+    simple inline ``{"a3m": <content>}`` / ``{"alignment": <content>}`` is
+    wrapped into the single official ``{"main": {"a3m": ...}}`` form.
+    """
+    if not isinstance(seq, dict):
+        return None
+    msa = seq.get("msa")
+    if not isinstance(msa, dict):
+        return None
+    # (a) already-official nested shape: {<db>: {a3m: {alignment, format}}}.
+    official: dict[str, Any] = {}
+    for db_name, db_val in msa.items():
+        if not isinstance(db_val, dict):
+            continue
+        a3m = db_val.get("a3m")
+        if not isinstance(a3m, dict):
+            continue
+        alignment = a3m.get("alignment")
+        if isinstance(alignment, str) and alignment.strip():
+            official[str(db_name)] = {
+                "a3m": {
+                    "alignment": alignment,
+                    "format": a3m.get("format") or "a3m",
+                }
+            }
+    if official:
+        return official
+    # (b) simple inline content form: {"a3m": <content>} / {"alignment": <content>}.
+    inline = msa.get("a3m")
+    if not (isinstance(inline, str) and inline.strip()):
+        inline = msa.get("alignment")
+    if isinstance(inline, str) and inline.strip():
+        return {"main": {"a3m": {"alignment": inline, "format": "a3m"}}}
+    return None
+
+
+def _openfold3_primary_alignment(msa_object: dict[str, Any] | None) -> str | None:
+    """Return the first a3m alignment content string from a built MSA object
+    (used only for LLM-safe digesting; never persisted as raw content)."""
+    if not isinstance(msa_object, dict):
+        return None
+    for db_val in msa_object.values():
+        if not isinstance(db_val, dict):
+            continue
+        a3m = db_val.get("a3m")
+        if isinstance(a3m, dict):
+            alignment = a3m.get("alignment")
+            if isinstance(alignment, str) and alignment:
+                return alignment
+    return None
+
+
+# ── Storage-backed MSA (a3m) extraction (Step 7 output -> Step 8 kwargs). ──
+#
+# The NvidiaNIM_msa_search return schema is `additionalProperties true`. The
+# real live ColabFold/MMseqs2 payload nests the a3m alignment at
+# `payload.data.alignments.<database>.a3m.alignment` (with the format at
+# `...a3m.format`). Around that the adapter/envelope adds another `payload`
+# wrapper and `_call_tool` stores it under `output`, so the full stored path is
+# `output.payload.data.alignments.<db>.a3m.alignment`. The extractor descends
+# dict/list containers, prefers the plausible alignment keys, orders multiple
+# databases deterministically (ColabFold first, then sorted keys), validates
+# the leaf string with `_looks_like_a3m`, and rejects empty / non-a3m text. It
+# is applied ONLY at Step 8 runtime to the stored tool output; the extracted
+# alignment is passed to the OpenFold3 runtime kwargs and never written into a
+# normalized artifact.
+
+_A3M_ALIGNMENT_KEYS = ("a3m", "alignment", "alignments", "msa")
+_A3M_CONTAINER_KEYS = ("result", "results", "data", "output", "outputs", "payload", "response")
+_A3M_MAX_DEPTH = 12
+_A3M_HEADER_BODY_RE = re.compile(r">[^\n]*\n\s*[A-Za-z][A-Za-z\-\.]*")
+
+
+def _looks_like_a3m(text: Any) -> bool:
+    if not isinstance(text, str):
+        return False
+    s = text.strip()
+    if len(s) < 2:
+        return False
+    # a3m / fasta-style alignment: at least one '>' header followed by a
+    # residue line. Reject anything without a header+body (e.g. status text).
+    # ColabFold a3m may prefix a `#` comment line before the first '>' header.
+    if not (s.lstrip().startswith(">") or "\n>" in s):
+        return False
+    return bool(_A3M_HEADER_BODY_RE.search(s))
+
+
+def _ordered_alignment_databases(alignments: dict[str, Any]) -> list[str]:
+    """Deterministic database order for an ``alignments`` map.
+
+    ColabFold first when present, then the remaining database keys sorted, so
+    the same stored payload always yields the same a3m regardless of dict
+    insertion order.
+    """
+    keys = [k for k in alignments if isinstance(k, str)]
+    colabfold = sorted(k for k in keys if k.lower() == "colabfold")
+    rest = sorted(k for k in keys if k.lower() != "colabfold")
+    return colabfold + rest
+
+
+def _extract_a3m_alignment(payload: Any, _depth: int = 0) -> str | None:
+    """Return the first a3m-looking alignment string from a structured payload.
+
+    Recognizes the real ``…alignments.<db>.a3m.alignment`` shape (with
+    deterministic database ordering) and, more generally, descends dict/list
+    containers under the plausible alignment keys. Returns ``None`` when no
+    usable a3m is present.
+    """
+    if _depth > _A3M_MAX_DEPTH:
+        return None
+    if isinstance(payload, str):
+        return payload if _looks_like_a3m(payload) else None
+    if isinstance(payload, dict):
+        # Leaf a3m block: {"alignment": <a3m str>, "format": ...}.
+        direct = payload.get("alignment")
+        if isinstance(direct, str) and _looks_like_a3m(direct):
+            return direct
+        # Alignment-key values. When the value is a database map
+        # ({<db>: {...}}), iterate databases in deterministic order.
+        for key in _A3M_ALIGNMENT_KEYS:
+            if key not in payload:
+                continue
+            value = payload[key]
+            if isinstance(value, dict):
+                for db in _ordered_alignment_databases(value):
+                    found = _extract_a3m_alignment(value[db], _depth + 1)
+                    if found:
+                        return found
+            else:
+                found = _extract_a3m_alignment(value, _depth + 1)
+                if found:
+                    return found
+        # Descend container keys, then remaining keys (sorted for determinism).
+        remaining = [k for k in _A3M_CONTAINER_KEYS if k in payload]
+        remaining += sorted(
+            k for k in payload
+            if k not in _A3M_CONTAINER_KEYS and k not in _A3M_ALIGNMENT_KEYS
+        )
+        for key in remaining:
+            found = _extract_a3m_alignment(payload[key], _depth + 1)
+            if found:
+                return found
+        return None
+    if isinstance(payload, list):
+        for item in payload:
+            found = _extract_a3m_alignment(item, _depth + 1)
+            if found:
+                return found
+    return None
+
+
+def _resolve_stored_msa_a3m_object(
+    msa_tool_output_ref: str | None, *, storage: Storage,
+) -> dict[str, Any] | None:
+    """Read a stored MSA tool output and build the official OpenFold3 msa object.
+
+    Returns ``{"main": {"a3m": {"alignment": <raw a3m>, "format": "a3m"}}}`` when
+    a usable a3m alignment is present, else ``None``. Reads storage ONLY at
+    Step 8 runtime; the raw a3m never leaves this call except into the OpenFold3
+    runtime kwargs built by the caller.
+    """
+    if not msa_tool_output_ref:
+        return None
+    try:
+        stored = storage.read_json(msa_tool_output_ref)
+    except Exception:  # noqa: BLE001
+        return None
+    a3m = _extract_a3m_alignment(stored)
+    if not a3m:
+        return None
+    return {"main": {"a3m": {"alignment": a3m, "format": "a3m"}}}
+
+
+def _resolve_step8_msa_inline(all_inputs: list[dict] | None, *, storage: Storage) -> None:
+    """In-memory only: resolve each sequence's Step 7 ``msa_tool_output_ref``
+    into an official inline OpenFold3 ``msa`` object so the planner/runtime can
+    inject it.
+
+    The raw a3m is attached to the in-memory ``seq`` dict ONLY — Step 8 never
+    re-persists the Step 7 package, so it never reaches a normalized artifact.
+    When a stored MSA output exists but no usable a3m can be extracted, the
+    sequence is marked ``msa_a3m_extraction_failed`` so the planner reports
+    ``openfold3_msa_a3m_not_found`` instead of pretending it is ready.
+    """
+    for sin in all_inputs or []:
+        if not isinstance(sin, dict):
+            continue
+        for seq in sin.get("sequence_refs_for_prediction") or []:
+            if not isinstance(seq, dict):
+                continue
+            if seq.get("msa"):
+                continue  # already inline (or resolved on a prior pass).
+            ref = seq.get("msa_tool_output_ref")
+            if not ref:
+                continue
+            msa_object = _resolve_stored_msa_a3m_object(ref, storage=storage)
+            if msa_object is not None:
+                seq["msa"] = msa_object
+                seq.pop("msa_a3m_extraction_failed", None)
+            else:
+                seq["msa_a3m_extraction_failed"] = True
+
+
+def _classify_openfold3_msa_roles(
+    sequence_inputs: list[dict[str, Any]],
+) -> tuple[list[str], list[str], list[str]]:
+    """Classify antigen/heavy/light roles by OpenFold3 MSA readiness.
+
+    Returns ``(no_msa_roles, a3m_not_found_roles, unmappable_roles)``:
+
+    - ``no_msa_roles`` — protein roles with NO MSA metadata at all.
+    - ``a3m_not_found_roles`` — protein roles whose Step 7 MSA search produced a
+      stored output, but no usable a3m alignment could be extracted from it.
+    - ``unmappable_roles`` — protein roles that carry MSA metadata only as a
+      bare external reference (no stored resolvable output, no inline a3m), so
+      it cannot be mapped to the OpenFold3 a3m contract at runtime.
+
+    A role that carries runtime-mappable inline a3m content is in none of them.
+    """
+    no_msa: list[str] = []
+    a3m_not_found: list[str] = []
+    unmappable: list[str] = []
+    for item in sequence_inputs:
+        if not isinstance(item, dict):
+            continue
+        chain_role = item.get("chain_role")
+        if chain_role not in {"antigen", "antibody_heavy", "antibody_light"}:
+            continue
+        if item.get("msa_a3m_runtime_mappable"):
+            continue  # resolvable a3m present -> ready.
+        if item.get("msa_a3m_not_found"):
+            a3m_not_found.append(str(chain_role))
+        elif _has_openfold3_msa(item) or item.get("msa_tool_output_ref"):
+            unmappable.append(str(chain_role))
+        else:
+            no_msa.append(str(chain_role))
+    return sorted(set(no_msa)), sorted(set(a3m_not_found)), sorted(set(unmappable))
+
+
+def _dedupe_step8_prediction_sequence_inputs(
+    sequence_inputs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Deduplicate sequence inputs for a single antigen-antibody NIM plan.
+
+    If two entries point at the same concrete sequence source for the same role,
+    keep one.  Prefer runtime-ready entries over identifier-only entries when
+    they target the same role/source identity.
+    """
+    by_role: dict[str, list[dict[str, Any]]] = {
+        "antigen": [],
+        "antibody_heavy": [],
+        "antibody_light": [],
+    }
+    other_entries: list[dict[str, Any]] = []
+    for entry in sequence_inputs:
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("chain_role")
+        if role not in by_role:
+            other_entries.append(entry)
+            continue
+
+        by_role[role].append(entry)
+
+    deduped: list[dict[str, Any]] = []
+    for role in ("antigen", "antibody_heavy", "antibody_light"):
+        role_entries = by_role[role]
+        if not role_entries:
+            continue
+        role_seen: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        role_seen_ready: dict[tuple[str, str, str, str], bool] = {}
+        for entry in role_entries:
+            sequence_storage_ref = str(entry.get("sequence_storage_ref") or "")
+            source_ref = str(entry.get("source_ref") or "")
+            sha_prefix = str(entry.get("sha256_prefix") or "")
+            sequence_id = str(entry.get("sequence_id") or "")
+            if sequence_storage_ref or source_ref or sha_prefix:
+                key = (role, sequence_storage_ref, source_ref, sha_prefix)
+            else:
+                key = (role, "", "", sequence_id)
+            is_ready = entry.get("sequence_readiness") == "ready"
+            if key not in role_seen or (is_ready and not role_seen_ready.get(key)):
+                role_seen[key] = entry
+                role_seen_ready[key] = is_ready
+        role_items = list(role_seen.values())
+        ready_entries = [entry for entry in role_items if entry.get("sequence_readiness") == "ready"]
+        if ready_entries:
+            deduped.extend(ready_entries)
+        else:
+            deduped.extend(role_items)
+
+    ordered: list[dict[str, Any]] = deduped + other_entries
+    return ordered
 
 
 def _build_nim_runtime_invocation(
@@ -2387,11 +3014,21 @@ def _build_nim_runtime_invocation(
         if value:
             audit_entry["sequence_length"] = len(value)
             audit_entry["sha256_prefix"] = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
-            resolved.append({
+            resolved_entry: dict[str, Any] = {
                 "sequence_id": sequence_id,
                 "chain_role": item.get("chain_role"),
                 "sequence": value,
-            })
+            }
+            # OpenFold3 requires a per-protein-molecule MSA. Attach the
+            # official a3m MSA object built from the prepared sequence ref's
+            # INLINE alignment content. The raw alignment travels only in the
+            # runtime kwargs, never into the audit/compact summary below.
+            if tool_name == "NvidiaNIM_openfold3":
+                msa_object = _openfold3_msa_object(seq)
+                if msa_object is not None:
+                    resolved_entry["msa"] = msa_object
+                    audit_entry["msa_a3m_runtime_mappable"] = True
+            resolved.append(resolved_entry)
         audit.append({k: v for k, v in audit_entry.items() if v not in (None, "", [])})
     if len(resolved) < 3:
         return {
@@ -2399,18 +3036,21 @@ def _build_nim_runtime_invocation(
             "reason": "NvidiaNIM runtime sequence resolution requires antigen, antibody heavy, and antibody light sequences",
             "audit": audit,
         }
+    if tool_name == "NvidiaNIM_openfold3":
+        molecules_without_msa = [item for item in resolved if not item.get("msa")]
+        if molecules_without_msa:
+            return {
+                "status": "unresolved",
+                "reason": "openfold3_msa_runtime_mapping_missing",
+                "audit": audit,
+            }
     kwargs = _nim_kwargs(tool_name, resolved)
     return {
         "status": "ok",
         "kwargs": kwargs,
         "compact_arguments": {
             "sequence_inputs": [
-                {
-                    "sequence_id": item["sequence_id"],
-                    "chain_role": item.get("chain_role"),
-                    "sequence_length": len(item["sequence"]),
-                    "sha256_prefix": hashlib.sha256(item["sequence"].encode("utf-8")).hexdigest()[:12],
-                }
+                _compact_runtime_sequence_summary(item)
                 for item in resolved
             ],
             "sequence_count": len(resolved),
@@ -2418,6 +3058,136 @@ def _build_nim_runtime_invocation(
         },
         "audit": audit,
     }
+
+
+def _compact_runtime_sequence_summary(item: dict[str, Any]) -> dict[str, Any]:
+    """LLM-safe digest of one resolved runtime sequence entry.
+
+    Emits only lengths / sha256 prefixes and a boolean MSA-present marker —
+    never the raw sequence and never the raw a3m alignment content.
+    """
+    summary: dict[str, Any] = {
+        "sequence_id": item["sequence_id"],
+        "chain_role": item.get("chain_role"),
+        "sequence_length": len(item["sequence"]),
+        "sha256_prefix": hashlib.sha256(item["sequence"].encode("utf-8")).hexdigest()[:12],
+    }
+    msa_object = item.get("msa")
+    if msa_object:
+        summary["msa_a3m_present"] = True
+        alignment = _openfold3_primary_alignment(msa_object)
+        if alignment:
+            summary["msa_alignment_length"] = len(alignment)
+            summary["msa_alignment_sha256_prefix"] = hashlib.sha256(
+                alignment.encode("utf-8")
+            ).hexdigest()[:12]
+    return summary
+
+
+_STEP7_SELECTED_FAILURE_STATUSES = {"failed", "upstream_error"}
+
+
+def _step7_selected_failure_warnings(
+    tool_call_records: list[ToolCallRecord],
+) -> list[dict[str, Any]]:
+    """Compact warnings for SELECTED Step 7 tool calls that failed.
+
+    Only ``routing_decision == "selected"`` calls count (not_applicable /
+    scope_unavailable skips are non-fatal). Each warning carries the tool
+    name, chain role (if any), run status, and a short adapter-compacted
+    reason — never a raw payload, sequence, or alignment.
+    """
+    out: list[dict[str, Any]] = []
+    for tc in tool_call_records:
+        summary = tc.tool_input_summary or {}
+        if summary.get("routing_decision") != "selected":
+            continue
+        if tc.run_status not in _STEP7_SELECTED_FAILURE_STATUSES:
+            continue
+        warning: dict[str, Any] = {
+            "tool_name": tc.tool_name,
+            "run_status": tc.run_status,
+            "reason": _short(str(tc.error_message or "selected tool preparation failed")),
+        }
+        chain_role = summary.get("msa_chain_role")
+        if chain_role:
+            warning["chain_role"] = chain_role
+        label = summary.get("label")
+        if label:
+            warning["label"] = _short(str(label))
+        out.append(warning)
+    return out
+
+
+def _step7_msa_semantic_warnings(
+    prepared: list[StructureInputRecord],
+) -> list[dict[str, Any]]:
+    """Compact warnings for MSA searches that transported OK but yielded no
+    usable a3m (``msa_status == "a3m_not_found"``).
+
+    A selected MSA call that returns ``ok`` but from which no a3m alignment can
+    be extracted is a semantic preparation failure — it must not be reported as
+    a clean ``ok``. Deduplicated per underlying tool call. Carries only compact
+    metadata (never raw sequence / a3m).
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[Any, Any, Any]] = set()
+    for record in prepared:
+        for ref in getattr(record, "sequence_refs_for_prediction", []) or []:
+            if getattr(ref, "msa_status", None) != "a3m_not_found":
+                continue
+            tool_name = getattr(ref, "msa_source_tool", None)
+            if not tool_name:
+                continue
+            key = (tool_name, ref.chain_role, getattr(ref, "msa_tool_call_id", None))
+            if key in seen:
+                continue
+            seen.add(key)
+            warning: dict[str, Any] = {
+                "tool_name": tool_name,
+                "run_status": "a3m_not_found",
+                "reason": "MSA search returned ok but no usable a3m alignment could be extracted",
+            }
+            if ref.chain_role:
+                warning["chain_role"] = ref.chain_role
+            out.append(warning)
+    return out
+
+
+def _apply_step7_msa_metadata(ref: Any, meta: dict[str, Any]) -> None:
+    """Copy compact MSA metadata (refs + digests only) onto a SequenceRef.
+
+    Shared by the first-occurrence writer and the duplicate-ref reuse path so
+    every ref for the same (role, sequence) points at the single MSA output.
+    """
+    for attr in (
+        "msa_source_tool",
+        "msa_tool_call_id",
+        "msa_tool_output_ref",
+        "msa_status",
+        "msa_alignment_format",
+        "msa_alignment_length",
+        "msa_alignment_sha256_prefix",
+    ):
+        if attr in meta:
+            setattr(ref, attr, meta[attr])
+
+
+def _step7_runtime_protein_sequence(ref: Any, *, storage: Storage) -> str | None:
+    """Resolve the raw amino-acid sequence for a Step 7 ``SequenceRef`` at
+    runtime (inline value or resolvable FASTA ref). Returns ``None`` for
+    identifier-only / UniProt-only / unresolvable refs. The raw value is used
+    only to build the MSA-search tool call and is never persisted."""
+    seq_dict = {
+        "sequence_id": getattr(ref, "sequence_id", None),
+        "prediction_input_kind": getattr(ref, "prediction_input_kind", None),
+        "sequence_value_status": getattr(ref, "sequence_value_status", None),
+        "sequence": getattr(ref, "sequence", None),
+        "sequence_storage_ref": getattr(ref, "sequence_storage_ref", None),
+        "source_ref": getattr(ref, "source_ref", None),
+    }
+    value, _err = _runtime_sequence_value(seq_dict, storage=storage)
+    return value
 
 
 def _runtime_sequence_value(
@@ -2484,17 +3254,27 @@ def _nim_kwargs(tool_name: str, resolved: list[dict[str, Any]]) -> dict[str, Any
     if tool_name == "NvidiaNIM_alphafold2_multimer":
         return {"sequences": [item["sequence"] for item in resolved]}
     if tool_name == "NvidiaNIM_openfold3":
+        molecules: list[dict[str, Any]] = []
+        for item in resolved:
+            molecule: dict[str, Any] = {"type": "protein", "sequence": item["sequence"]}
+            msa_object = item.get("msa")
+            if msa_object:
+                molecule["msa"] = msa_object
+            molecules.append(molecule)
         return {
             "inputs": [
-                {"id": item.get("chain_role") or item["sequence_id"], "sequence": item["sequence"]}
-                for item in resolved
+                {
+                    "input_id": "adc_antigen_antibody_complex",
+                    "molecules": molecules,
+                    "output_format": "pdb",
+                }
             ]
         }
     if tool_name == "NvidiaNIM_boltz2":
         return {
             "polymers": [
                 {
-                    "id": item.get("chain_role") or item["sequence_id"],
+                    "id": _nim_chain_id(item.get("chain_role"), item["sequence_id"]),
                     "molecule_type": "protein",
                     "sequence": item["sequence"],
                 }
@@ -2503,6 +3283,18 @@ def _nim_kwargs(tool_name: str, resolved: list[dict[str, Any]]) -> dict[str, Any
             "output_format": "mmcif",
         }
     return {}
+
+
+def _nim_chain_id(chain_role: Any, sequence_id: str) -> str:
+    mapping = {
+        "antigen": "A",
+        "antibody_heavy": "H",
+        "antibody_light": "L",
+    }
+    if isinstance(chain_role, str) and chain_role in mapping:
+        return mapping[chain_role]
+    digest = hashlib.sha256(str(sequence_id).encode("utf-8")).hexdigest()
+    return chr(ord("B") + (int(digest[:2], 16) % 24))
 
 
 def _nim_argument_schema_name(tool_name: str) -> str:
@@ -2539,6 +3331,47 @@ def _compact_prediction_sequence_inputs(sin: dict) -> list[dict[str, Any]]:
             "sha256_prefix": seq.get("sha256_prefix"),
             "resource_binding_status": seq.get("resource_binding_status"),
         }
+        for key in (
+            "msa_ref",
+            "msa_source_ref",
+            "msa_storage_ref",
+            "msa_path",
+            "msa_url",
+            "msa_artifact_ref",
+            "msa_file_ref",
+            "msa_content_ref",
+        ):
+            if key in seq and seq.get(key):
+                item[key] = seq.get(key)
+
+        msa = seq.get("msa")
+        if isinstance(msa, dict):
+            for key in ("artifact_ref", "storage_ref", "path", "source_ref"):
+                msa_value = msa.get(key)
+                if msa_value:
+                    item[f"msa_{key}"] = msa_value
+            # Do not persist raw MSA sequences/an alignment payloads.
+        # Step 7 MSA-search compact metadata (ref + digests only, never raw
+        # a3m). ``msa_tool_output_ref`` is the storage-backed resolver handle
+        # Step 8 reads at runtime.
+        if seq.get("msa_tool_output_ref"):
+            item["msa_tool_output_ref"] = _short(str(seq.get("msa_tool_output_ref")))
+        if seq.get("msa_status"):
+            item["msa_status"] = seq.get("msa_status")
+        # Compact, LLM-safe marker of whether this sequence carries an MSA that
+        # can be mapped to the OpenFold3 a3m contract at runtime. Only a boolean
+        # flag plus a digest are persisted here — never the raw alignment.
+        msa_object = _openfold3_msa_object(seq)
+        if msa_object is not None:
+            item["msa_a3m_runtime_mappable"] = True
+            alignment = _openfold3_primary_alignment(msa_object)
+            if alignment:
+                item["msa_alignment_length"] = len(alignment)
+                item["msa_alignment_sha256_prefix"] = hashlib.sha256(
+                    alignment.encode("utf-8")
+                ).hexdigest()[:12]
+        elif seq.get("msa_a3m_extraction_failed"):
+            item["msa_a3m_not_found"] = True
         storage_ref = seq.get("sequence_storage_ref")
         if storage_ref:
             item["sequence_storage_ref"] = _short(str(storage_ref))

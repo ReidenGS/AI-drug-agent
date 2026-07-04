@@ -66,6 +66,40 @@ def NvidiaNIM_boltz2(
     return _call_nim("NvidiaNIM_boltz2", args, _live=_live)
 
 
+def NvidiaNIM_msa_search(
+    sequence: str | None = None,
+    *,
+    e_value: float | None = None,
+    iterations: int | None = None,
+    output_alignment_formats: list[Any] | None = None,
+    databases: list[Any] | None = None,
+    max_msa_sequences: int | None = None,
+    _live: bool = False,
+) -> dict[str, Any]:
+    """GPU-accelerated MSA search (ColabFold/MMseqs2) via NVIDIA NIM.
+
+    Official ToolUniverse schema: the only required argument is ``sequence``
+    (a single protein sequence, 1-4096 aa). Optional args mirror the official
+    schema exactly: ``e_value`` (default 0.0001), ``iterations`` (default 1),
+    ``output_alignment_formats`` (enum ["a3m","fasta"], default ["a3m"]),
+    ``databases``, ``max_msa_sequences``. We only forward args the caller set
+    so ToolUniverse applies its own documented defaults otherwise. No direct
+    NVIDIA client and no offline mock success — this is a thin adapter binding.
+    """
+    args: dict[str, Any] = {"sequence": sequence or ""}
+    if e_value is not None:
+        args["e_value"] = e_value
+    if iterations is not None:
+        args["iterations"] = iterations
+    if output_alignment_formats is not None:
+        args["output_alignment_formats"] = output_alignment_formats
+    if databases is not None:
+        args["databases"] = databases
+    if max_msa_sequences is not None:
+        args["max_msa_sequences"] = max_msa_sequences
+    return _call_nim("NvidiaNIM_msa_search", args, _live=_live)
+
+
 def _ni(*_a, **_kw):
     raise NotImplementedError
 
@@ -74,6 +108,7 @@ BINDINGS = [
     ("NvidiaNIM_alphafold2_multimer", NvidiaNIM_alphafold2_multimer),
     ("NvidiaNIM_openfold3", NvidiaNIM_openfold3),
     ("NvidiaNIM_boltz2", NvidiaNIM_boltz2),
+    ("NvidiaNIM_msa_search", NvidiaNIM_msa_search),
     ("NvidiaNIM_rfdiffusion", _ni),
     ("NvidiaNIM_proteinmpnn", _ni),
 ]

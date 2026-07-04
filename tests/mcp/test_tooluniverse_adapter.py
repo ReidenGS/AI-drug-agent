@@ -13,14 +13,76 @@ here cover the adapter contract; per-wrapper routing tests live in
 
 from __future__ import annotations
 
+import time
+import socket
 from typing import Any
 
 import pytest
+import requests
 
 from app.mcp import tooluniverse_adapter
 from app.mcp.tools.alphafold import alphafold_get_prediction
 from app.mcp.tools.developability_compounds import DrugProps_calculate_qed
 from app.mcp.tools.evidence import EuropePMC_search_articles
+
+
+# ── include_tools resolution (sanctioned extras must be loadable) ──────────
+
+def test_include_tool_names_contain_sanctioned_extras():
+    """`include_tools` must union the git-tracked sanctioned extras so a live
+    call to NvidiaNIM_msa_search does not report 'not found even after loading
+    tools'."""
+    from app.mcp.scope_filter import ARCHITECTURE_SANCTIONED_EXTRA_TOOLS
+
+    tooluniverse_adapter._reset_for_tests()
+    include = tooluniverse_adapter._resolve_include_tool_names()
+    extras: set[str] = set()
+    for tools in ARCHITECTURE_SANCTIONED_EXTRA_TOOLS.values():
+        extras |= set(tools)
+    assert "NvidiaNIM_msa_search" in include
+    assert extras <= include
+
+
+def test_include_tool_names_do_not_widen_to_full_tooluniverse():
+    """Sanctioned extras are added on top of the inventory only — not a full
+    ToolUniverse load."""
+    tooluniverse_adapter._reset_for_tests()
+    inventory = tooluniverse_adapter._resolve_inventory_names()
+    extras = tooluniverse_adapter._sanctioned_extra_tool_names()
+    include = tooluniverse_adapter._resolve_include_tool_names()
+    assert include == frozenset(inventory | extras)
+    # The extra surface stays tiny (guards against accidental full load).
+    assert len(extras) <= 5
+    assert "NvidiaNIM_msa_search" in extras
+
+
+def test_get_universe_passes_include_tools_with_msa_search(monkeypatch):
+    """`_get_universe` forwards an `include_tools` list containing the
+    sanctioned extra to `ToolUniverse.load_tools`."""
+    import sys
+    import types
+
+    captured: dict[str, Any] = {}
+
+    class _FakeTU:
+        def load_tools(self, quiet: bool = True, include_tools=None) -> None:
+            captured["include_tools"] = include_tools
+
+        def get_available_tools(self, name_only: bool = True):
+            return list(captured.get("include_tools") or [])
+
+    fake_module = types.ModuleType("tooluniverse")
+    fake_module.ToolUniverse = _FakeTU  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "tooluniverse", fake_module)
+
+    tooluniverse_adapter._reset_for_tests()
+    try:
+        tooluniverse_adapter._get_universe()
+        include = captured.get("include_tools")
+        assert include is not None
+        assert "NvidiaNIM_msa_search" in include
+    finally:
+        tooluniverse_adapter._reset_for_tests()
 
 
 # ── adapter envelope normalization ─────────────────────────────────────────
@@ -32,6 +94,82 @@ def test_adapter_success_payload(install_universe):
     assert out["executor"] == "tooluniverse"
     assert out["arguments"] == {"query": "x"}
     assert out["payload"] == {"results": [{"id": "1"}]}
+
+
+def test_adapter_redacts_long_sequence_argument_in_envelope(install_universe):
+    install_universe(
+        tools={
+            "EuropePMC_search_articles": lambda args: {"results": [{"id": "1"}]}
+        }
+    )
+    seq = "M" * 250
+    out = tooluniverse_adapter.call_tool(
+        "EuropePMC_search_articles", {"query": "x", "sequence": seq, "operation": "search"}
+    )
+    assert out["status"] == "ok"
+    seq_arg = out["arguments"]["sequence"]
+    assert isinstance(seq_arg, dict)
+    assert seq_arg.get("redacted") is True
+    assert seq_arg["length"] == len(seq)
+    assert "operation" in out["arguments"]
+    assert out["arguments"]["operation"] == "search"
+    fake = tooluniverse_adapter._get_universe()
+    calls = fake.calls if hasattr(fake, "calls") else []
+    assert calls and calls[0]["arguments"]["sequence"] == seq
+
+
+def test_adapter_redacts_raw_pdb_like_argument_in_envelope(install_universe):
+    install_universe(
+        tools={"EuropePMC_search_articles": lambda args: {"results": [{"id": "1"}]}}
+    )
+    raw = "HEADER    TEST\nATOM      1  N   ASN A   1"
+    out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": raw})
+    arg = out["arguments"]["query"]
+    assert isinstance(arg, dict)
+    assert arg["redacted"] is True
+    fake = tooluniverse_adapter._get_universe()
+    assert fake.calls[0]["arguments"]["query"] == raw
+
+
+def test_adapter_redacts_nested_openfold_style_sequence_input(install_universe):
+    install_universe(
+        tools={
+            "NvidiaNIM_openfold3": lambda args: {"status": "ok", "model_ref": "ok"}
+        }
+    )
+    protein_seq = "G" * 300
+    args = {
+        "inputs": [
+            {
+                "input_id": "adc_antigen_antibody_complex",
+                "molecules": [
+                    {"type": "protein", "sequence": protein_seq, "msa": {"main": {"a3m": {"alignment": ">query\nAAA"}}}},
+                    {"type": "protein", "sequence": "ABCDE"},
+                ],
+                "output_format": "pdb",
+            }
+        ],
+        "operation": "predict",
+    }
+    out = tooluniverse_adapter.call_tool("NvidiaNIM_openfold3", args)
+    assert out["status"] == "ok"
+    redacted_sequence = out["arguments"]["inputs"][0]["molecules"][0]["sequence"]
+    assert isinstance(redacted_sequence, dict)
+    assert redacted_sequence.get("redacted") is True
+    assert redacted_sequence["length"] == len(protein_seq)
+    fake = tooluniverse_adapter._get_universe()
+    calls = fake.calls if hasattr(fake, "calls") else []
+    assert calls
+    assert calls[0]["arguments"]["inputs"][0]["molecules"][0]["sequence"] == protein_seq
+
+
+def test_adapter_keeps_short_scalar_values_in_argument_envelope(install_universe):
+    install_universe(
+        tools={"EuropePMC_search_articles": lambda args: {"results": [{"id": "1"}]}}
+    )
+    out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x", "pdb_id": "1N8Z"})
+    assert out["arguments"]["query"] == "x"
+    assert out["arguments"]["pdb_id"] == "1N8Z"
 
 
 def test_adapter_empty_list_payload(install_universe):
@@ -235,6 +373,30 @@ def test_hydrate_env_bridges_model_to_tu_compatible_names(monkeypatch):
     assert os.environ.get("TOOLUNIVERSE_LLM_MODEL_DEFAULT") == "gemini-3.5-flash"
 
 
+def test_hydrate_env_bridges_nvidia_key_for_nim_tools(monkeypatch):
+    from app.mcp.tooluniverse_adapter import _hydrate_env_from_settings
+    from app.settings import get_settings
+
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "nvidia_api_key", "nvidia-sentinel-key")
+    _hydrate_env_from_settings()
+    assert os.environ.get("NVIDIA_API_KEY") == "nvidia-sentinel-key"
+
+
+def test_hydrate_env_does_not_overwrite_operator_nvidia_key(monkeypatch):
+    from app.mcp.tooluniverse_adapter import _hydrate_env_from_settings
+    from app.settings import get_settings
+
+    monkeypatch.setenv("NVIDIA_API_KEY", "operator-nvidia-key")
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "nvidia_api_key", "dotenv-nvidia-key")
+    _hydrate_env_from_settings()
+    assert os.environ["NVIDIA_API_KEY"] == "operator-nvidia-key"
+
+
 # ── transient-failure retry policy ─────────────────────────────────────────
 
 
@@ -351,3 +513,176 @@ def test_success_first_try_reports_zero_retries(install_universe):
     assert out["retry_count"] == 0
     assert out["retryable"] is False
     assert "recovered_after_transient_error" not in out
+
+
+def test_live_call_outer_timeout_surfaces_upstream_error(install_universe, monkeypatch):
+    from app.settings import get_settings
+
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "tooluniverse_live_call_timeout", 0.01)
+
+    def _hang(_args):
+        time.sleep(2)
+        return {"results": [{"id": "late"}]}
+
+    install_universe(tools={"EuropePMC_search_articles": _hang})
+    out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
+    assert out["status"] == "upstream_error"
+    assert out["retry_count"] == tooluniverse_adapter._MAX_LIVE_RETRIES
+    assert out["retryable"] is True
+    assert out["final_error_type"] == "TimeoutError"
+    assert "exceeded" in out["error_message"]
+    assert "payload" not in out
+
+
+def test_live_call_timeout_sets_and_restores_socket_default(install_universe, monkeypatch):
+    from app.settings import get_settings
+
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "tooluniverse_live_call_timeout", 3.5)
+    monkeypatch.setattr(socket, "getdefaulttimeout", lambda: None)
+    seen: list[float | None] = []
+
+    def _capture(timeout):
+        seen.append(timeout)
+
+    monkeypatch.setattr(socket, "setdefaulttimeout", _capture)
+    install_universe(
+        tools={"EuropePMC_search_articles": lambda args: {"results": [{"id": "ok"}]}}
+    )
+    out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
+    assert out["status"] == "ok"
+    assert seen[0] == 3.5
+    assert seen[-1] is None
+
+
+def test_live_call_uses_tooluniverse_timeout_for_non_nvidia_tool(install_universe, monkeypatch):
+    from app.settings import get_settings
+
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "tooluniverse_live_call_timeout", 2.25)
+    monkeypatch.setattr(settings, "nvidia_nim_live_call_timeout", 999.0)
+    seen: list[float | None] = []
+
+    def _capture(timeout):
+        seen.append(timeout)
+
+    monkeypatch.setattr(socket, "setdefaulttimeout", _capture)
+    install_universe(
+        tools={"EuropePMC_search_articles": lambda args: {"results": [{"id": "ok"}]}}
+    )
+    out = tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
+    assert out["status"] == "ok"
+    assert seen[0] == 2.25
+    assert seen[-1] is None
+
+
+def test_live_call_uses_nvidia_timeout_for_nvidia_tool(install_universe, monkeypatch):
+    from app.settings import get_settings
+
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "tooluniverse_live_call_timeout", 2.25)
+    monkeypatch.setattr(settings, "nvidia_nim_live_call_timeout", 33.0)
+    seen: list[float | None] = []
+
+    def _capture(timeout):
+        seen.append(timeout)
+
+    monkeypatch.setattr(socket, "setdefaulttimeout", _capture)
+    install_universe(
+        tools={"NvidiaNIM_alphafold2_multimer": lambda args: {"predictions": []}}
+    )
+    out = tooluniverse_adapter.call_tool("NvidiaNIM_alphafold2_multimer", {"antigen_fasta": "x"})
+    assert out["status"] == "ok"
+    assert seen[0] == 33.0
+    assert seen[-1] is None
+
+
+def test_live_call_injects_requests_timeout_when_missing(install_universe, monkeypatch):
+    captured: dict[str, Any] = {}
+    timeout_during_bound_call: list[float | None] = []
+
+    def _fake_request(self, method, url, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        timeout_during_bound_call.append(kwargs.get("timeout"))
+        return type("Resp", (), {"json": lambda self: {"status": "ok"}})()
+
+    monkeypatch.setattr(requests.sessions.Session, "request", _fake_request)
+
+    class _RequestTool:
+        def __call__(self, args):
+            session = requests.Session()
+            session.request("GET", "https://example.org/ping")
+            return {"ok": True}
+
+    install_universe(tools={"EuropePMC_search_articles": _RequestTool()})
+    tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
+    assert captured["timeout"] == 60.0
+    assert timeout_during_bound_call == [60.0]
+
+
+def test_live_call_respects_explicit_requests_timeout(install_universe, monkeypatch):
+    captured: dict[str, Any] = {}
+    timeout_during_bound_call: list[float | None] = []
+
+    def _fake_request(self, method, url, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        timeout_during_bound_call.append(kwargs.get("timeout"))
+        return type("Resp", (), {"json": lambda self: {"status": "ok"}})()
+
+    monkeypatch.setattr(requests.sessions.Session, "request", _fake_request)
+
+    class _RequestTool:
+        def __call__(self, args):
+            session = requests.Session()
+            session.request("GET", "https://example.org/ping", timeout=7.25)
+            return {"ok": True}
+
+    install_universe(tools={"EuropePMC_search_articles": _RequestTool()})
+    tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
+    assert captured["timeout"] == 7.25
+    assert timeout_during_bound_call == [7.25]
+
+
+def test_live_call_restores_session_request_after_timeout_context(install_universe, monkeypatch):
+    captured_request_methods: list[Any] = []
+
+    def _fake_request(self, method, url, **kwargs):
+        captured_request_methods.append(requests.sessions.Session.request)
+        return type("Resp", (), {"json": lambda self: {"status": "ok"}})()
+
+    class _RequestTool:
+        def __call__(self, args):
+            session = requests.Session()
+            session.request("GET", "https://example.org/ping")
+            return {"ok": True}
+
+    monkeypatch.setattr(requests.sessions.Session, "request", _fake_request)
+    entry_request = requests.sessions.Session.request
+    install_universe(tools={"EuropePMC_search_articles": _RequestTool()})
+    tooluniverse_adapter.call_tool("EuropePMC_search_articles", {"query": "x"})
+    assert captured_request_methods and captured_request_methods[0] is not entry_request
+    assert requests.sessions.Session.request is entry_request
+
+
+def test_nvidia_tool_timeout_still_surfaces_upstream_error_on_retries(install_universe, monkeypatch):
+    from app.settings import get_settings
+
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "nvidia_nim_live_call_timeout", 0.01)
+
+    def _hang(_args):
+        time.sleep(0.1)
+        return {"predictions": ["late"]}
+
+    install_universe(tools={"NvidiaNIM_alphafold2_multimer": _hang})
+    out = tooluniverse_adapter.call_tool("NvidiaNIM_alphafold2_multimer", {"antigen": "x"})
+    assert out["status"] == "upstream_error"
+    assert out["retry_count"] == tooluniverse_adapter._MAX_LIVE_RETRIES
+    assert out["retryable"] is True
+    assert out["final_error_type"] == "TimeoutError"

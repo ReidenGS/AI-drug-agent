@@ -39,8 +39,16 @@ Design rules:
 from __future__ import annotations
 
 import os
+import signal
+import socket
+import hashlib
+import threading
 import time
+from contextlib import contextmanager
 from typing import Any
+from typing import Callable
+
+import requests
 
 from ..services.tool_inventory_service import ToolInventoryService
 
@@ -100,15 +108,166 @@ def _compact_error(message: str | None, *, limit: int = 200) -> str:
     return text[:limit]
 
 
+_BIO_SEQUENCE_CHARS = set("ACDEFGHIKLMNPQRSTVWYBZXUO*")
+
+
+def _looks_like_amino_acid_sequence(value: str) -> bool:
+    """Best-effort heuristic for raw AA sequences.
+
+    Used only for envelope redaction of persisted arguments, not for runtime
+    execution.
+    """
+    cleaned = "".join(ch for ch in value.upper() if ch.isalpha())
+    if len(cleaned) < 12:
+        return False
+    if len(cleaned) > 40_000:
+        return True
+    return (len(cleaned) / max(1, len(value)) >= 0.70 and set(cleaned) <= _BIO_SEQUENCE_CHARS)
+
+
+def _looks_like_raw_structural_payload(value: str) -> bool:
+    lowered = value.lower()
+    if "header" in lowered or "atom" in lowered or "hetatm" in lowered or "data_" in lowered or "loop_" in lowered:
+        return True
+    if ">" in value and ("\n" in value or "\\n" in value):
+        return True
+    return False
+
+
+def _safely_redact_argument_string(value: str, *, key: str | None = None) -> str | dict[str, Any]:
+    keep_short_literals = {
+        "operation",
+        "pdb_id",
+        "output_format",
+        "tool",
+        "tool_name",
+        "agent",
+        "task",
+    }
+    if key and key.lower() in keep_short_literals and len(value) <= 200:
+        return value
+    lowered_key = (key or "").lower()
+    if any(secret in lowered_key for secret in ("key", "token", "secret", "password", "api")):
+        return {
+            "redacted": True,
+            "length": len(value),
+            "reason": "sensitive credential-like key",
+        }
+    if _looks_like_raw_structural_payload(value) or _looks_like_amino_acid_sequence(value) or len(value) > 120:
+        sha = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+        return {
+            "redacted": True,
+            "length": len(value),
+            "sha256_prefix": sha,
+            "reason": "argument value omitted for compact audit",
+        }
+    return value
+
+
+def _compact_argument_value(value: Any, *, key: str | None = None) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _safely_redact_argument_string(value, key=key)
+    if isinstance(value, list):
+        return [_compact_argument_value(v) for v in value]
+    if isinstance(value, tuple):
+        return [_compact_argument_value(v) for v in value]
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for child_key, child_value in value.items():
+            if child_key == "arguments" and isinstance(child_value, dict):
+                out[child_key] = _compact_argument_value(child_value)
+            else:
+                out[child_key] = _compact_argument_value(
+                    child_value, key=str(child_key)
+                )
+        return out
+    return value
+
+
 def _sleep_backoff(attempt: int) -> None:
     # `attempt` is 1-based for the retry just completed.
     time.sleep(_RETRY_BACKOFF_BASE_SECONDS * attempt)
 
 
+def _live_call_timeout_seconds(tool_name: str | None = None) -> float:
+    """Return the configured outer timeout for one TU live call."""
+    try:
+        from ..settings import get_settings
+
+        settings = get_settings()
+        if str(tool_name or "").startswith("NvidiaNIM_"):
+            return float(settings.nvidia_nim_live_call_timeout or 0)
+        return float(settings.tooluniverse_live_call_timeout or 0)
+    except Exception:  # noqa: BLE001 — timeout lookup must not break dispatch
+        return 0.0
+
+
+def _inject_session_request_timeout(
+    timeout_seconds: float,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Patch `Session.request` to inject a default timeout if caller omitted one."""
+
+    def _patch_request(original: Callable[..., Any]) -> Callable[..., Any]:
+        def _wrapped(session: Any, method: str, url: str, *args: Any, **kwargs: Any) -> Any:
+            if "timeout" not in kwargs:
+                kwargs["timeout"] = timeout_seconds
+            return original(session, method, url, *args, **kwargs)
+
+        return _wrapped
+
+    return _patch_request
+
+
+@contextmanager
+def _bounded_live_call(timeout_seconds: float):
+    """Raise TimeoutError if a ToolUniverse call blocks past the outer limit.
+
+    ToolUniverse wraps many upstream clients. Some of those clients use
+    `requests` without a timeout, so our normal retry loop never sees an
+    exception. On the main thread, a short SIGALRM guard turns that socket
+    hang into a normal transient `TimeoutError`. Off the main thread, signal
+    alarms are unavailable, so we degrade to no outer timeout rather than
+    changing thread semantics.
+    """
+    if (
+        timeout_seconds <= 0
+        or threading.current_thread() is not threading.main_thread()
+        or not hasattr(signal, "setitimer")
+    ):
+        yield
+        return
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    previous_socket_timeout = socket.getdefaulttimeout()
+    previous_request = requests.sessions.Session.request
+
+    def _raise_timeout(_signum, _frame):
+        raise TimeoutError(f"ToolUniverse live call exceeded {timeout_seconds:g}s")
+
+    signal.signal(signal.SIGALRM, _raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    socket.setdefaulttimeout(timeout_seconds)
+    requests.sessions.Session.request = _inject_session_request_timeout(timeout_seconds)(
+        previous_request
+    )
+    try:
+        yield
+    finally:
+        requests.sessions.Session.request = previous_request
+        socket.setdefaulttimeout(previous_socket_timeout)
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer and previous_timer[0] > 0:
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+
 # ── env hydration ──────────────────────────────────────────────────────────
 #
-# ToolUniverse's `AgenticTool` instances read LLM credentials directly from
-# `os.environ` (e.g. `GEMINI_API_KEY`). Our codebase loads `.env` via
+# ToolUniverse's tools read selected credentials directly from
+# `os.environ` (e.g. `GEMINI_API_KEY`, `NVIDIA_API_KEY`). Our codebase loads `.env` via
 # `pydantic-settings`, which populates the `Settings` object but does NOT
 # write to `os.environ`. Without bridging, TU sees no key and silently
 # fails to load the agentic sub-tools (`IntentAnalyzerAgent`,
@@ -134,6 +293,7 @@ def _hydrate_env_from_settings() -> None:
         ("gemini_api_key", "GEMINI_API_KEY"),
         ("gemini_model", "GEMINI_MODEL_ID"),
         ("gemini_model", "TOOLUNIVERSE_LLM_MODEL_DEFAULT"),
+        ("nvidia_api_key", "NVIDIA_API_KEY"),
     )
     for attr, env_name in bridges:
         if os.environ.get(env_name):
@@ -166,6 +326,34 @@ def _resolve_inventory_names() -> frozenset[str]:
     return _inventory_names
 
 
+def _sanctioned_extra_tool_names() -> frozenset[str]:
+    """Flat set of git-tracked architecture-sanctioned extra tool names.
+
+    These tools (e.g. NvidiaNIM_msa_search) are intentionally NOT in the
+    external v0.2 workbook — they are routed to a specific agent/step via
+    `scope_filter.ARCHITECTURE_SANCTIONED_EXTRA_TOOLS`. They must still be part
+    of ToolUniverse's `include_tools`, otherwise TU loads without them and a
+    live call reports "Tool '<name>' not found even after loading tools".
+    """
+    try:
+        from .scope_filter import ARCHITECTURE_SANCTIONED_EXTRA_TOOLS
+    except Exception:  # noqa: BLE001 - never break dispatch on import issues
+        return frozenset()
+    names: set[str] = set()
+    for tools in ARCHITECTURE_SANCTIONED_EXTRA_TOOLS.values():
+        names.update(t for t in tools if t)
+    return frozenset(names)
+
+
+def _resolve_include_tool_names() -> frozenset[str]:
+    """ToolUniverse `include_tools` set: inventory names + sanctioned extras.
+
+    Never widens to the full ToolUniverse registry — only the explicitly
+    listed sanctioned extras are added on top of the inventory-scoped names.
+    """
+    return frozenset(_resolve_inventory_names() | _sanctioned_extra_tool_names())
+
+
 def _get_universe() -> Any:
     """Lazy-build the ToolUniverse instance filtered to inventory names."""
     global _universe
@@ -183,9 +371,9 @@ def _get_universe() -> Any:
     # `AgenticTool` sub-tools can see `GEMINI_API_KEY` etc.
     _hydrate_env_from_settings()
 
-    inventory_names = _resolve_inventory_names()
+    include_names = _resolve_include_tool_names()
     inst = ToolUniverse()
-    include = sorted(inventory_names) or None
+    include = sorted(include_names) or None
     inst.load_tools(quiet=True, include_tools=include)
     _universe = inst
     return _universe
@@ -316,10 +504,11 @@ def call_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> dict[s
     `tool_output_ref` rather than embed it into normalized artifacts.
     """
     args = dict(arguments or {})
+    redacted_args = _compact_argument_value(args)
     envelope_base = {
         "source": tool_name,
         "executor": "tooluniverse",
-        "arguments": args,
+        "arguments": redacted_args,
     }
     try:
         universe = _get_universe()
@@ -346,11 +535,12 @@ def call_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> dict[s
 
     while True:
         try:
-            raw = universe.run_one_function(
-                {"name": tool_name, "arguments": args},
-                validate=True,
-                use_cache=False,
-            )
+            with _bounded_live_call(_live_call_timeout_seconds(tool_name)):
+                raw = universe.run_one_function(
+                    {"name": tool_name, "arguments": args},
+                    validate=True,
+                    use_cache=False,
+                )
             error_message: str | None = None
             error_type: str | None = None
             error_details: Any = None
