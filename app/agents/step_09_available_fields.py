@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from ..agents.tool_selection_policy import signature_schema_for
 from ..schemas.step_09_structure_variant_and_compound_screening import (
     Step9AvailableField,
     Step9HardGateAllowedTool,
@@ -67,6 +68,71 @@ _COMPOUND_TOOLS = {
 }
 
 _VARIANT_PATTERN = re.compile(r"\b(?:p\.)?[A-Z][A-Za-z0-9]{0,7}[0-9]{1,6}[A-Z][A-Za-z0-9]{0,7}\b")
+
+
+_TOOL_REQUIRED_ARGS_CACHE: dict[str, list[str]] = {}
+
+
+def _schema_required_args(tool_name: str) -> list[str]:
+    if tool_name in _TOOL_REQUIRED_ARGS_CACHE:
+        return _TOOL_REQUIRED_ARGS_CACHE[tool_name]
+
+    schema = signature_schema_for(tool_name) or {}
+    required = schema.get("required") or []
+    normalized: list[str] = []
+    for name in required:
+        if not isinstance(name, str):
+            continue
+        arg = name.strip()
+        if not arg or arg.startswith("_"):
+            continue
+        normalized.append(arg)
+    _TOOL_REQUIRED_ARGS_CACHE[tool_name] = normalized
+    return normalized
+
+
+def _infer_schema_arg_readiness(
+    candidate: dict,
+    step7_seq_refs: list[dict[str, Any]],
+    step8_result: dict | None,
+    arg_name: str,
+) -> bool:
+    """Best-effort mapping from TU argument name -> compact input readiness."""
+    arg = arg_name.lower().strip()
+    if not arg:
+        return False
+
+    # Candidate-provided sequence-like args.
+    if "variant" in arg or "mutation" in arg:
+        return bool(_extract_explicit_variants(candidate, ""))
+
+    if "uniprot" in arg and "id" in arg:
+        return _candidate_id_types(candidate, _UNIPROT_IDENTIFIER_TYPES)
+
+    if "sequence" in arg:
+        return _candidate_step9_sequence_presence(candidate, step7_seq_refs)
+
+    if "structure" in arg or "pdb" in arg or "pdb_id" in arg:
+        return _step8_structure_reference_available(step8_result, str(candidate.get("candidate_id") or ""))
+
+    if arg in {"operation", "mode", "task", "input_mode", "output_format"}:
+        return True
+
+    return False
+
+
+def _required_args_missing(
+    tool_name: str,
+    candidate: dict,
+    step7_seq_refs: list[dict[str, Any]],
+    step8_result: dict | None,
+) -> list[str]:
+    """Return schema-required args for `tool_name` that are not currently ready."""
+    missing = []
+    for arg in _schema_required_args(tool_name):
+        if not _infer_schema_arg_readiness(candidate, step7_seq_refs, step8_result, arg):
+            missing.append(arg)
+    return missing
 
 
 def _candidate_value_types(candidate: dict, material_types: set[str]) -> list[dict[str, Any]]:
@@ -255,18 +321,50 @@ def _protein_design_gate(
     has_structure_ref = _step8_structure_reference_available(step8_result, candidate_id)
     complex_ready, complex_missing = _design_complex_ready(step8_result, candidate_id)
 
-    # RFdiffusion / ProteinMPNN
-    for tool_name in sorted({"NvidiaNIM_rfdiffusion", "NvidiaNIM_proteinmpnn"}):
-        if complex_ready:
-            allowed.append(
-                Step9HardGateAllowedTool(
+    def _reason_for_missing(missing: list[str]) -> str:
+        if not missing:
+            return ""
+        return "schema_required:" + ",".join(sorted(missing))
+
+    def _allow_or_block(tool_name: str, fallback_reason: str) -> None:
+        nonlocal allowed, blocked
+        missing_from_schema = _required_args_missing(
+            tool_name, candidate, step7_seq_refs, step8_result
+        )
+        if missing_from_schema:
+            blocked.append(
+                Step9HardGateBlockedTool(
                     candidate_id=candidate_id,
                     tool_name=tool_name,
                     lane_type="protein_design",
-                    rationale="step_8 downstream_handoff includes true complex structure",
+                    reason=_reason_for_missing(missing_from_schema),
+                    rationale="required official TU args are missing",
                 )
             )
-        else:
+            return
+        if fallback_reason:
+            blocked.append(
+                Step9HardGateBlockedTool(
+                    candidate_id=candidate_id,
+                    tool_name=tool_name,
+                    lane_type="protein_design",
+                    reason=fallback_reason,
+                    rationale="requires input for runtime handoff and tool contract",
+                )
+            )
+            return
+        allowed.append(
+            Step9HardGateAllowedTool(
+                candidate_id=candidate_id,
+                tool_name=tool_name,
+                lane_type="protein_design",
+                rationale="required inputs available",
+            )
+        )
+
+    # RFdiffusion / ProteinMPNN
+    for tool_name in sorted({"NvidiaNIM_rfdiffusion", "NvidiaNIM_proteinmpnn"}):
+        if not complex_ready:
             blocked.append(
                 Step9HardGateBlockedTool(
                     candidate_id=candidate_id,
@@ -276,90 +374,41 @@ def _protein_design_gate(
                     rationale="requires true protein complex evidence",
                 )
             )
+            continue
+        _allow_or_block(tool_name, fallback_reason="")
 
     # AlphaMissense_get_variant_score
-    if has_uniprot and has_variants:
-        allowed.append(
-            Step9HardGateAllowedTool(
-                candidate_id=candidate_id,
-                tool_name="AlphaMissense_get_variant_score",
-                lane_type="protein_design",
-                rationale="uniprot_id + explicit variant present",
-            )
-        )
-    else:
-        blocked.append(
-            Step9HardGateBlockedTool(
-                candidate_id=candidate_id,
-                tool_name="AlphaMissense_get_variant_score",
-                lane_type="protein_design",
-                reason="explicit_variant_missing" if not has_variants else "uniprot_id_missing",
-                rationale="requires explicit uniprot id and explicit variant",
-            )
-        )
+    _allow_or_block(
+        "AlphaMissense_get_variant_score",
+        fallback_reason=(
+            "explicit_variant_missing" if not has_variants else
+            "uniprot_id_missing" if not has_uniprot else ""
+        ),
+    )
 
     # DynaMut2_predict_stability
-    if has_structure_ref and has_variants:
-        allowed.append(
-            Step9HardGateAllowedTool(
-                candidate_id=candidate_id,
-                tool_name="DynaMut2_predict_stability",
-                lane_type="protein_design",
-                rationale="explicit variant + structure reference available",
-            )
-        )
-    else:
-        blocked.append(
-            Step9HardGateBlockedTool(
-                candidate_id=candidate_id,
-                tool_name="DynaMut2_predict_stability",
-                lane_type="protein_design",
-                reason="mutation_missing" if not has_variants else "structure_reference_missing",
-                rationale="requires structure/PDB ref and explicit mutation",
-            )
-        )
+    _allow_or_block(
+        "DynaMut2_predict_stability",
+        fallback_reason=(
+            "mutation_missing" if not has_variants else
+            "structure_reference_missing" if not has_structure_ref else ""
+        ),
+    )
 
     # ESM_score_variant_sae_batch
-    if has_seq and has_variants:
-        allowed.append(
-            Step9HardGateAllowedTool(
-                candidate_id=candidate_id,
-                tool_name="ESM_score_variant_sae_batch",
-                lane_type="protein_design",
-                rationale="protein sequence + explicit variants available",
-            )
-        )
-    else:
-        blocked.append(
-            Step9HardGateBlockedTool(
-                candidate_id=candidate_id,
-                tool_name="ESM_score_variant_sae_batch",
-                lane_type="protein_design",
-                reason="explicit_variant_missing" if not has_variants else "sequence_value_unavailable",
-                rationale="requires sequence + explicit protein variants",
-            )
-        )
+    _allow_or_block(
+        "ESM_score_variant_sae_batch",
+        fallback_reason=(
+            "explicit_variant_missing" if not has_variants else
+            "sequence_value_unavailable" if not has_seq else ""
+        ),
+    )
 
     # ESM_generate_protein_sequence
-    if _readiness_text_hint_for_sequence_generation(readiness_text):
-        allowed.append(
-            Step9HardGateAllowedTool(
-                candidate_id=candidate_id,
-                tool_name="ESM_generate_protein_sequence",
-                lane_type="protein_design",
-                rationale="query indicates sequence generation intent",
-            )
-        )
-    else:
-        blocked.append(
-            Step9HardGateBlockedTool(
-                candidate_id=candidate_id,
-                tool_name="ESM_generate_protein_sequence",
-                lane_type="protein_design",
-                reason="intent_not_sequence_generation",
-                rationale="no explicit sequence-generation intent detected",
-            )
-        )
+    _allow_or_block(
+        "ESM_generate_protein_sequence",
+        fallback_reason="" if _readiness_text_hint_for_sequence_generation(readiness_text) else "intent_not_sequence_generation",
+    )
 
     blocked_missing = [tool.reason for tool in blocked]
     status = "ready" if allowed else "blocked"
