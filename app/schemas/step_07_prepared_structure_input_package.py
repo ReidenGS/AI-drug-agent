@@ -44,6 +44,20 @@ class SequenceRef(BaseModel):
     related_candidate_ids: list[str] = Field(default_factory=list)
     resource_binding_status: Literal["explicit", "inferred", "ambiguous", "unassigned"] = "unassigned"
     binding_confidence: float = 0.0
+    # ── Compact MSA metadata (Step 7 NvidiaNIM_msa_search → Step 8 OpenFold3). ──
+    # Populated only when Step 7 ran an MSA search for this sequence. These are
+    # LLM-safe refs/digests: the raw a3m alignment stays in the tool output
+    # (msa_tool_output_ref) and is resolved only at Step 8 runtime — it is NEVER
+    # embedded here or anywhere in the normalized artifact.
+    msa_tool_output_ref: Optional[str] = None
+    msa_source_tool: Optional[str] = None
+    msa_tool_call_id: Optional[str] = None
+    msa_status: Optional[
+        Literal["available", "upstream_error", "a3m_not_found", "not_run", "skipped"]
+    ] = None
+    msa_alignment_format: Optional[str] = None
+    msa_alignment_length: Optional[int] = None
+    msa_alignment_sha256_prefix: Optional[str] = None
 
 
 class ChainMapping(BaseModel):
