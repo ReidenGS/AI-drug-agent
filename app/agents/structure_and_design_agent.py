@@ -1494,7 +1494,18 @@ class StructureAndDesignAgent:
             raw_request = self.storage.read_json(self.storage.run_key(run_id, "inputs/raw_request_record.json"))
         except FileNotFoundError:
             raw_request = {}
-        compound_context_text = str(raw_request.get("raw_user_query") or "")
+        try:
+            structured_query = self.storage.read_json(
+                self.storage.run_key(run_id, "inputs/structured_query.json")
+            )
+        except FileNotFoundError:
+            structured_query = {}
+
+        compound_context_text = str(
+            structured_query.get("canonical_query")
+            or raw_request.get("raw_user_query")
+            or ""
+        )
 
         compound_candidates = [
             c for c in cct.get("candidate_records") or []

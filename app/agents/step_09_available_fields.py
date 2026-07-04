@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import re
+
 from ..agents.tool_selection_policy import signature_schema_for
 from ..schemas.step_09_structure_variant_and_compound_screening import (
     Step9AvailableField,
@@ -45,13 +47,17 @@ _EXPLICIT_PROTEIN_VARIANT_TYPES = {
 }
 _UNIPROT_IDENTIFIER_TYPES = {"uniprot_id", "uniprot"}
 
+_PDB_ID_RE = re.compile(r"[0-9][A-Za-z0-9]{3}")
+
 _PROTEIN_DESIGN_TOOLS = {
     "NvidiaNIM_rfdiffusion",
     "NvidiaNIM_proteinmpnn",
+    "ESM_generate_protein_sequence",
+}
+_VARIANT_EVALUATION_TOOLS = {
     "AlphaMissense_get_variant_score",
     "DynaMut2_predict_stability",
     "ESM_score_variant_sae_batch",
-    "ESM_generate_protein_sequence",
 }
 _COMPOUND_TOOLS = {
     "ChEMBL_search_molecules",
@@ -203,6 +209,70 @@ def _candidate_has_uniprot_id(candidate: dict) -> bool:
     return _candidate_id_types(candidate, _UNIPROT_IDENTIFIER_TYPES)
 
 
+def _candidate_identifier_values(candidate: dict, id_types: set[str]) -> list[str]:
+    return [
+        value.strip()
+        for value in _candidate_ids(candidate, id_types)
+        if isinstance(value, str) and value.strip()
+    ]
+
+
+def _looks_like_pdb_id(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    if not stripped or len(stripped) != 4:
+        return False
+    return bool(_PDB_ID_RE.fullmatch(stripped))
+
+
+def _candidate_has_real_pdb_id(candidate: dict, step8_result: dict | None, candidate_id: str) -> bool:
+    if any(_looks_like_pdb_id(v) for v in _candidate_identifier_values(candidate, {"pdb_id"})):
+        return True
+
+    for material in candidate.get("materials") or []:
+        if not isinstance(material, dict):
+            continue
+        if material.get("material_type") != "pdb_id":
+            continue
+        value = material.get("value")
+        if _looks_like_pdb_id(value):
+            return True
+
+    for ref in _step8_complex_refs(step8_result, candidate_id):
+        kind = str(ref.get("source_kind") or "").lower()
+        if kind not in {"existing_pdb_complex", "existing_pdb_structure"}:
+            continue
+        if _looks_like_pdb_id(ref.get("pdb_id")) or _looks_like_pdb_id(ref.get("source_ref")):
+            return True
+
+    if candidate_id:
+        for cr in _step8_candidate_results(step8_result, candidate_id):
+            handoff = cr.get("downstream_handoff")
+            if not isinstance(handoff, dict):
+                continue
+            if _looks_like_pdb_id(handoff.get("structure_for_variant_generation_ref")):
+                return True
+    return False
+
+
+def _candidate_has_variant_structure_input(candidate: dict, step8_result: dict | None, candidate_id: str) -> bool:
+    if candidate_id:
+        for result in _step8_candidate_results(step8_result, candidate_id):
+            handoff = result.get("downstream_handoff") if isinstance(result, dict) else None
+            if not isinstance(handoff, dict):
+                continue
+            if handoff.get("structure_for_variant_generation_ref"):
+                return True
+
+    for ref in _step8_complex_refs(step8_result, candidate_id):
+        kind = str(ref.get("source_kind") or "").lower()
+        if kind in {"existing_pdb_complex", "predicted_complex", "existing_pdb_structure"}:
+            if str(ref.get("storage_ref") or ref.get("source_ref") or ref.get("pdb_id") or "").strip():
+                return True
+    return False
+
+
 def _candidate_has_structured_variants(candidate: dict) -> bool:
     return bool(_extract_explicit_variants(candidate))
 
@@ -228,6 +298,48 @@ def _candidate_has_contigs(candidate: dict) -> bool:
     for material in _candidate_value_types(candidate, {"design_contigs", "contigs"}):
         if isinstance(material.get("value"), str) and material.get("value").strip():
             return True
+    return False
+
+
+def _sequence_generation_intent_text(intent_text: str | None) -> str:
+    if not isinstance(intent_text, str):
+        return ""
+    return " ".join(intent_text.lower().strip().split())
+
+
+_SEQUENCE_GENERATION_HINTS = (
+    "generate sequence",
+    "generate protein sequence",
+    "generate aa sequence",
+    "protein sequence generation",
+    "design sequence",
+    "design protein sequence",
+    "sequence generation",
+    "predict sequence",
+)
+
+
+def _is_sequence_generation_intent(intent_text: str) -> bool:
+    normalized = _sequence_generation_intent_text(intent_text)
+    if not normalized:
+        return False
+    return any(hint in normalized for hint in _SEQUENCE_GENERATION_HINTS)
+
+
+def _structure_arg_ready(
+    arg: str,
+    candidate: dict,
+    step7_seq_refs: list[dict[str, Any]],
+    step8_result: dict | None,
+    lane_type: str,
+    candidate_id: str,
+) -> bool:
+    if arg in {"input_pdb", "structure", "structure_ref", "backbone", "path", "pdb_file"}:
+        if lane_type == "protein_design":
+            return _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result)
+        if lane_type == "variant_evaluation":
+            return _candidate_has_variant_structure_input(candidate, step8_result, candidate_id)
+        return False
     return False
 
 
@@ -365,6 +477,7 @@ def _infer_schema_arg_readiness(
     step7_seq_refs: list[dict[str, Any]],
     step8_result: dict | None,
     arg_name: str,
+    lane_type: str,
     arg_schema: dict[str, Any] | None,
 ) -> bool:
     """Map schema arg name -> compact readiness check."""
@@ -396,13 +509,59 @@ def _infer_schema_arg_readiness(
         "mutation": lambda: _candidate_has_structured_variants(candidate),
         "chain": lambda: _candidate_has_chain(candidate),
         "contigs": lambda: _candidate_has_contigs_hint(candidate),
-        "input_pdb": lambda: _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result),
-        "pdb_id": lambda: _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result),
-        "structure": lambda: _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result),
-        "structure_ref": lambda: _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result),
-        "backbone": lambda: _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result),
-        "path": lambda: _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result),
-        "pdb_file": lambda: _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result),
+        "input_pdb": lambda: _structure_arg_ready(
+            "input_pdb",
+            candidate,
+            step7_seq_refs,
+            step8_result,
+            lane_type,
+            str(candidate.get("candidate_id") or ""),
+        ),
+        "pdb_id": lambda: _candidate_has_real_pdb_id(
+            candidate,
+            step8_result,
+            str(candidate.get("candidate_id") or ""),
+        ),
+        "structure": lambda: _structure_arg_ready(
+            "structure",
+            candidate,
+            step7_seq_refs,
+            step8_result,
+            lane_type,
+            str(candidate.get("candidate_id") or ""),
+        ),
+        "structure_ref": lambda: _structure_arg_ready(
+            "structure_ref",
+            candidate,
+            step7_seq_refs,
+            step8_result,
+            lane_type,
+            str(candidate.get("candidate_id") or ""),
+        ),
+        "backbone": lambda: _structure_arg_ready(
+            "backbone",
+            candidate,
+            step7_seq_refs,
+            step8_result,
+            lane_type,
+            str(candidate.get("candidate_id") or ""),
+        ),
+        "path": lambda: _structure_arg_ready(
+            "path",
+            candidate,
+            step7_seq_refs,
+            step8_result,
+            lane_type,
+            str(candidate.get("candidate_id") or ""),
+        ),
+        "pdb_file": lambda: _structure_arg_ready(
+            "pdb_file",
+            candidate,
+            step7_seq_refs,
+            step8_result,
+            lane_type,
+            str(candidate.get("candidate_id") or ""),
+        ),
         "sequence": lambda: _candidate_step9_sequence_presence(candidate, step7_seq_refs),
         "prompt_sequence": lambda: _candidate_has_prompt_sequence(candidate, step7_seq_refs, step8_result),
         "sequence_value": lambda: _candidate_step9_sequence_presence(candidate, step7_seq_refs),
@@ -418,8 +577,21 @@ def _infer_schema_arg_readiness(
         # Conservative default for opaque arguments.
         if arg.startswith("sequence"):
             return _candidate_step9_sequence_presence(candidate, step7_seq_refs)
-        if "structure" in arg or arg.endswith("_pdb") or arg in {"path", "file", "backbone"}:
-            return _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result)
+        if _structure_arg_ready(
+            arg,
+            candidate,
+            step7_seq_refs,
+            step8_result,
+            lane_type,
+            str(candidate.get("candidate_id") or ""),
+        ):
+            return True
+        if arg.endswith("_pdb") and lane_type == "variant_evaluation":
+            return _candidate_has_real_pdb_id(
+                candidate,
+                step8_result,
+                str(candidate.get("candidate_id") or ""),
+            )
         return False
     return bool(helper())
 
@@ -429,6 +601,7 @@ def _required_args_missing(
     candidate: dict,
     step7_seq_refs: list[dict[str, Any]],
     step8_result: dict | None,
+    lane_type: str = "protein_design",
     schema_props: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[str], list[str], list[str]]:
     required, source = _schema_required_args(tool_name)
@@ -451,6 +624,7 @@ def _required_args_missing(
             step7_seq_refs,
             step8_result,
             arg,
+            lane_type,
             schema_props.get(arg) if isinstance(schema_props.get(arg), dict) else None,
         )
         if ready:
@@ -465,10 +639,11 @@ def _required_args_missing_only(
     candidate: dict,
     step7_seq_refs: list[dict[str, Any]],
     step8_result: dict | None,
+    lane_type: str = "protein_design",
     schema_props: dict[str, dict[str, Any]] | None = None,
 ) -> list[str]:
     _, satisfiable, missing = _required_args_missing(
-        tool_name, candidate, step7_seq_refs, step8_result, schema_props
+        tool_name, candidate, step7_seq_refs, step8_result, lane_type, schema_props
     )
     return [arg for arg in missing if arg not in satisfiable]
 
@@ -507,29 +682,165 @@ def _protein_design_gate(
     candidate: dict,
     step7_refs: list[dict[str, Any]],
     step8_result: dict | None,
+    sequence_generation_intent: str,
 ) -> tuple[str, list[str], list[Step9HardGateAllowedTool], list[Step9HardGateBlockedTool], list[Step9ToolSchemaRequirement]]:
     candidate_id = str(candidate.get("candidate_id") or "")
     allowed: list[Step9HardGateAllowedTool] = []
     blocked: list[Step9HardGateBlockedTool] = []
     schema_requirements: list[Step9ToolSchemaRequirement] = []
 
-    has_uniprot = _candidate_id_types(candidate, _UNIPROT_IDENTIFIER_TYPES)
-    variants = _extract_explicit_variants(candidate)
-    has_variants = bool(variants)
-    has_seq = _candidate_step9_sequence_presence(candidate, step7_refs)
-    has_structure_ref = _step8_structure_reference_available(step8_result or {}, candidate_id)
+    sequence_generation_intent_flag = _is_sequence_generation_intent(sequence_generation_intent)
     complex_ready, complex_missing = _design_complex_ready(step8_result, candidate_id)
 
-    def _allow_or_block(tool_name: str, fallback_reason: str | None) -> None:
+    for tool_name in sorted(_PROTEIN_DESIGN_TOOLS):
         required, satisfiable, missing = _required_args_missing(
-            tool_name, candidate, step7_refs, step8_result, _schema_props(tool_name)
+            tool_name,
+            candidate,
+            step7_refs,
+            step8_result,
+            "protein_design",
+        )
+        schema_requirements.append(
+                _tool_schema_requirement_record(
+                    candidate,
+                    candidate_id,
+                    "protein_design",
+                    tool_name,
+                    required,
+                    satisfiable,
+                    missing,
+                    _schema_required_args(tool_name)[1],
+            )
+        )
+        if missing:
+            if tool_name in {"NvidiaNIM_rfdiffusion", "NvidiaNIM_proteinmpnn"}:
+                if not complex_ready:
+                    blocked.append(
+                        Step9HardGateBlockedTool(
+                            candidate_id=candidate_id,
+                            tool_name=tool_name,
+                            lane_type="protein_design",
+                            reason=complex_missing[0],
+                            rationale="requires true protein complex evidence",
+                        )
+                    )
+                    continue
+            blocked.append(
+                Step9HardGateBlockedTool(
+                    candidate_id=candidate_id,
+                    tool_name=tool_name,
+                    lane_type="protein_design",
+                    reason=(
+                        "tool_schema_unavailable"
+                        if missing == ["tool_schema_unavailable"]
+                        else "schema_required:" + ",".join(sorted(missing))
+                    ),
+                    rationale="required official TU args are missing",
+                )
+            )
+            continue
+
+        if tool_name in {"NvidiaNIM_rfdiffusion", "NvidiaNIM_proteinmpnn"}:
+            if not complex_ready:
+                blocked.append(
+                    Step9HardGateBlockedTool(
+                        candidate_id=candidate_id,
+                        tool_name=tool_name,
+                        lane_type="protein_design",
+                        reason=complex_missing[0],
+                        rationale="requires true protein complex evidence",
+                    )
+                )
+                continue
+
+            if tool_name == "NvidiaNIM_rfdiffusion" and "contigs" not in satisfiable:
+                blocked.append(
+                    Step9HardGateBlockedTool(
+                        candidate_id=candidate_id,
+                        tool_name=tool_name,
+                        lane_type="protein_design",
+                        reason="schema_required:contigs",
+                        rationale="requires deterministic contig template input",
+                    )
+                )
+                continue
+
+        if tool_name == "ESM_generate_protein_sequence":
+            if not sequence_generation_intent_flag:
+                blocked.append(
+                    Step9HardGateBlockedTool(
+                        candidate_id=candidate_id,
+                        tool_name=tool_name,
+                        lane_type="protein_design",
+                        reason="sequence_generation_intent_missing",
+                        rationale="sequence-generation intent not asserted in canonical/ raw query",
+                    )
+                )
+                continue
+
+            # Prompt sequence requirement is already handled by official required args.
+        allowed.append(
+            Step9HardGateAllowedTool(
+                candidate_id=candidate_id,
+                tool_name=tool_name,
+                lane_type="protein_design",
+                rationale=(
+                    "true complex and schema inputs available for protein design"
+                    if tool_name in {"NvidiaNIM_rfdiffusion", "NvidiaNIM_proteinmpnn"}
+                    else "sequence-generation intent and official args are available"
+                ),
+            )
+        )
+
+    blocked_missing = [tool.reason for tool in blocked]
+    has_any_tool_evidence = bool(_PROTEIN_DESIGN_TOOLS)
+    status = "ready" if allowed else ("not_applicable" if has_any_tool_evidence and not blocked else "blocked")
+    return status, blocked_missing, allowed, blocked, schema_requirements
+
+
+def _map_variant_missing_reason(tool_name: str, missing: list[str], missing_set: set[str]) -> str:
+    if "pdb_id" in missing_set:
+        return "pdb_id_missing"
+    if "variant" in missing_set or "variants" in missing_set or "mutation" in missing_set:
+        return "variant_missing"
+    if "chain" in missing_set:
+        return "chain_missing"
+    if "uniprot_id" in missing_set:
+        return "uniprot_id_missing"
+    if {"input_pdb", "structure", "structure_ref", "backbone", "path", "pdb_file"} & missing_set:
+        return "complex_structure_missing"
+    if "contigs" in missing_set:
+        return "contigs_missing"
+    if any(arg.endswith("_pdb") for arg in missing_set):
+        return "complex_structure_missing"
+    return "schema_required:" + ",".join(sorted(missing))
+
+
+def _variant_evaluation_gate(
+    candidate: dict,
+    step7_refs: list[dict[str, Any]],
+    step8_result: dict | None,
+) -> tuple[str, list[str], list[Step9HardGateAllowedTool], list[Step9HardGateBlockedTool], list[Step9ToolSchemaRequirement]]:
+    candidate_id = str(candidate.get("candidate_id") or "")
+    allowed: list[Step9HardGateAllowedTool] = []
+    blocked: list[Step9HardGateBlockedTool] = []
+    schema_requirements: list[Step9ToolSchemaRequirement] = []
+
+    for tool_name in sorted(_VARIANT_EVALUATION_TOOLS):
+        required, satisfiable, missing = _required_args_missing(
+            tool_name,
+            candidate,
+            step7_refs,
+            step8_result,
+            "variant_evaluation",
+            _schema_props(tool_name),
         )
         schema_source = _schema_required_args(tool_name)[1]
         schema_requirements.append(
             _tool_schema_requirement_record(
                 candidate,
                 candidate_id,
-                "protein_design",
+                "variant_evaluation",
                 tool_name,
                 required,
                 satisfiable,
@@ -537,94 +848,62 @@ def _protein_design_gate(
                 schema_source,
             )
         )
-        if missing:
-            blocked.append(
-                Step9HardGateBlockedTool(
-                    candidate_id=candidate_id,
-                    tool_name=tool_name,
-                    lane_type="protein_design",
-                    reason=(
-                        "tool_schema_unavailable"
-                        if missing == ["tool_schema_unavailable"]
-                        else "schema_required:" + ",".join(sorted(missing))
-                    ),
-                    rationale="required official TU args are missing",
-                )
-            )
-            return
-        if fallback_reason:
-            blocked.append(
-                Step9HardGateBlockedTool(
-                    candidate_id=candidate_id,
-                    tool_name=tool_name,
-                    lane_type="protein_design",
-                    reason=fallback_reason,
-                    rationale="requires input for runtime handoff and tool contract",
-                )
-            )
-            return
-        allowed.append(
-            Step9HardGateAllowedTool(
-                candidate_id=candidate_id,
-                tool_name=tool_name,
-                lane_type="protein_design",
-                rationale="required inputs available",
-            )
-        )
-
-    # RFdiffusion / ProteinMPNN require true complex evidence.
-    for tool_name in sorted({"NvidiaNIM_rfdiffusion", "NvidiaNIM_proteinmpnn"}):
-        required, satisfiable, missing = _required_args_missing(
-            tool_name, candidate, step7_refs, step8_result
-        )
-        schema_requirements.append(
-            _tool_schema_requirement_record(
-                candidate,
-                candidate_id,
-                "protein_design",
-                tool_name,
-                required,
-                satisfiable,
-                missing,
-                _schema_required_args(tool_name)[1],
-            )
-        )
-        if not complex_ready:
-            blocked.append(
-                Step9HardGateBlockedTool(
-                    candidate_id=candidate_id,
-                    tool_name=tool_name,
-                    lane_type="protein_design",
-                    reason=complex_missing[0],
-                    rationale="requires true protein complex evidence",
-                )
-            )
-            continue
 
         if missing:
+            missing_set = set(missing)
+            reason = _map_variant_missing_reason(tool_name, missing, missing_set)
+            if tool_name == "AlphaMissense_get_variant_score" and "variant" in missing_set and "uniprot_id" in missing_set:
+                if has := _candidate_has_structured_variants(candidate):
+                    if "uniprot_id" in missing_set:
+                        reason = "uniprot_id_missing"
+                elif "uniprot_id" in missing_set:
+                    reason = "uniprot_id_missing"
             blocked.append(
                 Step9HardGateBlockedTool(
                     candidate_id=candidate_id,
                     tool_name=tool_name,
-                    lane_type="protein_design",
-                    reason=(
-                        "tool_schema_unavailable"
-                        if missing == ["tool_schema_unavailable"]
-                        else "schema_required:" + ",".join(sorted(missing))
-                    ),
+                    lane_type="variant_evaluation",
+                    reason=reason,
                     rationale="required official TU args are missing",
                 )
             )
             continue
 
-        if tool_name == "NvidiaNIM_rfdiffusion" and "contigs" not in satisfiable:
+        # For schema that returns satisfiable args, allow execution.
+        blocked_reason = ""
+        if tool_name == "AlphaMissense_get_variant_score":
+            if "variant" in required and not _extract_explicit_variants(candidate):
+                blocked_reason = "variant_missing"
+            elif "uniprot_id" in required and not _candidate_has_uniprot_id(candidate):
+                blocked_reason = "uniprot_id_missing"
+
+        elif tool_name == "DynaMut2_predict_stability":
+            if "pdb_id" in required and not _candidate_has_real_pdb_id(
+                candidate, step8_result, candidate_id
+            ):
+                blocked_reason = "pdb_id_missing"
+            elif "chain" in required and not _candidate_has_chain(candidate):
+                blocked_reason = "chain_missing"
+            elif "mutation" in required and not _extract_explicit_variants(candidate):
+                blocked_reason = "variant_missing"
+
+        elif tool_name == "ESM_score_variant_sae_batch":
+            if (
+                "variants" in required
+                and not _extract_explicit_variants(candidate)
+            ):
+                blocked_reason = "variant_missing"
+            elif "sequence" in required and not _candidate_step9_sequence_presence(candidate, step7_refs):
+                blocked_reason = "sequence_missing"
+
+        if blocked_reason:
             blocked.append(
                 Step9HardGateBlockedTool(
                     candidate_id=candidate_id,
                     tool_name=tool_name,
-                    lane_type="protein_design",
-                    reason="schema_required:contigs",
-                    rationale="requires deterministic contig template input",
+                    lane_type="variant_evaluation",
+                    reason=blocked_reason,
+                    rationale="required official TU args are missing",
                 )
             )
             continue
@@ -633,47 +912,13 @@ def _protein_design_gate(
             Step9HardGateAllowedTool(
                 candidate_id=candidate_id,
                 tool_name=tool_name,
-                lane_type="protein_design",
-                rationale=(
-                    "true complex and schema inputs available for RFdiffusion"
-                    if tool_name == "NvidiaNIM_rfdiffusion"
-                    else "true complex and schema inputs available for protein design"
-                ),
+                lane_type="variant_evaluation",
+                rationale="required official TU inputs available for variant evaluation",
             )
         )
 
-    # DynaMut_stability: requires operation/pdb_id/chain/mutation.
-    _allow_or_block(
-        "DynaMut2_predict_stability",
-        fallback_reason="",
-    )
-
-    # AlphaMissense: requires uniprot+variant + (operation default fixed).
-    _allow_or_block(
-        "AlphaMissense_get_variant_score",
-        fallback_reason=(
-            "explicit_variant_missing" if not has_variants else
-            "uniprot_id_missing" if not has_uniprot else ""
-        ),
-    )
-
-    # ESM score: requires sequence + variants.
-    _allow_or_block(
-        "ESM_score_variant_sae_batch",
-        fallback_reason=(
-            "explicit_variant_missing" if not has_variants else
-            "sequence_value_unavailable" if not has_seq else ""
-        ),
-    )
-
-    # ESM generate: requires prompt sequence.
-    _allow_or_block(
-        "ESM_generate_protein_sequence",
-        fallback_reason="intent_not_sequence_generation",
-    )
-
-    blocked_missing = [tool.reason for tool in blocked]
-    status = "ready" if (complex_ready and allowed) else "blocked"
+    status = "ready" if allowed else ("not_applicable" if not blocked else "blocked")
+    blocked_missing = [entry.reason for entry in blocked]
     return status, blocked_missing, allowed, blocked, schema_requirements
 
 
@@ -1031,7 +1276,10 @@ def project_step9_readiness(
             continue
 
         fields = _available_fields_for_protein_candidate(candidate, prepared_inputs)
-        status, _, allowed, blocked, reqs = _protein_design_gate(candidate, step7_refs, step8_data)
+        sequence_generation_intent = _sequence_generation_intent_text(compound_context_text)
+        status, _, allowed, blocked, reqs = _protein_design_gate(
+            candidate, step7_refs, step8_data, sequence_generation_intent
+        )
         schema_requirements.extend(reqs)
         lane_statuses.append(
             _lane_status(candidate, "protein_design", allowed, blocked, fields, status)
@@ -1040,10 +1288,35 @@ def project_step9_readiness(
         allowed_tools.extend(allowed)
         blocked_tools.extend(blocked)
 
+        variant_status, _, variant_allowed, variant_blocked, variant_reqs = _variant_evaluation_gate(
+            candidate, step7_refs, step8_data
+        )
+        schema_requirements.extend(variant_reqs)
+        lane_statuses.append(
+            _lane_status(candidate, "variant_evaluation", variant_allowed, variant_blocked, fields, variant_status)
+        )
+        allowed_tools.extend(variant_allowed)
+        blocked_tools.extend(variant_blocked)
+
     summary = Step9ReadinessSummary(
         total_candidates=len(candidate_records),
         protein_design_candidates=sum(
             1 for candidate in candidate_records if isinstance(candidate, dict) and str(candidate.get("candidate_type") or "") != "compound_component"
+        ),
+        variant_evaluation_candidates=sum(
+            1 for candidate in candidate_records if isinstance(candidate, dict) and str(candidate.get("candidate_type") or "") != "compound_component"
+        ),
+        variant_evaluation_ready_candidates=sum(
+            1 for lane in lane_statuses
+            if lane.lane_type == "variant_evaluation" and lane.status == "ready"
+        ),
+        variant_evaluation_blocked_candidates=sum(
+            1 for lane in lane_statuses
+            if lane.lane_type == "variant_evaluation" and lane.status == "blocked"
+        ),
+        variant_evaluation_not_applicable_candidates=sum(
+            1 for lane in lane_statuses
+            if lane.lane_type == "variant_evaluation" and lane.status == "not_applicable"
         ),
         protein_design_ready_candidates=sum(
             1 for lane in lane_statuses if lane.lane_type == "protein_design" and lane.status == "ready"
@@ -1065,9 +1338,6 @@ def project_step9_readiness(
         hard_gate_blocked_tool_count=len(blocked_tools),
     )
 
-    # Keep backward compatibility with prior callers.
-    _ = compound_context_text
-
     all_missing = list(dict.fromkeys(
         reason
         for lane in lane_statuses
@@ -1083,7 +1353,7 @@ def project_step9_readiness(
         "compound_screening_readiness": _aggregate_readiness_profile(
             lane_statuses, "compound_screening"
         ),
-        "variant_evaluation_readiness": Step9LaneReadinessProfile(status="not_applicable"),
+        "variant_evaluation_readiness": _aggregate_readiness_profile(lane_statuses, "variant_evaluation"),
         "step9_hard_gate_allowed_tools": allowed_tools,
         "step9_hard_gate_blocked_tools_with_reason": blocked_tools,
         "step9_tool_schema_requirements": schema_requirements,

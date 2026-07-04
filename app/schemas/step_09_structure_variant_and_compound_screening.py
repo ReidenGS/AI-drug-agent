@@ -1,4 +1,4 @@
-"""Step 9 — protein_design_artifact + compound_screening_artifact.
+"""Step 9 — protein_design_artifact + variant_evaluation + compound_screening_artifact.
 
 Step 9 may run a protein design lane (RFdiffusion / ProteinMPNN / ESM) and/or a
 compound screening lane (ChEMBL / ZINC libraries). The hard constraint: the
@@ -32,14 +32,14 @@ class Step9AvailableField(BaseModel):
 
 class Step9HardGateAllowedTool(BaseModel):
     tool_name: str
-    lane_type: Literal["protein_design", "compound_screening"]
+    lane_type: Literal["protein_design", "variant_evaluation", "compound_screening"]
     candidate_id: str
     rationale: Optional[str] = None
 
 
 class Step9HardGateBlockedTool(BaseModel):
     tool_name: str
-    lane_type: Literal["protein_design", "compound_screening"]
+    lane_type: Literal["protein_design", "variant_evaluation", "compound_screening"]
     candidate_id: str
     reason: str
     rationale: Optional[str] = None
@@ -48,7 +48,7 @@ class Step9HardGateBlockedTool(BaseModel):
 class Step9ToolSchemaRequirement(BaseModel):
     candidate_id: str
     tool_name: str
-    lane_type: Literal["protein_design", "compound_screening"]
+    lane_type: Literal["protein_design", "variant_evaluation", "compound_screening"]
     required_fields: list[str] = Field(default_factory=list)
     schema_source: Literal["tooluniverse", "signature", "tooluniverse_or_signature", "unavailable"]
     satisfiable_required_fields: list[str] = Field(default_factory=list)
@@ -58,7 +58,7 @@ class Step9ToolSchemaRequirement(BaseModel):
 
 
 class Step9LaneStatus(BaseModel):
-    lane_type: Literal["protein_design", "compound_screening"]
+    lane_type: Literal["protein_design", "variant_evaluation", "compound_screening"]
     candidate_id: str
     candidate_type: str
     status: Literal["ready", "blocked", "not_applicable", "partial", "partial_or_skipped"]
@@ -75,6 +75,10 @@ class Step9ReadinessSummary(BaseModel):
     protein_design_ready_candidates: int = 0
     protein_design_blocked_candidates: int = 0
     protein_design_not_applicable_candidates: int = 0
+    variant_evaluation_candidates: int = 0
+    variant_evaluation_ready_candidates: int = 0
+    variant_evaluation_blocked_candidates: int = 0
+    variant_evaluation_not_applicable_candidates: int = 0
     compound_candidates: int = 0
     compound_candidate_with_tools: int = 0
     hard_gate_allowed_tool_count: int = 0
