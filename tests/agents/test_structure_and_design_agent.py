@@ -3476,6 +3476,10 @@ def test_step9_smiles_triggers_zinc_search_by_smiles(
 
     tool_names = {tc.tool_name for tc in artifact.tool_call_records}
     assert "ZINC_search_by_smiles" in tool_names
+    assert "ZINC_search_by_smiles" in artifact.step9_dry_run_resolved_tools
+    assert artifact.step9_dry_run_execution_mode == "dry_run_only"
+    dry_run_names = {entry.get("tool_name") for entry in artifact.step9_dry_run_execution_plan}
+    assert "ZINC_search_by_smiles" in dry_run_names
 
     # No record claims ZINC22.
     for hit in artifact.compound_hits:
@@ -3716,6 +3720,18 @@ def test_step9_readiness_projection_allows_protein_design_when_true_complex_pres
     profile = artifact.protein_design_readiness
     assert profile.ready_tool_count >= 1
     assert profile.status == "ready"
+    dry_run_names = {entry.get("tool_name") for entry in artifact.step9_dry_run_execution_plan}
+    assert "NvidiaNIM_proteinmpnn" in dry_run_names
+    assert all(entry.get("execution_mode") == "dry_run_only" for entry in artifact.step9_dry_run_execution_plan)
+    executed_tool_names = {tc.tool_name for tc in artifact.tool_call_records}
+    assert not {
+        "NvidiaNIM_rfdiffusion",
+        "NvidiaNIM_proteinmpnn",
+        "AlphaMissense_get_variant_score",
+        "DynaMut2_predict_stability",
+        "ESM_generate_protein_sequence",
+        "ESM_score_variant_sae_batch",
+    } & executed_tool_names
 
     # Keep raw-sequence secrecy.
     assert "HEADER" not in json.dumps(artifact.model_dump())
