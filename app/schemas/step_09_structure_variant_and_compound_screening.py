@@ -45,6 +45,18 @@ class Step9HardGateBlockedTool(BaseModel):
     rationale: Optional[str] = None
 
 
+class Step9ToolSchemaRequirement(BaseModel):
+    candidate_id: str
+    tool_name: str
+    lane_type: Literal["protein_design", "compound_screening"]
+    required_fields: list[str] = Field(default_factory=list)
+    schema_source: Literal["tooluniverse", "signature", "tooluniverse_or_signature", "unavailable"]
+    satisfiable_required_fields: list[str] = Field(default_factory=list)
+    missing_required_fields: list[str] = Field(default_factory=list)
+    hard_gate_decision: Literal["allowed", "blocked"]
+    reason: str
+
+
 class Step9LaneStatus(BaseModel):
     lane_type: Literal["protein_design", "compound_screening"]
     candidate_id: str
@@ -154,6 +166,9 @@ class CompoundScreeningArtifact(BaseModel):
         default_factory=list
     )
     step9_hard_gate_blocked_tools_with_reason: list[Step9HardGateBlockedTool] = Field(
+        default_factory=list
+    )
+    step9_tool_schema_requirements: list[Step9ToolSchemaRequirement] = Field(
         default_factory=list
     )
     step9_missing_inputs: list[str] = Field(default_factory=list)

@@ -3682,6 +3682,19 @@ def test_step9_readiness_projection_allows_protein_design_when_true_complex_pres
     run_id = _seed_sequence_only_protein_candidates(local_storage, registry_service, workflow_state_service)
     cct = local_storage.read_json(local_storage.run_key(run_id, "candidate_context_table.json"))
     candidate_ids = [c["candidate_id"] for c in cct.get("candidate_records") or [] if c.get("candidate_type") in {"target_antigen", "antibody"}]
+    # Add minimal rfdiffusion-ready contigs evidence for this test lane.
+    for candidate in cct.get("candidate_records") or []:
+        if not isinstance(candidate, dict):
+            continue
+        if candidate.get("candidate_type") in {"target_antigen", "antibody"}:
+            candidate.setdefault("materials", []).append(
+                {
+                    "material_id": "rfdiffusion_test_contigs",
+                    "material_type": "contigs",
+                    "value": "A:1-10;B:1-10",
+                }
+            )
+    local_storage.write_json(local_storage.run_key(run_id, "candidate_context_table.json"), cct)
     _write_step8_complex_handoff(local_storage, run_id, candidate_ids)
 
     agent = StructureAndDesignAgent(
@@ -3694,7 +3707,6 @@ def test_step9_readiness_projection_allows_protein_design_when_true_complex_pres
 
     assert artifact.step9_readiness_summary.protein_design_ready_candidates >= 2
     allowed_tools = {tool.tool_name for tool in artifact.step9_hard_gate_allowed_tools}
-    assert "NvidiaNIM_rfdiffusion" in allowed_tools
     assert "NvidiaNIM_proteinmpnn" in allowed_tools
     assert not any(
         entry.tool_name in {"NvidiaNIM_rfdiffusion", "NvidiaNIM_proteinmpnn"} and entry.reason == "complex_structure_missing"

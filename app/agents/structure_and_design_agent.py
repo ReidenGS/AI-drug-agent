@@ -1587,6 +1587,7 @@ class StructureAndDesignAgent:
             compound_screening_readiness=readiness_projection["compound_screening_readiness"],
             step9_hard_gate_allowed_tools=readiness_projection["step9_hard_gate_allowed_tools"],
             step9_hard_gate_blocked_tools_with_reason=readiness_projection["step9_hard_gate_blocked_tools_with_reason"],
+            step9_tool_schema_requirements=readiness_projection["step9_tool_schema_requirements"],
             step9_missing_inputs=readiness_projection["step9_missing_inputs"],
         )
 

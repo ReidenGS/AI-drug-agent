@@ -1,13 +1,11 @@
 """Step 9 readiness projection + hard-gate helpers.
 
-This module is pure projection logic: it reads normalized artifacts from prior
-steps and computes compact readiness metadata consumed by Step 9 runtime and
-future selector layers.
+This module reads artifacts from previous steps and computes compact readiness
+signals for Step 9 selector/runtime input.
 """
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from ..agents.tool_selection_policy import signature_schema_for
@@ -18,6 +16,7 @@ from ..schemas.step_09_structure_variant_and_compound_screening import (
     Step9LaneReadinessProfile,
     Step9LaneStatus,
     Step9ReadinessSummary,
+    Step9ToolSchemaRequirement,
 )
 
 
@@ -54,8 +53,6 @@ _PROTEIN_DESIGN_TOOLS = {
     "ESM_score_variant_sae_batch",
     "ESM_generate_protein_sequence",
 }
-_STRUCTURE_TOOLS = {"NvidiaNIM_rfdiffusion", "NvidiaNIM_proteinmpnn"}
-
 _COMPOUND_TOOLS = {
     "ChEMBL_search_molecules",
     "ChEMBL_search_similarity",
@@ -67,17 +64,25 @@ _COMPOUND_TOOLS = {
     "ZINC_search_compounds",
 }
 
-_VARIANT_PATTERN = re.compile(r"\b(?:p\.)?[A-Z][A-Za-z0-9]{0,7}[0-9]{1,6}[A-Z][A-Za-z0-9]{0,7}\b")
-
 
 _TOOL_REQUIRED_ARGS_CACHE: dict[str, list[str]] = {}
+_TOOL_SCHEMA_SOURCE_CACHE: dict[str, str] = {}
 
 
-def _schema_required_args(tool_name: str) -> list[str]:
+def _schema_required_args(tool_name: str) -> tuple[list[str], str]:
+    """Return required parameters and where the schema came from."""
     if tool_name in _TOOL_REQUIRED_ARGS_CACHE:
-        return _TOOL_REQUIRED_ARGS_CACHE[tool_name]
+        return (
+            _TOOL_REQUIRED_ARGS_CACHE[tool_name],
+            _TOOL_SCHEMA_SOURCE_CACHE.get(tool_name, "unavailable"),
+        )
 
-    schema = signature_schema_for(tool_name) or {}
+    schema = signature_schema_for(tool_name)
+    if not isinstance(schema, dict):
+        _TOOL_REQUIRED_ARGS_CACHE[tool_name] = []
+        _TOOL_SCHEMA_SOURCE_CACHE[tool_name] = "unavailable"
+        return [], "unavailable"
+
     required = schema.get("required") or []
     normalized: list[str] = []
     for name in required:
@@ -87,56 +92,38 @@ def _schema_required_args(tool_name: str) -> list[str]:
         if not arg or arg.startswith("_"):
             continue
         normalized.append(arg)
+
+    properties = schema.get("properties")
+    schema_source = "signature"
+    has_tooluniverse_spec = False
+    try:
+        from ..mcp import tooluniverse_adapter
+
+        has_tooluniverse_spec = tooluniverse_adapter.get_tool_specification(tool_name) is not None
+        if has_tooluniverse_spec:
+            schema_source = "tooluniverse_or_signature"
+    except Exception:  # noqa: BLE001
+        schema_source = "signature"
+
     _TOOL_REQUIRED_ARGS_CACHE[tool_name] = normalized
-    return normalized
+    _TOOL_SCHEMA_SOURCE_CACHE[tool_name] = schema_source
+    return normalized, schema_source
 
 
-def _infer_schema_arg_readiness(
-    candidate: dict,
-    step7_seq_refs: list[dict[str, Any]],
-    step8_result: dict | None,
-    arg_name: str,
-) -> bool:
-    """Best-effort mapping from TU argument name -> compact input readiness."""
-    arg = arg_name.lower().strip()
-    if not arg:
-        return False
-
-    # Candidate-provided sequence-like args.
-    if "variant" in arg or "mutation" in arg:
-        return bool(_extract_explicit_variants(candidate, ""))
-
-    if "uniprot" in arg and "id" in arg:
-        return _candidate_id_types(candidate, _UNIPROT_IDENTIFIER_TYPES)
-
-    if "sequence" in arg:
-        return _candidate_step9_sequence_presence(candidate, step7_seq_refs)
-
-    if "structure" in arg or "pdb" in arg or "pdb_id" in arg:
-        return _step8_structure_reference_available(step8_result, str(candidate.get("candidate_id") or ""))
-
-    if arg in {"operation", "mode", "task", "input_mode", "output_format"}:
-        return True
-
-    return False
-
-
-def _required_args_missing(
-    tool_name: str,
-    candidate: dict,
-    step7_seq_refs: list[dict[str, Any]],
-    step8_result: dict | None,
-) -> list[str]:
-    """Return schema-required args for `tool_name` that are not currently ready."""
-    missing = []
-    for arg in _schema_required_args(tool_name):
-        if not _infer_schema_arg_readiness(candidate, step7_seq_refs, step8_result, arg):
-            missing.append(arg)
-    return missing
+def _schema_props(tool_name: str) -> dict[str, dict[str, Any]]:
+    schema = signature_schema_for(tool_name) or {}
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        return properties
+    return {}
 
 
 def _candidate_value_types(candidate: dict, material_types: set[str]) -> list[dict[str, Any]]:
-    return [m for m in (candidate.get("materials") or []) if isinstance(m, dict) and m.get("material_type") in material_types]
+    return [
+        m
+        for m in (candidate.get("materials") or [])
+        if isinstance(m, dict) and m.get("material_type") in material_types
+    ]
 
 
 def _candidate_ids(candidate: dict, id_types: set[str]) -> list[str]:
@@ -155,7 +142,7 @@ def _candidate_id_types(candidate: dict, id_types: set[str]) -> bool:
     return bool(_candidate_ids(candidate, id_types))
 
 
-def _extract_explicit_variants(candidate: dict, readiness_text: str) -> list[str]:
+def _extract_explicit_variants(candidate: dict) -> list[str]:
     variants: list[str] = []
     for ident in candidate.get("identifiers") or []:
         if isinstance(ident, dict) and ident.get("id_type") in _EXPLICIT_PROTEIN_VARIANT_TYPES:
@@ -169,8 +156,6 @@ def _extract_explicit_variants(candidate: dict, readiness_text: str) -> list[str
             value = mat.get("value")
             if isinstance(value, str) and value.strip():
                 variants.append(value.strip())
-    if isinstance(readiness_text, str):
-        variants.extend(_VARIANT_PATTERN.findall(readiness_text))
     deduped: list[str] = []
     seen: set[str] = set()
     for value in variants:
@@ -180,61 +165,95 @@ def _extract_explicit_variants(candidate: dict, readiness_text: str) -> list[str
     return deduped
 
 
-def _sequence_readiness_label(seq_ref: dict[str, Any]) -> str:
-    status = str(seq_ref.get("sequence_value_status") or "").lower()
-    if status in {"inline", "referenced"}:
-        return "ready"
-    if status == "identifier_only":
-        return "identifier_only"
-    return "unavailable"
+def _candidate_has_compound_smiles(candidate: dict) -> bool:
+    return bool(_candidate_value_types(candidate, _COMPOUND_SMILES_MATERIAL_TYPES))
 
 
-def _readiness_text_hint_for_sequence_generation(text: str) -> bool:
-    if not isinstance(text, str):
-        return False
-    lowered = text.lower()
-    return any(
-        phrase in lowered
-        for phrase in (
-            "generate sequence",
-            "sequence generation",
-            "design sequence",
-            "generate a sequence",
-            "predict sequence",
-            "optimize sequence",
-        )
-    )
+def _candidate_has_compound_name(candidate: dict) -> bool:
+    for material in candidate.get("materials") or []:
+        if (
+            isinstance(material, dict)
+            and material.get("material_type") in _COMPOUND_NAME_MATERIAL_TYPES
+            and isinstance(material.get("value"), str)
+            and material.get("value").strip()
+        ):
+            return True
+    return False
 
 
-def _build_step7_sequence_refs(prepared_inputs: list[dict], candidate_id: str) -> list[dict[str, Any]]:
-    out = []
-    for sin in prepared_inputs:
-        if not isinstance(sin, dict):
+def _candidate_has_smiles_like_query_text(candidate: dict) -> bool:
+    # Preserve deterministic behavior: explicit string fields can be used as a
+    # query-like hint. This intentionally does not scan raw user query.
+    return _candidate_has_compound_name(candidate)
+
+
+def _candidate_has_zinc_id(candidate: dict) -> bool:
+    return _candidate_id_types(candidate, {"zinc_id"})
+
+
+def _candidate_has_chembl_id(candidate: dict) -> bool:
+    return _candidate_id_types(candidate, {"chembl_id"})
+
+
+def _candidate_has_pubchem_id(candidate: dict) -> bool:
+    return _candidate_id_types(candidate, {"pubchem_cid"})
+
+
+def _candidate_has_uniprot_id(candidate: dict) -> bool:
+    return _candidate_id_types(candidate, _UNIPROT_IDENTIFIER_TYPES)
+
+
+def _candidate_has_structured_variants(candidate: dict) -> bool:
+    return bool(_extract_explicit_variants(candidate))
+
+
+def _candidate_has_chain(candidate: dict) -> bool:
+    for ident in candidate.get("identifiers") or []:
+        if isinstance(ident, dict) and str(ident.get("id_type") or "").lower() in {
+            "chain_id",
+            "chain",
+        }:
+            if isinstance(ident.get("id_value"), str) and ident.get("id_value").strip():
+                return True
+    for mat in candidate.get("materials") or []:
+        if not isinstance(mat, dict):
             continue
-        if str(sin.get("candidate_id") or "") != candidate_id:
-            continue
-        for seq_ref in sin.get("sequence_refs_for_prediction") or []:
-            if not isinstance(seq_ref, dict):
-                continue
-            out.append(
-                {
-                    "sequence_id": seq_ref.get("sequence_id"),
-                    "candidate_id": candidate_id,
-                    "field_ref": f"step7_sequence:{seq_ref.get('sequence_id')}",
-                    "chain_role": seq_ref.get("chain_role"),
-                    "sequence_value_status": seq_ref.get("sequence_value_status"),
-                    "source_ref": seq_ref.get("source_ref"),
-                    "prediction_input_kind": seq_ref.get("prediction_input_kind"),
-                    "sequence_length": seq_ref.get("sequence_length"),
-                    "sha256_prefix": seq_ref.get("sha256_prefix"),
-                }
-            )
-    return out
+        role = str(mat.get("chain_role") or "").strip().lower()
+        if role:
+            return True
+    return False
+
+
+def _candidate_has_contigs(candidate: dict) -> bool:
+    for material in _candidate_value_types(candidate, {"design_contigs", "contigs"}):
+        if isinstance(material.get("value"), str) and material.get("value").strip():
+            return True
+    return False
+
+
+def _candidate_step9_sequence_presence(candidate: dict, step7_seq_refs: list[dict[str, Any]]) -> bool:
+    for material in _candidate_value_types(candidate, _PROTEIN_SEQUENCE_MATERIAL_TYPES):
+        value = material.get("value")
+        if isinstance(value, str) and value.strip():
+            return True
+    for seq_ref in step7_seq_refs:
+        if str(seq_ref.get("sequence_value_status") or "").lower() in {
+            "inline",
+            "referenced",
+        }:
+            return True
+    return False
+
+
+def _candidate_has_prompt_sequence(candidate: dict, step7_seq_refs: list[dict[str, Any]], _: dict | None) -> bool:
+    return _candidate_step9_sequence_presence(candidate, step7_seq_refs)
 
 
 def _step8_candidate_results(step8_result: dict | None, candidate_id: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for item in step8_result.get("candidate_structure_results") or [] if isinstance(step8_result, dict) else []:
+    if not isinstance(step8_result, dict):
+        return out
+    for item in step8_result.get("candidate_structure_results") or []:
         if isinstance(item, dict) and str(item.get("candidate_id") or "") == str(candidate_id):
             out.append(item)
     return out
@@ -263,15 +282,54 @@ def _design_complex_ready(step8_result: dict | None, candidate_id: str) -> tuple
     return False, ["complex_structure_missing"]
 
 
-def _candidate_step9_sequence_presence(candidate: dict, step7_seq_refs: list[dict[str, Any]]) -> bool:
-    for material in _candidate_value_types(candidate, _PROTEIN_SEQUENCE_MATERIAL_TYPES):
-        value = material.get("value")
-        if isinstance(value, str) and value.strip():
-            return True
-    for seq_ref in step7_seq_refs:
-        if str(seq_ref.get("sequence_value_status") or "") in {"inline", "referenced"}:
+def _step8_structure_reference_available(step8_result: dict, candidate_id: str) -> bool:
+    for cr in _step8_candidate_results(step8_result, candidate_id):
+        handoff = cr.get("downstream_handoff") if isinstance(cr, dict) else None
+        if not isinstance(handoff, dict):
+            continue
+        if handoff.get("validated_structure_ref") or handoff.get("structure_for_variant_generation_ref"):
             return True
     return False
+
+
+def _candidate_has_complex_structure_ref(candidate_id: str, step8_result: dict | None) -> bool:
+    ready, _ = _design_complex_ready(step8_result, candidate_id)
+    return ready
+
+
+def _sequence_readiness_label(seq_ref: dict[str, Any]) -> str:
+    status = str(seq_ref.get("sequence_value_status") or "").lower()
+    if status in {"inline", "referenced"}:
+        return "ready"
+    if status == "identifier_only":
+        return "identifier_only"
+    return "unavailable"
+
+
+def _build_step7_sequence_refs(prepared_inputs: list[dict], candidate_id: str) -> list[dict[str, Any]]:
+    out = []
+    for sin in prepared_inputs:
+        if not isinstance(sin, dict):
+            continue
+        if str(sin.get("candidate_id") or "") != candidate_id:
+            continue
+        for seq_ref in sin.get("sequence_refs_for_prediction") or []:
+            if not isinstance(seq_ref, dict):
+                continue
+            out.append(
+                {
+                    "sequence_id": seq_ref.get("sequence_id"),
+                    "candidate_id": candidate_id,
+                    "field_ref": f"step7_sequence:{seq_ref.get('sequence_id')}",
+                    "chain_role": seq_ref.get("chain_role"),
+                    "sequence_value_status": seq_ref.get("sequence_value_status"),
+                    "source_ref": seq_ref.get("source_ref"),
+                    "prediction_input_kind": seq_ref.get("prediction_input_kind"),
+                    "sequence_length": seq_ref.get("sequence_length"),
+                    "sha256_prefix": seq_ref.get("sha256_prefix"),
+                }
+            )
+    return out
 
 
 def _handoff_bool(step8_result: dict, candidate_id: str, field: str) -> bool:
@@ -294,50 +352,202 @@ def _handoff_value(step8_result: dict, candidate_id: str, field: str) -> list[st
     return None
 
 
-def _step8_structure_reference_available(step8_result: dict, candidate_id: str) -> bool:
-    for cr in _step8_candidate_results(step8_result, candidate_id):
-        handoff = cr.get("downstream_handoff") if isinstance(cr, dict) else None
-        if not isinstance(handoff, dict):
-            continue
-        if handoff.get("validated_structure_ref") or handoff.get("structure_for_variant_generation_ref"):
+def _candidate_has_contigs_hint(candidate: dict) -> bool:
+    return _candidate_has_contigs(candidate)
+
+
+def _candidate_has_design_structure_input(candidate: dict, step7_seq_refs: list[dict[str, Any]], step8_result: dict | None) -> bool:
+    return _candidate_has_complex_structure_ref(str(candidate.get("candidate_id") or ""), step8_result)
+
+
+def _infer_schema_arg_readiness(
+    candidate: dict,
+    step7_seq_refs: list[dict[str, Any]],
+    step8_result: dict | None,
+    arg_name: str,
+    arg_schema: dict[str, Any] | None,
+) -> bool:
+    """Map schema arg name -> compact readiness check."""
+    arg = arg_name.lower().strip()
+    if not arg:
+        return False
+
+    # Enum singleton args are fixed constants in official schema.
+    if isinstance(arg_schema, dict):
+        enum_values = arg_schema.get("enum")
+        if isinstance(enum_values, list) and enum_values and len(enum_values) == 1:
             return True
-    return False
+
+    arg_readiness_map: dict[str, Any] = {
+        "operation": lambda: True,
+        "mode": lambda: True,
+        "output_format": lambda: True,
+        "task": lambda: True,
+        "input_mode": lambda: True,
+        "smiles": lambda: _candidate_has_compound_smiles(candidate),
+        "query": lambda: _candidate_has_smiles_like_query_text(candidate),
+        "zinc_id": lambda: _candidate_has_zinc_id(candidate),
+        "molecule_chembl_id": lambda: _candidate_has_chembl_id(candidate),
+        "chembl_id": lambda: _candidate_has_chembl_id(candidate),
+        "pubchem_cid": lambda: _candidate_has_pubchem_id(candidate),
+        "uniprot_id": lambda: _candidate_has_uniprot_id(candidate),
+        "variant": lambda: _candidate_has_structured_variants(candidate),
+        "variants": lambda: bool(_extract_explicit_variants(candidate)),
+        "mutation": lambda: _candidate_has_structured_variants(candidate),
+        "chain": lambda: _candidate_has_chain(candidate),
+        "contigs": lambda: _candidate_has_contigs_hint(candidate),
+        "input_pdb": lambda: _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result),
+        "pdb_id": lambda: _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result),
+        "structure": lambda: _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result),
+        "structure_ref": lambda: _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result),
+        "backbone": lambda: _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result),
+        "path": lambda: _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result),
+        "pdb_file": lambda: _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result),
+        "sequence": lambda: _candidate_step9_sequence_presence(candidate, step7_seq_refs),
+        "prompt_sequence": lambda: _candidate_has_prompt_sequence(candidate, step7_seq_refs, step8_result),
+        "sequence_value": lambda: _candidate_step9_sequence_presence(candidate, step7_seq_refs),
+        "sequence_1": lambda: _candidate_step9_sequence_presence(candidate, step7_seq_refs),
+        "sequence_2": lambda: _candidate_step9_sequence_presence(candidate, step7_seq_refs),
+        "sequence_3": lambda: _candidate_step9_sequence_presence(candidate, step7_seq_refs),
+        "sequence_a": lambda: _candidate_step9_sequence_presence(candidate, step7_seq_refs),
+        "sequence_b": lambda: _candidate_step9_sequence_presence(candidate, step7_seq_refs),
+    }
+
+    helper = arg_readiness_map.get(arg)
+    if helper is None:
+        # Conservative default for opaque arguments.
+        if arg.startswith("sequence"):
+            return _candidate_step9_sequence_presence(candidate, step7_seq_refs)
+        if "structure" in arg or arg.endswith("_pdb") or arg in {"path", "file", "backbone"}:
+            return _candidate_has_design_structure_input(candidate, step7_seq_refs, step8_result)
+        return False
+    return bool(helper())
+
+
+def _required_args_missing(
+    tool_name: str,
+    candidate: dict,
+    step7_seq_refs: list[dict[str, Any]],
+    step8_result: dict | None,
+    schema_props: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[str], list[str], list[str]]:
+    required, source = _schema_required_args(tool_name)
+    if source == "unavailable":
+        if required:
+            return required, [], required
+        return [], [], ["tool_schema_unavailable"]
+
+    if not required:
+        return [], [], []
+
+    if schema_props is None:
+        schema_props = _schema_props(tool_name)
+
+    satisfiable: list[str] = []
+    missing: list[str] = []
+    for arg in required:
+        ready = _infer_schema_arg_readiness(
+            candidate,
+            step7_seq_refs,
+            step8_result,
+            arg,
+            schema_props.get(arg) if isinstance(schema_props.get(arg), dict) else None,
+        )
+        if ready:
+            satisfiable.append(arg)
+        else:
+            missing.append(arg)
+    return required, satisfiable, missing
+
+
+def _required_args_missing_only(
+    tool_name: str,
+    candidate: dict,
+    step7_seq_refs: list[dict[str, Any]],
+    step8_result: dict | None,
+    schema_props: dict[str, dict[str, Any]] | None = None,
+) -> list[str]:
+    _, satisfiable, missing = _required_args_missing(
+        tool_name, candidate, step7_seq_refs, step8_result, schema_props
+    )
+    return [arg for arg in missing if arg not in satisfiable]
+
+
+def _tool_schema_requirement_record(
+    candidate: dict,
+    candidate_id: str,
+    lane_type: str,
+    tool_name: str,
+    required: list[str],
+    satisfiable: list[str],
+    missing: list[str],
+    schema_source: str,
+) -> Step9ToolSchemaRequirement:
+    decision = "allowed" if not missing else "blocked"
+    if missing and missing == ["tool_schema_unavailable"]:
+        reason = "tool_schema_unavailable"
+    elif missing:
+        reason = f"schema_required:{','.join(sorted(missing))}"
+    else:
+        reason = "schema_requirements_satisfied"
+    return Step9ToolSchemaRequirement(
+        candidate_id=candidate_id,
+        tool_name=tool_name,
+        lane_type=lane_type,
+        required_fields=required,
+        schema_source=schema_source,
+        satisfiable_required_fields=satisfiable,
+        missing_required_fields=missing,
+        hard_gate_decision=decision,
+        reason=reason,
+    )
 
 
 def _protein_design_gate(
     candidate: dict,
-    step7_seq_refs: list[dict[str, Any]],
+    step7_refs: list[dict[str, Any]],
     step8_result: dict | None,
-    readiness_text: str,
-) -> tuple[str, list[str], list[Step9HardGateAllowedTool], list[Step9HardGateBlockedTool]]:
+) -> tuple[str, list[str], list[Step9HardGateAllowedTool], list[Step9HardGateBlockedTool], list[Step9ToolSchemaRequirement]]:
     candidate_id = str(candidate.get("candidate_id") or "")
     allowed: list[Step9HardGateAllowedTool] = []
     blocked: list[Step9HardGateBlockedTool] = []
+    schema_requirements: list[Step9ToolSchemaRequirement] = []
 
     has_uniprot = _candidate_id_types(candidate, _UNIPROT_IDENTIFIER_TYPES)
-    variants = _extract_explicit_variants(candidate, readiness_text)
+    variants = _extract_explicit_variants(candidate)
     has_variants = bool(variants)
-    has_seq = _candidate_step9_sequence_presence(candidate, step7_seq_refs)
-    has_structure_ref = _step8_structure_reference_available(step8_result, candidate_id)
+    has_seq = _candidate_step9_sequence_presence(candidate, step7_refs)
+    has_structure_ref = _step8_structure_reference_available(step8_result or {}, candidate_id)
     complex_ready, complex_missing = _design_complex_ready(step8_result, candidate_id)
 
-    def _reason_for_missing(missing: list[str]) -> str:
-        if not missing:
-            return ""
-        return "schema_required:" + ",".join(sorted(missing))
-
-    def _allow_or_block(tool_name: str, fallback_reason: str) -> None:
-        nonlocal allowed, blocked
-        missing_from_schema = _required_args_missing(
-            tool_name, candidate, step7_seq_refs, step8_result
+    def _allow_or_block(tool_name: str, fallback_reason: str | None) -> None:
+        required, satisfiable, missing = _required_args_missing(
+            tool_name, candidate, step7_refs, step8_result, _schema_props(tool_name)
         )
-        if missing_from_schema:
+        schema_source = _schema_required_args(tool_name)[1]
+        schema_requirements.append(
+            _tool_schema_requirement_record(
+                candidate,
+                candidate_id,
+                "protein_design",
+                tool_name,
+                required,
+                satisfiable,
+                missing,
+                schema_source,
+            )
+        )
+        if missing:
             blocked.append(
                 Step9HardGateBlockedTool(
                     candidate_id=candidate_id,
                     tool_name=tool_name,
                     lane_type="protein_design",
-                    reason=_reason_for_missing(missing_from_schema),
+                    reason=(
+                        "tool_schema_unavailable"
+                        if missing == ["tool_schema_unavailable"]
+                        else "schema_required:" + ",".join(sorted(missing))
+                    ),
                     rationale="required official TU args are missing",
                 )
             )
@@ -362,8 +572,23 @@ def _protein_design_gate(
             )
         )
 
-    # RFdiffusion / ProteinMPNN
+    # RFdiffusion / ProteinMPNN require true complex evidence.
     for tool_name in sorted({"NvidiaNIM_rfdiffusion", "NvidiaNIM_proteinmpnn"}):
+        required, satisfiable, missing = _required_args_missing(
+            tool_name, candidate, step7_refs, step8_result
+        )
+        schema_requirements.append(
+            _tool_schema_requirement_record(
+                candidate,
+                candidate_id,
+                "protein_design",
+                tool_name,
+                required,
+                satisfiable,
+                missing,
+                _schema_required_args(tool_name)[1],
+            )
+        )
         if not complex_ready:
             blocked.append(
                 Step9HardGateBlockedTool(
@@ -375,9 +600,55 @@ def _protein_design_gate(
                 )
             )
             continue
-        _allow_or_block(tool_name, fallback_reason="")
 
-    # AlphaMissense_get_variant_score
+        if missing:
+            blocked.append(
+                Step9HardGateBlockedTool(
+                    candidate_id=candidate_id,
+                    tool_name=tool_name,
+                    lane_type="protein_design",
+                    reason=(
+                        "tool_schema_unavailable"
+                        if missing == ["tool_schema_unavailable"]
+                        else "schema_required:" + ",".join(sorted(missing))
+                    ),
+                    rationale="required official TU args are missing",
+                )
+            )
+            continue
+
+        if tool_name == "NvidiaNIM_rfdiffusion" and "contigs" not in satisfiable:
+            blocked.append(
+                Step9HardGateBlockedTool(
+                    candidate_id=candidate_id,
+                    tool_name=tool_name,
+                    lane_type="protein_design",
+                    reason="schema_required:contigs",
+                    rationale="requires deterministic contig template input",
+                )
+            )
+            continue
+
+        allowed.append(
+            Step9HardGateAllowedTool(
+                candidate_id=candidate_id,
+                tool_name=tool_name,
+                lane_type="protein_design",
+                rationale=(
+                    "true complex and schema inputs available for RFdiffusion"
+                    if tool_name == "NvidiaNIM_rfdiffusion"
+                    else "true complex and schema inputs available for protein design"
+                ),
+            )
+        )
+
+    # DynaMut_stability: requires operation/pdb_id/chain/mutation.
+    _allow_or_block(
+        "DynaMut2_predict_stability",
+        fallback_reason="",
+    )
+
+    # AlphaMissense: requires uniprot+variant + (operation default fixed).
     _allow_or_block(
         "AlphaMissense_get_variant_score",
         fallback_reason=(
@@ -386,16 +657,7 @@ def _protein_design_gate(
         ),
     )
 
-    # DynaMut2_predict_stability
-    _allow_or_block(
-        "DynaMut2_predict_stability",
-        fallback_reason=(
-            "mutation_missing" if not has_variants else
-            "structure_reference_missing" if not has_structure_ref else ""
-        ),
-    )
-
-    # ESM_score_variant_sae_batch
+    # ESM score: requires sequence + variants.
     _allow_or_block(
         "ESM_score_variant_sae_batch",
         fallback_reason=(
@@ -404,58 +666,132 @@ def _protein_design_gate(
         ),
     )
 
-    # ESM_generate_protein_sequence
+    # ESM generate: requires prompt sequence.
     _allow_or_block(
         "ESM_generate_protein_sequence",
-        fallback_reason="" if _readiness_text_hint_for_sequence_generation(readiness_text) else "intent_not_sequence_generation",
+        fallback_reason="intent_not_sequence_generation",
     )
 
     blocked_missing = [tool.reason for tool in blocked]
-    status = "ready" if allowed else "blocked"
-    return status, blocked_missing, allowed, blocked
+    status = "ready" if (complex_ready and allowed) else "blocked"
+    return status, blocked_missing, allowed, blocked, schema_requirements
 
 
 def _compound_gate(
     candidate: dict,
-) -> tuple[str, list[str], list[Step9HardGateAllowedTool], list[Step9HardGateBlockedTool]]:
+) -> tuple[str, list[str], list[Step9HardGateAllowedTool], list[Step9HardGateBlockedTool], list[Step9ToolSchemaRequirement]]:
     candidate_id = str(candidate.get("candidate_id") or "")
     allowed: list[Step9HardGateAllowedTool] = []
     blocked: list[Step9HardGateBlockedTool] = []
+    schema_requirements: list[Step9ToolSchemaRequirement] = []
 
-    has_smiles = bool(_candidate_value_types(candidate, _COMPOUND_SMILES_MATERIAL_TYPES))
-    has_name = bool(_candidate_value_types(candidate, _COMPOUND_NAME_MATERIAL_TYPES))
+    has_smiles = _candidate_has_compound_smiles(candidate)
+    has_name = _candidate_has_compound_name(candidate)
     has_identifier = _candidate_id_types(candidate, _COMPOUND_IDENTIFIER_TYPES)
 
     if not (has_smiles or has_name or has_identifier):
-        blocked.append(
-            Step9HardGateBlockedTool(
-                candidate_id=candidate_id,
-                tool_name="compound_screening",
-                lane_type="compound_screening",
-                reason="compound_input_missing",
-                rationale="compound evidence not present",
+        for tool in sorted(_COMPOUND_TOOLS):
+            required, satisfiable, missing = _required_args_missing(tool, candidate, [], None)
+            schema_source = _schema_required_args(tool)[1]
+            schema_requirements.append(
+                _tool_schema_requirement_record(
+                    candidate,
+                    candidate_id,
+                    "compound_screening",
+                    tool,
+                    required,
+                    satisfiable,
+                    missing,
+                    schema_source,
+                )
             )
-        )
-        return "not_applicable", ["compound_input_missing"], allowed, blocked
+            # Keep existing semantic: no compound evidence => not applicable.
+        return "not_applicable", ["compound_input_missing"], allowed, blocked, schema_requirements
 
     for tool in sorted(_COMPOUND_TOOLS):
-        if (
-            (tool == "ZINC_search_by_smiles" and has_smiles)
-            or (tool == "ZINC_get_compound" and has_identifier)
-            or (tool in {"ZINC_search_compounds", "ZINC_search_by_properties", "ZINC_get_purchasable"} and has_name)
-            or (tool.startswith("ChEMBL") and _candidate_id_types(candidate, {"chembl_id"}))
-        ):
-            allowed.append(
-                Step9HardGateAllowedTool(
+        required, satisfiable, missing = _required_args_missing(tool, candidate, [], None)
+        schema_source = _schema_required_args(tool)[1]
+        schema_requirements.append(
+            _tool_schema_requirement_record(
+                candidate,
+                candidate_id,
+                "compound_screening",
+                tool,
+                required,
+                satisfiable,
+                missing,
+                schema_source,
+            )
+        )
+        if missing:
+            blocked.append(
+                Step9HardGateBlockedTool(
                     candidate_id=candidate_id,
                     tool_name=tool,
                     lane_type="compound_screening",
-                    rationale="compound evidence available",
+                    reason=(
+                        "tool_schema_unavailable"
+                        if missing == ["tool_schema_unavailable"]
+                        else "schema_required:" + ",".join(sorted(missing))
+                    ),
+                    rationale="required official TU args are missing",
                 )
             )
-    if not allowed:
-        return "blocked", ["compound_tool_evidence_gap"], allowed, blocked
-    return "ready", [], allowed, blocked
+            continue
+
+        required_set = set(required)
+        tool_is_allowed = (
+            (
+                "zinc_id" in required_set
+                and _candidate_has_zinc_id(candidate)
+            )
+            or (
+                "smiles" in required_set
+                and has_smiles
+            )
+            or (
+                "query" in required_set
+                and _candidate_has_smiles_like_query_text(candidate)
+            )
+            or (
+                # No explicit query evidence required by schema (example:
+                # ChEMBL_search_molecules), but keep existing expectation:
+                # only attempt tools when compound context is present.
+                not required_set
+                and (has_smiles or has_name or has_identifier)
+            )
+            or (
+                # For schema-required tier cases, keep generic compound
+                # evidence gating and let threshold/tier missing be schema
+                # blocking if not provided.
+                "tier" in required_set
+                and (has_smiles or has_name or has_identifier)
+            )
+        )
+        if not tool_is_allowed:
+            blocked.append(
+                Step9HardGateBlockedTool(
+                    candidate_id=candidate_id,
+                    tool_name=tool,
+                    lane_type="compound_screening",
+                    reason="compound_input_missing",
+                    rationale="compound lane evidence not sufficient for this tool",
+                )
+            )
+            continue
+
+        allowed.append(
+            Step9HardGateAllowedTool(
+                candidate_id=candidate_id,
+                tool_name=tool,
+                lane_type="compound_screening",
+                rationale="compound evidence available",
+            )
+        )
+
+    if not allowed and not blocked:
+        return "blocked", ["compound_tool_evidence_gap"], allowed, blocked, schema_requirements
+    return ("ready" if allowed else "blocked"), ([tool.reason for tool in blocked if tool.reason]), allowed, blocked, schema_requirements
 
 
 def _available_fields_for_compound(candidate: dict) -> list[Step9AvailableField]:
@@ -627,6 +963,12 @@ def project_step9_readiness(
     structure_prediction_and_interface_results: dict | None,
     compound_context_text: str,
 ) -> dict[str, Any]:
+    # Keep production behavior deterministic in long-lived test/daemon processes.
+    # Cache entries can carry monkeypatched schema state across tests.
+    global _TOOL_REQUIRED_ARGS_CACHE, _TOOL_SCHEMA_SOURCE_CACHE
+    _TOOL_REQUIRED_ARGS_CACHE = {}
+    _TOOL_SCHEMA_SOURCE_CACHE = {}
+
     candidate_records = candidate_context_table.get("candidate_records") or []
     if not isinstance(candidate_records, list):
         candidate_records = []
@@ -641,6 +983,7 @@ def project_step9_readiness(
     available_fields: list[Step9AvailableField] = []
     allowed_tools: list[Step9HardGateAllowedTool] = []
     blocked_tools: list[Step9HardGateBlockedTool] = []
+    schema_requirements: list[Step9ToolSchemaRequirement] = []
     lane_statuses: list[Step9LaneStatus] = []
 
     step8_data = structure_prediction_and_interface_results or {}
@@ -657,8 +1000,6 @@ def project_step9_readiness(
 
         if candidate_type == "compound_component":
             fields = _available_fields_for_compound(candidate)
-            status, missing, allowed, blocked = _compound_gate(candidate)
-            # Compound candidates may also expose referenced compounds in Step 5 identifiers.
             for ident in candidate.get("identifiers") or []:
                 if (
                     isinstance(ident, dict)
@@ -675,8 +1016,11 @@ def project_step9_readiness(
                             value_kind=str(ident.get("id_type")),
                         )
                     )
+            status, _, allowed, blocked, reqs = _compound_gate(candidate)
+            schema_requirements.extend(reqs)
+            # Keep legacy status semantics for no-evidence compound candidates.
             status_value = (
-                "ready" if any(tool.tool_name != "compound_screening" for tool in allowed) else ("not_applicable" if missing else "partial")
+                "ready" if any(tool.tool_name != "compound_screening" for tool in allowed) else ("not_applicable" if status == "not_applicable" else "partial")
             )
             lane_statuses.append(
                 _lane_status(candidate, "compound_screening", allowed, blocked, fields, status_value)
@@ -687,7 +1031,8 @@ def project_step9_readiness(
             continue
 
         fields = _available_fields_for_protein_candidate(candidate, prepared_inputs)
-        status, _, allowed, blocked = _protein_design_gate(candidate, step7_refs, step8_data, compound_context_text)
+        status, _, allowed, blocked, reqs = _protein_design_gate(candidate, step7_refs, step8_data)
+        schema_requirements.extend(reqs)
         lane_statuses.append(
             _lane_status(candidate, "protein_design", allowed, blocked, fields, status)
         )
@@ -698,8 +1043,7 @@ def project_step9_readiness(
     summary = Step9ReadinessSummary(
         total_candidates=len(candidate_records),
         protein_design_candidates=sum(
-            1 for candidate in candidate_records
-            if isinstance(candidate, dict) and str(candidate.get("candidate_type") or "") != "compound_component"
+            1 for candidate in candidate_records if isinstance(candidate, dict) and str(candidate.get("candidate_type") or "") != "compound_component"
         ),
         protein_design_ready_candidates=sum(
             1 for lane in lane_statuses if lane.lane_type == "protein_design" and lane.status == "ready"
@@ -721,6 +1065,9 @@ def project_step9_readiness(
         hard_gate_blocked_tool_count=len(blocked_tools),
     )
 
+    # Keep backward compatibility with prior callers.
+    _ = compound_context_text
+
     all_missing = list(dict.fromkeys(
         reason
         for lane in lane_statuses
@@ -739,5 +1086,6 @@ def project_step9_readiness(
         "variant_evaluation_readiness": Step9LaneReadinessProfile(status="not_applicable"),
         "step9_hard_gate_allowed_tools": allowed_tools,
         "step9_hard_gate_blocked_tools_with_reason": blocked_tools,
+        "step9_tool_schema_requirements": schema_requirements,
         "step9_missing_inputs": all_missing,
     }
