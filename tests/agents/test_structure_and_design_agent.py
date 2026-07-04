@@ -3549,6 +3549,166 @@ def test_step9_dependency_unavailable_marks_partial_not_crash(
     assert "dependency_unavailable" in statuses
 
 
+def _seed_sequence_only_protein_candidates(
+    local_storage, registry_service, workflow_state_service, *, include_antibody_light=True
+) -> str:
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        referenced_inputs=[
+            {
+                "id_type": "target_sequence",
+                "value": "MKTAYIAKQNNVG",
+                "source": "raw_request_text",
+            },
+            {
+                "id_type": "antibody_heavy_chain_sequence",
+                "value": "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK",
+                "source": "raw_request_text",
+            },
+        ] + (
+            [
+                {
+                    "id_type": "antibody_light_chain_sequence",
+                    "value": "QSALTQPASVSGSPGQSITISCT",
+                    "source": "raw_request_text",
+                }
+            ]
+            if include_antibody_light
+            else []
+        ),
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for candidate in cct.get("candidate_records") or []:
+        if not isinstance(candidate, dict):
+            continue
+        ctype = candidate.get("candidate_type")
+        if ctype == "target_antigen":
+            candidate["materials"] = [
+                {
+                    "material_id": "target_seq_for_step9",
+                    "material_type": "target_sequence",
+                    "value": "MKTAYIAKQNNVG",
+                }
+            ]
+        elif ctype == "antibody":
+            candidate["materials"] = [
+                {
+                    "material_id": "heavy_seq_for_step9",
+                    "material_type": "antibody_heavy_chain_sequence",
+                    "value": "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK",
+                },
+                {
+                    "material_id": "light_seq_for_step9",
+                    "material_type": "antibody_light_chain_sequence",
+                    "value": "QSALTQPASVSGSPGQSITISCT",
+                },
+            ]
+    local_storage.write_json(cct_path, cct)
+    return run_id
+
+
+def _write_step8_complex_handoff(local_storage, run_id: str, candidate_ids: list[str]) -> None:
+    results = []
+    for candidate_id in candidate_ids:
+        results.append(
+            {
+                "candidate_id": candidate_id,
+                "structure_input_id": f"si_{candidate_id}",
+                "run_case": "existing_complex_interface_evaluation",
+                "run_status": "ok",
+                "complex_structure_refs": [
+                    {
+                        "source_kind": "existing_pdb_complex",
+                        "source_ref": "1N8Z",
+                        "pdb_id": "1N8Z",
+                        "structure_format": "pdb",
+                        "source_tool_call_id": f"tc_setup_{candidate_id}",
+                    }
+                ],
+                "interface_analysis_records": [],
+                "downstream_handoff": {
+                    "has_complex_structure": True,
+                    "structure_for_variant_generation_ref": "s3://bucket/complex.pdb",
+                    "has_interface_features": False,
+                    "validation_available": False,
+                    "has_validated_structure": False,
+                    "missing_for_step9": [],
+                },
+            }
+        )
+    local_storage.write_json(
+        local_storage.run_key(run_id, "structure_prediction_and_interface_results.json"),
+        {
+            "candidate_structure_results": results,
+        },
+    )
+
+
+def test_step9_readiness_projection_blocks_protein_candidates_without_true_complex(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_only_protein_candidates(local_storage, registry_service, workflow_state_service)
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    artifact = agent.run_step_9(run_id)
+
+    summary = artifact.step9_readiness_summary
+    assert summary.protein_design_candidates >= 2
+    assert summary.protein_design_ready_candidates == 0
+    assert summary.protein_design_blocked_candidates >= 2
+
+    blocked_tools = {tool.tool_name for tool in artifact.step9_hard_gate_blocked_tools_with_reason}
+    assert "NvidiaNIM_rfdiffusion" in blocked_tools
+    assert "NvidiaNIM_proteinmpnn" in blocked_tools
+    assert any(entry.reason == "complex_structure_missing" for entry in artifact.step9_hard_gate_blocked_tools_with_reason)
+
+    # No raw sequence appears in readiness projections.
+    blob = json.dumps(artifact.model_dump())
+    assert "MKTAYIAKQNNVG" not in blob
+    assert "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK" not in blob
+    assert "QSALTQPASVSGSPGQSITISCT" not in blob
+
+
+def test_step9_readiness_projection_allows_protein_design_when_true_complex_present(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_only_protein_candidates(local_storage, registry_service, workflow_state_service)
+    cct = local_storage.read_json(local_storage.run_key(run_id, "candidate_context_table.json"))
+    candidate_ids = [c["candidate_id"] for c in cct.get("candidate_records") or [] if c.get("candidate_type") in {"target_antigen", "antibody"}]
+    _write_step8_complex_handoff(local_storage, run_id, candidate_ids)
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    artifact = agent.run_step_9(run_id)
+
+    assert artifact.step9_readiness_summary.protein_design_ready_candidates >= 2
+    allowed_tools = {tool.tool_name for tool in artifact.step9_hard_gate_allowed_tools}
+    assert "NvidiaNIM_rfdiffusion" in allowed_tools
+    assert "NvidiaNIM_proteinmpnn" in allowed_tools
+    assert not any(
+        entry.tool_name in {"NvidiaNIM_rfdiffusion", "NvidiaNIM_proteinmpnn"} and entry.reason == "complex_structure_missing"
+        for entry in artifact.step9_hard_gate_blocked_tools_with_reason
+    )
+
+    profile = artifact.protein_design_readiness
+    assert profile.ready_tool_count >= 1
+    assert profile.status == "ready"
+
+    # Keep raw-sequence secrecy.
+    assert "HEADER" not in json.dumps(artifact.model_dump())
+    assert "ATOM" not in json.dumps(artifact.model_dump())
+
 # ── precondition errors ─────────────────────────────────────────────────────
 
 def test_step7_requires_step5_artifact(

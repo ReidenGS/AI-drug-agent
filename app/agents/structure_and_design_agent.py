@@ -40,6 +40,7 @@ from ..agents.tool_selection_policy import (
     ToolInvocationPlan,
     select_and_build_invocations,
 )
+from ..agents.step_09_available_fields import project_step9_readiness
 from ..llm.provider import LLMProvider, MockLLMProvider
 from ..mcp.client import MCPClient
 from ..schemas.common import ToolCallRecord
@@ -1476,10 +1477,36 @@ class StructureAndDesignAgent:
         cct = self.storage.read_json(
             self.storage.run_key(run_id, "candidate_context_table.json")
         )
+        try:
+            step7_pkg = self.storage.read_json(
+                self.storage.run_key(run_id, "prepared_structure_input_package.json")
+            )
+        except FileNotFoundError:
+            step7_pkg = {}
+        try:
+            step8_artifact = self.storage.read_json(
+                self.storage.run_key(run_id, "structure_prediction_and_interface_results.json")
+            )
+        except FileNotFoundError:
+            step8_artifact = None
+
+        try:
+            raw_request = self.storage.read_json(self.storage.run_key(run_id, "inputs/raw_request_record.json"))
+        except FileNotFoundError:
+            raw_request = {}
+        compound_context_text = str(raw_request.get("raw_user_query") or "")
+
         compound_candidates = [
             c for c in cct.get("candidate_records") or []
             if c.get("candidate_type") == "compound_component"
         ]
+
+        readiness_projection = project_step9_readiness(
+            candidate_context_table=cct,
+            prepared_structure_input_package=step7_pkg,
+            structure_prediction_and_interface_results=step8_artifact,
+            compound_context_text=compound_context_text,
+        )
 
         tool_calls: list[ToolCallRecord] = []
         hits: list[CompoundHit] = []
@@ -1552,6 +1579,15 @@ class StructureAndDesignAgent:
             screening_status=screening_status,  # type: ignore[arg-type]
             compound_hits=hits,
             tool_call_records=tool_calls,
+            step9_available_fields=readiness_projection["step9_available_fields"],
+            step9_readiness_summary=readiness_projection["step9_readiness_summary"],
+            step9_lane_statuses=readiness_projection["step9_lane_statuses"],
+            protein_design_readiness=readiness_projection["protein_design_readiness"],
+            variant_evaluation_readiness=readiness_projection["variant_evaluation_readiness"],
+            compound_screening_readiness=readiness_projection["compound_screening_readiness"],
+            step9_hard_gate_allowed_tools=readiness_projection["step9_hard_gate_allowed_tools"],
+            step9_hard_gate_blocked_tools_with_reason=readiness_projection["step9_hard_gate_blocked_tools_with_reason"],
+            step9_missing_inputs=readiness_projection["step9_missing_inputs"],
         )
 
         artifact_id = new_artifact_id("compound_screening_artifact")

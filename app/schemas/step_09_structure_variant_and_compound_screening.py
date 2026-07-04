@@ -14,6 +14,70 @@ from pydantic import BaseModel, Field
 from .common import ToolCallRecord
 
 
+class Step9AvailableField(BaseModel):
+    """Compact, raw-safe readiness inputs projected for Step 9 hard gate.
+
+    These are intentionally non-sensitive references (refs/hashes/flags), never
+    raw sequence or raw molecular payload.
+    """
+
+    candidate_id: str
+    field_ref: str
+    provider: Literal["step_05", "step_07", "step_08", "inferred"]
+    field_type: str
+    value_kind: str
+    source_ref: Optional[str] = None
+    status: Literal["available", "blocked", "not_applicable"] = "available"
+
+
+class Step9HardGateAllowedTool(BaseModel):
+    tool_name: str
+    lane_type: Literal["protein_design", "compound_screening"]
+    candidate_id: str
+    rationale: Optional[str] = None
+
+
+class Step9HardGateBlockedTool(BaseModel):
+    tool_name: str
+    lane_type: Literal["protein_design", "compound_screening"]
+    candidate_id: str
+    reason: str
+    rationale: Optional[str] = None
+
+
+class Step9LaneStatus(BaseModel):
+    lane_type: Literal["protein_design", "compound_screening"]
+    candidate_id: str
+    candidate_type: str
+    status: Literal["ready", "blocked", "not_applicable", "partial", "partial_or_skipped"]
+    allowed_tools: list[str] = Field(default_factory=list)
+    blocked_tools: list[str] = Field(default_factory=list)
+    missing_requirements: list[str] = Field(default_factory=list)
+    gate_reasons: list[str] = Field(default_factory=list)
+    available_field_refs: list[str] = Field(default_factory=list)
+
+
+class Step9ReadinessSummary(BaseModel):
+    total_candidates: int = 0
+    protein_design_candidates: int = 0
+    protein_design_ready_candidates: int = 0
+    protein_design_blocked_candidates: int = 0
+    protein_design_not_applicable_candidates: int = 0
+    compound_candidates: int = 0
+    compound_candidate_with_tools: int = 0
+    hard_gate_allowed_tool_count: int = 0
+    hard_gate_blocked_tool_count: int = 0
+
+
+class Step9LaneReadinessProfile(BaseModel):
+    status: Literal["ready", "blocked", "not_applicable"] = "not_applicable"
+    ready_tool_count: int = 0
+    blocked_tool_count: int = 0
+    missing_requirements: list[str] = Field(default_factory=list)
+    allowed_tools: list[str] = Field(default_factory=list)
+    blocked_tools: list[str] = Field(default_factory=list)
+
+
 class ProteinDesignVariant(BaseModel):
     variant_id: str
     parent_structure_input_id: str
@@ -83,3 +147,22 @@ class CompoundScreeningArtifact(BaseModel):
     screening_status: Literal["ok", "partial", "skipped", "failed"] = "skipped"
     compound_hits: list[CompoundHit] = Field(default_factory=list)
     tool_call_records: list[ToolCallRecord] = Field(default_factory=list)
+    step9_available_fields: list[Step9AvailableField] = Field(default_factory=list)
+    step9_readiness_summary: Step9ReadinessSummary = Field(default_factory=Step9ReadinessSummary)
+    step9_lane_statuses: list[Step9LaneStatus] = Field(default_factory=list)
+    step9_hard_gate_allowed_tools: list[Step9HardGateAllowedTool] = Field(
+        default_factory=list
+    )
+    step9_hard_gate_blocked_tools_with_reason: list[Step9HardGateBlockedTool] = Field(
+        default_factory=list
+    )
+    step9_missing_inputs: list[str] = Field(default_factory=list)
+    protein_design_readiness: Step9LaneReadinessProfile = Field(
+        default_factory=Step9LaneReadinessProfile
+    )
+    variant_evaluation_readiness: Step9LaneReadinessProfile = Field(
+        default_factory=Step9LaneReadinessProfile
+    )
+    compound_screening_readiness: Step9LaneReadinessProfile = Field(
+        default_factory=Step9LaneReadinessProfile
+    )
