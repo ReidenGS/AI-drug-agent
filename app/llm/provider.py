@@ -248,6 +248,90 @@ def _mock_step9_tool_selection_stage1(schema: dict) -> dict:
     }
 
 
+def _mock_step9_tool_schema_mapping_stage2(schema: dict) -> dict:
+    fields = schema.get("step9_available_fields") or []
+    tools = schema.get("tools") or []
+
+    def match(arg_name: str) -> dict | None:
+        lowered = arg_name.lower()
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            value_kind = str(field.get("value_kind") or "").lower()
+            field_type = str(field.get("field_type") or "").lower()
+            field_ref = str(field.get("field_ref") or "").lower()
+            provider = str(field.get("provider") or "").lower()
+            if lowered in {"smiles", "canonical_smiles"} and value_kind == "smiles":
+                return field
+            if lowered == "query" and value_kind in {"name", "compound_name"}:
+                return field
+            if lowered == "zinc_id" and (value_kind == "zinc_id" or "identifier:zinc_id:" in field_ref):
+                return field
+            if lowered in {"chembl_id", "molecule_chembl_id"} and (
+                value_kind == "chembl_id" or "identifier:chembl_id:" in field_ref
+            ):
+                return field
+            if lowered == "uniprot_id" and (value_kind == "uniprot_id" or "identifier:uniprot" in field_ref):
+                return field
+            if lowered in {"variant", "variants", "mutation"} and value_kind in {"variant", "variants", "mutation", "protein_variant"}:
+                return field
+            if lowered == "chain" and (value_kind in {"chain", "chain_id", "chain_role"} or "chain" in field_ref):
+                return field
+            if lowered == "pdb_id" and (value_kind == "pdb_id" or "identifier:pdb_id:" in field_ref):
+                return field
+            if lowered in {"input_pdb", "pdb_file", "structure_ref", "structure", "backbone", "path"} and provider == "step_08":
+                return field
+            if lowered == "contigs" and value_kind in {"contigs", "design_contigs"}:
+                return field
+            if lowered in {"prompt_sequence", "sequence", "sequence_value", "sequence_1", "sequence_2", "sequence_3", "sequence_a", "sequence_b"} and field_type == "protein_sequence":
+                return field
+        return None
+
+    def literal(arg_name: str, full_schema: dict) -> Any | None:
+        prop = (full_schema.get("properties") or {}).get(arg_name)
+        if not isinstance(prop, dict):
+            return None
+        if "const" in prop:
+            return prop.get("const")
+        enum_values = prop.get("enum")
+        if isinstance(enum_values, list) and len(enum_values) == 1:
+            return enum_values[0]
+        if "default" in prop:
+            return prop.get("default")
+        return None
+
+    out: list[dict] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        full_schema = tool.get("full_schema") or {}
+        required = [str(arg) for arg in (tool.get("required_fields") or full_schema.get("required") or [])]
+        mappings: list[dict] = []
+        literals: list[dict] = []
+        missing: list[str] = []
+        for arg in required:
+            field = match(arg)
+            if field is not None:
+                mappings.append({"schema_arg": arg, "field_ref": field["field_ref"]})
+                continue
+            lit = literal(arg, full_schema)
+            if lit is not None:
+                literals.append({"schema_arg": arg, "literal_value": lit})
+                continue
+            missing.append(arg)
+        out.append({
+            "tool_name": tool.get("tool_name"),
+            "lane_type": tool.get("lane_type"),
+            "can_invoke": not missing,
+            "argument_mappings": mappings,
+            "argument_literals": literals,
+            "missing_required_fields": missing,
+            "skip_reason": "" if not missing else "missing_required_fields",
+            "argument_mapping_reason": "mock mapped Step 9 schema args to available field refs",
+        })
+    return {"tools": out}
+
+
 _TARGET_HINTS = (
     "HER2", "EGFR", "TROP2", "BCMA", "CD19", "CD20", "CD22", "CD33", "CD30", "CD79",
     "Nectin-4", "B7-H3", "FOLR1", "MET", "MUC1", "ROR1", "PSMA", "Claudin18.2",
@@ -364,6 +448,8 @@ class MockLLMProvider:
             return _mock_step6_schema_mapping_stage2(schema)
         if task == "step9_tool_selection_stage_1":
             return _mock_step9_tool_selection_stage1(schema)
+        if task == "step9_tool_schema_mapping_stage_2":
+            return _mock_step9_tool_schema_mapping_stage2(schema)
 
         raw = (schema or {}).get("raw_request_record") or {}
         ctx = raw.get("user_provided_context") or {}

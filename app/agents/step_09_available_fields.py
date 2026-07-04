@@ -1083,7 +1083,7 @@ def _available_fields_for_compound(candidate: dict) -> list[Step9AvailableField]
 
 
 def _available_fields_for_protein_candidate(
-    candidate: dict, step7_prepared_inputs: list[dict]
+    candidate: dict, step7_prepared_inputs: list[dict], step8_result: dict | None = None
 ) -> list[Step9AvailableField]:
     out: list[Step9AvailableField] = []
     candidate_id = str(candidate.get("candidate_id") or "")
@@ -1097,6 +1097,72 @@ def _available_fields_for_protein_candidate(
                     provider="step_05",
                     field_type="protein_sequence",
                     value_kind="sequence_material",
+                    status="available",
+                )
+            )
+    for material in _candidate_value_types(candidate, _EXPLICIT_PROTEIN_VARIANT_TYPES):
+        mat_id = material.get("material_id")
+        if isinstance(mat_id, str) and mat_id:
+            out.append(
+                Step9AvailableField(
+                    candidate_id=candidate_id,
+                    field_ref=f"material:{mat_id}",
+                    provider="step_05",
+                    field_type="variant",
+                    value_kind=str(material.get("material_type") or "variant"),
+                    status="available",
+                )
+            )
+    for material in _candidate_value_types(candidate, {"design_contigs", "contigs"}):
+        mat_id = material.get("material_id")
+        if isinstance(mat_id, str) and mat_id:
+            out.append(
+                Step9AvailableField(
+                    candidate_id=candidate_id,
+                    field_ref=f"material:{mat_id}",
+                    provider="step_05",
+                    field_type="design_constraint",
+                    value_kind="design_contigs",
+                    status="available",
+                )
+            )
+    for ident in candidate.get("identifiers") or []:
+        if not isinstance(ident, dict):
+            continue
+        id_type = str(ident.get("id_type") or "").lower()
+        value = ident.get("id_value")
+        if not isinstance(value, str) or not value.strip():
+            continue
+        if id_type in _EXPLICIT_PROTEIN_VARIANT_TYPES:
+            out.append(
+                Step9AvailableField(
+                    candidate_id=candidate_id,
+                    field_ref=f"identifier:{id_type}:{value.strip()}",
+                    provider="step_05",
+                    field_type="variant",
+                    value_kind=id_type,
+                    status="available",
+                )
+            )
+        if id_type in {"chain_id", "chain"}:
+            out.append(
+                Step9AvailableField(
+                    candidate_id=candidate_id,
+                    field_ref=f"identifier:{id_type}:{value.strip()}",
+                    provider="step_05",
+                    field_type="chain",
+                    value_kind="chain_id",
+                    status="available",
+                )
+            )
+        if id_type == "pdb_id" and _looks_like_pdb_id(value):
+            out.append(
+                Step9AvailableField(
+                    candidate_id=candidate_id,
+                    field_ref=f"identifier:pdb_id:{value.strip()}",
+                    provider="step_05",
+                    field_type="structure_identifier",
+                    value_kind="pdb_id",
                     status="available",
                 )
             )
@@ -1114,6 +1180,29 @@ def _available_fields_for_protein_candidate(
                     provider="step_05",
                     field_type="identifier",
                     value_kind="uniprot_id",
+                )
+            )
+    if isinstance(step8_result, dict):
+        for i, ref in enumerate(_step8_complex_refs(step8_result, candidate_id)):
+            if not isinstance(ref, dict):
+                continue
+            source_kind = str(ref.get("source_kind") or "").lower()
+            if source_kind not in {"existing_pdb_complex", "predicted_complex", "existing_pdb_structure"}:
+                continue
+            source_ref = str(
+                ref.get("storage_ref") or ref.get("pdb_id") or ref.get("source_ref") or ""
+            ).strip()
+            if not source_ref:
+                continue
+            out.append(
+                Step9AvailableField(
+                    candidate_id=candidate_id,
+                    field_ref=f"step8_complex_ref:{candidate_id}:{i}",
+                    provider="step_08",
+                    field_type="structure",
+                    value_kind="complex_structure_ref",
+                    source_ref=source_ref,
+                    status="available",
                 )
             )
     for seq_ref in _build_step7_sequence_refs(step7_prepared_inputs, candidate_id):
@@ -1281,7 +1370,7 @@ def project_step9_readiness(
             blocked_tools.extend(blocked)
             continue
 
-        fields = _available_fields_for_protein_candidate(candidate, prepared_inputs)
+        fields = _available_fields_for_protein_candidate(candidate, prepared_inputs, step8_data)
         sequence_generation_intent = _sequence_generation_intent_text(compound_context_text)
         status, _, allowed, blocked, reqs = _protein_design_gate(
             candidate, step7_refs, step8_data, sequence_generation_intent

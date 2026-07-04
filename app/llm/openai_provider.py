@@ -115,6 +115,77 @@ class _Step9ToolSelectionStage1Response(BaseModel):
     selections: list[_Step9Stage1Selection] = Field(default_factory=list)
 
 
+class _Step9Stage2ArgumentMapping(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    schema_arg: str
+    field_ref: str
+
+
+class _Step9Stage2ArgumentLiteral(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    schema_arg: str
+    literal_value: Optional[Union[str, int, float, bool]] = None
+
+
+class _Step9Stage2ToolForParser(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tool_name: str
+    lane_type: Literal[
+        "protein_design",
+        "variant_evaluation",
+        "compound_screening",
+    ]
+    can_invoke: bool
+    argument_mappings: list[_Step9Stage2ArgumentMapping] = Field(default_factory=list)
+    argument_literals: list[_Step9Stage2ArgumentLiteral] = Field(default_factory=list)
+    missing_required_fields: list[str] = Field(default_factory=list)
+    skip_reason: Optional[str] = None
+    argument_mapping_reason: Optional[str] = None
+
+
+class _Step9SchemaMappingStage2Response(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tools: list[_Step9Stage2ToolForParser] = Field(default_factory=list)
+
+    def to_external_dict(self) -> dict:
+        tools_out: list[dict[str, Any]] = []
+        for tool in self.tools:
+            mapping_seen: set[str] = set()
+            literal_seen: set[str] = set()
+            mappings: list[dict[str, str]] = []
+            literals: list[dict[str, Any]] = []
+            for pair in tool.argument_mappings:
+                if pair.schema_arg in mapping_seen or pair.schema_arg in literal_seen:
+                    raise OpenAIProviderError(
+                        "step9_tool_schema_mapping_stage_2 duplicate schema_arg "
+                        f"`{pair.schema_arg}`"
+                    )
+                mapping_seen.add(pair.schema_arg)
+                mappings.append(pair.model_dump())
+            for pair in tool.argument_literals:
+                if pair.schema_arg in literal_seen or pair.schema_arg in mapping_seen:
+                    raise OpenAIProviderError(
+                        "step9_tool_schema_mapping_stage_2 duplicate schema_arg "
+                        f"`{pair.schema_arg}`"
+                    )
+                literal_seen.add(pair.schema_arg)
+                literals.append(pair.model_dump())
+            out: dict[str, Any] = {
+                "tool_name": tool.tool_name,
+                "lane_type": tool.lane_type,
+                "can_invoke": tool.can_invoke,
+                "argument_mappings": mappings,
+                "argument_literals": literals,
+                "missing_required_fields": list(tool.missing_required_fields),
+            }
+            if tool.skip_reason is not None:
+                out["skip_reason"] = tool.skip_reason
+            if tool.argument_mapping_reason is not None:
+                out["argument_mapping_reason"] = tool.argument_mapping_reason
+            tools_out.append(out)
+        return {"tools": tools_out}
+
+
 # ── Step 6 Stage 2: strict list-of-pairs parser shape ──────────────────────
 #
 # The external step6_schema_mapping_stage_2 shape has dynamic `schema_arg`
@@ -206,6 +277,7 @@ _RESPONSE_MODEL_FOR_TASK: dict[str, type[BaseModel]] = {
     "step6_schema_mapping_stage_1": _Step6SchemaMappingStage1Response,
     "step6_schema_mapping_stage_2": _Step6SchemaMappingStage2ParserResponse,
     "step9_tool_selection_stage_1": _Step9ToolSelectionStage1Response,
+    "step9_tool_schema_mapping_stage_2": _Step9SchemaMappingStage2Response,
 }
 
 

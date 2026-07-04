@@ -19,6 +19,7 @@ from app.llm.openai_provider import (
     _ToolSelectionStage1Response,
     _Step6SchemaMappingStage1Response,
     _Step6SchemaMappingStage2ParserResponse,
+    _Step9SchemaMappingStage2Response,
     _Step9ToolSelectionStage1Response,
 )
 
@@ -160,6 +161,22 @@ def test_step9_tool_selection_stage1_passes_without_task_intent():
         "pick", schema={"task": "step9_tool_selection_stage_1"}
     )
     assert out["selections"][0]["lane_type"] == "compound_screening"
+
+
+def test_step9_schema_mapping_stage2_passes_without_task_intent():
+    provider = _provider_with_responses([
+        _chat_response(
+            '{"tools":[{"tool_name":"ZINC_search_by_smiles",'
+            '"lane_type":"compound_screening","can_invoke":true,'
+            '"argument_mappings":[{"schema_arg":"smiles","field_ref":"material:m1"}],'
+            '"argument_literals":[],"missing_required_fields":[],'
+            '"skip_reason":"","argument_mapping_reason":"mapped"}]}'
+        )
+    ])
+    out = provider.generate_json(
+        "map", schema={"task": "step9_tool_schema_mapping_stage_2"}
+    )
+    assert out["tools"][0]["argument_mappings"][0]["schema_arg"] == "smiles"
 
 
 # ── error paths ───────────────────────────────────────────────────────────
@@ -566,6 +583,7 @@ def test_parser_models_produce_real_strict_schema():
         "step6_schema_mapping_stage_1",
         "step6_schema_mapping_stage_2",
         "step9_tool_selection_stage_1",
+        "step9_tool_schema_mapping_stage_2",
     }
     for task, model in _RESPONSE_MODEL_FOR_TASK.items():
         schema = to_strict_json_schema(model)
@@ -629,6 +647,73 @@ def test_openai_step9_stage1_uses_structured_parser_and_returns_dict():
     assert isinstance(out, dict)
     assert not isinstance(out, _Step9ToolSelectionStage1Response)
     assert out["selections"][0]["tool_name"] == "ZINC_search_by_smiles"
+
+
+def test_openai_step9_stage2_uses_structured_parser_and_returns_dict():
+    parsed = _Step9SchemaMappingStage2Response(
+        tools=[{
+            "tool_name": "ZINC_search_by_smiles",
+            "lane_type": "compound_screening",
+            "can_invoke": True,
+            "argument_mappings": [
+                {"schema_arg": "smiles", "field_ref": "material:m1"},
+            ],
+            "argument_literals": [],
+            "missing_required_fields": [],
+            "skip_reason": "",
+            "argument_mapping_reason": "mapped",
+        }]
+    )
+    client = _fake_openai_client(parse=_parsed_response(parsed))
+    provider = _provider_with_client(client)
+    out = provider.generate_json(
+        "map", schema={"task": "step9_tool_schema_mapping_stage_2"}
+    )
+    assert client._calls["parse"] and not client._calls["create"]
+    assert client._calls["parse"][0]["response_format"] is _Step9SchemaMappingStage2Response
+    assert isinstance(out, dict)
+    assert not isinstance(out, _Step9SchemaMappingStage2Response)
+    assert out["tools"][0]["argument_mappings"] == [
+        {"schema_arg": "smiles", "field_ref": "material:m1"}
+    ]
+
+
+def test_openai_step9_stage2_duplicate_schema_arg_raises_then_retry_succeeds():
+    dup = _Step9SchemaMappingStage2Response(
+        tools=[{
+            "tool_name": "ZINC_search_by_smiles",
+            "lane_type": "compound_screening",
+            "can_invoke": True,
+            "argument_mappings": [
+                {"schema_arg": "smiles", "field_ref": "material:m1"},
+                {"schema_arg": "smiles", "field_ref": "material:m2"},
+            ],
+            "argument_literals": [],
+            "missing_required_fields": [],
+        }]
+    )
+    good = _Step9SchemaMappingStage2Response(
+        tools=[{
+            "tool_name": "ZINC_search_by_smiles",
+            "lane_type": "compound_screening",
+            "can_invoke": True,
+            "argument_mappings": [
+                {"schema_arg": "smiles", "field_ref": "material:m1"},
+            ],
+            "argument_literals": [],
+            "missing_required_fields": [],
+        }]
+    )
+    seq = iter([_parsed_response(dup), _parsed_response(good)])
+    client = _fake_openai_client(parse=lambda **kw: next(seq))
+    provider = _provider_with_client(client, max_retries=1)
+    out = provider.generate_json(
+        "map", schema={"task": "step9_tool_schema_mapping_stage_2"}
+    )
+    assert len(client._calls["parse"]) == 2
+    assert out["tools"][0]["argument_mappings"] == [
+        {"schema_arg": "smiles", "field_ref": "material:m1"}
+    ]
 
 
 def test_openai_parser_output_flows_through_validate_task_shape():

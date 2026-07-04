@@ -180,6 +180,12 @@ class CompoundScreeningArtifact(BaseModel):
     step9_stage1_rejected_tools_with_reason: list[dict] = Field(default_factory=list)
     step9_stage1_selection_source: str = "not_run"
     step9_stage1_prompt_cache_layout_version: str = "not_run"
+    step9_stage2_schema_survivors: list[str] = Field(default_factory=list)
+    step9_stage2_mapped_tools: list[dict] = Field(default_factory=list)
+    step9_stage2_uninvokable_tools: list[str] = Field(default_factory=list)
+    step9_stage2_uninvokable_tool_details: list[dict] = Field(default_factory=list)
+    step9_stage2_argument_mapping_audit: list[dict] = Field(default_factory=list)
+    step9_stage2_prompt_cache_layout_version: str = "not_run"
     step9_missing_inputs: list[str] = Field(default_factory=list)
     protein_design_readiness: Step9LaneReadinessProfile = Field(
         default_factory=Step9LaneReadinessProfile

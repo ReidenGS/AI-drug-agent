@@ -102,6 +102,13 @@ def build_json_prompt_sections(
     catalog. Candidate/run context, readiness projection, allowed-name audit,
     blocked-count summary, and user intent summary are rendered only in the
     trailing dynamic block.
+
+    Step 9 Stage 2 split: for ``step9_tool_schema_mapping_stage_2``, the
+    stable prefix contains the selected-tool schema block only
+    (``tools[tool_name/lane_type/full_schema/required_fields/schema_source]``),
+    sorted by lane then tool. Candidate IDs, field refs, Stage-1 reasons,
+    readiness summaries, and intent summaries are rendered only in the dynamic
+    suffix.
     """
     schema = schema or {}
     task = schema.get("task") or "structured_query"
@@ -171,6 +178,18 @@ _STEP9_STAGE1_DYNAMIC_KEYS: tuple[str, ...] = (
     "blocked_summary",
     "user_intent_summary",
     "step8_downstream_handoff_status",
+    "candidate_context_refs",
+)
+
+
+_STEP9_STAGE2_DYNAMIC_KEYS: tuple[str, ...] = (
+    "candidate_id",
+    "selected_tools",
+    "step9_available_fields",
+    "step9_tool_schema_requirements",
+    "lane_readiness_status",
+    "step8_downstream_handoff_status",
+    "user_intent_summary",
     "candidate_context_refs",
 )
 
@@ -291,6 +310,39 @@ def _split_prompt_schema(schema: dict, task: str) -> tuple[dict | None, dict]:
             }
             return stable_schema, dynamic_schema
 
+    if task == "step9_tool_schema_mapping_stage_2":
+        if any(k in schema for k in _STEP9_STAGE2_DYNAMIC_KEYS):
+            stable_schema = {
+                k: v
+                for k, v in schema.items()
+                if k not in _STEP9_STAGE2_DYNAMIC_KEYS
+            }
+            tools = stable_schema.get("tools")
+            if isinstance(tools, list):
+                stable_schema["tools"] = sorted(
+                    [
+                        {
+                            "tool_name": t.get("tool_name"),
+                            "lane_type": t.get("lane_type"),
+                            "full_schema": t.get("full_schema"),
+                            "required_fields": t.get("required_fields"),
+                            "schema_source": t.get("schema_source"),
+                        }
+                        for t in tools
+                        if isinstance(t, dict)
+                    ],
+                    key=lambda t: (
+                        str(t.get("lane_type") or ""),
+                        str(t.get("tool_name") or ""),
+                    ),
+                )
+            dynamic_schema = {
+                k: schema[k]
+                for k in _STEP9_STAGE2_DYNAMIC_KEYS
+                if k in schema
+            }
+            return stable_schema, dynamic_schema
+
     # Step 2 structured_query: trim ``raw_request_record`` out of the
     # dynamic dump so it never reaches a real provider's prompt text.
     if task == "structured_query" and "prompt_inputs" in schema:
@@ -303,6 +355,16 @@ def _split_prompt_schema(schema: dict, task: str) -> tuple[dict | None, dict]:
 
 
 def shape_instruction(task: str) -> str:
+    if task == "step9_tool_schema_mapping_stage_2":
+        return (
+            '{"tools":[{"tool_name":"string",'
+            '"lane_type":"protein_design|variant_evaluation|compound_screening",'
+            '"can_invoke":true,'
+            '"argument_mappings":[{"schema_arg":"string","field_ref":"string"}],'
+            '"argument_literals":[{"schema_arg":"string","literal_value":"string|number|boolean|null"}],'
+            '"missing_required_fields":["string"],"skip_reason":"string",'
+            '"argument_mapping_reason":"string"}]}'
+        )
     if task == "step9_tool_selection_stage_1":
         return (
             '{"selections":[{"tool_name":"string",'
@@ -660,6 +722,85 @@ def validate_task_shape(data: dict, task: str, *, error_factory: ErrorFactory) -
             if "selection_reason" in entry and not isinstance(entry["selection_reason"], str):
                 raise error_factory(
                     f"step9_tool_selection_stage_1 selections[{i}] `selection_reason` must be a string"
+                )
+        return data
+
+    if task == "step9_tool_schema_mapping_stage_2":
+        tools = data.get("tools")
+        if not isinstance(tools, list):
+            raise error_factory(
+                "step9_tool_schema_mapping_stage_2 response requires list `tools`"
+            )
+        allowed_lanes = {
+            "protein_design",
+            "variant_evaluation",
+            "compound_screening",
+        }
+        for i, entry in enumerate(tools):
+            if not isinstance(entry, dict):
+                raise error_factory(
+                    f"step9_tool_schema_mapping_stage_2 tools[{i}] must be an object"
+                )
+            if not isinstance(entry.get("tool_name"), str) or not entry.get("tool_name"):
+                raise error_factory(
+                    f"step9_tool_schema_mapping_stage_2 tools[{i}] requires string `tool_name`"
+                )
+            if entry.get("lane_type") not in allowed_lanes:
+                raise error_factory(
+                    f"step9_tool_schema_mapping_stage_2 tools[{i}] requires valid `lane_type`"
+                )
+            if not isinstance(entry.get("can_invoke"), bool):
+                raise error_factory(
+                    f"step9_tool_schema_mapping_stage_2 tools[{i}] requires boolean `can_invoke`"
+                )
+            for key in ("argument_mappings", "argument_literals"):
+                if not isinstance(entry.get(key), list):
+                    raise error_factory(
+                        f"step9_tool_schema_mapping_stage_2 tools[{i}] requires list `{key}`"
+                    )
+            for j, pair in enumerate(entry.get("argument_mappings") or []):
+                if not isinstance(pair, dict):
+                    raise error_factory(
+                        f"step9_tool_schema_mapping_stage_2 tools[{i}].argument_mappings[{j}] must be an object"
+                    )
+                if not isinstance(pair.get("schema_arg"), str) or not pair.get("schema_arg"):
+                    raise error_factory(
+                        f"step9_tool_schema_mapping_stage_2 tools[{i}].argument_mappings[{j}] requires string `schema_arg`"
+                    )
+                if not isinstance(pair.get("field_ref"), str) or not pair.get("field_ref"):
+                    raise error_factory(
+                        f"step9_tool_schema_mapping_stage_2 tools[{i}].argument_mappings[{j}] requires string `field_ref`"
+                    )
+            for j, pair in enumerate(entry.get("argument_literals") or []):
+                if not isinstance(pair, dict):
+                    raise error_factory(
+                        f"step9_tool_schema_mapping_stage_2 tools[{i}].argument_literals[{j}] must be an object"
+                    )
+                if not isinstance(pair.get("schema_arg"), str) or not pair.get("schema_arg"):
+                    raise error_factory(
+                        f"step9_tool_schema_mapping_stage_2 tools[{i}].argument_literals[{j}] requires string `schema_arg`"
+                    )
+                if not isinstance(pair.get("literal_value"), (str, int, float, bool, type(None))):
+                    raise error_factory(
+                        f"step9_tool_schema_mapping_stage_2 tools[{i}].argument_literals[{j}] `literal_value` must be scalar or null"
+                    )
+            if not isinstance(entry.get("missing_required_fields"), list):
+                raise error_factory(
+                    f"step9_tool_schema_mapping_stage_2 tools[{i}] requires list `missing_required_fields`"
+                )
+            if not all(isinstance(item, str) for item in entry.get("missing_required_fields") or []):
+                raise error_factory(
+                    f"step9_tool_schema_mapping_stage_2 tools[{i}] `missing_required_fields` must contain strings"
+                )
+            if "skip_reason" in entry and not isinstance(entry["skip_reason"], str):
+                raise error_factory(
+                    f"step9_tool_schema_mapping_stage_2 tools[{i}] `skip_reason` must be a string"
+                )
+            if "argument_mapping_reason" in entry and not isinstance(
+                entry["argument_mapping_reason"], str
+            ):
+                raise error_factory(
+                    f"step9_tool_schema_mapping_stage_2 tools[{i}] `argument_mapping_reason` must be a string"
                 )
         return data
 

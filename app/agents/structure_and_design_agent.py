@@ -41,7 +41,10 @@ from ..agents.tool_selection_policy import (
     select_and_build_invocations,
 )
 from ..agents.step_09_available_fields import project_step9_readiness
-from ..agents.step_09_selection_policy import select_step9_stage1_tools
+from ..agents.step_09_selection_policy import (
+    select_step9_stage1_tools,
+    select_step9_stage2_mappings,
+)
 from ..llm.provider import LLMProvider, MockLLMProvider
 from ..mcp.client import MCPClient
 from ..schemas.common import ToolCallRecord
@@ -1527,6 +1530,15 @@ class StructureAndDesignAgent:
             raw_user_query=str(raw_request.get("raw_user_query") or ""),
             step8_downstream_handoff_status=_step9_compact_handoff_status(step8_artifact),
         )
+        stage2_mapping = select_step9_stage2_mappings(
+            llm=self.llm,
+            readiness_projection=readiness_projection,
+            selected_tools=stage1_selection.selected_tools,
+            candidate_id="all_candidates",
+            canonical_query=str(structured_query.get("canonical_query") or ""),
+            raw_user_query=str(raw_request.get("raw_user_query") or ""),
+            step8_downstream_handoff_status=_step9_compact_handoff_status(step8_artifact),
+        )
 
         tool_calls: list[ToolCallRecord] = []
         hits: list[CompoundHit] = []
@@ -1615,6 +1627,14 @@ class StructureAndDesignAgent:
             step9_stage1_rejected_tools_with_reason=stage1_selection.rejected_tools_with_reason,
             step9_stage1_selection_source=stage1_selection.selection_source,
             step9_stage1_prompt_cache_layout_version=stage1_selection.prompt_cache_layout_version,
+            step9_stage2_schema_survivors=stage2_mapping.schema_survivors,
+            step9_stage2_mapped_tools=[
+                item.model_dump() for item in stage2_mapping.mapped_tools
+            ],
+            step9_stage2_uninvokable_tools=stage2_mapping.uninvokable_tools,
+            step9_stage2_uninvokable_tool_details=stage2_mapping.uninvokable_tool_details,
+            step9_stage2_argument_mapping_audit=stage2_mapping.argument_mapping_audit,
+            step9_stage2_prompt_cache_layout_version=stage2_mapping.prompt_cache_layout_version,
             step9_missing_inputs=readiness_projection["step9_missing_inputs"],
         )
 
