@@ -3455,17 +3455,16 @@ def test_step8_prediction_model_ref_rejects_raw_or_generic_outputs(local_storage
 
 # ── Step 9 ──────────────────────────────────────────────────────────────────
 
-def test_step9_smiles_triggers_zinc_search_by_smiles(
+def test_step9_smiles_does_not_trigger_zinc_or_chembl(
     local_storage, registry_service, workflow_state_service
 ):
-    """Step 5 picks up a SMILES referenced_input → payload_smiles material;
-    Step 9 routes that to ZINC_search_by_smiles. The normalized record stays
-    raw-free and never claims ZINC22."""
+    """Compound payloads are legacy context, not active Step 9 tools."""
     run_id = _seed(
         local_storage, registry_service, workflow_state_service,
         referenced_inputs=[
             {"id_type": "smiles", "value": "CC(=O)NCCC1=CN(c2ccc(O)cc2)C(=O)C1",
              "source": "raw_request_text"},
+            {"id_type": "compound_name", "value": "example payload", "source": "raw_request_text"},
         ],
     )
     agent = StructureAndDesignAgent(
@@ -3475,24 +3474,21 @@ def test_step9_smiles_triggers_zinc_search_by_smiles(
     artifact = agent.run_step_9(run_id)
 
     tool_names = {tc.tool_name for tc in artifact.tool_call_records}
-    assert "ZINC_search_by_smiles" in tool_names
+    assert not any(name.startswith(("ZINC_", "ChEMBL_")) for name in tool_names)
+    assert artifact.tool_call_records == []
+    assert artifact.compound_hits == []
+    assert artifact.screening_status == "skipped"
+    assert artifact.compound_screening_readiness.status == "not_applicable"
 
-    # No record claims ZINC22.
-    for hit in artifact.compound_hits:
-        assert hit.source_library in {"ZINC", "ZINC15"}  # never "ZINC22"
-        assert hit.source_database_version != "ZINC22"
-        # The mock wrapper records its source as ZINC15 family; the agent's
-        # honest default for unverified upstream is `unknown`.
-        assert hit.source_database_version in {"unknown", "ZINC15"}
-
-    # Raw payload (mocked envelope contains "status: mocked", "hits: ...")
-    # must not bleed into compound_hits.
-    cand_blob = json.dumps([h.model_dump() for h in artifact.compound_hits])
-    assert "mocked" not in cand_blob
-    assert "ZINC_search_by_smiles" not in cand_blob or True  # source_tool_name is allowed
+    exposed_names = set(artifact.step9_stage1_catalog_tool_names)
+    exposed_names.update(item.get("tool_name", "") for item in artifact.step9_stage1_selected_tools)
+    exposed_names.update(artifact.step9_stage2_schema_survivors)
+    exposed_names.update(item.get("tool_name", "") for item in artifact.step9_stage2_mapped_tools)
+    assert not any(name.startswith(("ZINC_", "ChEMBL_")) for name in exposed_names)
+    assert "CC(=O)NCCC1=CN" not in json.dumps(artifact.model_dump())
 
 
-def test_step9_zinc_id_triggers_zinc_get_compound(
+def test_step9_zinc_id_does_not_trigger_zinc_get_compound(
     local_storage, registry_service, workflow_state_service
 ):
     run_id = _seed(
@@ -3507,14 +3503,17 @@ def test_step9_zinc_id_triggers_zinc_get_compound(
     )
     artifact = agent.run_step_9(run_id)
     tool_names = {tc.tool_name for tc in artifact.tool_call_records}
-    assert "ZINC_get_compound" in tool_names
+    assert "ZINC_get_compound" not in tool_names
+    assert not any(name.startswith(("ZINC_", "ChEMBL_")) for name in tool_names)
+    assert artifact.tool_call_records == []
+    assert artifact.compound_hits == []
+    assert artifact.compound_screening_readiness.status == "not_applicable"
 
-    # No record defaults to ZINC22.
     blob = json.dumps(artifact.model_dump())
     assert "ZINC22" not in blob
 
 
-def test_step9_dependency_unavailable_marks_partial_not_crash(
+def test_step9_compound_tool_dependencies_are_not_called(
     local_storage, registry_service, workflow_state_service
 ):
     from app.mcp.tools._registry import _all_bindings
@@ -3544,9 +3543,10 @@ def test_step9_dependency_unavailable_marks_partial_not_crash(
         workflow_state=workflow_state_service, mcp_client=mcp,
     )
     artifact = agent.run_step_9(run_id)
-    assert artifact.screening_status in {"partial", "failed", "skipped"}
-    statuses = [tc.run_status for tc in artifact.tool_call_records]
-    assert "dependency_unavailable" in statuses
+    assert artifact.screening_status == "skipped"
+    assert artifact.tool_call_records == []
+    assert artifact.compound_hits == []
+    assert artifact.compound_screening_readiness.status == "not_applicable"
 
 
 def _seed_sequence_only_protein_candidates(

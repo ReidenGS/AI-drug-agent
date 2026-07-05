@@ -56,9 +56,14 @@ def test_step6_9_13_14_record_selection_metadata(
     assert any("selection_policy_version" in tc["tool_input_summary"] for tc in step6_calls)
 
     step9 = local_storage.read_json(local_storage.run_key(run_id, "compound_screening_artifact.json"))
-    assert step9["tool_call_records"]
-    assert all("selection_policy_version" in tc["tool_input_summary"] for tc in step9["tool_call_records"])
-    assert "ZINC22" not in str(step9)
+    assert step9["tool_call_records"] == []
+    step9_names = set(step9["step9_stage1_catalog_tool_names"])
+    step9_names.update(step9["step9_stage2_schema_survivors"])
+    assert step9_names
+    assert not any(name.startswith(("ZINC_", "ChEMBL_")) for name in step9_names)
+    assert step9["step9_stage1_selection_source"] != "not_run"
+    assert step9["step9_stage1_prompt_cache_layout_version"] != "not_run"
+    assert step9["step9_stage2_prompt_cache_layout_version"] != "not_run"
 
     step13 = local_storage.read_json(local_storage.run_key(run_id, "scientific_evidence_table.json"))
     assert step13["tool_call_records"]

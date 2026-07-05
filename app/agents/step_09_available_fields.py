@@ -59,18 +59,6 @@ _VARIANT_EVALUATION_TOOLS = {
     "DynaMut2_predict_stability",
     "ESM_score_variant_sae_batch",
 }
-_COMPOUND_TOOLS = {
-    "ChEMBL_search_molecules",
-    "ChEMBL_search_similarity",
-    "ChEMBL_search_substructure",
-    "ZINC_get_compound",
-    "ZINC_get_purchasable",
-    "ZINC_search_by_properties",
-    "ZINC_search_by_smiles",
-    "ZINC_search_compounds",
-}
-
-
 _TOOL_REQUIRED_ARGS_CACHE: dict[str, list[str]] = {}
 _TOOL_SCHEMA_SOURCE_CACHE: dict[str, str] = {}
 
@@ -922,123 +910,6 @@ def _variant_evaluation_gate(
     return status, blocked_missing, allowed, blocked, schema_requirements
 
 
-def _compound_gate(
-    candidate: dict,
-) -> tuple[str, list[str], list[Step9HardGateAllowedTool], list[Step9HardGateBlockedTool], list[Step9ToolSchemaRequirement]]:
-    candidate_id = str(candidate.get("candidate_id") or "")
-    allowed: list[Step9HardGateAllowedTool] = []
-    blocked: list[Step9HardGateBlockedTool] = []
-    schema_requirements: list[Step9ToolSchemaRequirement] = []
-
-    has_smiles = _candidate_has_compound_smiles(candidate)
-    has_name = _candidate_has_compound_name(candidate)
-    has_identifier = _candidate_id_types(candidate, _COMPOUND_IDENTIFIER_TYPES)
-
-    if not (has_smiles or has_name or has_identifier):
-        for tool in sorted(_COMPOUND_TOOLS):
-            required, satisfiable, missing = _required_args_missing(tool, candidate, [], None)
-            schema_source = _schema_required_args(tool)[1]
-            schema_requirements.append(
-                _tool_schema_requirement_record(
-                    candidate,
-                    candidate_id,
-                    "compound_screening",
-                    tool,
-                    required,
-                    satisfiable,
-                    missing,
-                    schema_source,
-                )
-            )
-            # Keep existing semantic: no compound evidence => not applicable.
-        return "not_applicable", ["compound_input_missing"], allowed, blocked, schema_requirements
-
-    for tool in sorted(_COMPOUND_TOOLS):
-        required, satisfiable, missing = _required_args_missing(tool, candidate, [], None)
-        schema_source = _schema_required_args(tool)[1]
-        schema_requirements.append(
-            _tool_schema_requirement_record(
-                candidate,
-                candidate_id,
-                "compound_screening",
-                tool,
-                required,
-                satisfiable,
-                missing,
-                schema_source,
-            )
-        )
-        if missing:
-            blocked.append(
-                Step9HardGateBlockedTool(
-                    candidate_id=candidate_id,
-                    tool_name=tool,
-                    lane_type="compound_screening",
-                    reason=(
-                        "tool_schema_unavailable"
-                        if missing == ["tool_schema_unavailable"]
-                        else "schema_required:" + ",".join(sorted(missing))
-                    ),
-                    rationale="required official TU args are missing",
-                )
-            )
-            continue
-
-        required_set = set(required)
-        tool_is_allowed = (
-            (
-                "zinc_id" in required_set
-                and _candidate_has_zinc_id(candidate)
-            )
-            or (
-                "smiles" in required_set
-                and has_smiles
-            )
-            or (
-                "query" in required_set
-                and _candidate_has_smiles_like_query_text(candidate)
-            )
-            or (
-                # No explicit query evidence required by schema (example:
-                # ChEMBL_search_molecules), but keep existing expectation:
-                # only attempt tools when compound context is present.
-                not required_set
-                and (has_smiles or has_name or has_identifier)
-            )
-            or (
-                # For schema-required tier cases, keep generic compound
-                # evidence gating and let threshold/tier missing be schema
-                # blocking if not provided.
-                "tier" in required_set
-                and (has_smiles or has_name or has_identifier)
-            )
-        )
-        if not tool_is_allowed:
-            blocked.append(
-                Step9HardGateBlockedTool(
-                    candidate_id=candidate_id,
-                    tool_name=tool,
-                    lane_type="compound_screening",
-                    reason="compound_input_missing",
-                    rationale="compound lane evidence not sufficient for this tool",
-                )
-            )
-            continue
-
-        allowed.append(
-            Step9HardGateAllowedTool(
-                candidate_id=candidate_id,
-                tool_name=tool,
-                lane_type="compound_screening",
-                rationale="compound evidence available",
-            )
-        )
-
-    if not allowed and not blocked:
-        return "blocked", ["compound_tool_evidence_gap"], allowed, blocked, schema_requirements
-    return ("ready" if allowed else "blocked"), ([tool.reason for tool in blocked if tool.reason]), allowed, blocked, schema_requirements
-
-
 def _available_fields_for_compound(candidate: dict) -> list[Step9AvailableField]:
     out: list[Step9AvailableField] = []
     candidate_id = str(candidate.get("candidate_id") or "")
@@ -1356,18 +1227,13 @@ def project_step9_readiness(
                             value_kind=str(ident.get("id_type")),
                         )
                     )
-            status, _, allowed, blocked, reqs = _compound_gate(candidate)
-            schema_requirements.extend(reqs)
-            # Keep legacy status semantics for no-evidence compound candidates.
-            status_value = (
-                "ready" if any(tool.tool_name != "compound_screening" for tool in allowed) else ("not_applicable" if status == "not_applicable" else "partial")
-            )
+            # Workflow v0.1 Step 9 is structural variant generation/evaluation.
+            # Compound screening fields remain visible only as legacy-compatible
+            # audit context; they must not expose ZINC/ChEMBL tools to Stage 1/2.
             lane_statuses.append(
-                _lane_status(candidate, "compound_screening", allowed, blocked, fields, status_value)
+                _lane_status(candidate, "compound_screening", [], [], fields, "not_applicable")
             )
             available_fields.extend(fields)
-            allowed_tools.extend(allowed)
-            blocked_tools.extend(blocked)
             continue
 
         fields = _available_fields_for_protein_candidate(candidate, prepared_inputs, step8_data)

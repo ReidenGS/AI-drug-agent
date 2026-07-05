@@ -61,13 +61,14 @@ def _blocked(tool_name: str, lane_type: str, candidate_id: str = "cand_a"):
 
 
 def _req(tool_name: str, lane_type: str, *, decision: str = "allowed"):
+    required = ["prompt_sequence"] if tool_name == "ESM_generate_protein_sequence" else ["sequence"]
     return Step9ToolSchemaRequirement(
         candidate_id="cand_a",
         tool_name=tool_name,
         lane_type=lane_type,  # type: ignore[arg-type]
-        required_fields=["smiles"] if lane_type == "compound_screening" else ["sequence"],
+        required_fields=required,
         schema_source="signature",
-        satisfiable_required_fields=["smiles"] if decision == "allowed" else [],
+        satisfiable_required_fields=required if decision == "allowed" else [],
         missing_required_fields=[] if decision == "allowed" else ["pdb_id"],
         hard_gate_decision=decision,  # type: ignore[arg-type]
         reason="schema_requirements_satisfied" if decision == "allowed" else "schema_required:pdb_id",
@@ -79,22 +80,22 @@ def _field(candidate_id: str = "cand_a", field_ref: str = "material:mat_a"):
         candidate_id=candidate_id,
         field_ref=field_ref,
         provider="step_05",
-        field_type="compound",
-        value_kind="smiles",
+        field_type="protein_sequence",
+        value_kind="sequence_material",
     )
 
 
 def _lane(
     *,
     candidate_id: str = "cand_a",
-    lane_type: str = "compound_screening",
+    lane_type: str = "protein_design",
     allowed_tools=None,
     blocked_tools=None,
 ):
     return Step9LaneStatus(
         lane_type=lane_type,  # type: ignore[arg-type]
         candidate_id=candidate_id,
-        candidate_type="compound_component",
+        candidate_type="target_antigen",
         status="ready" if allowed_tools else "blocked",
         allowed_tools=allowed_tools or [],
         blocked_tools=blocked_tools or [],
@@ -104,7 +105,7 @@ def _lane(
 
 
 def _projection(*, allowed=None, blocked=None, fields=None, lanes=None, reqs=None):
-    allowed = allowed if allowed is not None else [_allowed("ZINC_search_by_smiles", "compound_screening")]
+    allowed = allowed if allowed is not None else [_allowed("ESM_generate_protein_sequence", "protein_design")]
     blocked = blocked if blocked is not None else [_blocked("DynaMut2_predict_stability", "variant_evaluation")]
     reqs = reqs if reqs is not None else [
         _req(t.tool_name, t.lane_type, decision="allowed") for t in allowed
@@ -186,12 +187,12 @@ def test_candidate_specific_values_only_after_stable_prefix():
 
 def test_stable_prefix_contains_allowed_catalog_only_not_blocked_tools():
     projection = _projection(
-        allowed=[_allowed("ZINC_search_by_smiles", "compound_screening")],
+        allowed=[_allowed("ESM_generate_protein_sequence", "protein_design")],
         blocked=[_blocked("DynaMut2_predict_stability", "variant_evaluation")],
     )
     stable, dynamic, full = _sections_for(projection)
     names = [entry["tool_name"] for entry in _stable_catalog(stable)]
-    assert names == ["ZINC_search_by_smiles"]
+    assert names == ["ESM_generate_protein_sequence"]
     assert "DynaMut2_predict_stability" not in stable
     assert "DynaMut2_predict_stability" not in dynamic
     assert "DynaMut2_predict_stability" not in full
@@ -212,12 +213,12 @@ def test_stable_prefix_excludes_raw_sequence_pdb_fasta_a3m_and_api_key():
 def test_stable_catalog_sorted_by_lane_then_tool():
     projection = _projection(
         allowed=[
-            _allowed("ZINC_search_by_smiles", "compound_screening"),
+            _allowed("NvidiaNIM_proteinmpnn", "protein_design"),
             _allowed("ESM_generate_protein_sequence", "protein_design"),
             _allowed("AlphaMissense_get_variant_score", "variant_evaluation"),
         ],
         reqs=[
-            _req("ZINC_search_by_smiles", "compound_screening"),
+            _req("NvidiaNIM_proteinmpnn", "protein_design"),
             _req("ESM_generate_protein_sequence", "protein_design"),
             _req("AlphaMissense_get_variant_score", "variant_evaluation"),
         ],
@@ -251,14 +252,14 @@ def test_variant_only_allowed_set_does_not_include_protein_design_tools():
 
 def test_hallucinated_or_blocked_tool_is_dropped_and_audited():
     projection = _projection(
-        allowed=[_allowed("ZINC_search_by_smiles", "compound_screening")],
+        allowed=[_allowed("ESM_generate_protein_sequence", "protein_design")],
         blocked=[_blocked("DynaMut2_predict_stability", "variant_evaluation")],
     )
     llm = _LLM({
         "selections": [
             {
-                "tool_name": "ZINC_search_by_smiles",
-                "lane_type": "compound_screening",
+                "tool_name": "ESM_generate_protein_sequence",
+                "lane_type": "protein_design",
                 "selection_reason": "valid",
             },
             {
@@ -278,7 +279,7 @@ def test_hallucinated_or_blocked_tool_is_dropped_and_audited():
         readiness_projection=projection,
         candidate_id="cand_a",
     )
-    assert [item.tool_name for item in result.selected_tools] == ["ZINC_search_by_smiles"]
+    assert [item.tool_name for item in result.selected_tools] == ["ESM_generate_protein_sequence"]
     rejected = {item["tool_name"]: item["reason"] for item in result.rejected_tools_with_reason}
     assert rejected["DynaMut2_predict_stability"] == "tool_not_in_allowed_catalog"
     assert rejected["Imaginary_tool"] == "tool_not_in_allowed_catalog"
@@ -288,10 +289,10 @@ def test_valid_empty_selection_respected_no_forced_selection():
     result = select_step9_stage1_tools(
         llm=_LLM({"selections": []}),
         readiness_projection=_projection(
-            allowed=[_allowed("ZINC_search_by_smiles", "compound_screening")]
+            allowed=[_allowed("ESM_generate_protein_sequence", "protein_design")]
         ),
         candidate_id="cand_a",
     )
-    assert result.catalog_tool_names == ["ZINC_search_by_smiles"]
+    assert result.catalog_tool_names == ["ESM_generate_protein_sequence"]
     assert result.selected_tools == []
     assert result.rejected_tools_with_reason == []

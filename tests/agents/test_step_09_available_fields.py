@@ -120,14 +120,6 @@ _STEP9_TOOL_SIGNATURE_CONTRACT_REQUIRED: dict[str, list[str]] = {
     "ESM_score_variant_sae_batch": ["sequence", "variants"],
     "NvidiaNIM_proteinmpnn": ["input_pdb"],
     "NvidiaNIM_rfdiffusion": ["contigs", "input_pdb"],
-    "ChEMBL_search_molecules": [],
-    "ChEMBL_search_similarity": ["smiles", "threshold"],
-    "ChEMBL_search_substructure": ["smiles"],
-    "ZINC_get_compound": ["operation", "zinc_id"],
-    "ZINC_get_purchasable": ["operation", "tier"],
-    "ZINC_search_by_properties": ["operation"],
-    "ZINC_search_by_smiles": ["operation", "smiles"],
-    "ZINC_search_compounds": ["operation", "query"],
 }
 
 
@@ -432,15 +424,13 @@ def test_step9_compound_gate_schema_driven_gaps_and_allow(monkeypatch):
         structure_prediction_and_interface_results={},
         compound_context_text="",
     )
-    blocked = {
-        entry.tool_name: entry.reason
-        for entry in readiness["step9_hard_gate_blocked_tools_with_reason"]
-    }
     allowed = {entry.tool_name for entry in readiness["step9_hard_gate_allowed_tools"]}
-    assert "ZINC_search_by_smiles" in allowed
-    assert "ChEMBL_search_substructure" in allowed
-    assert blocked["ChEMBL_search_similarity"] == "schema_required:threshold"
-    assert blocked["ZINC_get_purchasable"] == "schema_required:tier"
+    blocked = {entry.tool_name for entry in readiness["step9_hard_gate_blocked_tools_with_reason"]}
+    assert not any(name.startswith(("ZINC_", "ChEMBL_")) for name in allowed)
+    assert not any(name.startswith(("ZINC_", "ChEMBL_")) for name in blocked)
+    assert readiness["compound_screening_readiness"].status == "not_applicable"
+    assert readiness["compound_screening_readiness"].ready_tool_count == 0
+    assert readiness["compound_screening_readiness"].blocked_tool_count == 0
 
 
 def test_step9_schema_unavailable_blocked_reason(monkeypatch):
@@ -453,11 +443,12 @@ def test_step9_schema_unavailable_blocked_reason(monkeypatch):
         structure_prediction_and_interface_results=_seed_step8_complex_result(),
         compound_context_text="",
     )
-    blocked = {
-        entry.tool_name: entry.reason
+    names = {
+        entry.tool_name
         for entry in readiness["step9_hard_gate_blocked_tools_with_reason"]
     }
-    assert blocked["ChEMBL_search_similarity"] == "tool_schema_unavailable"
+    assert "ChEMBL_search_similarity" not in names
+    assert readiness["compound_screening_readiness"].status == "not_applicable"
 
 
 def test_step9_variant_lane_readiness_profile_is_not_not_applicable(monkeypatch):
@@ -610,14 +601,16 @@ def test_step9_aggregate_readiness_profile_counts_tools_in_compound_screening_la
     )
 
     profile = readiness["compound_screening_readiness"]
-    assert profile.ready_tool_count == len(profile.allowed_tools)
-    assert profile.blocked_tool_count == len(profile.blocked_tools)
-    assert profile.ready_tool_count >= 1
-    assert profile.blocked_tool_count >= 1
+    assert profile.status == "not_applicable"
+    assert profile.allowed_tools == []
+    assert profile.blocked_tools == []
+    assert profile.ready_tool_count == 0
+    assert profile.blocked_tool_count == 0
 
     profile_entries = readiness["step9_lane_statuses"]
     compound_lanes = [entry for entry in profile_entries if entry.lane_type == "compound_screening"]
     assert len(compound_lanes) == 1
     lane = compound_lanes[0]
-    assert len(lane.allowed_tools) == profile.ready_tool_count
-    assert len(lane.blocked_tools) == profile.blocked_tool_count
+    assert lane.status == "not_applicable"
+    assert lane.allowed_tools == []
+    assert lane.blocked_tools == []

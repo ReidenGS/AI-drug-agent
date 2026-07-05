@@ -13,14 +13,15 @@ tool-calling agent. The three entry points are:
   validation/refinement lookup, and deferred complex-prediction audit.
   Raw outputs are referenced via `output_artifacts[]` and stored under
   `tool_outputs/step_08/{tool_call_id}.json`.
-- `run_step_9(run_id)` — compound library screening for compound-component
-  candidates. Routes to ZINC tools when SMILES, ZINC id, or compound name is
-  present. **No record claims `ZINC22` confirmation**; `source_library` stays
-  `"ZINC"` and `source_database_version` stays `"unknown"`.
+- `run_step_9(run_id)` — structural variant generation/evaluation planning
+  audit for protein-design and variant-evaluation lanes. Legacy compound
+  artifact fields are retained for compatibility, but Step 9 no longer routes
+  compound candidates to ZINC/ChEMBL.
 
 Hard constraints (architecture v0.1):
-- RFdiffusion `contigs_dsl` is NOT generated freely by this agent. Step 9
-  protein-design lane is not part of the MVP; see TODO at bottom.
+- RFdiffusion `contigs_dsl` is NOT generated freely by this agent.
+- Step 9 currently records readiness and Stage 1/2 audit only; it does not
+  execute protein/variant MCP tools yet.
 - All MCP calls go through the inventory-scoped client. Raw payloads NEVER
   appear inside normalized records.
 """
@@ -35,11 +36,6 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Optional
 
-from ..agents.tool_selection_policy import (
-    SelectionContext,
-    ToolInvocationPlan,
-    select_and_build_invocations,
-)
 from ..agents.step_09_available_fields import project_step9_readiness
 from ..agents.step_09_selection_policy import (
     select_step9_stage1_tools,
@@ -1511,11 +1507,6 @@ class StructureAndDesignAgent:
             or ""
         )
 
-        compound_candidates = [
-            c for c in cct.get("candidate_records") or []
-            if c.get("candidate_type") == "compound_component"
-        ]
-
         readiness_projection = project_step9_readiness(
             candidate_context_table=cct,
             prepared_structure_input_package=step7_pkg,
@@ -1542,68 +1533,7 @@ class StructureAndDesignAgent:
 
         tool_calls: list[ToolCallRecord] = []
         hits: list[CompoundHit] = []
-        any_real_attempt = False
-        any_partial = False
-
-        for cand in compound_candidates:
-            smiles_mats = _materials_by_type(cand, {"payload_smiles", "linker_smiles", "compound_smiles"})
-            name_mats = _materials_by_type(cand, {"payload_name", "linker_name", "compound_name"})
-            zinc_idents = _identifiers_by_type(cand, {"zinc_id"})
-            chembl_idents = _identifiers_by_type(cand, {"chembl_id"})
-            pubchem_idents = _identifiers_by_type(cand, {"pubchem_cid"})
-
-            if not (smiles_mats or name_mats or zinc_idents or chembl_idents or pubchem_idents):
-                continue
-
-            context = _compound_selection_context(cand)
-            plans = select_and_build_invocations(
-                agent_name=_AGENT_NAME,
-                step_id=_STEP_09,
-                mcp_client=self.mcp_client,
-                llm=self.llm,
-                context=context,
-                deterministic_fallback=lambda c=cand: _compound_fallback_plans(c),
-                deterministic_argument_mapping=_compound_argument_mapping,
-            )
-            if not plans:
-                plans = _compound_fallback_plans(cand)
-
-            for plan in plans:
-                if plan.validation_status == "skipped":
-                    tc = _skipped_tool_record(
-                        tool_name=plan.tool_name,
-                        agent_name=_AGENT_NAME,
-                        step_id=_STEP_09,
-                        summary={
-                            "label": f"compound:{cand.get('candidate_label')}",
-                            **_selection_summary(plan),
-                        },
-                    )
-                    tool_calls.append(tc)
-                    any_partial = True
-                    continue
-                tc = self._call_tool(
-                    run_id=run_id,
-                    step_id=_STEP_09,
-                    tool_name=plan.tool_name,
-                    kwargs=plan.arguments,
-                    output_dir="step_09",
-                    label=f"compound:{cand.get('candidate_label')}",
-                    extra_input_summary=_selection_summary(plan),
-                )
-                tool_calls.append(tc)
-                any_real_attempt = True
-                if tc.run_status == "success":
-                    hits.append(_compound_hit_from_call(cand, tc, plan.arguments, plan.tool_name))
-                else:
-                    any_partial = True
-
-        if not any_real_attempt:
-            screening_status = "skipped"
-        elif any_partial or not hits:
-            screening_status = "partial"
-        else:
-            screening_status = "ok"
+        screening_status = "skipped"
 
         artifact = CompoundScreeningArtifact(
             run_id=run_id,
@@ -4024,91 +3954,10 @@ def _compact_structure_refs_for_audit(structure_refs: list[Any]) -> list[dict[st
     return out
 
 
-def _compound_hit_from_call(candidate: dict, tc: ToolCallRecord, kwargs: dict, tool_name: str) -> CompoundHit:
-    """Build a normalized CompoundHit. Raw payload stays at `tool_output_ref`."""
-    smiles = kwargs.get("smiles") or _materials_by_type(candidate, {"payload_smiles", "linker_smiles", "compound_smiles"})
-    if isinstance(smiles, list):
-        smiles = (smiles[0] if smiles else {}).get("value", "")
-    return CompoundHit(
-        compound_id=new_artifact_id("compound_hit"),
-        # Wrapper currently hits ZINC15 (per architecture audit). We record
-        # the family (`ZINC`) and an honest version (`unknown`) so no record
-        # ever claims `ZINC22` confirmation.
-        source_library="ZINC",
-        smiles=str(smiles or ""),
-        similarity_score=None,
-        source_database_version="unknown",
-        source_tool_name=tool_name,
-        source_runtime_status="success",
-        notes=f"raw payload at tool_output_ref={tc.tool_output_ref}",
-    )
-
-
 def _short(v: Any) -> Any:
     if isinstance(v, str) and len(v) > 200:
         return v[:200] + "…"
     return v
-
-
-def _compound_selection_context(candidate: dict) -> SelectionContext:
-    smiles = _first_material_value(candidate.get("materials") or [], {"payload_smiles", "linker_smiles", "compound_smiles"})
-    name = _first_material_value(candidate.get("materials") or [], {"payload_name", "linker_name", "compound_name"})
-    zinc_id = _first_identifier_value(candidate.get("identifiers") or [], {"zinc_id"})
-    chembl_id = _first_identifier_value(candidate.get("identifiers") or [], {"chembl_id"})
-    pubchem_cid = _first_identifier_value(candidate.get("identifiers") or [], {"pubchem_cid"})
-    return SelectionContext(
-        signals={
-            "smiles": bool(smiles),
-            "compound_name": bool(name),
-            "zinc_id": bool(zinc_id),
-            "chembl_id": bool(chembl_id),
-            "pubchem_cid": bool(pubchem_cid),
-        },
-        arg_hints={
-            k: v for k, v in {
-                "smiles": smiles,
-                "query": name or smiles,
-                "zinc_id": zinc_id,
-                "chembl_id": chembl_id,
-                "pubchem_cid": pubchem_cid,
-                "compound_name": name,
-            }.items() if v
-        },
-        note=f"step_09 compound candidate_id={candidate.get('candidate_id', '')}",
-    )
-
-
-def _compound_fallback_plans(candidate: dict) -> list[ToolInvocationPlan]:
-    smiles = _first_material_value(candidate.get("materials") or [], {"payload_smiles", "linker_smiles", "compound_smiles"})
-    name = _first_material_value(candidate.get("materials") or [], {"payload_name", "linker_name", "compound_name"})
-    zinc_id = _first_identifier_value(candidate.get("identifiers") or [], {"zinc_id"})
-    raw: list[tuple[str, dict[str, Any]]] = []
-    if smiles:
-        raw.append(("ZINC_search_by_smiles", {"smiles": smiles}))
-    if zinc_id:
-        raw.append(("ZINC_get_compound", {"zinc_id": zinc_id}))
-    if not raw and name:
-        raw.append(("ZINC_search_compounds", {"query": name}))
-    return [
-        ToolInvocationPlan(
-            tool_name=tool,
-            selection_reason="deterministic Step 9 compound fallback",
-            arguments=args,
-            argument_construction_reason="deterministic compound argument mapping",
-            selected_by="deterministic_fallback",
-        )
-        for tool, args in raw
-    ]
-
-
-def _compound_argument_mapping(tool_name: str, arg_hints: dict) -> dict[str, Any]:
-    if tool_name == "ZINC_search_by_smiles":
-        return {"smiles": arg_hints.get("smiles") or ""}
-    if tool_name == "ZINC_get_compound":
-        return {"zinc_id": arg_hints.get("zinc_id") or ""}
-    if tool_name == "ZINC_search_compounds":
-        return {"query": arg_hints.get("query") or arg_hints.get("compound_name") or ""}
-    return {"query": arg_hints.get("query") or arg_hints.get("compound_name") or arg_hints.get("smiles") or ""}
 
 
 def _step9_compact_handoff_status(step8_artifact: dict | None) -> list[dict[str, Any]]:
@@ -4143,18 +3992,6 @@ def _step9_compact_handoff_status(step8_artifact: dict | None) -> list[dict[str,
             }
         )
     return out
-
-
-def _selection_summary(plan: ToolInvocationPlan) -> dict[str, Any]:
-    return {
-        "selected_by": plan.selected_by,
-        "selection_reason": plan.selection_reason,
-        "selection_policy_version": plan.selection_policy_version,
-        "argument_construction_reason": plan.argument_construction_reason,
-        "validation_status": plan.validation_status,
-        "validation_warnings": plan.validation_warnings,
-    }
-
 
 def _apply_step7_tool_output_metadata(
     storage: Storage, record: StructureInputRecord, tool_call: ToolCallRecord, tool_name: str
@@ -4520,17 +4357,3 @@ def _nonexecuted_tool_record(
         tool_input_summary=summary,
         error_message=f"tool invocation not executed: {run_status}",
     )
-
-
-
-def _first_material_value(materials: list[dict], types: set[str]) -> Optional[str]:
-    for m in materials:
-        if m.get("material_type") in types and m.get("value"):
-            return str(m.get("value"))
-    return None
-
-def _first_identifier_value(identifiers: list[dict], types: set[str]) -> Optional[str]:
-    for i in identifiers:
-        if i.get("id_type") in types and i.get("id_value"):
-            return str(i.get("id_value"))
-    return None

@@ -42,27 +42,27 @@ class _LLM:
         return self.response
 
 
-SMILES_SCHEMA = {
+ESM_SEQUENCE_SCHEMA = {
     "type": "object",
     "properties": {
-        "smiles": {"type": "string"},
-        "operation": {"type": "string", "enum": ["similarity"]},
+        "prompt_sequence": {"type": "string"},
+        "task": {"type": "string", "enum": ["generate"]},
     },
-    "required": ["operation", "smiles"],
+    "required": ["task", "prompt_sequence"],
 }
 
 
-THRESHOLD_SCHEMA = {
+RF_DIFFUSION_SCHEMA = {
     "type": "object",
     "properties": {
-        "smiles": {"type": "string"},
-        "threshold": {"type": "number"},
+        "input_pdb": {"type": "string"},
+        "contigs": {"type": "string"},
     },
-    "required": ["smiles", "threshold"],
+    "required": ["input_pdb", "contigs"],
 }
 
 
-def _field(candidate_id="cand_a", field_ref="material:mat_a", value_kind="smiles", field_type="compound"):
+def _field(candidate_id="cand_a", field_ref="material:mat_a", value_kind="sequence_material", field_type="protein_sequence"):
     return Step9AvailableField(
         candidate_id=candidate_id,
         field_ref=field_ref,
@@ -72,8 +72,19 @@ def _field(candidate_id="cand_a", field_ref="material:mat_a", value_kind="smiles
     )
 
 
-def _req(tool_name="ZINC_search_by_smiles", lane_type="compound_screening", required=None):
-    required = required or ["smiles"]
+def _step8_complex_field(candidate_id="cand_a", field_ref="step8_complex_ref:cand_a:0"):
+    return Step9AvailableField(
+        candidate_id=candidate_id,
+        field_ref=field_ref,
+        provider="step_08",
+        field_type="structure",
+        value_kind="complex_structure_ref",
+        source_ref="1N8Z",
+    )
+
+
+def _req(tool_name="ESM_generate_protein_sequence", lane_type="protein_design", required=None):
+    required = required or ["prompt_sequence"]
     return Step9ToolSchemaRequirement(
         candidate_id="cand_a",
         tool_name=tool_name,
@@ -87,11 +98,11 @@ def _req(tool_name="ZINC_search_by_smiles", lane_type="compound_screening", requ
     )
 
 
-def _lane(candidate_id="cand_a", tool_name="ZINC_search_by_smiles"):
+def _lane(candidate_id="cand_a", tool_name="ESM_generate_protein_sequence"):
     return Step9LaneStatus(
-        lane_type="compound_screening",
+        lane_type="protein_design",
         candidate_id=candidate_id,
-        candidate_type="compound_component",
+        candidate_type="target_antigen",
         status="ready",
         allowed_tools=[tool_name],
         available_field_refs=[f"material:{candidate_id}_mat"],
@@ -101,12 +112,12 @@ def _lane(candidate_id="cand_a", tool_name="ZINC_search_by_smiles"):
 def _projection(fields=None, reqs=None, lanes=None):
     return {
         "step9_available_fields": fields if fields is not None else [_field()],
-        "step9_tool_schema_requirements": reqs if reqs is not None else [_req(required=["operation", "smiles"])],
+        "step9_tool_schema_requirements": reqs if reqs is not None else [_req(required=["task", "prompt_sequence"])],
         "step9_lane_statuses": lanes if lanes is not None else [_lane()],
     }
 
 
-def _selected(tool_name="ZINC_search_by_smiles", lane_type="compound_screening", reason="selected"):
+def _selected(tool_name="ESM_generate_protein_sequence", lane_type="protein_design", reason="selected"):
     return [Step9Stage1SelectionAudit(tool_name=tool_name, lane_type=lane_type, selection_reason=reason)]
 
 
@@ -138,7 +149,7 @@ def _stable_tools(stable: str) -> list[dict]:
 
 
 def test_same_selected_schema_set_different_candidate_fields_stable_prefix_identical(monkeypatch):
-    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: SMILES_SCHEMA)
+    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: ESM_SEQUENCE_SCHEMA)
     stable_a, _, _ = _sections_for(
         _projection(fields=[_field("cand_alpha", "material:alpha")]),
         candidate_id="cand_alpha",
@@ -153,7 +164,7 @@ def test_same_selected_schema_set_different_candidate_fields_stable_prefix_ident
 
 
 def test_candidate_specific_data_only_after_stable_prefix(monkeypatch):
-    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: SMILES_SCHEMA)
+    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: ESM_SEQUENCE_SCHEMA)
     stable, dynamic, full = _sections_for(
         _projection(fields=[_field("cand_SENTINEL", "material:field_SENTINEL")]),
         candidate_id="cand_SENTINEL",
@@ -167,18 +178,18 @@ def test_candidate_specific_data_only_after_stable_prefix(monkeypatch):
 
 
 def test_stable_prefix_includes_only_selected_tool_schemas(monkeypatch):
-    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: SMILES_SCHEMA)
+    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: ESM_SEQUENCE_SCHEMA)
     stable, _, _ = _sections_for(
         _projection(),
-        selected=_selected("ZINC_search_by_smiles", "compound_screening"),
+        selected=_selected("ESM_generate_protein_sequence", "protein_design"),
     )
     names = [tool["tool_name"] for tool in _stable_tools(stable)]
-    assert names == ["ZINC_search_by_smiles"]
+    assert names == ["ESM_generate_protein_sequence"]
     assert "AlphaMissense_get_variant_score" not in stable
 
 
 def test_stable_prefix_excludes_raw_sequence_pdb_fasta_a3m_and_api_key(monkeypatch):
-    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: SMILES_SCHEMA)
+    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: ESM_SEQUENCE_SCHEMA)
     stable, dynamic, full = _sections_for(
         _projection(),
         canonical_query=f"{RAW_SEQ} sk-secretvalue123",
@@ -191,15 +202,15 @@ def test_stable_prefix_excludes_raw_sequence_pdb_fasta_a3m_and_api_key(monkeypat
 
 
 def test_selected_tools_sorted_deterministically(monkeypatch):
-    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: SMILES_SCHEMA)
+    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: ESM_SEQUENCE_SCHEMA)
     stable, _, _ = _sections_for(
         _projection(reqs=[
-            _req("ZINC_search_by_smiles", "compound_screening"),
+            _req("ESM_generate_protein_sequence", "protein_design"),
             _req("AlphaMissense_get_variant_score", "variant_evaluation"),
         ]),
         selected=[
             Step9Stage1SelectionAudit(tool_name="AlphaMissense_get_variant_score", lane_type="variant_evaluation"),
-            Step9Stage1SelectionAudit(tool_name="ZINC_search_by_smiles", lane_type="compound_screening"),
+            Step9Stage1SelectionAudit(tool_name="ESM_generate_protein_sequence", lane_type="protein_design"),
         ],
     )
     pairs = [(tool["lane_type"], tool["tool_name"]) for tool in _stable_tools(stable)]
@@ -207,103 +218,103 @@ def test_selected_tools_sorted_deterministically(monkeypatch):
 
 
 def test_field_refs_only_in_dynamic_suffix(monkeypatch):
-    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: SMILES_SCHEMA)
+    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: ESM_SEQUENCE_SCHEMA)
     stable, dynamic, _ = _sections_for(_projection(fields=[_field(field_ref="material:only_dynamic")]))
     assert "material:only_dynamic" not in stable
     assert "material:only_dynamic" in dynamic
 
 
 def test_missing_required_fields_produce_uninvokable_not_fake_mapping(monkeypatch):
-    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: THRESHOLD_SCHEMA)
+    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: RF_DIFFUSION_SCHEMA)
     result = select_step9_stage2_mappings(
         llm=_LLM({"tools": [{
-            "tool_name": "ChEMBL_search_similarity",
-            "lane_type": "compound_screening",
+            "tool_name": "NvidiaNIM_rfdiffusion",
+            "lane_type": "protein_design",
             "can_invoke": True,
-            "argument_mappings": [{"schema_arg": "smiles", "field_ref": "material:smiles"}],
+            "argument_mappings": [{"schema_arg": "input_pdb", "field_ref": "step8_complex_ref:cand_a:0"}],
             "argument_literals": [],
             "missing_required_fields": [],
             "skip_reason": "",
-            "argument_mapping_reason": "mapped smiles only",
+            "argument_mapping_reason": "mapped input only",
         }]}),
         readiness_projection=_projection(
-            fields=[_field(field_ref="material:smiles")],
-            reqs=[_req("ChEMBL_search_similarity", "compound_screening", ["smiles", "threshold"])],
+            fields=[_step8_complex_field()],
+            reqs=[_req("NvidiaNIM_rfdiffusion", "protein_design", ["input_pdb", "contigs"])],
         ),
-        selected_tools=_selected("ChEMBL_search_similarity", "compound_screening"),
+        selected_tools=_selected("NvidiaNIM_rfdiffusion", "protein_design"),
         candidate_id="cand_a",
     )
     tool = result.mapped_tools[0]
     assert tool.can_invoke is False
-    assert tool.missing_required_fields == ["threshold"]
+    assert tool.missing_required_fields == ["contigs"]
 
 
 def test_official_literal_accepted_only_when_schema_permits():
     tool = {
-        "tool_name": "ZINC_search_by_smiles",
-        "lane_type": "compound_screening",
-        "full_schema": SMILES_SCHEMA,
-        "required_fields": ["operation", "smiles"],
+        "tool_name": "ESM_generate_protein_sequence",
+        "lane_type": "protein_design",
+        "full_schema": ESM_SEQUENCE_SCHEMA,
+        "required_fields": ["task", "prompt_sequence"],
     }
     valid = validate_step9_stage2_mapping(
         response_item={
-            "tool_name": "ZINC_search_by_smiles",
-            "lane_type": "compound_screening",
+            "tool_name": "ESM_generate_protein_sequence",
+            "lane_type": "protein_design",
             "can_invoke": True,
-            "argument_mappings": [{"schema_arg": "smiles", "field_ref": "material:smiles"}],
-            "argument_literals": [{"schema_arg": "operation", "literal_value": "similarity"}],
+            "argument_mappings": [{"schema_arg": "prompt_sequence", "field_ref": "material:sequence"}],
+            "argument_literals": [{"schema_arg": "task", "literal_value": "generate"}],
             "missing_required_fields": [],
         },
         selected_tool=tool,
-        available_fields=[_field(field_ref="material:smiles").model_dump()],
+        available_fields=[_field(field_ref="material:sequence").model_dump()],
     )
     invalid = validate_step9_stage2_mapping(
         response_item={
-            "tool_name": "ZINC_search_by_smiles",
-            "lane_type": "compound_screening",
+            "tool_name": "ESM_generate_protein_sequence",
+            "lane_type": "protein_design",
             "can_invoke": True,
-            "argument_mappings": [{"schema_arg": "smiles", "field_ref": "material:smiles"}],
-            "argument_literals": [{"schema_arg": "operation", "literal_value": "invented"}],
+            "argument_mappings": [{"schema_arg": "prompt_sequence", "field_ref": "material:sequence"}],
+            "argument_literals": [{"schema_arg": "task", "literal_value": "invented"}],
             "missing_required_fields": [],
         },
         selected_tool=tool,
-        available_fields=[_field(field_ref="material:smiles").model_dump()],
+        available_fields=[_field(field_ref="material:sequence").model_dump()],
     )
     assert valid.can_invoke is True
-    assert valid.argument_literals[0].literal_value == "similarity"
+    assert valid.argument_literals[0].literal_value == "generate"
     assert invalid.can_invoke is True  # deterministic singleton literal repairs it
-    assert invalid.argument_literals[0].literal_value == "similarity"
-    assert "literal_not_allowed:operation" in invalid.argument_mapping_reason
+    assert invalid.argument_literals[0].literal_value == "generate"
+    assert "literal_not_allowed:task" in invalid.argument_mapping_reason
 
 
 def test_hallucinated_schema_arg_is_dropped_and_duplicate_does_not_overwrite():
     tool = {
-        "tool_name": "ZINC_search_by_smiles",
-        "lane_type": "compound_screening",
-        "full_schema": SMILES_SCHEMA,
-        "required_fields": ["smiles"],
+        "tool_name": "ESM_generate_protein_sequence",
+        "lane_type": "protein_design",
+        "full_schema": ESM_SEQUENCE_SCHEMA,
+        "required_fields": ["prompt_sequence"],
     }
     mapped = validate_step9_stage2_mapping(
         response_item={
-            "tool_name": "ZINC_search_by_smiles",
-            "lane_type": "compound_screening",
+            "tool_name": "ESM_generate_protein_sequence",
+            "lane_type": "protein_design",
             "can_invoke": True,
             "argument_mappings": [
-                {"schema_arg": "smiles", "field_ref": "material:smiles_a"},
-                {"schema_arg": "smiles", "field_ref": "material:smiles_b"},
-                {"schema_arg": "not_in_schema", "field_ref": "material:smiles_a"},
+                {"schema_arg": "prompt_sequence", "field_ref": "material:sequence_a"},
+                {"schema_arg": "prompt_sequence", "field_ref": "material:sequence_b"},
+                {"schema_arg": "not_in_schema", "field_ref": "material:sequence_a"},
             ],
             "argument_literals": [],
             "missing_required_fields": [],
         },
         selected_tool=tool,
-        available_fields=[_field(field_ref="material:smiles_a").model_dump(), _field(field_ref="material:smiles_b").model_dump()],
+        available_fields=[_field(field_ref="material:sequence_a").model_dump(), _field(field_ref="material:sequence_b").model_dump()],
     )
     assert mapped.can_invoke is True
     assert [(m.schema_arg, m.field_ref) for m in mapped.argument_mappings] == [
-        ("smiles", "material:smiles_a")
+        ("prompt_sequence", "material:sequence_a")
     ]
-    assert "duplicate_schema_arg:smiles" in mapped.argument_mapping_reason
+    assert "duplicate_schema_arg:prompt_sequence" in mapped.argument_mapping_reason
     assert "schema_arg_not_in_full_schema:not_in_schema" in mapped.argument_mapping_reason
 
 
@@ -452,37 +463,45 @@ def test_proteinmpnn_with_true_complex_maps_input_pdb(monkeypatch):
     assert tool.argument_mappings[0].schema_arg == "input_pdb"
 
 
-def test_chembl_similarity_smiles_without_threshold_uninvokable(monkeypatch):
-    tool = _run_mapping(
-        monkeypatch,
-        tool_name="ChEMBL_search_similarity",
-        lane_type="compound_screening",
-        schema=THRESHOLD_SCHEMA,
-        fields={"smiles": _field(field_ref="material:smiles", value_kind="smiles")},
-    )
-    assert tool.can_invoke is False
-    assert tool.missing_required_fields == ["threshold"]
-
-
-def test_zinc_search_by_smiles_maps_operation_literal_and_smiles(monkeypatch):
+def test_dynamut_missing_chain_uninvokable(monkeypatch):
     schema = {
         "type": "object",
-        "properties": {
-            "operation": {"type": "string", "enum": ["search_by_smiles"]},
-            "smiles": {"type": "string"},
-        },
-        "required": ["operation", "smiles"],
+        "properties": {"pdb_id": {"type": "string"}, "chain": {"type": "string"}, "mutation": {"type": "string"}},
+        "required": ["pdb_id", "chain", "mutation"],
     }
     tool = _run_mapping(
         monkeypatch,
-        tool_name="ZINC_search_by_smiles",
-        lane_type="compound_screening",
+        tool_name="DynaMut2_predict_stability",
+        lane_type="variant_evaluation",
         schema=schema,
-        fields={"smiles": _field(field_ref="material:smiles", value_kind="smiles")},
+        fields={
+            "pdb_id": _field(field_ref="identifier:pdb_id:1N8Z", value_kind="pdb_id", field_type="structure_identifier"),
+            "mutation": _field(field_ref="identifier:mutation:V777L", value_kind="mutation", field_type="variant"),
+        },
+    )
+    assert tool.can_invoke is False
+    assert tool.missing_required_fields == ["chain"]
+
+
+def test_esm_generate_sequence_maps_task_literal_and_prompt_sequence(monkeypatch):
+    schema = {
+        "type": "object",
+        "properties": {
+            "task": {"type": "string", "enum": ["generate"]},
+            "prompt_sequence": {"type": "string"},
+        },
+        "required": ["task", "prompt_sequence"],
+    }
+    tool = _run_mapping(
+        monkeypatch,
+        tool_name="ESM_generate_protein_sequence",
+        lane_type="protein_design",
+        schema=schema,
+        fields={"prompt_sequence": _field(field_ref="material:sequence", value_kind="sequence_material")},
     )
     assert tool.can_invoke is True
-    assert tool.argument_mappings[0].schema_arg == "smiles"
-    assert tool.argument_literals[0].literal_value == "search_by_smiles"
+    assert tool.argument_mappings[0].schema_arg == "prompt_sequence"
+    assert tool.argument_literals[0].literal_value == "generate"
 
 
 def test_no_raw_sequence_pdb_or_tooluniverse_payload_in_mapping_audit(monkeypatch):

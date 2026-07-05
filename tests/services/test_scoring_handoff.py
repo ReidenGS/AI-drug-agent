@@ -97,49 +97,19 @@ def test_step10_aggregates_step5_through_9_into_handoff(
     assert refs.structure_variant_and_compound_screening_id
 
 
-def test_step10_partial_when_no_compound_hits(
+def test_step10_does_not_require_legacy_compound_hits(
     local_storage, registry_service, workflow_state_service
 ):
-    """Force Step 9 wrappers to fail so the compound_screening_artifact has
-    zero hits; Step 10 must mark `partial` + a missing_inputs flag."""
+    """Step 9 compound hits are legacy-compatible fields, not required scoring inputs."""
     run_id = _seed_through_step_9(
         local_storage, registry_service, workflow_state_service, with_smiles=False
     )
-    # Re-run Step 9 with all ZINC wrappers as NotImplementedError → no hits.
-    from app.mcp.tools._registry import _all_bindings
-    bindings = dict(_all_bindings())
-
-    def _ni(**_):
-        raise NotImplementedError
-
-    # Disable every wrapper Step 9 can reach so compound_screening_artifact
-    # ends up empty. This list intentionally mirrors AGENT_TOOL_OVERRIDES for
-    # ("structure_and_design_agent", "step_09"); when new wrappers get
-    # adapter-wired (e.g. ChEMBL_search_molecules), update this list too.
-    for name in (
-        "ZINC_search_compounds", "ZINC_get_compound",
-        "ZINC_search_by_smiles", "ZINC_search_by_properties",
-        "ZINC_get_purchasable",
-        "ChEMBL_search_molecules", "ChEMBL_search_similarity",
-        "ChEMBL_search_substructure",
-    ):
-        bindings[name] = _ni
-    sd_mcp = LocalMCPClient(
-        inventory=ToolInventoryService(
-            os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))
-        ),
-        bindings=bindings,
-    )
-    StructureAndDesignAgent(
-        storage=local_storage, registry=registry_service,
-        workflow_state=workflow_state_service, mcp_client=sd_mcp,
-    ).run_step_9(run_id)
 
     pkg = ScoringHandoffService(
         local_storage, registry_service, workflow_state_service
     ).prepare(run_id)
-    assert pkg.handoff_status == "partial"
-    assert any("compound" in flag for flag in pkg.missing_inputs)
+    assert pkg.handoff_status == "awaiting_external_scoring"
+    assert not any("compound" in flag for flag in pkg.missing_inputs)
 
 
 def test_step10_does_not_embed_raw_mcp_payloads(
