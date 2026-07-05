@@ -578,17 +578,50 @@ def test_parser_models_produce_real_strict_schema():
     production gate — not a fake-client assertion that `parse` was called."""
     from openai.lib._pydantic import to_strict_json_schema
 
+    # Currently ACTIVE parser tasks. step6_schema_mapping_stage_2 is
+    # temporarily disabled from the parser path (json_object instead) while
+    # the Step 6 Stage 2 prompt still asks for the legacy dynamic-dict shape.
     assert set(_RESPONSE_MODEL_FOR_TASK) == {
         "tool_selection_stage_1",
         "step6_schema_mapping_stage_1",
-        "step6_schema_mapping_stage_2",
         "step9_tool_selection_stage_1",
         "step9_tool_schema_mapping_stage_2",
     }
+    assert "step6_schema_mapping_stage_2" not in _RESPONSE_MODEL_FOR_TASK
     for task, model in _RESPONSE_MODEL_FOR_TASK.items():
         schema = to_strict_json_schema(model)
         violations = _strict_schema_violations(schema)
         assert not violations, f"{task}/{model.__name__} strict-schema violations: {violations}"
+
+
+def test_disabled_step6_stage2_parser_model_is_still_strict_for_future_use():
+    """The Step 6 Stage 2 list-of-pairs parser model is TEMPORARILY DISABLED
+    from the active parser path but kept for future re-enable. It must still
+    produce a genuinely strict schema so re-enabling is a one-line change."""
+    from openai.lib._pydantic import to_strict_json_schema
+
+    schema = to_strict_json_schema(_Step6SchemaMappingStage2ParserResponse)
+    violations = _strict_schema_violations(schema)
+    assert not violations, f"disabled step6 stage2 model strict-schema violations: {violations}"
+
+
+def test_step6_stage2_uses_json_object_path_not_parser():
+    """Even when the parser IS available, step6_schema_mapping_stage_2 must go
+    through the json_object path (returning the legacy dynamic-dict shape),
+    because it is disabled from the parser registry."""
+    client = _fake_openai_client(
+        has_parse=True,
+        create=_chat_response(
+            '{"tools":[{"tool_name":"DrugProps_pains_filter","can_invoke":true,'
+            '"argument_mapping":{"smiles":"candidate:c1:material:m1:value"},'
+            '"missing_required_fields":[],"argument_mapping_reason":"mapped"}]}'
+        ),
+    )
+    provider = _provider_with_client(client)
+    out = provider.generate_json("map", schema={"task": "step6_schema_mapping_stage_2"})
+    assert client._calls["parse"] == []  # parser NOT used for disabled task
+    assert len(client._calls["create"]) == 1
+    assert out["tools"][0]["argument_mapping"] == {"smiles": "candidate:c1:material:m1:value"}
 
 
 def test_structured_query_not_routed_to_strict_parser():
@@ -842,9 +875,15 @@ def test_openai_structured_query_stays_on_json_object_path():
     assert out["requested_outputs"] == ["ranked_candidates", "report"]
 
 
-def test_openai_step6_stage2_parser_list_of_pairs_converts_to_dynamic_dict():
-    """The Step 6 Stage 2 strict list-of-pairs parser output is folded back to
-    the external dynamic-dict shape (argument_mapping / argument_literals)."""
+# ── Step 6 Stage 2 parser model: TEMPORARILY DISABLED, kept for future ──────
+# These exercise the KEPT list-of-pairs parser model + `to_external_dict`
+# directly (NOT the provider routing, which is json_object for this task now),
+# so the conversion + duplicate-guard code stays covered for a future
+# re-enable. See `test_step6_stage2_uses_json_object_path_not_parser` for the
+# active routing behavior.
+
+
+def test_future_step6_stage2_model_list_of_pairs_converts_to_dynamic_dict():
     parsed = _Step6SchemaMappingStage2ParserResponse(
         tools=[{
             "tool_name": "SwissADME_calculate_adme",
@@ -859,16 +898,8 @@ def test_openai_step6_stage2_parser_list_of_pairs_converts_to_dynamic_dict():
             "argument_mapping_reason": "smiles mapped; operation is a schema literal",
         }]
     )
-    client = _fake_openai_client(parse=_parsed_response(parsed))
-    provider = _provider_with_client(client)
-    out = provider.generate_json("map", schema={"task": "step6_schema_mapping_stage_2"})
-
-    assert client._calls["parse"] and not client._calls["create"]
-    assert client._calls["parse"][0]["response_format"] is _Step6SchemaMappingStage2ParserResponse
-    assert isinstance(out, dict)
-    assert not isinstance(out, _Step6SchemaMappingStage2ParserResponse)
-    tool = out["tools"][0]
-    # list-of-pairs → dynamic dict
+    external = parsed.to_external_dict()
+    tool = external["tools"][0]
     assert tool["argument_mapping"] == {"smiles": "candidate:c1:material:m1:value"}
     assert tool["argument_literals"] == {"operation": "calculate_adme"}
     assert tool["can_invoke"] is True
@@ -876,7 +907,7 @@ def test_openai_step6_stage2_parser_list_of_pairs_converts_to_dynamic_dict():
     assert tool["argument_mapping_reason"].startswith("smiles mapped")
 
 
-def test_openai_step6_stage2_argument_literals_empty_list_becomes_empty_dict():
+def test_future_step6_stage2_model_empty_literals_becomes_empty_dict():
     parsed = _Step6SchemaMappingStage2ParserResponse(
         tools=[{
             "tool_name": "DrugProps_pains_filter",
@@ -888,14 +919,12 @@ def test_openai_step6_stage2_argument_literals_empty_list_becomes_empty_dict():
             "missing_required_fields": [],
         }]
     )
-    client = _fake_openai_client(parse=_parsed_response(parsed))
-    provider = _provider_with_client(client)
-    out = provider.generate_json("map", schema={"task": "step6_schema_mapping_stage_2"})
-    assert out["tools"][0]["argument_literals"] == {}
-    assert out["tools"][0]["argument_mapping"] == {"smiles": "candidate:c1:material:m1:value"}
+    external = parsed.to_external_dict()
+    assert external["tools"][0]["argument_literals"] == {}
+    assert external["tools"][0]["argument_mapping"] == {"smiles": "candidate:c1:material:m1:value"}
 
 
-def test_openai_step6_stage2_can_invoke_false_empty_mappings_missing_fields():
+def test_future_step6_stage2_model_can_invoke_false_empty_mappings_missing_fields():
     parsed = _Step6SchemaMappingStage2ParserResponse(
         tools=[{
             "tool_name": "PDBePISA_get_interfaces",
@@ -906,53 +935,17 @@ def test_openai_step6_stage2_can_invoke_false_empty_mappings_missing_fields():
             "argument_mapping_reason": "no pdb_id available",
         }]
     )
-    client = _fake_openai_client(parse=_parsed_response(parsed))
-    provider = _provider_with_client(client)
-    out = provider.generate_json("map", schema={"task": "step6_schema_mapping_stage_2"})
-    tool = out["tools"][0]
+    external = parsed.to_external_dict()
+    tool = external["tools"][0]
     assert tool["can_invoke"] is False
     assert tool["argument_mapping"] == {}
     assert tool["argument_literals"] == {}
     assert tool["missing_required_fields"] == ["pdb_id"]
 
 
-def test_openai_step6_stage2_duplicate_schema_arg_raises_then_retry_succeeds():
-    """Duplicate argument_mapping schema_arg raises (no silent overwrite),
-    triggering a retry; a clean second parse succeeds."""
-    dup = _Step6SchemaMappingStage2ParserResponse(
-        tools=[{
-            "tool_name": "SwissADME_calculate_adme",
-            "can_invoke": True,
-            "argument_mappings": [
-                {"schema_arg": "smiles", "field_ref": "candidate:c1:material:m1:value"},
-                {"schema_arg": "smiles", "field_ref": "candidate:c1:material:m2:value"},
-            ],
-            "argument_literals": [],
-            "missing_required_fields": [],
-        }]
-    )
-    good = _Step6SchemaMappingStage2ParserResponse(
-        tools=[{
-            "tool_name": "SwissADME_calculate_adme",
-            "can_invoke": True,
-            "argument_mappings": [
-                {"schema_arg": "smiles", "field_ref": "candidate:c1:material:m1:value"},
-            ],
-            "argument_literals": [],
-            "missing_required_fields": [],
-        }]
-    )
-    seq = iter([_parsed_response(dup), _parsed_response(good)])
-    client = _fake_openai_client(parse=lambda **kw: next(seq))
-    provider = _provider_with_client(client, max_retries=1)
-    out = provider.generate_json("map", schema={"task": "step6_schema_mapping_stage_2"})
-    assert len(client._calls["parse"]) == 2  # retried after duplicate
-    assert out["tools"][0]["argument_mapping"] == {"smiles": "candidate:c1:material:m1:value"}
-
-
-def test_openai_step6_stage2_duplicate_schema_arg_exhausts_retries():
-    """Persistent duplicate → OpenAIProviderError after retries (never a
-    silent overwrite / fake success)."""
+def test_future_step6_stage2_model_duplicate_schema_arg_raises_no_silent_overwrite():
+    """Duplicate argument_mapping schema_arg raises (never a silent overwrite)
+    at conversion time, so a future re-enable keeps that guarantee."""
     dup = _Step6SchemaMappingStage2ParserResponse(
         tools=[{
             "tool_name": "SwissADME_calculate_adme",
@@ -965,10 +958,8 @@ def test_openai_step6_stage2_duplicate_schema_arg_exhausts_retries():
             "missing_required_fields": [],
         }]
     )
-    client = _fake_openai_client(parse=_parsed_response(dup))
-    provider = _provider_with_client(client, max_retries=1)
     with pytest.raises(OpenAIProviderError, match="duplicate argument_mapping"):
-        provider.generate_json("map", schema={"task": "step6_schema_mapping_stage_2"})
+        dup.to_external_dict()
 
 
 def test_openai_step6_stage2_fallback_json_object_accepts_old_dict_shape():

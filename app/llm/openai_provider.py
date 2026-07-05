@@ -52,13 +52,13 @@ def _validate_task_shape(data: dict, task: str) -> dict:
 #   - tool_selection_stage_1
 #   - step6_schema_mapping_stage_1
 #
-# step6_schema_mapping_stage_2 has dynamic `schema_arg -> value` maps
-# (`argument_mapping` / `argument_literals`, keys unknown at author time). A
-# dynamic-key object is inherently `additionalProperties: true`, so the parser
-# model uses a strict LIST-OF-PAIRS shape instead, and the provider converts
-# it back to the dynamic-dict external shape (see `_Step6Stage2ToolForParser.
-# to_external_dict`). The external `generate_json` return + Step 6 agent shape
-# are unchanged.
+# step6_schema_mapping_stage_2 has a strict LIST-OF-PAIRS parser model
+# (`_Step6SchemaMappingStage2ParserResponse` + `to_external_dict`) that folds
+# dynamic `schema_arg -> value` maps back to the dynamic-dict external shape.
+# It is TEMPORARILY DISABLED (not registered in `_RESPONSE_MODEL_FOR_TASK`)
+# because the current Step 6 Stage 2 prompt still asks for the legacy
+# dynamic-dict shape; the task therefore runs on the json_object path until
+# the prompt/shared validation path is migrated to list-of-pairs.
 #
 # The authoritative per-task validation still runs afterward on the external
 # dict.
@@ -186,7 +186,14 @@ class _Step9SchemaMappingStage2Response(BaseModel):
         return {"tools": tools_out}
 
 
-# ── Step 6 Stage 2: strict list-of-pairs parser shape ──────────────────────
+# ── Step 6 Stage 2: strict list-of-pairs parser shape (TEMPORARILY DISABLED) ─
+#
+# Temporarily disabled because the current Step 6 Stage 2 prompt still asks
+# for the legacy dynamic-dict shape. Re-enable only after the prompt/shared
+# validation path is migrated to list-of-pairs. These models + to_external_dict
+# are intentionally KEPT (not deleted) for that future re-enable; they are just
+# not registered in `_RESPONSE_MODEL_FOR_TASK`, so step6_schema_mapping_stage_2
+# currently runs through the json_object path.
 #
 # The external step6_schema_mapping_stage_2 shape has dynamic `schema_arg`
 # keys; the strict parser model expresses those as explicit
@@ -275,7 +282,19 @@ class _Step6SchemaMappingStage2ParserResponse(BaseModel):
 _RESPONSE_MODEL_FOR_TASK: dict[str, type[BaseModel]] = {
     "tool_selection_stage_1": _ToolSelectionStage1Response,
     "step6_schema_mapping_stage_1": _Step6SchemaMappingStage1Response,
-    "step6_schema_mapping_stage_2": _Step6SchemaMappingStage2ParserResponse,
+    # step6_schema_mapping_stage_2 is TEMPORARILY DISABLED from the official
+    # parser path. The current Step 6 Stage 2 prompt still asks for the legacy
+    # dynamic-dict shape ({"argument_mapping": {schema_arg: field_ref},
+    # "argument_literals": {schema_arg: literal}}), so routing it through the
+    # list-of-pairs parser model would make the parser schema and the prompt
+    # output requirement inconsistent. Until the prompt + shared validation
+    # path are migrated to list-of-pairs, this task goes through the
+    # json_object path (the legacy dict shape). Re-enable by restoring:
+    #     "step6_schema_mapping_stage_2": _Step6SchemaMappingStage2ParserResponse,
+    # The parser models below (_Step6Stage2ArgumentMapping /
+    # _Step6Stage2ArgumentLiteral / _Step6Stage2ToolForParser /
+    # _Step6SchemaMappingStage2ParserResponse + to_external_dict) are kept for
+    # that future re-enable.
     "step9_tool_selection_stage_1": _Step9ToolSelectionStage1Response,
     "step9_tool_schema_mapping_stage_2": _Step9SchemaMappingStage2Response,
 }
@@ -361,14 +380,14 @@ class OpenAIProvider:
         """Generate a JSON object and validate the expected top-level shape.
 
         OpenAI is JSON-only here. For the tasks in ``_RESPONSE_MODEL_FOR_TASK``
-        (tool_selection_stage_1, step6_schema_mapping_stage_1,
-        step6_schema_mapping_stage_2) it prefers the official structured-output
-        parser (``…completions.parse``) and falls back to the json_object path
-        when the running SDK/backend does not support it. Step 6 Stage 2 uses a
-        strict list-of-pairs parser model that the provider folds back to the
-        external dynamic-dict shape, so the ``generate_json`` return and the
-        Step 6 agent shape are unchanged. ``structured_query`` (deeply nested /
-        variant fields) stays on the json_object path. The external
+        (currently tool_selection_stage_1, step6_schema_mapping_stage_1, and the
+        step9 parser tasks) it prefers the official structured-output parser
+        (``…completions.parse``) and falls back to the json_object path when the
+        running SDK/backend does not support it. ``step6_schema_mapping_stage_2``
+        is TEMPORARILY DISABLED from the parser path (its list-of-pairs model is
+        kept for future re-enable) and therefore runs on the json_object path
+        with the legacy dynamic-dict shape. ``structured_query`` (deeply nested /
+        variant fields) also stays on the json_object path. The external
         ``generate_json`` contract is unchanged: same args, same ``dict``
         return, same validation + Step 2 normalization.
         """
