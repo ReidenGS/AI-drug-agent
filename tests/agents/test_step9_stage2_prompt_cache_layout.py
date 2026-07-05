@@ -1,10 +1,18 @@
-"""Step 9 Stage 2 prompt cache-friendly layout tests."""
+"""Step 9 Stage 2 prompt cache-friendly layout tests.
+
+Stage 2 now consumes ONLY `Step9InputProjection.input_fields` (rendered as
+the `step9_input_fields` payload key) — never Step 5/7/8 raw artifacts, and
+never the legacy `step9_available_fields` hard-gate shape.
+"""
 
 from __future__ import annotations
 
 import json
 
+import pytest
+
 from app.agents import step_09_selection_policy as step9sel
+from app.agents.step_09_input_projection import DuplicateStep9InputFieldError
 from app.agents.step_09_selection_policy import (
     STEP9_STAGE2_SYSTEM_PROMPT,
     STEP9_STAGE2_USER_PROMPT,
@@ -14,11 +22,6 @@ from app.agents.step_09_selection_policy import (
     validate_step9_stage2_mapping,
 )
 from app.llm.json_task_validation import build_json_prompt, build_json_prompt_sections
-from app.schemas.step_09_structure_variant_and_compound_screening import (
-    Step9AvailableField,
-    Step9LaneStatus,
-    Step9ToolSchemaRequirement,
-)
 
 
 RAW_SEQ = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
@@ -42,6 +45,17 @@ class _LLM:
         return self.response
 
 
+class _ExplodingLLM:
+    name = "must-not-call"
+    model = "must-not-call"
+
+    def generate(self, prompt: str, *, system: str | None = None, **kwargs):
+        raise AssertionError("LLM should not be called")
+
+    def generate_json(self, prompt: str, *, schema: dict, system: str | None = None) -> dict:
+        raise AssertionError("LLM should not be called")
+
+
 ESM_SEQUENCE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -62,58 +76,47 @@ RF_DIFFUSION_SCHEMA = {
 }
 
 
-def _field(candidate_id="cand_a", field_ref="material:mat_a", value_kind="sequence_material", field_type="protein_sequence"):
-    return Step9AvailableField(
-        candidate_id=candidate_id,
-        field_ref=field_ref,
-        provider="step_05",
-        field_type=field_type,
-        value_kind=value_kind,
-    )
+def _field(
+    candidate_id="cand_a",
+    field_ref="material:mat_a",
+    value_kind="sequence_ref",
+    field_type="protein_sequence",
+    supports_tool_args=None,
+    status="available",
+    can_resolve_at_runtime=True,
+):
+    return {
+        "field_ref": field_ref,
+        "candidate_id": candidate_id,
+        "source_step": "step_05",
+        "source_artifact": "candidate_context_table",
+        "source_path": "candidate_records[].materials[]",
+        "field_name": "field",
+        "field_type": field_type,
+        "value_kind": value_kind,
+        "supports_tool_args": supports_tool_args if supports_tool_args is not None else ["sequence", "prompt_sequence"],
+        "can_resolve_at_runtime": can_resolve_at_runtime,
+        "status": status,
+    }
 
 
 def _step8_complex_field(candidate_id="cand_a", field_ref="step8_complex_ref:cand_a:0"):
-    return Step9AvailableField(
+    return _field(
         candidate_id=candidate_id,
         field_ref=field_ref,
-        provider="step_08",
-        field_type="structure",
         value_kind="complex_structure_ref",
-        source_ref="1N8Z",
+        field_type="complex_structure",
+        supports_tool_args=["input_pdb", "pdb_file", "structure", "complex_structure", "backbone"],
     )
 
 
-def _req(tool_name="ESM_generate_protein_sequence", lane_type="protein_design", required=None):
-    required = required or ["prompt_sequence"]
-    return Step9ToolSchemaRequirement(
-        candidate_id="cand_a",
-        tool_name=tool_name,
-        lane_type=lane_type,  # type: ignore[arg-type]
-        required_fields=required,
-        schema_source="signature",
-        satisfiable_required_fields=required,
-        missing_required_fields=[],
-        hard_gate_decision="allowed",
-        reason="schema_requirements_satisfied",
-    )
-
-
-def _lane(candidate_id="cand_a", tool_name="ESM_generate_protein_sequence"):
-    return Step9LaneStatus(
-        lane_type="protein_design",
-        candidate_id=candidate_id,
-        candidate_type="target_antigen",
-        status="ready",
-        allowed_tools=[tool_name],
-        available_field_refs=[f"material:{candidate_id}_mat"],
-    )
-
-
-def _projection(fields=None, reqs=None, lanes=None):
+def _projection(fields=None, canonical_query="", raw_user_query=""):
     return {
-        "step9_available_fields": fields if fields is not None else [_field()],
-        "step9_tool_schema_requirements": reqs if reqs is not None else [_req(required=["task", "prompt_sequence"])],
-        "step9_lane_statuses": lanes if lanes is not None else [_lane()],
+        "input_fields": fields if fields is not None else [_field()],
+        "candidate_summaries": [],
+        "handoff_summary": {"candidates": []},
+        "missing_inputs": [],
+        "query_summary": {"canonical_query": canonical_query, "raw_user_query": raw_user_query},
     }
 
 
@@ -121,14 +124,11 @@ def _selected(tool_name="ESM_generate_protein_sequence", lane_type="protein_desi
     return [Step9Stage1SelectionAudit(tool_name=tool_name, lane_type=lane_type, selection_reason=reason)]
 
 
-def _sections_for(projection, *, selected=None, candidate_id="cand_a", canonical_query="", raw_user_query=""):
+def _sections_for(projection, *, selected=None, candidate_id="cand_a"):
     payload = build_step9_stage2_payload(
         candidate_id=candidate_id,
         selected_tools=selected or _selected(),
-        readiness_projection=projection,
-        canonical_query=canonical_query,
-        raw_user_query=raw_user_query,
-        step8_downstream_handoff_status=[{"candidate_id": candidate_id, "has_complex_structure": False}],
+        projection=projection,
     )
     stable, dynamic = build_json_prompt_sections(
         prompt=STEP9_STAGE2_USER_PROMPT,
@@ -153,23 +153,32 @@ def test_same_selected_schema_set_different_candidate_fields_stable_prefix_ident
     stable_a, _, _ = _sections_for(
         _projection(fields=[_field("cand_alpha", "material:alpha")]),
         candidate_id="cand_alpha",
-        canonical_query="alpha query",
     )
     stable_b, _, _ = _sections_for(
         _projection(fields=[_field("cand_beta", "material:beta")]),
         candidate_id="cand_beta",
-        canonical_query="beta query",
     )
     assert stable_a == stable_b
+
+
+def test_no_selected_tools_skips_stage2_llm_call():
+    result = select_step9_stage2_mappings(
+        llm=_ExplodingLLM(),
+        projection=_projection(),
+        selected_tools=[],
+        candidate_id="cand_no_selected",
+    )
+    assert result.schema_survivors == []
+    assert result.mapped_tools == []
+    assert result.uninvokable_tools == []
+    assert result.argument_mapping_audit == []
 
 
 def test_candidate_specific_data_only_after_stable_prefix(monkeypatch):
     monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: ESM_SEQUENCE_SCHEMA)
     stable, dynamic, full = _sections_for(
-        _projection(fields=[_field("cand_SENTINEL", "material:field_SENTINEL")]),
+        _projection(fields=[_field("cand_SENTINEL", "material:field_SENTINEL")], canonical_query="CANONICAL_SENTINEL", raw_user_query="RAW_SENTINEL"),
         candidate_id="cand_SENTINEL",
-        canonical_query="CANONICAL_SENTINEL",
-        raw_user_query="RAW_SENTINEL",
     )
     for needle in ("cand_SENTINEL", "material:field_SENTINEL", "CANONICAL_SENTINEL", "RAW_SENTINEL"):
         assert needle not in stable
@@ -185,15 +194,38 @@ def test_stable_prefix_includes_only_selected_tool_schemas(monkeypatch):
     )
     names = [tool["tool_name"] for tool in _stable_tools(stable)]
     assert names == ["ESM_generate_protein_sequence"]
-    assert "AlphaMissense_get_variant_score" not in stable
+    assert "AlphaMissense_get_variant_score" not in names
+
+
+def test_stable_prefix_declares_stage2_output_fields_and_few_shots(monkeypatch):
+    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: ESM_SEQUENCE_SCHEMA)
+    stable, dynamic, _ = _sections_for(
+        _projection(fields=[_field("cand_SENTINEL", "material:field_SENTINEL")], canonical_query="CANONICAL_SENTINEL", raw_user_query="RAW_SENTINEL"),
+        candidate_id="cand_SENTINEL",
+    )
+    for needle in (
+        '"tools"',
+        '"can_invoke"',
+        '"argument_mappings"',
+        '"argument_literals"',
+        '"missing_required_fields"',
+        '"skip_reason"',
+        '"argument_mapping_reason"',
+        "DynaMut2_predict_stability",
+        '"field_ref": "identifier:mutation:V777L"',
+        "supports_tool_args includes",
+        "missing_required_fields",
+    ):
+        assert needle in stable
+    for dynamic_only in ("cand_SENTINEL", "material:field_SENTINEL", "CANONICAL_SENTINEL", "RAW_SENTINEL"):
+        assert dynamic_only not in stable
+        assert dynamic_only in dynamic
 
 
 def test_stable_prefix_excludes_raw_sequence_pdb_fasta_a3m_and_api_key(monkeypatch):
     monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: ESM_SEQUENCE_SCHEMA)
     stable, dynamic, full = _sections_for(
-        _projection(),
-        canonical_query=f"{RAW_SEQ} sk-secretvalue123",
-        raw_user_query=f"{RAW_PDB}\n>seq\n{RAW_SEQ}\nA3M",
+        _projection(canonical_query=f"{RAW_SEQ} sk-secretvalue123", raw_user_query=f"{RAW_PDB}\n>seq\n{RAW_SEQ}\nA3M"),
     )
     for forbidden in (RAW_SEQ, "HEADER TEST PDB", "ATOM      1", "sk-secretvalue123"):
         assert forbidden not in stable
@@ -204,10 +236,7 @@ def test_stable_prefix_excludes_raw_sequence_pdb_fasta_a3m_and_api_key(monkeypat
 def test_selected_tools_sorted_deterministically(monkeypatch):
     monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: ESM_SEQUENCE_SCHEMA)
     stable, _, _ = _sections_for(
-        _projection(reqs=[
-            _req("ESM_generate_protein_sequence", "protein_design"),
-            _req("AlphaMissense_get_variant_score", "variant_evaluation"),
-        ]),
+        _projection(),
         selected=[
             Step9Stage1SelectionAudit(tool_name="AlphaMissense_get_variant_score", lane_type="variant_evaluation"),
             Step9Stage1SelectionAudit(tool_name="ESM_generate_protein_sequence", lane_type="protein_design"),
@@ -237,10 +266,7 @@ def test_missing_required_fields_produce_uninvokable_not_fake_mapping(monkeypatc
             "skip_reason": "",
             "argument_mapping_reason": "mapped input only",
         }]}),
-        readiness_projection=_projection(
-            fields=[_step8_complex_field()],
-            reqs=[_req("NvidiaNIM_rfdiffusion", "protein_design", ["input_pdb", "contigs"])],
-        ),
+        projection=_projection(fields=[_step8_complex_field()]),
         selected_tools=_selected("NvidiaNIM_rfdiffusion", "protein_design"),
         candidate_id="cand_a",
     )
@@ -266,7 +292,7 @@ def test_official_literal_accepted_only_when_schema_permits():
             "missing_required_fields": [],
         },
         selected_tool=tool,
-        available_fields=[_field(field_ref="material:sequence").model_dump()],
+        available_fields=[_field(field_ref="material:sequence")],
     )
     invalid = validate_step9_stage2_mapping(
         response_item={
@@ -278,7 +304,7 @@ def test_official_literal_accepted_only_when_schema_permits():
             "missing_required_fields": [],
         },
         selected_tool=tool,
-        available_fields=[_field(field_ref="material:sequence").model_dump()],
+        available_fields=[_field(field_ref="material:sequence")],
     )
     assert valid.can_invoke is True
     assert valid.argument_literals[0].literal_value == "generate"
@@ -308,7 +334,7 @@ def test_hallucinated_schema_arg_is_dropped_and_duplicate_does_not_overwrite():
             "missing_required_fields": [],
         },
         selected_tool=tool,
-        available_fields=[_field(field_ref="material:sequence_a").model_dump(), _field(field_ref="material:sequence_b").model_dump()],
+        available_fields=[_field(field_ref="material:sequence_a"), _field(field_ref="material:sequence_b")],
     )
     assert mapped.can_invoke is True
     assert [(m.schema_arg, m.field_ref) for m in mapped.argument_mappings] == [
@@ -318,16 +344,62 @@ def test_hallucinated_schema_arg_is_dropped_and_duplicate_does_not_overwrite():
     assert "schema_arg_not_in_full_schema:not_in_schema" in mapped.argument_mapping_reason
 
 
+def test_field_ref_not_in_projection_is_rejected():
+    tool = {
+        "tool_name": "ESM_generate_protein_sequence",
+        "lane_type": "protein_design",
+        "full_schema": ESM_SEQUENCE_SCHEMA,
+        "required_fields": ["prompt_sequence"],
+    }
+    mapped = validate_step9_stage2_mapping(
+        response_item={
+            "tool_name": "ESM_generate_protein_sequence",
+            "lane_type": "protein_design",
+            "can_invoke": True,
+            "argument_mappings": [{"schema_arg": "prompt_sequence", "field_ref": "material:not_in_projection"}],
+            "argument_literals": [],
+            "missing_required_fields": [],
+        },
+        selected_tool=tool,
+        available_fields=[_field(field_ref="material:sequence_a")],
+    )
+    assert mapped.can_invoke is False
+    assert "prompt_sequence" in mapped.missing_required_fields
+    assert "field_ref_not_available:prompt_sequence" in mapped.argument_mapping_reason
+
+
+def test_schema_arg_not_in_official_schema_is_rejected():
+    tool = {
+        "tool_name": "ESM_generate_protein_sequence",
+        "lane_type": "protein_design",
+        "full_schema": ESM_SEQUENCE_SCHEMA,
+        "required_fields": ["prompt_sequence"],
+    }
+    mapped = validate_step9_stage2_mapping(
+        response_item={
+            "tool_name": "ESM_generate_protein_sequence",
+            "lane_type": "protein_design",
+            "can_invoke": True,
+            "argument_mappings": [{"schema_arg": "not_a_real_arg", "field_ref": "material:sequence_a"}],
+            "argument_literals": [],
+            "missing_required_fields": [],
+        },
+        selected_tool=tool,
+        available_fields=[_field(field_ref="material:sequence_a")],
+    )
+    assert "schema_arg_not_in_full_schema:not_a_real_arg" in mapped.argument_mapping_reason
+    assert mapped.argument_mappings == []
+
+
 def _run_mapping(monkeypatch, *, tool_name, lane_type, schema, fields, response=None):
     monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: schema)
-    required = list(schema.get("required") or [])
     return select_step9_stage2_mappings(
         llm=_LLM(response or {"tools": [{
             "tool_name": tool_name,
             "lane_type": lane_type,
             "can_invoke": True,
             "argument_mappings": [
-                {"schema_arg": arg, "field_ref": field.field_ref}
+                {"schema_arg": arg, "field_ref": field["field_ref"]}
                 for arg, field in fields.items()
             ],
             "argument_literals": [],
@@ -335,10 +407,7 @@ def _run_mapping(monkeypatch, *, tool_name, lane_type, schema, fields, response=
             "skip_reason": "",
             "argument_mapping_reason": "test mapping",
         }]}),
-        readiness_projection=_projection(
-            fields=list(fields.values()),
-            reqs=[_req(tool_name, lane_type, required)],
-        ),
+        projection=_projection(fields=list(fields.values())),
         selected_tools=_selected(tool_name, lane_type),
         candidate_id="cand_a",
     ).mapped_tools[0]
@@ -356,12 +425,47 @@ def test_alphamissense_selected_with_uniprot_and_variant_maps_both_args(monkeypa
         lane_type="variant_evaluation",
         schema=schema,
         fields={
-            "uniprot_id": _field(field_ref="identifier:uniprot_id:P04626", value_kind="uniprot_id", field_type="identifier"),
-            "variant": _field(field_ref="identifier:variant:V777L", value_kind="variant", field_type="variant"),
+            "uniprot_id": _field(field_ref="identifier:uniprot_id:P04626", value_kind="uniprot_id", field_type="identifier", supports_tool_args=["uniprot_id", "accession", "uniprot_accession"]),
+            "variant": _field(field_ref="identifier:variant:V777L", value_kind="variant", field_type="variant", supports_tool_args=["variant", "variants", "mutation", "mutations"]),
         },
     )
     assert tool.can_invoke is True
     assert {m.schema_arg for m in tool.argument_mappings} == {"uniprot_id", "variant"}
+
+
+def test_alphamissense_cannot_use_identifier_only_uniprot_as_raw_sequence(monkeypatch):
+    schema = {
+        "type": "object",
+        "properties": {"sequence": {"type": "string"}},
+        "required": ["sequence"],
+    }
+    tool = _run_mapping(
+        monkeypatch,
+        tool_name="ESM_generate_protein_sequence",
+        lane_type="protein_design",
+        schema=schema,
+        fields={
+            "sequence": _field(
+                field_ref="identifier:uniprot_id:P04626",
+                value_kind="uniprot_id",
+                field_type="identifier",
+                supports_tool_args=["uniprot_id", "accession", "uniprot_accession"],
+            ),
+        },
+        response={"tools": [{
+            "tool_name": "ESM_generate_protein_sequence",
+            "lane_type": "protein_design",
+            "can_invoke": True,
+            "argument_mappings": [{"schema_arg": "sequence", "field_ref": "identifier:uniprot_id:P04626"}],
+            "argument_literals": [],
+            "missing_required_fields": [],
+            "skip_reason": "",
+            "argument_mapping_reason": "attempted identifier-only mapping",
+        }]},
+    )
+    assert tool.can_invoke is False
+    assert "sequence" in tool.missing_required_fields
+    assert "field_ref_incompatible:sequence" in tool.argument_mapping_reason
 
 
 def test_dynamut_selected_maps_pdb_chain_mutation_and_operation_literal(monkeypatch):
@@ -381,9 +485,9 @@ def test_dynamut_selected_maps_pdb_chain_mutation_and_operation_literal(monkeypa
         lane_type="variant_evaluation",
         schema=schema,
         fields={
-            "pdb_id": _field(field_ref="identifier:pdb_id:1N8Z", value_kind="pdb_id", field_type="structure_identifier"),
-            "chain": _field(field_ref="identifier:chain:A", value_kind="chain_id", field_type="chain"),
-            "mutation": _field(field_ref="identifier:mutation:V777L", value_kind="mutation", field_type="variant"),
+            "pdb_id": _field(field_ref="identifier:pdb_id:1N8Z", value_kind="pdb_id", field_type="structure_identifier", supports_tool_args=["pdb_id"]),
+            "chain": _field(field_ref="identifier:chain:A", value_kind="chain_id", field_type="chain", supports_tool_args=["chain", "chain_id"]),
+            "mutation": _field(field_ref="identifier:mutation:V777L", value_kind="mutation", field_type="variant", supports_tool_args=["variant", "variants", "mutation", "mutations"]),
         },
     )
     assert tool.can_invoke is True
@@ -393,7 +497,7 @@ def test_dynamut_selected_maps_pdb_chain_mutation_and_operation_literal(monkeypa
     ]
 
 
-def test_dynamut_predicted_complex_without_true_pdb_id_uninvokable_missing_pdb_id(monkeypatch):
+def test_dynamut_without_true_pdb_id_uninvokable_missing_pdb_id(monkeypatch):
     schema = {
         "type": "object",
         "properties": {"pdb_id": {"type": "string"}, "chain": {"type": "string"}, "mutation": {"type": "string"}},
@@ -405,8 +509,8 @@ def test_dynamut_predicted_complex_without_true_pdb_id_uninvokable_missing_pdb_i
         lane_type="variant_evaluation",
         schema=schema,
         fields={
-            "chain": _field(field_ref="identifier:chain:A", value_kind="chain_id", field_type="chain"),
-            "mutation": _field(field_ref="identifier:mutation:V777L", value_kind="mutation", field_type="variant"),
+            "chain": _field(field_ref="identifier:chain:A", value_kind="chain_id", field_type="chain", supports_tool_args=["chain", "chain_id"]),
+            "mutation": _field(field_ref="identifier:mutation:V777L", value_kind="mutation", field_type="variant", supports_tool_args=["variant", "variants", "mutation", "mutations"]),
         },
     )
     assert tool.can_invoke is False
@@ -419,20 +523,12 @@ def test_rfdiffusion_without_contigs_uninvokable_missing_contigs(monkeypatch):
         "properties": {"input_pdb": {"type": "string"}, "contigs": {"type": "string"}},
         "required": ["input_pdb", "contigs"],
     }
-    step8_field = Step9AvailableField(
-        candidate_id="cand_a",
-        field_ref="step8_complex_ref:cand_a:0",
-        provider="step_08",
-        field_type="structure",
-        value_kind="complex_structure_ref",
-        source_ref="1N8Z",
-    )
     tool = _run_mapping(
         monkeypatch,
         tool_name="NvidiaNIM_rfdiffusion",
         lane_type="protein_design",
         schema=schema,
-        fields={"input_pdb": step8_field},
+        fields={"input_pdb": _step8_complex_field()},
     )
     assert tool.can_invoke is False
     assert "contigs" in tool.missing_required_fields
@@ -444,20 +540,12 @@ def test_proteinmpnn_with_true_complex_maps_input_pdb(monkeypatch):
         "properties": {"input_pdb": {"type": "string"}},
         "required": ["input_pdb"],
     }
-    step8_field = Step9AvailableField(
-        candidate_id="cand_a",
-        field_ref="step8_complex_ref:cand_a:0",
-        provider="step_08",
-        field_type="structure",
-        value_kind="complex_structure_ref",
-        source_ref="1N8Z",
-    )
     tool = _run_mapping(
         monkeypatch,
         tool_name="NvidiaNIM_proteinmpnn",
         lane_type="protein_design",
         schema=schema,
-        fields={"input_pdb": step8_field},
+        fields={"input_pdb": _step8_complex_field()},
     )
     assert tool.can_invoke is True
     assert tool.argument_mappings[0].schema_arg == "input_pdb"
@@ -475,8 +563,8 @@ def test_dynamut_missing_chain_uninvokable(monkeypatch):
         lane_type="variant_evaluation",
         schema=schema,
         fields={
-            "pdb_id": _field(field_ref="identifier:pdb_id:1N8Z", value_kind="pdb_id", field_type="structure_identifier"),
-            "mutation": _field(field_ref="identifier:mutation:V777L", value_kind="mutation", field_type="variant"),
+            "pdb_id": _field(field_ref="identifier:pdb_id:1N8Z", value_kind="pdb_id", field_type="structure_identifier", supports_tool_args=["pdb_id"]),
+            "mutation": _field(field_ref="identifier:mutation:V777L", value_kind="mutation", field_type="variant", supports_tool_args=["variant", "variants", "mutation", "mutations"]),
         },
     )
     assert tool.can_invoke is False
@@ -497,7 +585,7 @@ def test_esm_generate_sequence_maps_task_literal_and_prompt_sequence(monkeypatch
         tool_name="ESM_generate_protein_sequence",
         lane_type="protein_design",
         schema=schema,
-        fields={"prompt_sequence": _field(field_ref="material:sequence", value_kind="sequence_material")},
+        fields={"prompt_sequence": _field(field_ref="material:sequence", value_kind="sequence_ref")},
     )
     assert tool.can_invoke is True
     assert tool.argument_mappings[0].schema_arg == "prompt_sequence"
@@ -518,7 +606,7 @@ def test_no_raw_sequence_pdb_or_tooluniverse_payload_in_mapping_audit(monkeypatc
         fields={
             "prompt_sequence": _field(
                 field_ref="material:sequence_ref",
-                value_kind="sequence_material",
+                value_kind="sequence_ref",
                 field_type="protein_sequence",
             )
         },
@@ -527,3 +615,32 @@ def test_no_raw_sequence_pdb_or_tooluniverse_payload_in_mapping_audit(monkeypatc
     assert RAW_SEQ not in blob
     assert RAW_PDB not in blob
     assert "ToolUniverse" not in blob
+
+
+def test_duplicate_field_ref_in_available_fields_raises_not_silent_overwrite():
+    """A non-canonical `available_fields` list with two entries sharing the
+    same field_ref must be rejected loudly, not resolved by whichever entry
+    the dict-comprehension lookup happens to keep last."""
+    tool = {
+        "tool_name": "ESM_generate_protein_sequence",
+        "lane_type": "protein_design",
+        "full_schema": ESM_SEQUENCE_SCHEMA,
+        "required_fields": ["prompt_sequence"],
+    }
+    duplicate_fields = [
+        _field(field_ref="material:sequence", candidate_id="cand_a"),
+        _field(field_ref="material:sequence", candidate_id="cand_b"),
+    ]
+    with pytest.raises(DuplicateStep9InputFieldError, match="material:sequence"):
+        validate_step9_stage2_mapping(
+            response_item={
+                "tool_name": "ESM_generate_protein_sequence",
+                "lane_type": "protein_design",
+                "can_invoke": True,
+                "argument_mappings": [{"schema_arg": "prompt_sequence", "field_ref": "material:sequence"}],
+                "argument_literals": [],
+                "missing_required_fields": [],
+            },
+            selected_tool=tool,
+            available_fields=duplicate_fields,
+        )

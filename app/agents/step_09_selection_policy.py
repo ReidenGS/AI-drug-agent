@@ -1,67 +1,171 @@
 """Step 9 LLM relevance selection and schema mapping.
 
-These selectors are audit-only for the current Step 9 iteration. Stage 1 asks
-which hard-gate-allowed Step 9 tools are relevant. Stage 2 maps selected tool
-schemas to available field refs / official schema literals. Neither stage
-executes Step 9 protein/variant tools.
+These selectors are audit-only for the current Step 9 iteration. Stage 1
+selects relevant tools from the FULL active Step 9 tool catalog (all 6 active
+tools, independent of any hard-gate/readiness computation). Stage 2 maps
+selected tool schemas to `Step9InputProjection.input_fields` field refs /
+official schema literals. Neither stage executes Step 9 protein/variant
+tools.
+
+Architecture note: prior iterations built the Stage 1 catalog from a
+per-candidate hard-gate `step9_hard_gate_allowed_tools` list, and Stage 2
+consumed `step9_available_fields` computed by the same hard gate. Both stages
+now consume ONLY the centralized `step_09_input_projection` output — the hard
+gate (`step_09_available_fields.py`) remains for backward-compatible audit
+fields only and no longer drives catalog/selection/mapping.
 """
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..llm.provider import LLMProvider
-from ..schemas.step_09_structure_variant_and_compound_screening import (
-    Step9AvailableField,
-    Step9HardGateAllowedTool,
-    Step9LaneStatus,
-    Step9ToolSchemaRequirement,
-)
-from .tool_selection_policy import CAPABILITY_REGISTRY
+from .step_09_input_projection import _compact_text, assert_unique_input_field_refs
 from .tool_selection_policy import signature_schema_for
 
 
-STEP9_STAGE1_PROMPT_CACHE_LAYOUT_VERSION = "step9_stage1_v1"
-STEP9_STAGE2_PROMPT_CACHE_LAYOUT_VERSION = "step9_stage2_v1"
+STEP9_STAGE1_PROMPT_CACHE_LAYOUT_VERSION = "step9_stage1_v2"
+STEP9_STAGE2_PROMPT_CACHE_LAYOUT_VERSION = "step9_stage2_v2"
+
+
+# ── Active Step 9 tool catalog (production authority; NOT hard-gate driven) ─
+
+ACTIVE_STEP9_TOOLS: dict[str, dict[str, str]] = {
+    "NvidiaNIM_rfdiffusion": {
+        "lane_type": "protein_design",
+        "short_description": "RFdiffusion backbone-conditioned structure generation",
+    },
+    "NvidiaNIM_proteinmpnn": {
+        "lane_type": "protein_design",
+        "short_description": "ProteinMPNN backbone-conditioned sequence design",
+    },
+    "ESM_generate_protein_sequence": {
+        "lane_type": "protein_design",
+        "short_description": "ESM protein sequence completion/generation",
+    },
+    "DynaMut2_predict_stability": {
+        "lane_type": "variant_evaluation",
+        "short_description": "DynaMut2 mutation stability impact prediction",
+    },
+    "AlphaMissense_get_variant_score": {
+        "lane_type": "variant_evaluation",
+        "short_description": "AlphaMissense variant pathogenicity scoring",
+    },
+    "ESM_score_variant_sae_batch": {
+        "lane_type": "variant_evaluation",
+        "short_description": "ESM SAE batch variant scoring",
+    },
+}
+
 
 STEP9_STAGE1_SYSTEM_PROMPT = """You select relevant Step 9 tools.
 
 Rules:
-1. Select only from the allowed catalog.
-2. Do not select blocked tools.
-3. Do not construct tool arguments.
-4. Do not invent variants, mutations, contigs, sequences, PDB IDs, structures, compounds, thresholds, or tiers.
-5. Avoid redundant tools; if tools answer the same question, choose the best one.
-6. Return exactly one valid JSON object matching the requested shape.
+1. Select only from the given catalog (the full active Step 9 tool set).
+2. A tool being in the catalog does not mean its inputs are ready yet —
+   judge relevance to the user's request, not input availability.
+3. Use the dynamic query_summary / projection overview only to judge relevance.
+4. Do not construct tool arguments.
+5. Do not invent variants, mutations, contigs, sequences, PDB IDs, structures, compounds, thresholds, or tiers.
+6. Avoid redundant tools; if tools answer the same question, choose the best one.
+7. Return exactly one valid JSON object with this shape:
+{
+  "selections": [
+    {
+      "tool_name": "string from the catalog",
+      "lane_type": "protein_design or variant_evaluation",
+      "selection_reason": "short reason"
+    }
+  ]
+}
+8. If no catalog tool is relevant, return {"selections": []}.
+
+Relevant-tool example:
+Input situation: catalog contains AlphaMissense_get_variant_score; query_summary asks to evaluate a protein variant; projection overview shows UniProt and variant input fields.
+Output:
+{
+  "selections": [
+    {
+      "tool_name": "AlphaMissense_get_variant_score",
+      "lane_type": "variant_evaluation",
+      "selection_reason": "Variant scoring is relevant and required inputs are available."
+    }
+  ]
+}
+
+No-relevant-tool example:
+Input situation: no catalog tool is relevant.
+Output:
+{"selections": []}
 """.strip()
 
 
 STEP9_STAGE1_USER_PROMPT = (
-    "Select relevant Step 9 tools from the allowed catalog. Return only "
+    "Select relevant Step 9 tools from the active tool catalog. Return only "
     "tool_name, lane_type, and selection_reason; do not construct arguments."
 )
 
 
-STEP9_STAGE2_SYSTEM_PROMPT = """You map selected Step 9 tool schemas to candidate field refs.
+STEP9_STAGE2_SYSTEM_PROMPT = """You map selected Step 9 tool schemas to Step9InputProjection field refs.
 
 Rules:
 1. Use only selected tools.
-2. Use only official full_schema / required_fields and candidate available fields.
+2. Use only official full_schema / required_fields and step9_input_fields.
 3. Do not output raw values.
 4. Do not invent variants, mutations, contigs, thresholds, tiers, PDB IDs, structures, sequences, or compounds.
 5. Output schema_arg -> field_ref using list-of-pairs.
 6. Use argument_literals only for official enum/singleton/default-like schema literals.
-7. If required args cannot be satisfied, can_invoke=false and list missing_required_fields.
-8. Return exactly one valid JSON object matching the requested shape.
+7. A field_ref only satisfies a schema_arg when the field's supports_tool_args includes that schema_arg.
+8. If required args cannot be satisfied, can_invoke=false and list missing_required_fields.
+9. Return exactly one valid JSON object with this shape:
+{
+  "tools": [
+    {
+      "tool_name": "string from selected tools",
+      "lane_type": "protein_design or variant_evaluation",
+      "can_invoke": true,
+      "argument_mappings": [
+        {"schema_arg": "official schema arg", "field_ref": "step9_input_fields field_ref"}
+      ],
+      "argument_literals": [
+        {"schema_arg": "official schema arg", "literal_value": "official literal"}
+      ],
+      "missing_required_fields": [],
+      "skip_reason": "",
+      "argument_mapping_reason": "short reason"
+    }
+  ]
+}
+10. Return one tools[] item for every selected tool.
+11. Do not map storage paths or uploaded file paths as PDB IDs.
+
+Example:
+Input situation: selected tool DynaMut2_predict_stability requires pdb_id, chain, mutation. step9_input_fields includes {"field_ref": "identifier:mutation:V777L", "field_type": "variant", "value_kind": "mutation", "supports_tool_args": ["variant","variants","mutation","mutations"]}. No field's supports_tool_args includes "pdb_id" or "chain".
+Output:
+{
+  "tools": [
+    {
+      "tool_name": "DynaMut2_predict_stability",
+      "lane_type": "variant_evaluation",
+      "can_invoke": false,
+      "argument_mappings": [
+        {"schema_arg": "mutation", "field_ref": "identifier:mutation:V777L"}
+      ],
+      "argument_literals": [],
+      "missing_required_fields": ["pdb_id", "chain"],
+      "skip_reason": "missing_required_fields",
+      "argument_mapping_reason": "Mutation is available, but no field supports pdb_id or chain."
+    }
+  ]
+}
 """.strip()
 
 
 STEP9_STAGE2_USER_PROMPT = (
-    "Map selected Step 9 tool schemas to candidate field refs and official "
-    "schema literals. Return list-of-pairs only."
+    "Map selected Step 9 tool schemas to step9_input_fields field refs and "
+    "official schema literals. Return list-of-pairs only."
 )
 
 
@@ -121,39 +225,36 @@ class Step9Stage2MappingResult(BaseModel):
     prompt_cache_layout_version: str = STEP9_STAGE2_PROMPT_CACHE_LAYOUT_VERSION
 
 
-def build_step9_stage1_catalog(
-    allowed_tools: list[Step9HardGateAllowedTool],
-    schema_requirements: list[Step9ToolSchemaRequirement],
-) -> list[dict[str, Any]]:
-    """Build a stable allowed-only catalog, sorted by lane then tool."""
+def _tool_schema_source(tool_name: str) -> str:
+    try:
+        from ..mcp import tooluniverse_adapter
 
-    req_by_tool_lane: dict[tuple[str, str], Step9ToolSchemaRequirement] = {}
-    for req in schema_requirements:
-        if req.hard_gate_decision != "allowed":
-            continue
-        key = (req.tool_name, req.lane_type)
-        req_by_tool_lane.setdefault(key, req)
+        if tooluniverse_adapter.get_tool_specification(tool_name) is not None:
+            return "tooluniverse_or_signature"
+    except Exception:  # noqa: BLE001
+        pass
+    return "signature"
 
-    seen: set[tuple[str, str]] = set()
+
+def build_step9_stage1_catalog() -> list[dict[str, Any]]:
+    """Return the FULL active Step 9 tool catalog — always all 6 active
+    tools, sorted by lane then tool name for a stable prompt-cache prefix.
+
+    This is independent of any per-candidate hard-gate/readiness state; the
+    hard gate no longer drives which tools Stage 1 sees.
+    """
     catalog: list[dict[str, Any]] = []
-    for tool in sorted(allowed_tools, key=lambda t: (t.lane_type, t.tool_name)):
-        key = (tool.tool_name, tool.lane_type)
-        if key in seen:
-            continue
-        seen.add(key)
-        meta = CAPABILITY_REGISTRY.get(tool.tool_name) or {}
-        req = req_by_tool_lane.get(key)
+    for tool_name in sorted(ACTIVE_STEP9_TOOLS, key=lambda name: (ACTIVE_STEP9_TOOLS[name]["lane_type"], name)):
+        meta = ACTIVE_STEP9_TOOLS[tool_name]
+        schema = signature_schema_for(tool_name) or {}
+        required = [str(arg) for arg in (schema.get("required") or []) if isinstance(arg, str)]
         catalog.append(
             {
-                "tool_name": tool.tool_name,
-                "lane_type": tool.lane_type,
-                "short_description": str(
-                    meta.get("short_description") or tool.tool_name.replace("_", " ")
-                ),
-                "required_fields": list(req.required_fields if req else []),
-                "schema_source": str(req.schema_source if req else "unavailable"),
-                "capability_tags": list(meta.get("capability_tags") or []),
-                "purpose": str(tool.rationale or ""),
+                "tool_name": tool_name,
+                "lane_type": meta["lane_type"],
+                "short_description": meta["short_description"],
+                "required_fields": required,
+                "schema_source": _tool_schema_source(tool_name),
             }
         )
     return catalog
@@ -163,10 +264,7 @@ def build_step9_stage1_payload(
     *,
     candidate_id: str,
     catalog: list[dict[str, Any]],
-    readiness_projection: dict[str, Any],
-    canonical_query: str = "",
-    raw_user_query: str = "",
-    step8_downstream_handoff_status: list[dict[str, Any]] | None = None,
+    projection: dict[str, Any],
 ) -> dict[str, Any]:
     """Assemble the schema payload for the Step 9 Stage 1 LLM call."""
 
@@ -174,26 +272,11 @@ def build_step9_stage1_payload(
         "task": "step9_tool_selection_stage_1",
         "compact_catalog": catalog,
         "candidate_id": candidate_id,
-        "lane_readiness_status": _compact_lane_statuses(
-            readiness_projection.get("step9_lane_statuses") or []
-        ),
-        "step9_available_fields": _model_dump_list(
-            readiness_projection.get("step9_available_fields") or []
-        ),
-        "step9_tool_schema_requirements": _compact_schema_requirements(
-            readiness_projection.get("step9_tool_schema_requirements") or []
-        ),
-        "step9_hard_gate_allowed_tool_names": [entry["tool_name"] for entry in catalog],
-        "blocked_summary": _compact_blocked_summary(
-            readiness_projection.get("step9_lane_statuses") or []
-        ),
-        "user_intent_summary": {
-            "canonical_query": _compact_text(canonical_query),
-            "raw_user_query": _compact_text(raw_user_query),
-        },
-        "step8_downstream_handoff_status": step8_downstream_handoff_status or [],
-        "candidate_context_refs": _candidate_context_refs(
-            readiness_projection.get("step9_available_fields") or []
+        "query_summary": _redact_query_summary(projection.get("query_summary") or {}),
+        "projection_handoff_summary": projection.get("handoff_summary") or {},
+        "projection_missing_inputs": list(projection.get("missing_inputs") or []),
+        "projection_input_overview": _compact_input_field_overview(
+            projection.get("input_fields") or []
         ),
     }
 
@@ -201,27 +284,18 @@ def build_step9_stage1_payload(
 def select_step9_stage1_tools(
     *,
     llm: LLMProvider,
-    readiness_projection: dict[str, Any],
-    candidate_id: str,
-    canonical_query: str = "",
-    raw_user_query: str = "",
-    step8_downstream_handoff_status: list[dict[str, Any]] | None = None,
+    projection: dict[str, Any],
+    candidate_id: str = "all_candidates",
 ) -> Step9Stage1SelectionResult:
-    """Run Stage 1 and validate selections against the hard-gate catalog."""
+    """Run Stage 1 and validate selections against the active tool catalog."""
 
-    catalog = build_step9_stage1_catalog(
-        readiness_projection.get("step9_hard_gate_allowed_tools") or [],
-        readiness_projection.get("step9_tool_schema_requirements") or [],
-    )
+    catalog = build_step9_stage1_catalog()
     allowed = {(entry["tool_name"], entry["lane_type"]) for entry in catalog}
     allowed_names = {entry["tool_name"] for entry in catalog}
     payload = build_step9_stage1_payload(
         candidate_id=candidate_id,
         catalog=catalog,
-        readiness_projection=readiness_projection,
-        canonical_query=canonical_query,
-        raw_user_query=raw_user_query,
-        step8_downstream_handoff_status=step8_downstream_handoff_status,
+        projection=projection,
     )
     response = llm.generate_json(
         STEP9_STAGE1_USER_PROMPT,
@@ -247,9 +321,9 @@ def select_step9_stage1_tools(
         key = (tool_name, lane_type)
         if key not in allowed:
             reason = (
-                "tool_not_in_allowed_catalog"
+                "tool_not_in_active_catalog"
                 if tool_name not in allowed_names
-                else "tool_lane_not_in_allowed_catalog"
+                else "tool_lane_not_in_active_catalog"
             )
             rejected.append({"tool_name": tool_name, "reason": reason})
             continue
@@ -277,15 +351,12 @@ def build_step9_stage2_payload(
     *,
     candidate_id: str,
     selected_tools: list[Step9Stage1SelectionAudit] | list[dict[str, Any]],
-    readiness_projection: dict[str, Any],
-    canonical_query: str = "",
-    raw_user_query: str = "",
-    step8_downstream_handoff_status: list[dict[str, Any]] | None = None,
+    projection: dict[str, Any],
 ) -> dict[str, Any]:
     """Assemble the Stage 2 schema payload.
 
     The stable selected-tool schema block is ``tools``. Candidate-specific
-    field refs and Stage-1 reasons stay as dynamic payload keys; the shared
+    field refs and Stage 1 reasons stay as dynamic payload keys; the shared
     prompt renderer splits them accordingly.
     """
 
@@ -295,24 +366,17 @@ def build_step9_stage2_payload(
         for item in selected
         if item.get("tool_name") and item.get("lane_type")
     }
-    reqs = _compact_schema_requirements(
-        readiness_projection.get("step9_tool_schema_requirements") or []
-    )
-    req_by_pair = {
-        (str(req.get("tool_name") or ""), str(req.get("lane_type") or "")): req
-        for req in reqs
-    }
     tools: list[dict[str, Any]] = []
     for tool_name, lane_type in sorted(selected_pairs, key=lambda p: (p[1], p[0])):
-        req = req_by_pair.get((tool_name, lane_type), {})
-        schema = signature_schema_for(tool_name) or _schema_from_requirement(req)
+        schema = signature_schema_for(tool_name) or {}
+        required = [str(arg) for arg in (schema.get("required") or []) if isinstance(arg, str)]
         tools.append(
             {
                 "tool_name": tool_name,
                 "lane_type": lane_type,
                 "full_schema": _compact_schema(schema),
-                "required_fields": list(req.get("required_fields") or schema.get("required") or []),
-                "schema_source": str(req.get("schema_source") or "unavailable"),
+                "required_fields": required,
+                "schema_source": _tool_schema_source(tool_name),
             }
         )
 
@@ -321,43 +385,24 @@ def build_step9_stage2_payload(
         "candidate_id": candidate_id,
         "tools": tools,
         "selected_tools": selected,
-        "step9_available_fields": _model_dump_list(
-            readiness_projection.get("step9_available_fields") or []
+        "step9_input_fields": _compact_input_fields_for_stage2(
+            projection.get("input_fields") or []
         ),
-        "step9_tool_schema_requirements": [
-            req for req in reqs if (req.get("tool_name"), req.get("lane_type")) in selected_pairs
-        ],
-        "lane_readiness_status": _compact_lane_statuses(
-            readiness_projection.get("step9_lane_statuses") or []
-        ),
-        "step8_downstream_handoff_status": step8_downstream_handoff_status or [],
-        "user_intent_summary": {
-            "canonical_query": _compact_text(canonical_query),
-            "raw_user_query": _compact_text(raw_user_query),
-        },
-        "candidate_context_refs": _candidate_context_refs(
-            readiness_projection.get("step9_available_fields") or []
-        ),
+        "query_summary": _redact_query_summary(projection.get("query_summary") or {}),
     }
 
 
 def select_step9_stage2_mappings(
     *,
     llm: LLMProvider,
-    readiness_projection: dict[str, Any],
+    projection: dict[str, Any],
     selected_tools: list[Step9Stage1SelectionAudit],
-    candidate_id: str,
-    canonical_query: str = "",
-    raw_user_query: str = "",
-    step8_downstream_handoff_status: list[dict[str, Any]] | None = None,
+    candidate_id: str = "all_candidates",
 ) -> Step9Stage2MappingResult:
     payload = build_step9_stage2_payload(
         candidate_id=candidate_id,
         selected_tools=selected_tools,
-        readiness_projection=readiness_projection,
-        canonical_query=canonical_query,
-        raw_user_query=raw_user_query,
-        step8_downstream_handoff_status=step8_downstream_handoff_status,
+        projection=projection,
     )
     stage2_tools = [tool for tool in payload["tools"] if isinstance(tool, dict)]
     schema_survivors = [str(tool.get("tool_name") or "") for tool in stage2_tools]
@@ -393,7 +438,7 @@ def select_step9_stage2_mappings(
         key = (str(item.get("tool_name") or ""), str(item.get("lane_type") or ""))
         response_by_pair.setdefault(key, item)
 
-    fields = _model_dump_list(readiness_projection.get("step9_available_fields") or [])
+    fields = _model_dump_list(projection.get("input_fields") or [])
     mapped: list[Step9Stage2MappedTool] = []
     uninvokable: list[str] = []
     details: list[dict[str, Any]] = []
@@ -454,6 +499,12 @@ def validate_step9_stage2_mapping(
     missing: set[str] = {
         str(arg) for arg in (response_item.get("missing_required_fields") or []) if isinstance(arg, str)
     }
+    # `Step9InputProjection.input_fields` is contractually field_ref-unique
+    # (see `step_09_input_projection._merge_duplicate_field_refs`). A
+    # duplicate reaching here means an upstream contract violation; fail
+    # fast instead of letting the dict comprehension below silently keep
+    # whichever entry appears last in the list.
+    assert_unique_input_field_refs(available_fields)
     field_refs = {str(field.get("field_ref") or ""): field for field in available_fields}
     seen_args: set[str] = set()
     warnings: list[str] = []
@@ -554,48 +605,39 @@ def _selection_dict(item: Step9Stage1SelectionAudit | dict[str, Any]) -> dict[st
     return {}
 
 
-def _compact_lane_statuses(items: list[Any]) -> list[dict[str, Any]]:
-    statuses = _model_dump_list(items)
+def _compact_input_field_overview(items: list[Any]) -> list[dict[str, Any]]:
+    fields = _model_dump_list(items)
     return [
         {
-            "candidate_id": item.get("candidate_id"),
-            "lane_type": item.get("lane_type"),
-            "candidate_type": item.get("candidate_type"),
-            "status": item.get("status"),
-            "allowed_tools": list(item.get("allowed_tools") or []),
-            "missing_requirements": list(item.get("missing_requirements") or []),
-            "available_field_refs": list(item.get("available_field_refs") or []),
+            "candidate_id": field.get("candidate_id"),
+            "field_ref": field.get("field_ref"),
+            "field_type": field.get("field_type"),
+            "value_kind": field.get("value_kind"),
+            "status": field.get("status"),
         }
-        for item in statuses
+        for field in fields
     ]
 
 
-def _compact_schema_requirements(items: list[Any]) -> list[dict[str, Any]]:
-    reqs = _model_dump_list(items)
+def _compact_input_fields_for_stage2(items: list[Any]) -> list[dict[str, Any]]:
+    fields = _model_dump_list(items)
     return [
         {
-            "candidate_id": req.get("candidate_id"),
-            "tool_name": req.get("tool_name"),
-            "lane_type": req.get("lane_type"),
-            "required_fields": list(req.get("required_fields") or []),
-            "schema_source": req.get("schema_source"),
-            "satisfiable_required_fields": list(
-                req.get("satisfiable_required_fields") or []
-            ),
-            "missing_required_fields": list(req.get("missing_required_fields") or []),
-            "hard_gate_decision": req.get("hard_gate_decision"),
-            "reason": req.get("reason"),
+            "candidate_id": field.get("candidate_id"),
+            "field_ref": field.get("field_ref"),
+            "field_type": field.get("field_type"),
+            "value_kind": field.get("value_kind"),
+            "supports_tool_args": list(field.get("supports_tool_args") or []),
+            "status": field.get("status"),
         }
-        for req in reqs
+        for field in fields
     ]
 
 
-def _schema_from_requirement(req: dict[str, Any]) -> dict[str, Any]:
-    required = [str(arg) for arg in (req.get("required_fields") or []) if isinstance(arg, str)]
+def _redact_query_summary(query_summary: dict[str, Any]) -> dict[str, Any]:
     return {
-        "type": "object",
-        "properties": {arg: {"type": "string"} for arg in required},
-        "required": required,
+        "canonical_query": _compact_text(str(query_summary.get("canonical_query") or "")),
+        "raw_user_query": _compact_text(str(query_summary.get("raw_user_query") or "")),
     }
 
 
@@ -616,43 +658,6 @@ def _compact_schema(schema: dict[str, Any]) -> dict[str, Any]:
         "properties": compact_props,
         "required": sorted(required),
     }
-
-
-def _compact_blocked_summary(items: list[Step9LaneStatus]) -> list[dict[str, Any]]:
-    statuses = _model_dump_list(items)
-    summary: dict[tuple[str, str], dict[str, Any]] = {}
-    for lane in statuses:
-        key = (str(lane.get("candidate_id") or ""), str(lane.get("lane_type") or ""))
-        bucket = summary.setdefault(
-            key,
-            {
-                "candidate_id": key[0],
-                "lane_type": key[1],
-                "blocked_tool_count": 0,
-                "missing_requirements": [],
-            },
-        )
-        bucket["blocked_tool_count"] += len(lane.get("blocked_tools") or [])
-        bucket["missing_requirements"] = sorted(
-            set(bucket["missing_requirements"]) | set(lane.get("missing_requirements") or [])
-        )
-    return sorted(summary.values(), key=lambda item: (item["candidate_id"], item["lane_type"]))
-
-
-def _candidate_context_refs(items: list[Step9AvailableField]) -> list[dict[str, str]]:
-    fields = _model_dump_list(items)
-    refs: list[dict[str, str]] = []
-    for field in fields:
-        refs.append(
-            {
-                "candidate_id": str(field.get("candidate_id") or ""),
-                "field_ref": str(field.get("field_ref") or ""),
-                "field_type": str(field.get("field_type") or ""),
-                "value_kind": str(field.get("value_kind") or ""),
-                "status": str(field.get("status") or ""),
-            }
-        )
-    return refs
 
 
 def _mapping_audit_entries(tool: Step9Stage2MappedTool) -> list[dict[str, Any]]:
@@ -697,52 +702,13 @@ def _mapping_audit_entries(tool: Step9Stage2MappedTool) -> list[dict[str, Any]]:
 
 
 def _step9_field_can_satisfy_arg(arg: str, field: dict[str, Any]) -> bool:
+    """A field satisfies a schema_arg only when the projection layer already
+    marked that arg as supported (`supports_tool_args`), computed once,
+    deterministically, from the raw Step 5/7/8 shapes — Stage 2 never
+    re-derives compatibility from raw value_kind/provider heuristics."""
     lowered = arg.lower().strip()
-    value_kind = str(field.get("value_kind") or "").lower()
-    field_type = str(field.get("field_type") or "").lower()
-    field_ref = str(field.get("field_ref") or "").lower()
-    provider = str(field.get("provider") or "").lower()
-    source_ref = str(field.get("source_ref") or "").lower()
-
-    if lowered in {"smiles", "canonical_smiles"}:
-        return value_kind == "smiles" or field_type == "compound"
-    if lowered == "query":
-        return value_kind in {"name", "compound_name"} or (
-            field_type in {"candidate_metadata", "compound"} and value_kind == "name"
-        )
-    if lowered == "zinc_id":
-        return value_kind == "zinc_id" or "identifier:zinc_id:" in field_ref
-    if lowered in {"chembl_id", "molecule_chembl_id"}:
-        return value_kind == "chembl_id" or "identifier:chembl_id:" in field_ref
-    if lowered in {"pubchem_cid", "cid"}:
-        return value_kind == "pubchem_cid" or "identifier:pubchem_cid:" in field_ref
-    if lowered in {"uniprot_id", "accession", "uniprot_accession"}:
-        return value_kind == "uniprot_id" or "identifier:uniprot" in field_ref
-    if lowered in {"variant", "variants", "mutation", "mutations"}:
-        return value_kind in {"variant", "variants", "mutation", "protein_variant"}
-    if lowered == "chain":
-        return value_kind in {"chain", "chain_id", "chain_role"} or "chain" in field_ref
-    if lowered == "pdb_id":
-        return value_kind == "pdb_id" or "identifier:pdb_id:" in field_ref
-    if lowered in {"input_pdb", "pdb_file", "structure_ref", "structure", "backbone", "path"}:
-        return (
-            provider == "step_08"
-            and field_type in {"structure", "structure_ref", "complex_structure"}
-            and value_kind in {"complex_structure_ref", "structure_ref", "pdb_id"}
-        ) or (
-            provider == "step_08"
-            and ("complex" in source_ref or "pdb" in source_ref)
-        )
-    if lowered == "contigs":
-        return value_kind in {"contigs", "design_contigs"} or "contig" in field_ref
-    if lowered in {"prompt_sequence", "sequence", "sequence_value", "sequence_1", "sequence_2", "sequence_3", "sequence_a", "sequence_b"}:
-        return field_type == "protein_sequence" or value_kind in {
-            "sequence_material",
-            "protein_sequence",
-            "fasta_ref",
-            "uploaded_fasta_ref",
-        }
-    return False
+    supports = {str(a).lower() for a in (field.get("supports_tool_args") or [])}
+    return lowered in supports
 
 
 def _literal_allowed_by_schema(value: Any, prop: dict[str, Any]) -> tuple[bool, Any]:
@@ -774,16 +740,3 @@ def _deterministic_step9_literal_if_allowed(arg: str, schema: dict[str, Any]) ->
     if "default" in prop:
         return prop.get("default")
     return None
-
-
-def _compact_text(value: str) -> str:
-    text = " ".join(str(value or "").split())
-    text = re.sub(
-        r"\b[ACDEFGHIKLMNPQRSTVWY]{12,}\b",
-        "[redacted_biological_sequence]",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(r"\b(HEADER|ATOM|HETATM|MODEL|ENDMDL)\b.*", "[redacted_structure_payload]", text)
-    text = re.sub(r"sk-[A-Za-z0-9_\-]{8,}", "[redacted_api_key]", text)
-    return text[:800]

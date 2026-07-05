@@ -3549,6 +3549,126 @@ def test_step9_compound_tool_dependencies_are_not_called(
     assert artifact.compound_screening_readiness.status == "not_applicable"
 
 
+class _Step9RuntimePlannerLLM:
+    name = "step9-runtime-planner-test"
+    model = "step9-runtime-planner-test"
+
+    def generate(self, prompt: str, *, system: str | None = None, **kwargs):
+        raise NotImplementedError
+
+    def generate_json(self, prompt: str, *, schema: dict, system: str | None = None) -> dict:
+        task = schema.get("task")
+        if task == "step9_tool_selection_stage_1":
+            return {
+                "selections": [
+                    {
+                        "tool_name": "AlphaMissense_get_variant_score",
+                        "lane_type": "variant_evaluation",
+                        "selection_reason": "variant score requested",
+                    }
+                ]
+            }
+        if task == "step9_tool_schema_mapping_stage_2":
+            return {
+                "tools": [
+                    {
+                        "tool_name": "AlphaMissense_get_variant_score",
+                        "lane_type": "variant_evaluation",
+                        "can_invoke": True,
+                        "argument_mappings": [
+                            {
+                                "schema_arg": "uniprot_id",
+                                "field_ref": "identifier:uniprot_id:P04626",
+                            },
+                            {
+                                "schema_arg": "variant",
+                                "field_ref": "identifier:variant:V777L",
+                            },
+                        ],
+                        "argument_literals": [],
+                        "missing_required_fields": [],
+                        "skip_reason": "",
+                        "argument_mapping_reason": "test stage2 mapping",
+                    }
+                ]
+            }
+        return {}
+
+
+def test_step9_runtime_planner_populates_artifact_without_mcp_execution(
+    local_storage, registry_service, workflow_state_service
+):
+    raw_sequence = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        referenced_inputs=[
+            {"id_type": "target_sequence", "value": raw_sequence, "source": "raw_request_text"},
+            {"id_type": "smiles", "value": "CC(=O)NCCC1=CN(c2ccc(O)cc2)C(=O)C1", "source": "raw_request_text"},
+        ],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c.get("candidate_type") == "target_antigen")
+    target.setdefault("identifiers", []).extend(
+        [
+            {"id_type": "uniprot_id", "id_value": "P04626"},
+            {"id_type": "variant", "id_value": "V777L"},
+        ]
+    )
+    local_storage.write_json(cct_path, cct)
+
+    artifact = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+        llm=_Step9RuntimePlannerLLM(),
+    ).run_step_9(run_id)
+
+    assert artifact.step9_runtime_execution_mode == "planning_only"
+    assert artifact.step9_runtime_execution_plan
+    assert artifact.step9_runtime_resolved_tools
+    entry = artifact.step9_runtime_resolved_tools[0]
+    assert entry["tool_name"] == "AlphaMissense_get_variant_score"
+    assert entry["lane_type"] == "variant_evaluation"
+    assert entry["can_resolve"] is True
+    assert entry["would_execute"] is False
+    assert set(entry["argument_keys"]) == {"uniprot_id", "variant"}
+    assert artifact.step9_runtime_kwargs_contracts
+    contract = artifact.step9_runtime_kwargs_contracts[0]
+    assert contract["tool_name"] == "AlphaMissense_get_variant_score"
+    assert contract["can_build_kwargs"] is True
+    assert contract["execution_mode"] == "planning_only"
+    assert set(contract["kwargs_keys"]) == {"uniprot_id", "variant"}
+    assert all(
+        item.get("value_placeholder") == "<resolved_at_execution_time>"
+        for item in contract["kwargs_plan"]
+        if item.get("source") == "field_ref"
+    )
+    assert artifact.step9_runtime_kwargs_contract_audit
+    assert all(
+        item["candidate_value_persisted"] is False
+        for item in artifact.step9_runtime_kwargs_contract_audit
+    )
+
+    forbidden_prefixes = ("NvidiaNIM_", "ESM_", "AlphaMissense_", "DynaMut2_", "ZINC_", "ChEMBL_")
+    assert not any(tc.tool_name.startswith(forbidden_prefixes) for tc in artifact.tool_call_records)
+    runtime_blob = json.dumps(
+        {
+            "plan": artifact.step9_runtime_execution_plan,
+            "audit": artifact.step9_runtime_resolver_audit,
+            "kwargs_contracts": artifact.step9_runtime_kwargs_contracts,
+            "kwargs_contract_audit": artifact.step9_runtime_kwargs_contract_audit,
+        }
+    )
+    assert "ZINC_" not in runtime_blob
+    assert "ChEMBL_" not in runtime_blob
+    assert raw_sequence not in json.dumps(artifact.model_dump())
+    assert "CC(=O)NCCC1=CN" not in json.dumps(artifact.model_dump())
+
+
 def _seed_sequence_only_protein_candidates(
     local_storage, registry_service, workflow_state_service, *, include_antibody_light=True
 ) -> str:

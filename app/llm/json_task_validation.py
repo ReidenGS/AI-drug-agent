@@ -98,17 +98,18 @@ def build_json_prompt_sections(
 
     Step 9 Stage 1 split: for ``step9_tool_selection_stage_1``, the stable
     prefix contains only the fixed English selector rules, JSON shape
-    instruction, fixed user task text, and deterministic hard-gate-allowed
-    catalog. Candidate/run context, readiness projection, allowed-name audit,
-    blocked-count summary, and user intent summary are rendered only in the
-    trailing dynamic block.
+    instruction, fixed user task text, and the full active Step 9 tool
+    catalog (``compact_catalog``, all 6 active tools, independent of any
+    per-candidate hard-gate/readiness state). Candidate id, query summary,
+    and the Step9InputProjection handoff/missing-input/field overview are
+    rendered only in the trailing dynamic block.
 
     Step 9 Stage 2 split: for ``step9_tool_schema_mapping_stage_2``, the
     stable prefix contains the selected-tool schema block only
     (``tools[tool_name/lane_type/full_schema/required_fields/schema_source]``),
-    sorted by lane then tool. Candidate IDs, field refs, Stage-1 reasons,
-    readiness summaries, and intent summaries are rendered only in the dynamic
-    suffix.
+    sorted by lane then tool. Candidate id, Stage-1 selection reasons,
+    ``step9_input_fields`` (Step9InputProjection field refs), and the query
+    summary are rendered only in the dynamic suffix.
     """
     schema = schema or {}
     task = schema.get("task") or "structured_query"
@@ -171,26 +172,18 @@ _STEP6_STAGE2_DYNAMIC_KEYS: tuple[str, ...] = (
 
 _STEP9_STAGE1_DYNAMIC_KEYS: tuple[str, ...] = (
     "candidate_id",
-    "lane_readiness_status",
-    "step9_available_fields",
-    "step9_tool_schema_requirements",
-    "step9_hard_gate_allowed_tool_names",
-    "blocked_summary",
-    "user_intent_summary",
-    "step8_downstream_handoff_status",
-    "candidate_context_refs",
+    "query_summary",
+    "projection_handoff_summary",
+    "projection_missing_inputs",
+    "projection_input_overview",
 )
 
 
 _STEP9_STAGE2_DYNAMIC_KEYS: tuple[str, ...] = (
     "candidate_id",
     "selected_tools",
-    "step9_available_fields",
-    "step9_tool_schema_requirements",
-    "lane_readiness_status",
-    "step8_downstream_handoff_status",
-    "user_intent_summary",
-    "candidate_context_refs",
+    "step9_input_fields",
+    "query_summary",
 )
 
 

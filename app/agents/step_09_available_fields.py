@@ -368,6 +368,58 @@ def _step8_complex_refs(step8_result: dict | None, candidate_id: str) -> list[di
     return out
 
 
+def _step8_real_pdb_ids(step8_result: dict | None, candidate_id: str) -> list[str]:
+    out: list[str] = []
+    for ref in _step8_complex_refs(step8_result, candidate_id):
+        source_kind = str(ref.get("source_kind") or "").lower()
+        if source_kind not in {"existing_pdb_complex", "existing_pdb_structure"}:
+            continue
+        for key in ("pdb_id", "source_ref"):
+            value = ref.get(key)
+            if _looks_like_pdb_id(value):
+                out.append(str(value).strip().upper())
+    for result in _step8_candidate_results(step8_result, candidate_id):
+        handoff = result.get("downstream_handoff") if isinstance(result, dict) else None
+        if not isinstance(handoff, dict):
+            continue
+        for key in ("structure_for_variant_generation_ref", "validated_structure_ref"):
+            value = handoff.get(key)
+            if _looks_like_pdb_id(value):
+                out.append(str(value).strip().upper())
+    return list(dict.fromkeys(out))
+
+
+def _step8_structure_reference_fields(step8_result: dict | None, candidate_id: str) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for result in _step8_candidate_results(step8_result, candidate_id):
+        handoff = result.get("downstream_handoff") if isinstance(result, dict) else None
+        if not isinstance(handoff, dict):
+            continue
+        if handoff.get("validated_structure_ref"):
+            out.append(
+                {
+                    "field_ref": f"step8_validated_structure_ref:{candidate_id}",
+                    "value_kind": "structure_ref",
+                }
+            )
+        if handoff.get("structure_for_variant_generation_ref"):
+            out.append(
+                {
+                    "field_ref": f"step8_variant_structure_ref:{candidate_id}",
+                    "value_kind": "structure_ref",
+                }
+            )
+    deduped: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in out:
+        key = item["field_ref"]
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
 def _is_step9_design_complex_ref(ref: dict[str, Any]) -> bool:
     source_kind = str(ref.get("source_kind") or "").lower()
     return source_kind in {"existing_pdb_complex", "predicted_complex"}
@@ -457,7 +509,11 @@ def _candidate_has_contigs_hint(candidate: dict) -> bool:
 
 
 def _candidate_has_design_structure_input(candidate: dict, step7_seq_refs: list[dict[str, Any]], step8_result: dict | None) -> bool:
-    return _candidate_has_complex_structure_ref(str(candidate.get("candidate_id") or ""), step8_result)
+    candidate_id = str(candidate.get("candidate_id") or "")
+    return _candidate_has_complex_structure_ref(candidate_id, step8_result) or (
+        isinstance(step8_result, dict)
+        and _step8_structure_reference_available(step8_result, candidate_id)
+    )
 
 
 def _infer_schema_arg_readiness(
@@ -728,7 +784,20 @@ def _protein_design_gate(
             )
             continue
 
-        if tool_name in {"NvidiaNIM_rfdiffusion", "NvidiaNIM_proteinmpnn"}:
+        if tool_name == "NvidiaNIM_proteinmpnn":
+            if not _candidate_has_design_structure_input(candidate, step7_refs, step8_result):
+                blocked.append(
+                    Step9HardGateBlockedTool(
+                        candidate_id=candidate_id,
+                        tool_name=tool_name,
+                        lane_type="protein_design",
+                        reason="structure_input_missing",
+                        rationale="requires validated backbone or complex structure input",
+                    )
+                )
+                continue
+
+        if tool_name == "NvidiaNIM_rfdiffusion":
             if not complex_ready:
                 blocked.append(
                     Step9HardGateBlockedTool(
@@ -741,7 +810,7 @@ def _protein_design_gate(
                 )
                 continue
 
-            if tool_name == "NvidiaNIM_rfdiffusion" and "contigs" not in satisfiable:
+            if "contigs" not in satisfiable:
                 blocked.append(
                     Step9HardGateBlockedTool(
                         candidate_id=candidate_id,
@@ -773,8 +842,10 @@ def _protein_design_gate(
                 tool_name=tool_name,
                 lane_type="protein_design",
                 rationale=(
-                    "true complex and schema inputs available for protein design"
-                    if tool_name in {"NvidiaNIM_rfdiffusion", "NvidiaNIM_proteinmpnn"}
+                    "true complex and schema inputs available for RFdiffusion"
+                    if tool_name == "NvidiaNIM_rfdiffusion"
+                    else "validated backbone or complex structure available for ProteinMPNN"
+                    if tool_name == "NvidiaNIM_proteinmpnn"
                     else "sequence-generation intent and official args are available"
                 ),
             )
@@ -1076,6 +1147,29 @@ def _available_fields_for_protein_candidate(
                     status="available",
                 )
             )
+        for pdb_id in _step8_real_pdb_ids(step8_result, candidate_id):
+            out.append(
+                Step9AvailableField(
+                    candidate_id=candidate_id,
+                    field_ref=f"identifier:pdb_id:{pdb_id}",
+                    provider="step_08",
+                    field_type="structure_identifier",
+                    value_kind="pdb_id",
+                    source_ref=pdb_id,
+                    status="available",
+                )
+            )
+        for ref in _step8_structure_reference_fields(step8_result, candidate_id):
+            out.append(
+                Step9AvailableField(
+                    candidate_id=candidate_id,
+                    field_ref=ref["field_ref"],
+                    provider="step_08",
+                    field_type="structure",
+                    value_kind=ref["value_kind"],
+                    status="available",
+                )
+            )
     for seq_ref in _build_step7_sequence_refs(step7_prepared_inputs, candidate_id):
         status = _sequence_readiness_label(seq_ref)
         out.append(
@@ -1103,12 +1197,15 @@ def _aggregate_readiness_profile(
             blocked_tool_count=0,
         )
 
-    ready_tool_count = len(
-        list(dict.fromkeys(tool for lane in lanes for tool in lane.allowed_tools))
+    allowed_tools = sorted(
+        set(tool for lane in lanes for tool in lane.allowed_tools if tool)
     )
-    blocked_tool_count = len(
-        list(dict.fromkeys(tool for lane in lanes for tool in lane.blocked_tools))
+    blocked_tools = sorted(
+        set(tool for lane in lanes for tool in lane.blocked_tools if tool)
+        - set(allowed_tools)
     )
+    ready_tool_count = len(allowed_tools)
+    blocked_tool_count = len(blocked_tools)
     ready = len([lane for lane in lanes if lane.status == "ready"])
     blocked = len([lane for lane in lanes if lane.status == "blocked"])
     not_applicable = len([lane for lane in lanes if lane.status == "not_applicable"])
@@ -1120,8 +1217,7 @@ def _aggregate_readiness_profile(
             if req
         )
     )
-    allowed_tools = list(dict.fromkeys(tool for lane in lanes for tool in lane.allowed_tools))
-    blocked_tools = list(dict.fromkeys(tool for lane in lanes for tool in lane.blocked_tools))
+    missing_requirements = sorted(missing_requirements)
 
     if ready:
         status = "ready"

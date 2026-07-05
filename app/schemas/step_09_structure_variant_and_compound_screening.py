@@ -23,7 +23,10 @@ class Step9AvailableField(BaseModel):
     """Compact, raw-safe readiness inputs projected for Step 9 hard gate.
 
     These are intentionally non-sensitive references (refs/hashes/flags), never
-    raw sequence or raw molecular payload.
+    raw sequence or raw molecular payload. Retained for legacy hard-gate
+    audit/compatibility only — production Stage 1 / Stage 2 / runtime planning
+    consume `Step9InputField` (below) from the centralized
+    `step_09_input_projection` module instead.
     """
 
     candidate_id: str
@@ -33,6 +36,48 @@ class Step9AvailableField(BaseModel):
     value_kind: str
     source_ref: Optional[str] = None
     status: Literal["available", "blocked", "not_applicable"] = "available"
+
+
+class Step9InputField(BaseModel):
+    """Deterministic, raw-safe Step 9 input field produced by the centralized
+    `step_09_input_projection.project_step9_inputs` layer.
+
+    This is the SINGLE field shape Stage 1, Stage 2, and the runtime planner
+    consume. Only the projection layer understands raw Step 5 / Step 7 /
+    Step 8 / query artifact shapes; `source_path` records the schema
+    location the field was derived from (a dotted schema path, never a
+    storage path), and `runtime_lookup` records how to resolve the field at
+    real execution time without embedding the raw value here.
+
+    `field_ref` is guaranteed globally unique within a single projection
+    (`step_09_input_projection.project_step9_inputs`): when two or more raw
+    upstream fields (e.g. the same UniProt accession surfaced by both a Step
+    5 candidate identifier and a Step 7 identifier-only sequence ref, or the
+    same PDB id shared by two candidates' Step 8 complex results) would
+    otherwise collide on the same `field_ref`, the projection layer merges
+    them into one canonical field. `source_step`/`candidate_id` then carry
+    the first-seen source; `source_steps`/`candidate_ids` carry every
+    contributing source so no provenance is lost.
+    """
+
+    field_ref: str
+    candidate_id: Optional[str] = None
+    candidate_ids: list[str] = Field(default_factory=list)
+    source_step: Literal["step_05", "step_07", "step_08", "query"]
+    source_steps: list[str] = Field(default_factory=list)
+    source_artifact: str
+    source_path: str
+    field_name: str
+    field_type: str
+    value_kind: str
+    semantic_role: Optional[str] = None
+    chain_role: Optional[str] = None
+    supports_tool_args: list[str] = Field(default_factory=list)
+    can_resolve_at_runtime: bool = False
+    llm_safe_metadata: dict = Field(default_factory=dict)
+    runtime_lookup: dict = Field(default_factory=dict)
+    status: Literal["available", "missing", "blocked", "not_applicable"] = "available"
+    missing_reason: Optional[str] = None
 
 
 class Step9HardGateAllowedTool(BaseModel):
@@ -192,7 +237,22 @@ class CompoundScreeningArtifact(BaseModel):
     step9_stage2_uninvokable_tool_details: list[dict] = Field(default_factory=list)
     step9_stage2_argument_mapping_audit: list[dict] = Field(default_factory=list)
     step9_stage2_prompt_cache_layout_version: str = "not_run"
+    step9_runtime_execution_plan: list[dict] = Field(default_factory=list)
+    step9_runtime_resolved_tools: list[dict] = Field(default_factory=list)
+    step9_runtime_unresolved_tools: list[dict] = Field(default_factory=list)
+    step9_runtime_resolver_audit: list[dict] = Field(default_factory=list)
+    step9_runtime_kwargs_contracts: list[dict] = Field(default_factory=list)
+    step9_runtime_kwargs_contract_audit: list[dict] = Field(default_factory=list)
+    step9_runtime_execution_mode: str = "not_run"
     step9_missing_inputs: list[str] = Field(default_factory=list)
+    # ── Step9InputProjection (centralized deterministic projection layer) ──
+    # Production Stage 1 / Stage 2 / runtime planning consume ONLY these
+    # fields; the legacy `step9_hard_gate_*` / `step9_available_fields`
+    # fields above stay for backward-compatible audit and no longer drive
+    # catalog/selection/mapping/planning.
+    step9_input_fields: list[Step9InputField] = Field(default_factory=list)
+    step9_input_projection_summary: dict = Field(default_factory=dict)
+    step9_projection_missing_inputs: list[str] = Field(default_factory=list)
     protein_design_readiness: Step9LaneReadinessProfile = Field(
         default_factory=Step9LaneReadinessProfile
     )

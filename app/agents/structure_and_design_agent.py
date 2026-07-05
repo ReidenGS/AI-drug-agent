@@ -15,8 +15,7 @@ tool-calling agent. The three entry points are:
   `tool_outputs/step_08/{tool_call_id}.json`.
 - `run_step_9(run_id)` — structural variant generation/evaluation planning
   audit for protein-design and variant-evaluation lanes. Legacy compound
-  artifact fields are retained for compatibility, but Step 9 no longer routes
-  compound candidates to ZINC/ChEMBL.
+  artifact fields are retained for compatibility.
 
 Hard constraints (architecture v0.1):
 - RFdiffusion `contigs_dsl` is NOT generated freely by this agent.
@@ -37,10 +36,12 @@ from pathlib import PurePosixPath
 from typing import Any, Iterable, Optional
 
 from ..agents.step_09_available_fields import project_step9_readiness
+from ..agents.step_09_input_projection import project_step9_inputs
 from ..agents.step_09_selection_policy import (
     select_step9_stage1_tools,
     select_step9_stage2_mappings,
 )
+from ..agents.step_09_runtime_planner import plan_step9_runtime_execution
 from ..llm.provider import LLMProvider, MockLLMProvider
 from ..mcp.client import MCPClient
 from ..schemas.common import ToolCallRecord
@@ -1507,28 +1508,42 @@ class StructureAndDesignAgent:
             or ""
         )
 
+        # Legacy hard-gate readiness projection: retained for backward-
+        # compatible audit fields only (step9_hard_gate_*, step9_available_fields,
+        # readiness summaries). It no longer drives Stage 1 catalog, Stage 2
+        # mapping, or runtime planning — see `step9_input_projection` below.
         readiness_projection = project_step9_readiness(
             candidate_context_table=cct,
             prepared_structure_input_package=step7_pkg,
             structure_prediction_and_interface_results=step8_artifact,
             compound_context_text=compound_context_text,
         )
+
+        # Step9InputProjection: the SINGLE centralized, deterministic layer
+        # that understands raw Step 5/7/8/query artifact shapes for Step 9.
+        # Stage 1, Stage 2, and the runtime planner consume only this
+        # projection's `input_fields` / summaries from here on.
+        input_projection = project_step9_inputs(
+            candidate_context_table=cct,
+            prepared_structure_input_package=step7_pkg,
+            structure_prediction_and_interface_results=step8_artifact,
+            structured_query=structured_query,
+            raw_request=raw_request,
+        )
         stage1_selection = select_step9_stage1_tools(
             llm=self.llm,
-            readiness_projection=readiness_projection,
+            projection=input_projection,
             candidate_id="all_candidates",
-            canonical_query=str(structured_query.get("canonical_query") or ""),
-            raw_user_query=str(raw_request.get("raw_user_query") or ""),
-            step8_downstream_handoff_status=_step9_compact_handoff_status(step8_artifact),
         )
         stage2_mapping = select_step9_stage2_mappings(
             llm=self.llm,
-            readiness_projection=readiness_projection,
+            projection=input_projection,
             selected_tools=stage1_selection.selected_tools,
             candidate_id="all_candidates",
-            canonical_query=str(structured_query.get("canonical_query") or ""),
-            raw_user_query=str(raw_request.get("raw_user_query") or ""),
-            step8_downstream_handoff_status=_step9_compact_handoff_status(step8_artifact),
+        )
+        runtime_plan = plan_step9_runtime_execution(
+            mapped_tools=stage2_mapping.mapped_tools,
+            input_fields=input_projection["input_fields"],
         )
 
         tool_calls: list[ToolCallRecord] = []
@@ -1565,7 +1580,21 @@ class StructureAndDesignAgent:
             step9_stage2_uninvokable_tool_details=stage2_mapping.uninvokable_tool_details,
             step9_stage2_argument_mapping_audit=stage2_mapping.argument_mapping_audit,
             step9_stage2_prompt_cache_layout_version=stage2_mapping.prompt_cache_layout_version,
+            step9_runtime_execution_plan=runtime_plan["step9_runtime_execution_plan"],
+            step9_runtime_resolved_tools=runtime_plan["step9_runtime_resolved_tools"],
+            step9_runtime_unresolved_tools=runtime_plan["step9_runtime_unresolved_tools"],
+            step9_runtime_resolver_audit=runtime_plan["step9_runtime_resolver_audit"],
+            step9_runtime_kwargs_contracts=runtime_plan["step9_runtime_kwargs_contracts"],
+            step9_runtime_kwargs_contract_audit=runtime_plan["step9_runtime_kwargs_contract_audit"],
+            step9_runtime_execution_mode=runtime_plan["step9_runtime_execution_mode"],
             step9_missing_inputs=readiness_projection["step9_missing_inputs"],
+            step9_input_fields=input_projection["input_fields"],
+            step9_input_projection_summary={
+                "candidate_summaries": input_projection["candidate_summaries"],
+                "handoff_summary": input_projection["handoff_summary"],
+                "query_summary": input_projection["query_summary"],
+            },
+            step9_projection_missing_inputs=input_projection["missing_inputs"],
         )
 
         artifact_id = new_artifact_id("compound_screening_artifact")
@@ -3959,39 +3988,6 @@ def _short(v: Any) -> Any:
         return v[:200] + "…"
     return v
 
-
-def _step9_compact_handoff_status(step8_artifact: dict | None) -> list[dict[str, Any]]:
-    if not isinstance(step8_artifact, dict):
-        return []
-    out: list[dict[str, Any]] = []
-    for result in step8_artifact.get("candidate_structure_results") or []:
-        if not isinstance(result, dict):
-            continue
-        handoff = result.get("downstream_handoff")
-        refs = result.get("complex_structure_refs")
-        missing = []
-        if isinstance(handoff, dict):
-            missing = [
-                str(item)
-                for item in (handoff.get("missing_for_step9") or [])
-                if isinstance(item, str)
-            ]
-        out.append(
-            {
-                "candidate_id": str(result.get("candidate_id") or ""),
-                "run_status": str(result.get("run_status") or ""),
-                "has_downstream_handoff": isinstance(handoff, dict),
-                "has_complex_structure": bool(
-                    handoff.get("has_complex_structure") if isinstance(handoff, dict) else False
-                ),
-                "has_validated_structure": bool(
-                    handoff.get("has_validated_structure") if isinstance(handoff, dict) else False
-                ),
-                "complex_structure_ref_count": len(refs) if isinstance(refs, list) else 0,
-                "missing_for_step9": missing,
-            }
-        )
-    return out
 
 def _apply_step7_tool_output_metadata(
     storage: Storage, record: StructureInputRecord, tool_call: ToolCallRecord, tool_name: str

@@ -273,6 +273,36 @@ def test_step9_dynamut_requires_real_pdb_id_not_predicted_storage_ref(monkeypatc
         for entry in readiness["step9_hard_gate_blocked_tools_with_reason"]
     }
     assert blocked["DynaMut2_predict_stability"] == "pdb_id_missing"
+    fields = [
+        field.model_dump()
+        for field in readiness["step9_available_fields"]
+        if field.value_kind == "pdb_id"
+    ]
+    assert fields == []
+
+
+def test_step9_uploaded_or_storage_path_does_not_project_pdb_id(monkeypatch):
+    candidate_context = _seed_target_candidate_with_antigen_context()
+    candidate_context["candidate_records"][0]["identifiers"].append(
+        {"id_type": "chain", "id_value": "A"}
+    )
+    _configure_contract_schemas(monkeypatch)
+
+    readiness = step9.project_step9_readiness(
+        candidate_context_table=candidate_context,
+        prepared_structure_input_package={},
+        structure_prediction_and_interface_results=_seed_step8_design_results_without_complex(),
+        compound_context_text="",
+    )
+    assert not any(
+        field.value_kind == "pdb_id"
+        for field in readiness["step9_available_fields"]
+    )
+    blocked = {
+        entry.tool_name: entry.reason
+        for entry in readiness["step9_hard_gate_blocked_tools_with_reason"]
+    }
+    assert blocked["DynaMut2_predict_stability"] == "pdb_id_missing"
 
 
 def test_step9_dynamut_with_existing_pdb_complex_is_allowed(monkeypatch):
@@ -292,6 +322,16 @@ def test_step9_dynamut_with_existing_pdb_complex_is_allowed(monkeypatch):
         entry.tool_name for entry in readiness["step9_hard_gate_allowed_tools"]
     }
     assert "DynaMut2_predict_stability" in allowed
+    pdb_fields = [
+        field
+        for field in readiness["step9_available_fields"]
+        if field.field_ref == "identifier:pdb_id:1ABC"
+    ]
+    assert len(pdb_fields) == 1
+    assert pdb_fields[0].provider == "step_08"
+    assert pdb_fields[0].field_type == "structure_identifier"
+    assert pdb_fields[0].value_kind == "pdb_id"
+    assert pdb_fields[0].source_ref == "1ABC"
 
 
 def test_step9_esm_generate_requires_sequence_generation_intent(monkeypatch):
@@ -382,9 +422,19 @@ def test_step9_rfdiffusion_stays_not_ready_without_true_complex(monkeypatch):
         "complex_structure_missing",
         "schema_required:contigs,input_pdb",
     }
+    assert "NvidiaNIM_proteinmpnn" in {
+        entry.tool_name for entry in readiness["step9_hard_gate_allowed_tools"]
+    }
+    assert any(
+        field.field_ref == "step8_validated_structure_ref:cand_t1"
+        and field.provider == "step_08"
+        and field.field_type == "structure"
+        and field.value_kind == "structure_ref"
+        for field in readiness["step9_available_fields"]
+    )
 
 
-def test_step9_proteinmpnn_required_true_complex_for_input_pdb(monkeypatch):
+def test_step9_proteinmpnn_allows_true_complex_for_input_pdb(monkeypatch):
     candidate_context = _seed_target_candidate_with_antigen_context()
     _configure_contract_schemas(monkeypatch)
 
@@ -537,6 +587,50 @@ def test_step9_aggregate_readiness_profile_counts_tools_in_protein_design_lane(m
         "NvidiaNIM_rfdiffusion",
         "ESM_generate_protein_sequence",
     }
+
+
+def test_step9_aggregate_profile_does_not_show_allowed_tool_as_blocked(monkeypatch):
+    candidate_a = _seed_target_candidate_with_antigen_context()["candidate_records"][0]
+    candidate_a = {**candidate_a, "candidate_id": "cand_a"}
+    candidate_b = _seed_target_candidate_with_antigen_context()["candidate_records"][0]
+    candidate_b = {**candidate_b, "candidate_id": "cand_b"}
+    candidate_context = {"candidate_records": [candidate_a, candidate_b]}
+    step8_result = {
+        "candidate_structure_results": [
+            {
+                "candidate_id": "cand_a",
+                "complex_structure_refs": [
+                    {
+                        "source_kind": "existing_pdb_complex",
+                        "pdb_id": "1ABC",
+                        "source_ref": "1ABC",
+                    }
+                ],
+            }
+        ]
+    }
+    _configure_contract_schemas(monkeypatch)
+
+    readiness = step9.project_step9_readiness(
+        candidate_context_table=candidate_context,
+        prepared_structure_input_package={},
+        structure_prediction_and_interface_results=step8_result,
+        compound_context_text="",
+    )
+
+    profile = readiness["protein_design_readiness"]
+    assert "NvidiaNIM_proteinmpnn" in profile.allowed_tools
+    assert "NvidiaNIM_proteinmpnn" not in profile.blocked_tools
+    assert profile.ready_tool_count == len(profile.allowed_tools)
+    assert profile.blocked_tool_count == len(profile.blocked_tools)
+
+    blocked_records = [
+        entry
+        for entry in readiness["step9_hard_gate_blocked_tools_with_reason"]
+        if entry.candidate_id == "cand_b" and entry.tool_name == "NvidiaNIM_proteinmpnn"
+    ]
+    assert blocked_records
+    assert blocked_records[0].reason == "complex_structure_missing"
 
 
 def test_step9_aggregate_readiness_profile_counts_tools_in_variant_evaluation_lane(monkeypatch):

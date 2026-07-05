@@ -249,7 +249,7 @@ def _mock_step9_tool_selection_stage1(schema: dict) -> dict:
 
 
 def _mock_step9_tool_schema_mapping_stage2(schema: dict) -> dict:
-    fields = schema.get("step9_available_fields") or []
+    fields = schema.get("step9_input_fields") or []
     tools = schema.get("tools") or []
 
     def match(arg_name: str) -> dict | None:
@@ -257,33 +257,8 @@ def _mock_step9_tool_schema_mapping_stage2(schema: dict) -> dict:
         for field in fields:
             if not isinstance(field, dict):
                 continue
-            value_kind = str(field.get("value_kind") or "").lower()
-            field_type = str(field.get("field_type") or "").lower()
-            field_ref = str(field.get("field_ref") or "").lower()
-            provider = str(field.get("provider") or "").lower()
-            if lowered in {"smiles", "canonical_smiles"} and value_kind == "smiles":
-                return field
-            if lowered == "query" and value_kind in {"name", "compound_name"}:
-                return field
-            if lowered == "zinc_id" and (value_kind == "zinc_id" or "identifier:zinc_id:" in field_ref):
-                return field
-            if lowered in {"chembl_id", "molecule_chembl_id"} and (
-                value_kind == "chembl_id" or "identifier:chembl_id:" in field_ref
-            ):
-                return field
-            if lowered == "uniprot_id" and (value_kind == "uniprot_id" or "identifier:uniprot" in field_ref):
-                return field
-            if lowered in {"variant", "variants", "mutation"} and value_kind in {"variant", "variants", "mutation", "protein_variant"}:
-                return field
-            if lowered == "chain" and (value_kind in {"chain", "chain_id", "chain_role"} or "chain" in field_ref):
-                return field
-            if lowered == "pdb_id" and (value_kind == "pdb_id" or "identifier:pdb_id:" in field_ref):
-                return field
-            if lowered in {"input_pdb", "pdb_file", "structure_ref", "structure", "backbone", "path"} and provider == "step_08":
-                return field
-            if lowered == "contigs" and value_kind in {"contigs", "design_contigs"}:
-                return field
-            if lowered in {"prompt_sequence", "sequence", "sequence_value", "sequence_1", "sequence_2", "sequence_3", "sequence_a", "sequence_b"} and field_type == "protein_sequence":
+            supports = {str(a).lower() for a in (field.get("supports_tool_args") or [])}
+            if lowered in supports:
                 return field
         return None
 

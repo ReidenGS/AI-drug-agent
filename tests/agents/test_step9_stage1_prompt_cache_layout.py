@@ -1,10 +1,17 @@
-"""Step 9 Stage 1 prompt cache-friendly layout tests."""
+"""Step 9 Stage 1 prompt cache-friendly layout tests.
+
+Stage 1's catalog is now the FULL active Step 9 tool set (6 tools), built
+directly from `ACTIVE_STEP9_TOOLS` — independent of any per-candidate
+hard-gate/readiness computation. These tests prove that invariant plus the
+existing prompt-cache-friendly stable/dynamic split behavior.
+"""
 
 from __future__ import annotations
 
 import json
 
 from app.agents.step_09_selection_policy import (
+    ACTIVE_STEP9_TOOLS,
     STEP9_STAGE1_SYSTEM_PROMPT,
     STEP9_STAGE1_USER_PROMPT,
     build_step9_stage1_catalog,
@@ -12,17 +19,19 @@ from app.agents.step_09_selection_policy import (
     select_step9_stage1_tools,
 )
 from app.llm.json_task_validation import build_json_prompt, build_json_prompt_sections
-from app.schemas.step_09_structure_variant_and_compound_screening import (
-    Step9AvailableField,
-    Step9HardGateAllowedTool,
-    Step9HardGateBlockedTool,
-    Step9LaneStatus,
-    Step9ToolSchemaRequirement,
-)
 
 
 RAW_SEQ = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
 RAW_PDB = "HEADER TEST PDB\nATOM      1  N   GLY A   1"
+
+_ACTIVE_TOOL_NAMES = {
+    "NvidiaNIM_rfdiffusion",
+    "NvidiaNIM_proteinmpnn",
+    "ESM_generate_protein_sequence",
+    "DynaMut2_predict_stability",
+    "AlphaMissense_get_variant_score",
+    "ESM_score_variant_sae_batch",
+}
 
 
 class _LLM:
@@ -42,97 +51,43 @@ class _LLM:
         return self.response
 
 
-def _allowed(tool_name: str, lane_type: str, candidate_id: str = "cand_a"):
-    return Step9HardGateAllowedTool(
-        tool_name=tool_name,
-        lane_type=lane_type,  # type: ignore[arg-type]
-        candidate_id=candidate_id,
-        rationale="fixture allowed",
-    )
-
-
-def _blocked(tool_name: str, lane_type: str, candidate_id: str = "cand_a"):
-    return Step9HardGateBlockedTool(
-        tool_name=tool_name,
-        lane_type=lane_type,  # type: ignore[arg-type]
-        candidate_id=candidate_id,
-        reason="schema_required:pdb_id",
-    )
-
-
-def _req(tool_name: str, lane_type: str, *, decision: str = "allowed"):
-    required = ["prompt_sequence"] if tool_name == "ESM_generate_protein_sequence" else ["sequence"]
-    return Step9ToolSchemaRequirement(
-        candidate_id="cand_a",
-        tool_name=tool_name,
-        lane_type=lane_type,  # type: ignore[arg-type]
-        required_fields=required,
-        schema_source="signature",
-        satisfiable_required_fields=required if decision == "allowed" else [],
-        missing_required_fields=[] if decision == "allowed" else ["pdb_id"],
-        hard_gate_decision=decision,  # type: ignore[arg-type]
-        reason="schema_requirements_satisfied" if decision == "allowed" else "schema_required:pdb_id",
-    )
-
-
-def _field(candidate_id: str = "cand_a", field_ref: str = "material:mat_a"):
-    return Step9AvailableField(
-        candidate_id=candidate_id,
-        field_ref=field_ref,
-        provider="step_05",
-        field_type="protein_sequence",
-        value_kind="sequence_material",
-    )
-
-
-def _lane(
-    *,
-    candidate_id: str = "cand_a",
-    lane_type: str = "protein_design",
-    allowed_tools=None,
-    blocked_tools=None,
-):
-    return Step9LaneStatus(
-        lane_type=lane_type,  # type: ignore[arg-type]
-        candidate_id=candidate_id,
-        candidate_type="target_antigen",
-        status="ready" if allowed_tools else "blocked",
-        allowed_tools=allowed_tools or [],
-        blocked_tools=blocked_tools or [],
-        missing_requirements=["schema_required:pdb_id"] if blocked_tools else [],
-        available_field_refs=[f"material:{candidate_id}_mat"],
-    )
-
-
-def _projection(*, allowed=None, blocked=None, fields=None, lanes=None, reqs=None):
-    allowed = allowed if allowed is not None else [_allowed("ESM_generate_protein_sequence", "protein_design")]
-    blocked = blocked if blocked is not None else [_blocked("DynaMut2_predict_stability", "variant_evaluation")]
-    reqs = reqs if reqs is not None else [
-        _req(t.tool_name, t.lane_type, decision="allowed") for t in allowed
-    ]
+def _projection(*, candidate_id="cand_a", missing=None, canonical_query="", raw_user_query=""):
     return {
-        "step9_hard_gate_allowed_tools": allowed,
-        "step9_hard_gate_blocked_tools_with_reason": blocked,
-        "step9_tool_schema_requirements": reqs,
-        "step9_available_fields": fields if fields is not None else [_field()],
-        "step9_lane_statuses": lanes if lanes is not None else [
-            _lane(allowed_tools=[t.tool_name for t in allowed], blocked_tools=[b.tool_name for b in blocked])
+        "input_fields": [
+            {
+                "field_ref": f"material:{candidate_id}_mat",
+                "candidate_id": candidate_id,
+                "source_step": "step_05",
+                "source_artifact": "candidate_context_table",
+                "source_path": "candidate_records[].materials[]",
+                "field_name": "target_sequence",
+                "field_type": "protein_sequence",
+                "value_kind": "sequence_ref",
+                "supports_tool_args": ["sequence", "prompt_sequence"],
+                "can_resolve_at_runtime": True,
+                "status": "available",
+            }
         ],
+        "candidate_summaries": [
+            {
+                "candidate_id": candidate_id,
+                "candidate_type": "target_antigen",
+                "field_count": 1,
+                "field_types_present": ["protein_sequence"],
+            }
+        ],
+        "handoff_summary": {"candidates": [{"candidate_id": candidate_id, "has_complex_structure": False}]},
+        "missing_inputs": missing if missing is not None else [],
+        "query_summary": {"canonical_query": canonical_query, "raw_user_query": raw_user_query},
     }
 
 
-def _sections_for(projection: dict, *, candidate_id="cand_a", canonical_query="", raw_user_query=""):
-    catalog = build_step9_stage1_catalog(
-        projection["step9_hard_gate_allowed_tools"],
-        projection["step9_tool_schema_requirements"],
-    )
+def _sections_for(projection: dict, *, candidate_id="cand_a"):
+    catalog = build_step9_stage1_catalog()
     payload = build_step9_stage1_payload(
         candidate_id=candidate_id,
         catalog=catalog,
-        readiness_projection=projection,
-        canonical_query=canonical_query,
-        raw_user_query=raw_user_query,
-        step8_downstream_handoff_status=[{"candidate_id": candidate_id, "has_complex_structure": False}],
+        projection=projection,
     )
     stable, dynamic = build_json_prompt_sections(
         prompt=STEP9_STAGE1_USER_PROMPT,
@@ -152,57 +107,79 @@ def _stable_catalog(stable: str) -> list[dict]:
     return json.loads(block)["compact_catalog"]
 
 
-def test_same_allowed_catalog_different_candidate_context_stable_prefix_identical():
-    projection_a = _projection(fields=[_field("cand_alpha", "material:mat_alpha")])
-    projection_b = _projection(fields=[_field("cand_beta", "material:mat_beta")])
-    stable_a, _, _ = _sections_for(
-        projection_a,
-        candidate_id="cand_alpha",
-        canonical_query="screen alpha",
-        raw_user_query="alpha query",
-    )
-    stable_b, _, _ = _sections_for(
-        projection_b,
-        candidate_id="cand_beta",
-        canonical_query="screen beta",
-        raw_user_query="beta query",
-    )
+def test_active_catalog_is_always_all_six_tools_registry():
+    assert set(ACTIVE_STEP9_TOOLS) == _ACTIVE_TOOL_NAMES
+
+
+def test_stage1_catalog_always_contains_all_six_active_tools_regardless_of_readiness():
+    catalog = build_step9_stage1_catalog()
+    names = {entry["tool_name"] for entry in catalog}
+    assert names == _ACTIVE_TOOL_NAMES
+
+
+def test_stage1_catalog_has_no_zinc_or_chembl_tools():
+    catalog = build_step9_stage1_catalog()
+    names = {entry["tool_name"] for entry in catalog}
+    assert not any(name.startswith(("ZINC_", "ChEMBL_")) for name in names)
+
+
+def test_same_active_catalog_different_candidate_context_stable_prefix_identical():
+    projection_a = _projection(candidate_id="cand_alpha", canonical_query="screen alpha", raw_user_query="alpha query")
+    projection_b = _projection(candidate_id="cand_beta", canonical_query="screen beta", raw_user_query="beta query")
+    stable_a, _, _ = _sections_for(projection_a, candidate_id="cand_alpha")
+    stable_b, _, _ = _sections_for(projection_b, candidate_id="cand_beta")
     assert stable_a == stable_b
     assert stable_a
 
 
+def test_valid_empty_selection_respected_no_forced_selection():
+    result = select_step9_stage1_tools(
+        llm=_LLM({"selections": []}),
+        projection=_projection(),
+        candidate_id="cand_a",
+    )
+    assert set(result.catalog_tool_names) == _ACTIVE_TOOL_NAMES
+    assert result.selected_tools == []
+    assert result.rejected_tools_with_reason == []
+
+
 def test_candidate_specific_values_only_after_stable_prefix():
     stable, dynamic, full = _sections_for(
-        _projection(fields=[_field("cand_SENTINEL", "material:field_SENTINEL")]),
+        _projection(candidate_id="cand_SENTINEL", canonical_query="CANONICAL_SENTINEL", raw_user_query="RAW_QUERY_SENTINEL"),
         candidate_id="cand_SENTINEL",
-        canonical_query="CANONICAL_SENTINEL",
-        raw_user_query="RAW_QUERY_SENTINEL",
     )
-    for needle in ("cand_SENTINEL", "material:field_SENTINEL", "CANONICAL_SENTINEL", "RAW_QUERY_SENTINEL"):
+    for needle in ("cand_SENTINEL", "CANONICAL_SENTINEL", "RAW_QUERY_SENTINEL"):
         assert needle not in stable
         assert needle in dynamic
         assert full.index(needle) >= len(stable)
     assert full == stable + dynamic
 
 
-def test_stable_prefix_contains_allowed_catalog_only_not_blocked_tools():
-    projection = _projection(
-        allowed=[_allowed("ESM_generate_protein_sequence", "protein_design")],
-        blocked=[_blocked("DynaMut2_predict_stability", "variant_evaluation")],
+def test_stable_prefix_declares_stage1_output_fields_and_few_shots():
+    stable, dynamic, _ = _sections_for(
+        _projection(candidate_id="cand_SENTINEL", canonical_query="CANONICAL_SENTINEL", raw_user_query="RAW_QUERY_SENTINEL"),
+        candidate_id="cand_SENTINEL",
     )
-    stable, dynamic, full = _sections_for(projection)
-    names = [entry["tool_name"] for entry in _stable_catalog(stable)]
-    assert names == ["ESM_generate_protein_sequence"]
-    assert "DynaMut2_predict_stability" not in stable
-    assert "DynaMut2_predict_stability" not in dynamic
-    assert "DynaMut2_predict_stability" not in full
+    for needle in (
+        '"selections"',
+        '"tool_name"',
+        '"lane_type"',
+        '"selection_reason"',
+        "Relevant-tool example",
+        "AlphaMissense_get_variant_score",
+        "Variant scoring is relevant and required inputs are available.",
+        "No-relevant-tool example",
+        '{"selections": []}',
+    ):
+        assert needle in stable
+    for dynamic_only in ("cand_SENTINEL", "CANONICAL_SENTINEL", "RAW_QUERY_SENTINEL"):
+        assert dynamic_only not in stable
+        assert dynamic_only in dynamic
 
 
 def test_stable_prefix_excludes_raw_sequence_pdb_fasta_a3m_and_api_key():
     stable, dynamic, full = _sections_for(
-        _projection(),
-        canonical_query=f"design with {RAW_SEQ} and sk-secretvalue123",
-        raw_user_query=f"{RAW_PDB}\n>seq\n{RAW_SEQ}\nA3M",
+        _projection(canonical_query=f"design with {RAW_SEQ} and sk-secretvalue123", raw_user_query=f"{RAW_PDB}\n>seq\n{RAW_SEQ}\nA3M"),
     )
     for forbidden in (RAW_SEQ, "HEADER TEST PDB", "ATOM      1", "sk-secretvalue123"):
         assert forbidden not in stable
@@ -211,50 +188,12 @@ def test_stable_prefix_excludes_raw_sequence_pdb_fasta_a3m_and_api_key():
 
 
 def test_stable_catalog_sorted_by_lane_then_tool():
-    projection = _projection(
-        allowed=[
-            _allowed("NvidiaNIM_proteinmpnn", "protein_design"),
-            _allowed("ESM_generate_protein_sequence", "protein_design"),
-            _allowed("AlphaMissense_get_variant_score", "variant_evaluation"),
-        ],
-        reqs=[
-            _req("NvidiaNIM_proteinmpnn", "protein_design"),
-            _req("ESM_generate_protein_sequence", "protein_design"),
-            _req("AlphaMissense_get_variant_score", "variant_evaluation"),
-        ],
-    )
-    stable, _, _ = _sections_for(projection)
+    stable, _, _ = _sections_for(_projection())
     pairs = [(entry["lane_type"], entry["tool_name"]) for entry in _stable_catalog(stable)]
     assert pairs == sorted(pairs)
 
 
-def test_protein_only_allowed_set_does_not_include_compound_tools():
-    projection = _projection(
-        allowed=[_allowed("ESM_generate_protein_sequence", "protein_design")],
-        reqs=[_req("ESM_generate_protein_sequence", "protein_design")],
-    )
-    stable, _, _ = _sections_for(projection)
-    names = {entry["tool_name"] for entry in _stable_catalog(stable)}
-    assert names == {"ESM_generate_protein_sequence"}
-    assert "ZINC_search_by_smiles" not in names
-
-
-def test_variant_only_allowed_set_does_not_include_protein_design_tools():
-    projection = _projection(
-        allowed=[_allowed("AlphaMissense_get_variant_score", "variant_evaluation")],
-        reqs=[_req("AlphaMissense_get_variant_score", "variant_evaluation")],
-    )
-    stable, _, _ = _sections_for(projection)
-    names = {entry["tool_name"] for entry in _stable_catalog(stable)}
-    assert names == {"AlphaMissense_get_variant_score"}
-    assert "ESM_generate_protein_sequence" not in names
-
-
-def test_hallucinated_or_blocked_tool_is_dropped_and_audited():
-    projection = _projection(
-        allowed=[_allowed("ESM_generate_protein_sequence", "protein_design")],
-        blocked=[_blocked("DynaMut2_predict_stability", "variant_evaluation")],
-    )
+def test_hallucinated_or_non_active_tool_is_rejected():
     llm = _LLM({
         "selections": [
             {
@@ -263,9 +202,9 @@ def test_hallucinated_or_blocked_tool_is_dropped_and_audited():
                 "selection_reason": "valid",
             },
             {
-                "tool_name": "DynaMut2_predict_stability",
-                "lane_type": "variant_evaluation",
-                "selection_reason": "blocked",
+                "tool_name": "ZINC_search_by_smiles",
+                "lane_type": "compound_screening",
+                "selection_reason": "hallucinated non-active tool",
             },
             {
                 "tool_name": "Imaginary_tool",
@@ -276,23 +215,26 @@ def test_hallucinated_or_blocked_tool_is_dropped_and_audited():
     })
     result = select_step9_stage1_tools(
         llm=llm,
-        readiness_projection=projection,
+        projection=_projection(),
         candidate_id="cand_a",
     )
     assert [item.tool_name for item in result.selected_tools] == ["ESM_generate_protein_sequence"]
     rejected = {item["tool_name"]: item["reason"] for item in result.rejected_tools_with_reason}
-    assert rejected["DynaMut2_predict_stability"] == "tool_not_in_allowed_catalog"
-    assert rejected["Imaginary_tool"] == "tool_not_in_allowed_catalog"
+    assert rejected["ZINC_search_by_smiles"] == "tool_not_in_active_catalog"
+    assert rejected["Imaginary_tool"] == "tool_not_in_active_catalog"
 
 
-def test_valid_empty_selection_respected_no_forced_selection():
-    result = select_step9_stage1_tools(
-        llm=_LLM({"selections": []}),
-        readiness_projection=_projection(
-            allowed=[_allowed("ESM_generate_protein_sequence", "protein_design")]
-        ),
-        candidate_id="cand_a",
-    )
-    assert result.catalog_tool_names == ["ESM_generate_protein_sequence"]
+def test_wrong_lane_for_known_tool_is_rejected():
+    llm = _LLM({
+        "selections": [
+            {
+                "tool_name": "ESM_generate_protein_sequence",
+                "lane_type": "variant_evaluation",
+                "selection_reason": "wrong lane",
+            },
+        ]
+    })
+    result = select_step9_stage1_tools(llm=llm, projection=_projection(), candidate_id="cand_a")
     assert result.selected_tools == []
-    assert result.rejected_tools_with_reason == []
+    rejected = {item["tool_name"]: item["reason"] for item in result.rejected_tools_with_reason}
+    assert rejected["ESM_generate_protein_sequence"] == "tool_lane_not_in_active_catalog"
