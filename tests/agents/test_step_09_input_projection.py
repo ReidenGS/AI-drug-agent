@@ -299,6 +299,89 @@ def test_step5_material_heavy_light_target_sequence_supports_sequence_only():
     assert "prompt_sequence" not in fields[0].supports_tool_args
 
 
+def test_step5_prompt_sequence_material_projects_masked_prompt_field():
+    """A Step 5 `prompt_sequence` material (explicit masked generation prompt,
+    value = storage ref, compact `content_descriptor`) is the ONLY Step 5
+    material projected as a `masked_prompt_sequence` field that supports the
+    `prompt_sequence` arg. The raw masked prompt is never in the material value
+    (it's a storage ref) so nothing raw reaches the projection."""
+    candidate = _base_candidate(
+        materials=[
+            {
+                "material_id": "mat_prompt",
+                "material_type": "prompt_sequence",
+                "value": "adc_pilot/runs/r1/inputs/prompt_sequences/mat_prompt.txt",
+                "value_format": "masked_amino_acid_sequence",
+                "role": "protein_generation_prompt",
+                "role_status": "explicit",
+                "content_descriptor": {
+                    "has_mask": True,
+                    "mask_token_style": "underscore",
+                    "prompt_length": 33,
+                    "sha256_prefix": "deadbeef0001",
+                    "source_kind": "inline",
+                    "value_is_storage_ref": True,
+                },
+            }
+        ]
+    )
+    projection = project_step9_inputs(
+        candidate_context_table=_cct(candidate),
+        prepared_structure_input_package=None,
+        structure_prediction_and_interface_results=None,
+    )
+    fields = [f for f in projection["input_fields"] if f.candidate_id == "cand_t1"]
+    assert len(fields) == 1
+    field = fields[0]
+    assert field.field_type == "protein_sequence"
+    assert field.value_kind == "masked_prompt_sequence"
+    assert field.supports_tool_args == ["prompt_sequence"]
+    assert "sequence" not in field.supports_tool_args
+    assert field.semantic_role == "protein_generation_prompt"
+    assert field.can_resolve_at_runtime is True
+    # compact fingerprint surfaced; raw prompt never present.
+    assert field.llm_safe_metadata["has_mask"] is True
+    assert field.llm_safe_metadata["sha256_prefix"] == "deadbeef0001"
+    assert field.runtime_lookup["material_id"] == "mat_prompt"
+
+
+def test_ordinary_sequence_and_masked_prompt_dont_cross_contaminate():
+    """When both an ordinary heavy-chain sequence AND an explicit masked
+    prompt are present, only the masked prompt supports `prompt_sequence`; the
+    ordinary chain supports `sequence` only."""
+    candidate = _base_candidate(
+        candidate_type="antibody",
+        materials=[
+            {
+                "material_id": "mat_heavy",
+                "material_type": "antibody_heavy_chain_sequence",
+                "value": RAW_SEQ,
+            },
+            {
+                "material_id": "mat_prompt",
+                "material_type": "prompt_sequence",
+                "value": "adc_pilot/runs/r1/inputs/prompt_sequences/mat_prompt.txt",
+                "content_descriptor": {"has_mask": True, "prompt_length": 20},
+            },
+        ],
+    )
+    projection = project_step9_inputs(
+        candidate_context_table=_cct(candidate),
+        prepared_structure_input_package=None,
+        structure_prediction_and_interface_results=None,
+    )
+    by_material = {
+        f.field_ref: f
+        for f in projection["input_fields"]
+        if f.field_ref.startswith("material:")
+    }
+    heavy = by_material["material:mat_heavy"]
+    prompt = by_material["material:mat_prompt"]
+    assert set(heavy.supports_tool_args) == {"sequence"}
+    assert prompt.supports_tool_args == ["prompt_sequence"]
+    assert prompt.value_kind == "masked_prompt_sequence"
+
+
 def test_step8_complex_structure_ref_supports_complex_and_backbone_args():
     step8 = {
         "candidate_structure_results": [

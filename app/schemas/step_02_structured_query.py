@@ -138,6 +138,10 @@ MissingSlotName = Literal[
     "pdb_id",
     "uniprot_id",
     "smiles",
+    # Explicit ESM protein-generation masked prompt (contains "_" / "<mask>"
+    # mask positions). Distinct from `structure_or_sequence` / `sequence_role`
+    # — an ordinary complete heavy/light/target sequence never satisfies it.
+    "prompt_sequence",
     "task_intent",
     "constraint",
     "other",

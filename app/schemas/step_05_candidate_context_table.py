@@ -30,6 +30,14 @@ class Material(BaseModel):
     # inferred from an alias decomposition.
     role: Optional[str] = None
     role_status: Literal["explicit", "inferred", "unknown"] = "unknown"
+    # Compact, raw-safe descriptor of the material's content (additive,
+    # optional). Used when `value` is a storage ref rather than the raw
+    # content itself (e.g. an explicit ESM `prompt_sequence` material whose
+    # raw masked prompt is held in storage, never written into this artifact):
+    # downstream projection layers read length / hash / format flags from here
+    # without touching the raw bytes. Only holds non-sensitive fingerprints
+    # (length, sha256 prefix, mask flags) — never the raw sequence/prompt.
+    content_descriptor: Optional[dict] = None
 
 
 class ADCLinks(BaseModel):

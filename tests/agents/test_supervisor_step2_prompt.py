@@ -695,3 +695,64 @@ def test_normalizer_is_idempotent_on_canonical_payload():
     assert out["referenced_inputs"][1]["id_type"] == "antibody_light_chain_sequence"
     assert out["referenced_inputs"][1]["source"] == "user"
     assert out["parse_warnings"] == []
+
+
+# ── prompt_sequence (ESM masked generation prompt) prompt text ────────────
+
+
+def test_step2_prompt_states_prompt_sequence_requirement_concisely():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "prompt_sequence" in sp
+    assert '"id_type": "prompt_sequence"' in sp
+    assert "masked generation prompt" in sp
+    assert 'mask positions such as\n  "_" or "<mask>"' in sp
+    assert "never an ordinary complete heavy/light/target sequence" in sp
+    assert "blocking `missing_slots` slot \"prompt_sequence\"" in sp
+
+
+def test_step2_prompt_describes_conditional_prompt_sequence_slot():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "conditional prompt_sequence" in sp
+    assert "blocking prompt_sequence ONLY when the user asks to generate" in sp
+    assert "does NOT satisfy this slot" in sp
+
+
+def test_step2_prompt_does_not_ask_llm_to_inspect_uploaded_file_content():
+    """The LLM never sees uploaded-file bytes — the prompt must not imply
+    it should inspect file content or check for mask markers inside a file
+    to decide whether something is a prompt_sequence."""
+    sp_lower = SUPERVISOR_SYSTEM_PROMPT.lower()
+    for forbidden in (
+        "inspect uploaded file content",
+        "inspect the uploaded file",
+        "if the file contains",
+        "check header/content",
+        "check the file content",
+        "read the uploaded file",
+        "read the file content",
+    ):
+        assert forbidden not in sp_lower, forbidden
+
+
+def test_step2_referenced_inputs_enum_includes_prompt_sequence():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    assert "prompt_sequence" in sp
+    assert '"source": "prompt_sequence"' in sp
+
+
+# ── prompt_sequence normalizer behaviour ────────────────────────────────────
+
+
+def test_normalizer_prompt_sequence_id_type_not_swept_into_generic_antibody_alias():
+    """`prompt_sequence` must stay its own id_type — it must never be
+    coerced into `antibody_sequence_reference` alongside the generic
+    `protein_sequence` / `fasta_sequence` aliases."""
+    out = _normalize(
+        {
+            "referenced_inputs": [
+                {"id_type": "prompt_sequence", "value": "MKT_YIAKQNNVGA", "source": "user"},
+            ],
+            "parse_warnings": [],
+        }
+    )
+    assert out["referenced_inputs"][0]["id_type"] == "prompt_sequence"

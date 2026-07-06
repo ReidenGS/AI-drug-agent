@@ -13,6 +13,8 @@ from __future__ import annotations
 import re
 from typing import Any, Protocol, runtime_checkable
 
+from .json_task_validation import looks_like_masked_prompt_sequence, requests_protein_generation
+
 
 @runtime_checkable
 class LLMProvider(Protocol):
@@ -488,6 +490,10 @@ class MockLLMProvider:
 
         referenced = _detect_referenced_inputs(haystack)
         referenced.extend(_uploaded_file_refs(uploaded_files))
+        prompt_sequence_ref = _detect_prompt_sequence_referenced_input(haystack, uploaded_files)
+        if prompt_sequence_ref:
+            referenced.append(prompt_sequence_ref)
+        wants_protein_generation = requests_protein_generation(haystack)
 
         # Constraint preservation: keep the user's explicit constraints
         # verbatim. Don't try to interpret numeric tolerances here.
@@ -572,6 +578,7 @@ class MockLLMProvider:
             referenced=referenced,
             normalized_entities=normalized_entities,
             mentioned_drugs=mentioned_drugs,
+            wants_protein_generation=wants_protein_generation,
         )
         response = _compose_missing_slots_response(missing_slots)
         canonical_query = _compose_canonical_query(
@@ -1310,6 +1317,7 @@ def _compute_missing_slots(
     referenced: list[dict],
     normalized_entities: list[dict],
     mentioned_drugs: list[str],
+    wants_protein_generation: bool = False,
 ) -> list[dict]:
     """Mock missing_slots that follow the prompt's required_slot_schema.
 
@@ -1390,6 +1398,29 @@ def _compute_missing_slots(
                 "Which target, drug, or compound should we search for?",
             )
 
+    # Cross-cutting: protein generation requires an explicit prompt_sequence
+    # regardless of primary_intent. An ordinary heavy/light/target sequence
+    # (or any other referenced input) never satisfies it.
+    if wants_protein_generation:
+        has_valid_prompt_sequence = any(
+            isinstance(r, dict)
+            and (
+                (
+                    r.get("id_type") == "prompt_sequence"
+                    and looks_like_masked_prompt_sequence(r.get("value"))
+                )
+                or (r.get("id_type") == "uploaded_file" and r.get("source") == "prompt_sequence")
+            )
+            for r in referenced
+        )
+        if not has_valid_prompt_sequence:
+            _add(
+                "prompt_sequence", "sequence", "blocking", [primary_intent],
+                "Protein generation requires an explicit masked prompt_sequence.",
+                'Please provide the masked protein generation prompt '
+                '(containing "_" or "<mask>") you want ESM to complete.',
+            )
+
     return slots
 
 
@@ -1402,6 +1433,7 @@ _SLOT_PHRASES = {
     "pdb_id": "PDB ID",
     "uniprot_id": "UniProt ID",
     "smiles": "SMILES",
+    "prompt_sequence": 'masked protein generation prompt (containing "_" or "<mask>")',
     "task_intent": "workflow you want to run",
     "constraint": "constraints",
     "other": "additional details",
@@ -1496,6 +1528,66 @@ def _compose_canonical_query(
     detail = "; ".join(p for p in parts if p)
     text = head if not detail else f"{head} ({detail})."
     return text[:800]
+
+
+_PROMPT_SEQUENCE_LABEL_RE = re.compile(
+    r"prompt[_ ]sequence|masked\s+(?:protein\s+)?prompt|generation\s+prompt|"
+    r"sequence[_ ]completion\s+prompt",
+    re.IGNORECASE,
+)
+_PROTEIN_LIKE_TOKEN_RE = re.compile(r"\b[ACDEFGHIKLMNPQRSTVWY_]{6,}\b", re.IGNORECASE)
+
+
+def _detect_prompt_sequence_referenced_input(haystack: str, uploaded_files: list) -> dict | None:
+    """Mock stand-in for LLM semantic role recognition: does the user's own
+    text explicitly label an inline sequence or an uploaded file as the ESM
+    generation prompt_sequence / masked protein prompt?
+
+    Never inspects uploaded-file bytes — only query/context text (already in
+    `haystack`) and filename metadata. Mask-marker content validation for the
+    inline candidate is a separate, deterministic step
+    (`looks_like_masked_prompt_sequence`) applied uniformly to every
+    provider's output in
+    `supervisor_agent._normalize_prompt_sequence_references` — this function
+    only recognizes that a role was declared, exactly like every other
+    referenced-input detector in this mock.
+    """
+    if _PROMPT_SEQUENCE_LABEL_RE.search(haystack):
+        for token_match in _PROTEIN_LIKE_TOKEN_RE.finditer(haystack):
+            token = token_match.group(0)
+            has_mask = "_" in token or "<mask>" in token.lower()
+            letters_only = token.replace("_", "")
+            if not letters_only or not re.fullmatch(
+                r"[ACDEFGHIKLMNPQRSTVWY]+", letters_only, re.IGNORECASE
+            ):
+                continue
+            # A masked token (contains "_"/"<mask>") is unambiguous even
+            # short; an unmasked token must be long enough to not collide
+            # with ordinary short English words that happen to use only
+            # amino-acid letters (e.g. "Please", "Capitals").
+            min_len = 6 if has_mask else 12
+            if len(token) < min_len:
+                continue
+            return {"id_type": "prompt_sequence", "value": token, "source": "user"}
+        for f in uploaded_files or []:
+            if isinstance(f, dict) and f.get("file_id"):
+                return {
+                    "id_type": "uploaded_file",
+                    "value": f["file_id"],
+                    "source": "prompt_sequence",
+                }
+        return None
+    for f in uploaded_files or []:
+        if not isinstance(f, dict):
+            continue
+        filename = str(f.get("original_filename") or "").lower()
+        if "prompt" in filename and f.get("file_id"):
+            return {
+                "id_type": "uploaded_file",
+                "value": f["file_id"],
+                "source": "prompt_sequence",
+            }
+    return None
 
 
 def _uploaded_file_refs(files: list) -> list[dict]:

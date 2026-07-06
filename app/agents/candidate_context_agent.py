@@ -32,6 +32,7 @@ ZINC guard: ZINC ids land as `zinc_id` identifiers; no material is marked as
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Optional
@@ -81,6 +82,70 @@ _ARTIFACT_KEY = "candidate_context_table.json"
 
 _PDB_EXTS = {".pdb", ".cif", ".mmcif", ".ent"}
 _FASTA_EXTS = {".fasta", ".fa", ".faa", ".seq"}
+
+# ── explicit ESM prompt_sequence (masked generation prompt) ──────────────────
+# Step 2 hands Step 5 exactly two shapes for a user-declared masked generation
+# prompt (see supervisor_agent._normalize_prompt_sequence_references):
+#   inline:   {"id_type": "prompt_sequence", "value": "<masked text>", "source": "user"}
+#   uploaded: {"id_type": "uploaded_file", "value": "<file_id>", "source": "prompt_sequence"}
+# Step 5 is the first step with storage access, so it owns reading the uploaded
+# file's content and running the deterministic mask/format validation Step 2
+# could not. A masked prompt is a protein-like sequence carrying at least one
+# ESM mask position ("_" or "<mask>") to be completed — never an ordinary
+# complete heavy/light/target chain.
+_PROMPT_SEQUENCE_ID_TYPE = "prompt_sequence"
+_PROMPT_SEQUENCE_UPLOADED_SOURCE = "prompt_sequence"
+_PROMPT_SEQUENCE_MATERIAL_TYPE = "prompt_sequence"
+# Amino-acid single-letter alphabet allowed in a masked prompt, beside the mask
+# markers and FASTA whitespace/headers. Standard 20 only — no B/J/O/U/X/Z, no
+# digits, no punctuation: those signal DNA/RNA/plain text, not a protein prompt.
+_PROMPT_SEQUENCE_AA_RE = re.compile(r"^[ACDEFGHIKLMNPQRSTVWY]*$", re.IGNORECASE)
+_PROMPT_SEQUENCE_MASK_RE = re.compile(r"_|<mask>", re.IGNORECASE)
+_PROMPT_SEQUENCE_ANGLE_MASK_RE = re.compile(r"<mask>", re.IGNORECASE)
+
+
+def _extract_masked_prompt_sequence(raw_text: str) -> tuple[str | None, str | None]:
+    """Extract and validate a user-declared masked ESM generation prompt.
+
+    Returns ``(masked_sequence, None)`` when ``raw_text`` is a plausible
+    protein-like masked prompt (amino-acid letters + at least one "_"/"<mask>"
+    mask position, FASTA header/whitespace tolerated), or ``(None, reason)``
+    otherwise. The returned sequence is the concatenated residue/mask text with
+    FASTA headers and all whitespace stripped; it is never logged and only the
+    caller decides how to persist it (storage-ref only, never in the artifact).
+    """
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return None, "prompt_sequence_empty"
+    # FASTA-tolerant: drop header (">") lines, keep residue lines. A plain
+    # inline sequence has no header lines and is used as-is.
+    residue_lines = [
+        line.strip()
+        for line in raw_text.splitlines()
+        if line.strip() and not line.startswith(">")
+    ]
+    masked = "".join(residue_lines)
+    masked = "".join(masked.split())  # remove any remaining internal whitespace
+    if not masked:
+        return None, "prompt_sequence_empty"
+    if not _PROMPT_SEQUENCE_MASK_RE.search(masked):
+        return None, "prompt_sequence_mask_missing"
+    # Plausibility: remove the mask markers, then everything left must be
+    # amino-acid letters. Anything else (digits, other letters, punctuation)
+    # means this is not a protein generation prompt.
+    residues_only = _PROMPT_SEQUENCE_ANGLE_MASK_RE.sub("", masked).replace("_", "")
+    if not _PROMPT_SEQUENCE_AA_RE.fullmatch(residues_only):
+        return None, "prompt_sequence_invalid_format"
+    return masked, None
+
+
+def _mask_token_style(masked: str) -> str:
+    has_angle = bool(_PROMPT_SEQUENCE_ANGLE_MASK_RE.search(masked))
+    has_underscore = "_" in _PROMPT_SEQUENCE_ANGLE_MASK_RE.sub("", masked)
+    if has_angle and has_underscore:
+        return "mixed"
+    if has_angle:
+        return "angle_mask"
+    return "underscore"
 
 # Step 5 CDR3 → IEDB extension.
 _IEDB_BCR_TOOL_NAME = "iedb_search_bcr_sequences"
@@ -592,14 +657,29 @@ class CandidateContextAgent:
         for r in refs:
             refs_by_type.setdefault(r.get("id_type", ""), []).append(r)
 
+        # Uploaded files a user explicitly declared as an ESM masked
+        # generation prompt (Step 2 `uploaded_file` ref with
+        # source="prompt_sequence"). Diverted to the prompt_sequence lane
+        # below and excluded from ordinary heavy/light/target FASTA routing so
+        # a declared prompt file never becomes a chain-sequence material.
+        prompt_sequence_file_ids = {
+            str(r.get("value") or "")
+            for r in refs_by_type.get("uploaded_file", [])
+            if isinstance(r, dict)
+            and str(r.get("source") or "") == _PROMPT_SEQUENCE_UPLOADED_SOURCE
+            and str(r.get("value") or "")
+        }
+
         # File-derived materials.
         structure_files = [
             f for f in uploaded
             if PurePosixPath(f.get("original_filename", "")).suffix.lower() in _PDB_EXTS
+            and str(f.get("file_id") or "") not in prompt_sequence_file_ids
         ]
         sequence_files = [
             f for f in uploaded
             if PurePosixPath(f.get("original_filename", "")).suffix.lower() in _FASTA_EXTS
+            and str(f.get("file_id") or "") not in prompt_sequence_file_ids
         ]
         antibody_sequence_files, target_sequence_files, unassigned_sequence_files = \
             _split_sequence_files_by_semantic_routing(
@@ -710,6 +790,22 @@ class CandidateContextAgent:
             if tcs:
                 ab_cand.candidate_notes = _notes_for(tcs[-1], "antibody context enrichment")
             candidate_records.append(ab_cand)
+
+        # ── explicit ESM prompt_sequence (masked generation prompt) ─────────
+        prompt_sequence_cand = self._build_prompt_sequence_candidate(
+            run_id=run_id,
+            inline_refs=refs_by_type.get(_PROMPT_SEQUENCE_ID_TYPE, []),
+            uploaded_refs=[
+                r
+                for r in refs_by_type.get("uploaded_file", [])
+                if isinstance(r, dict)
+                and str(r.get("source") or "") == _PROMPT_SEQUENCE_UPLOADED_SOURCE
+            ],
+            uploaded_files=uploaded,
+            sq_artifact_id=sq_artifact_id,
+        )
+        if prompt_sequence_cand is not None:
+            candidate_records.append(prompt_sequence_cand)
 
         # ── payload / linker / generic compound candidates ──────────────────
         payload_text = entities.get("payload_text") or ctx.get("payload_linker_text")
@@ -998,6 +1094,143 @@ class CandidateContextAgent:
             candidate_id=new_artifact_id("candidate"),
             candidate_label=antibody_text or "antibody_from_sequence_input",
             candidate_type="antibody",
+            source_records=[sq_artifact_id] if sq_artifact_id else [],
+            identifiers=[],
+            materials=materials,
+            adc_links=ADCLinks(),
+            candidate_status="partially_ready_for_step6",
+            candidate_notes=None,
+            candidate_role="user_provided_candidate",
+            is_generated_candidate=False,
+            context_status="partial",
+            data_gaps=data_gaps,
+        )
+        for note in context_notes:
+            if note not in record.context_notes:
+                record.context_notes.append(note)
+        return record
+
+    def _build_prompt_sequence_candidate(
+        self,
+        *,
+        run_id: str,
+        inline_refs: list[dict],
+        uploaded_refs: list[dict],
+        uploaded_files: list[dict],
+        sq_artifact_id: str,
+    ) -> Optional[CandidateRecord]:
+        """Materialize user-declared ESM masked generation prompt(s).
+
+        Step 5 is the first step with storage access, so it — not Step 2 —
+        reads the uploaded file's content and runs the deterministic mask /
+        protein-format validation. A valid prompt becomes a dedicated
+        ``prompt_sequence`` material whose ``value`` is a STORAGE REF (never
+        the raw masked prompt) so the raw generation prompt never lands in the
+        persisted candidate_context_table artifact; the compact
+        ``content_descriptor`` carries only length/hash/mask fingerprints.
+        Invalid or unreadable inputs are NOT materialized as executable
+        prompts — they surface a compact data_gap / context_note instead.
+        """
+        if not inline_refs and not uploaded_refs:
+            return None
+
+        files_by_id = {
+            str(f.get("file_id") or ""): f
+            for f in (uploaded_files or [])
+            if isinstance(f, dict) and str(f.get("file_id") or "")
+        }
+
+        materials: list[Material] = []
+        context_notes: list[str] = []
+        data_gaps: list[str] = []
+
+        # (raw_text, source_kind, source_ref) tuples. `source_ref` is a compact,
+        # non-sensitive breadcrumb (a file_id or "inline"), never a storage path
+        # or the raw prompt itself.
+        candidates: list[tuple[str | None, str, str, str | None]] = []
+        for ref in inline_refs:
+            if not isinstance(ref, dict):
+                continue
+            value = str(ref.get("value") or "")
+            candidates.append((value, "inline", "inline", None))
+        for ref in uploaded_refs:
+            if not isinstance(ref, dict):
+                continue
+            file_id = str(ref.get("value") or "")
+            file_rec = files_by_id.get(file_id)
+            storage_path = str((file_rec or {}).get("storage_path") or "")
+            raw_text: str | None = None
+            read_error: str | None = None
+            if not storage_path:
+                read_error = "prompt_sequence_file_unresolved"
+            else:
+                try:
+                    raw_bytes = self.storage.read_bytes(storage_path) or b""
+                    raw_text = raw_bytes.decode("utf-8", errors="ignore")
+                except Exception:  # noqa: BLE001
+                    read_error = "prompt_sequence_file_unreadable"
+            candidates.append(
+                (raw_text, "uploaded_file", file_id or "uploaded_file", read_error)
+            )
+
+        for raw_text, source_kind, source_ref, read_error in candidates:
+            if read_error is not None:
+                context_notes.append(f"prompt_sequence_unusable:{source_ref}:{read_error}")
+                data_gaps.append(f"prompt_sequence_missing:{source_ref}:{read_error}")
+                continue
+            masked, reason = _extract_masked_prompt_sequence(raw_text or "")
+            if masked is None:
+                # Do NOT downgrade to a plain sequence; it must be unusable as a
+                # prompt_sequence. Record a compact, raw-free signal only.
+                context_notes.append(
+                    f"prompt_sequence_unusable:{source_ref}:{reason or 'prompt_sequence_invalid'}"
+                )
+                data_gaps.append(
+                    f"prompt_sequence_missing:{source_ref}:{reason or 'prompt_sequence_invalid'}"
+                )
+                continue
+
+            material_id = new_artifact_id("material")
+            sha_prefix = hashlib.sha256(masked.encode("utf-8")).hexdigest()[:12]
+            # Store the raw masked prompt as a storage ref only — never inside
+            # the persisted artifact / notes / summaries.
+            storage_key = self.storage.run_key(
+                run_id, "inputs/prompt_sequences", f"{material_id}.txt"
+            )
+            self.storage.write_bytes(storage_key, masked.encode("utf-8"))
+            material = Material(
+                material_id=material_id,
+                material_type=_PROMPT_SEQUENCE_MATERIAL_TYPE,
+                value=storage_key,
+                value_format="masked_amino_acid_sequence",
+                extraction_status="extracted",
+                validation_status="valid",
+                role="protein_generation_prompt",
+                role_status="explicit",
+                content_descriptor={
+                    "content_kind": "masked_amino_acid_sequence",
+                    "value_is_storage_ref": True,
+                    "has_mask": True,
+                    "mask_token_style": _mask_token_style(masked),
+                    "prompt_length": len(masked),
+                    "sha256_prefix": sha_prefix,
+                    "source_kind": source_kind,
+                    "source_ref": source_ref,
+                },
+            )
+            materials.append(material)
+            context_notes.append(
+                f"prompt_sequence_materialized:{source_ref}:"
+                f"len={len(masked)}:sha256={sha_prefix}"
+            )
+
+        if not materials and not data_gaps:
+            return None
+
+        record = CandidateRecord(
+            candidate_id=new_artifact_id("candidate"),
+            candidate_label="protein_generation_prompt",
+            candidate_type="unknown",
             source_records=[sq_artifact_id] if sq_artifact_id else [],
             identifiers=[],
             materials=materials,

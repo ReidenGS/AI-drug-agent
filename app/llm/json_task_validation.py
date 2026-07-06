@@ -17,9 +17,62 @@ returns prompt text in raised errors.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Callable
 
 ErrorFactory = Callable[[str], BaseException]
+
+
+# ESM generation `prompt_sequence` mask marker — the deterministic contract
+# shared by the Step 2 mock detector and the post-LLM normalizer: a usable
+# `prompt_sequence` must contain an explicit "_" run or literal "<mask>".
+_MASK_MARKER_RE = re.compile(r"_|<mask>", re.IGNORECASE)
+
+
+def looks_like_masked_prompt_sequence(value: Any) -> bool:
+    """True if `value` contains an explicit ESM generation mask marker.
+
+    This is the ONLY content check `id_type="prompt_sequence"` referenced
+    inputs are held to at Step 2 — it never inspects uploaded file bytes
+    (Step 2 has no storage access); it only checks inline text Step 2
+    already has in hand.
+    """
+    if not isinstance(value, str):
+        return False
+    return bool(_MASK_MARKER_RE.search(value))
+
+
+# Shared, LLM-agnostic keyword heuristic for "the user is asking to
+# generate/complete/fill a protein sequence" — used by both the Mock
+# provider's deterministic missing_slots computation and the post-LLM
+# `prompt_sequence` normalizer backstop in `supervisor_agent.py`, so a
+# real-LLM run and the Mock apply the identical rule.
+_PROTEIN_GENERATION_HINTS = (
+    "generate a protein sequence",
+    "generate protein sequence",
+    "generate the protein sequence",
+    "generate a candidate protein sequence",
+    "generate candidate protein sequences",
+    "generate a related candidate protein sequence",
+    "design candidate protein sequences",
+    "design a candidate protein sequence",
+    "complete the protein sequence",
+    "protein sequence completion",
+    "sequence completion",
+    "fill in the mask",
+    "fill in the masked",
+    "fill the mask",
+    "fill the masked",
+    "protein generation",
+)
+
+
+def requests_protein_generation(text: str) -> bool:
+    """True if `text` asks to generate/complete/fill a protein sequence."""
+    if not isinstance(text, str) or not text:
+        return False
+    lowered = text.lower()
+    return any(hint in lowered for hint in _PROTEIN_GENERATION_HINTS)
 
 
 # ── Prompt construction ────────────────────────────────────────────────────
@@ -430,7 +483,7 @@ def shape_instruction(task: str) -> str:
         "uploaded-file metadata. Each item: `slot_name` "
         '("target_or_antigen", "antibody", "payload", "linker", '
         '"structure_or_sequence", "sequence_role", "pdb_id", "uniprot_id", '
-        '"smiles", "task_intent", "constraint", "other"), `slot_category` ("target", '
+        '"smiles", "prompt_sequence", "task_intent", "constraint", "other"), `slot_category` ("target", '
         '"antibody", "payload", "linker", "structure", "sequence", '
         '"identifier", "task_intent", "constraint", "other"), `severity` '
         '("blocking", "warning", "optional"), `required_for` (list of '
@@ -1029,6 +1082,7 @@ _MISSING_SLOT_NAMES = frozenset(
         "pdb_id",
         "uniprot_id",
         "smiles",
+        "prompt_sequence",
         "task_intent",
         "constraint",
         "other",
@@ -1064,6 +1118,7 @@ _MISSING_SLOT_NAME_TO_CATEGORY = {
     "pdb_id": "identifier",
     "uniprot_id": "identifier",
     "smiles": "identifier",
+    "prompt_sequence": "sequence",
     "task_intent": "task_intent",
     "constraint": "constraint",
     "other": "other",

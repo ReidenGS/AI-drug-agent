@@ -40,6 +40,10 @@ _PROTEIN_SEQUENCE_MATERIAL_TYPES = {
     "antibody_light_chain_sequence",
 }
 _CONTIG_MATERIAL_TYPES = {"design_contigs", "contigs"}
+# Step 5 material_type carrying an explicit ESM masked generation prompt. The
+# ONLY material type allowed to satisfy `prompt_sequence` (its value is a
+# storage ref; the compact `content_descriptor` holds mask/length fingerprints).
+_PROMPT_SEQUENCE_MATERIAL_TYPE = "prompt_sequence"
 
 _STRUCTURE_TOOL_ARGS = ["input_pdb", "pdb_file", "structure", "backbone", "path"]
 _COMPLEX_STRUCTURE_TOOL_ARGS = ["input_pdb", "pdb_file", "structure", "complex_structure", "backbone"]
@@ -50,10 +54,9 @@ _COMPLEX_STRUCTURE_TOOL_ARGS = ["input_pdb", "pdb_file", "structure", "complex_s
 # sequence with "_" mask positions to complete), not a full existing chain —
 # mapping an ordinary sequence there causes a real ESM SDK error
 # (`ESMProteinError` has no `.sequence`), not a hallucination. There is
-# currently no Step 5/7 source of an actual masked prompt; `_PROMPT_SEQUENCE_TOOL_ARGS`
-# / `MASKED_PROMPT_SEQUENCE_VALUE_KIND` are scaffolding for a FUTURE field
-# that explicitly carries one — nothing here may synthesize a mask from an
-# ordinary sequence.
+# Step 5 can now materialize an explicitly user-provided masked prompt as a
+# `prompt_sequence` material. Nothing here may synthesize a mask from an
+# ordinary complete sequence.
 _SEQUENCE_TOOL_ARGS = ["sequence"]
 _PROMPT_SEQUENCE_TOOL_ARGS = ["prompt_sequence"]
 _UNIPROT_TOOL_ARGS = ["uniprot_id", "accession", "uniprot_accession"]
@@ -63,8 +66,8 @@ _CONTIGS_TOOL_ARGS = ["contigs"]
 _PDB_ID_TOOL_ARGS = ["pdb_id"]
 
 # `value_kind` a Step9InputField must carry to be eligible for `prompt_sequence`.
-# No current Step 5/7 projection path produces this value_kind — it is
-# reserved for a future explicit masked/generation-prompt input source.
+# Produced only from an explicit Step 5 `prompt_sequence` material whose raw
+# masked prompt is stored by reference and resolved at execution time.
 MASKED_PROMPT_SEQUENCE_VALUE_KIND = "masked_prompt_sequence"
 
 _QUERY_SUMMARY_MAX_LEN = 300
@@ -416,6 +419,48 @@ def _project_step5_candidate_fields(candidate: dict[str, Any], candidate_id: str
                     ),
                     status="available" if has_value else "missing",
                     missing_reason=None if has_value else "contigs_value_missing",
+                )
+            )
+        elif m_type == _PROMPT_SEQUENCE_MATERIAL_TYPE:
+            # Explicit ESM masked GENERATION PROMPT — the ONLY Step 5 material
+            # allowed to satisfy `prompt_sequence`. Step 5 stores the raw masked
+            # prompt as a storage ref (never in the artifact) and records a
+            # compact `content_descriptor`; the raw value is resolved only at
+            # execution time via `runtime_lookup`. An ordinary complete
+            # heavy/light/target sequence NEVER reaches this branch.
+            has_value = isinstance(value, str) and bool(value.strip())
+            descriptor = material.get("content_descriptor")
+            descriptor = descriptor if isinstance(descriptor, dict) else {}
+            llm_safe_metadata: dict[str, Any] = {"material_type": str(m_type)}
+            for key in ("has_mask", "mask_token_style", "prompt_length", "sha256_prefix", "source_kind"):
+                if key in descriptor:
+                    llm_safe_metadata[key] = descriptor[key]
+            out.append(
+                Step9InputField(
+                    field_ref=f"material:{mat_id}",
+                    candidate_id=candidate_id,
+                    source_step="step_05",
+                    source_artifact="candidate_context_table",
+                    source_path="candidate_records[].materials[]",
+                    field_name=str(m_type),
+                    field_type="protein_sequence",
+                    value_kind=MASKED_PROMPT_SEQUENCE_VALUE_KIND,
+                    semantic_role="protein_generation_prompt",
+                    supports_tool_args=list(_PROMPT_SEQUENCE_TOOL_ARGS) if has_value else [],
+                    can_resolve_at_runtime=has_value,
+                    llm_safe_metadata=llm_safe_metadata,
+                    runtime_lookup=(
+                        {
+                            "resolution_path": ["step_05.candidate_records[].materials[].value"],
+                            "candidate_id": candidate_id,
+                            "material_id": mat_id,
+                            "value_is_storage_ref": True,
+                        }
+                        if has_value
+                        else {}
+                    ),
+                    status="available" if has_value else "missing",
+                    missing_reason=None if has_value else "prompt_sequence_value_missing",
                 )
             )
         elif m_type in _PROTEIN_SEQUENCE_MATERIAL_TYPES:

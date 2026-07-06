@@ -31,9 +31,11 @@ from typing import Any, Optional
 from ..llm.provider import LLMProvider
 from ..schemas.step_01_raw_request_record import RawRequestRecord
 from ..llm.json_task_validation import (
+    looks_like_masked_prompt_sequence,
     normalize_canonical_query,
     normalize_missing_slots,
     normalize_response,
+    requests_protein_generation,
 )
 from ..schemas.step_02_structured_query import (
     EntityComponent,
@@ -95,6 +97,16 @@ Input-to-output mapping:
 - Do not infer heavy vs light from sequence content. Do not extract CDR3
   from a full sequence. Preserve only an explicitly supplied CDR3 as
   `antibody_cdr3_sequence`; downstream runtime extracts CDR3 when needed.
+- ESM protein generation requires an explicit `prompt_sequence`: a
+  user-declared masked generation prompt containing mask positions such as
+  "_" or "<mask>", never an ordinary complete heavy/light/target sequence.
+  If the user identifies an inline sequence or an uploaded file as the
+  masked prompt / prompt_sequence / sequence-completion input, use
+  `{"id_type": "prompt_sequence", "value": "<inline text>", "source": "user"}`
+  for inline text, or `{"id_type": "uploaded_file", "value": "<file_id>",
+  "source": "prompt_sequence"}` for a file. If the user asks to generate,
+  complete, or fill in a protein sequence and no prompt_sequence is
+  identified, report blocking `missing_slots` slot "prompt_sequence".
 - Composite ADC terms stay literal in `mentioned_entities` and decompose
   separately. `vc-MMAE` -> valine-citrulline linker + monomethyl
   auristatin E payload. `T-DM1` -> trastuzumab antibody + DM1 payload.
@@ -196,6 +208,12 @@ required_slot_schema (satisfied_by = any one is enough):
     and its role is unclear from filename, metadata, query, or context.
     Do not emit it when no FASTA exists or the role is clear.
     question: "Is the uploaded FASTA heavy chain, light chain, target/antigen, or another protein?"
+- conditional prompt_sequence:
+  - blocking prompt_sequence ONLY when the user asks to generate, complete,
+    or fill in a protein sequence AND no referenced_inputs[id_type=
+    prompt_sequence] (inline or uploaded_file) is identified. An ordinary
+    complete heavy/light/target sequence does NOT satisfy this slot.
+    question: "Please provide the masked protein generation prompt (containing \"_\" or \"<mask>\") you want ESM to complete."
 - literature_review / patent_ip_review:
   - focus on a searchable entity (target/drug/compound) if none is present;
     do NOT demand full ADC-design completeness. Use warning unless there is
@@ -818,6 +836,114 @@ def _normalize_antibody_chain_references(payload: dict[str, Any]) -> None:
                     )
 
 
+def _requests_protein_generation(raw_request_record: dict | None) -> bool:
+    haystack = " ".join(_raw_text_chunks_for_step2(raw_request_record))
+    return requests_protein_generation(haystack)
+
+
+def _has_declared_prompt_sequence(refs: list[Any]) -> bool:
+    for entry in refs:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("id_type") == "prompt_sequence":
+            return True
+        if entry.get("id_type") == "uploaded_file" and entry.get("source") == "prompt_sequence":
+            return True
+    return False
+
+
+def _ensure_blocking_missing_slot(payload: dict[str, Any], *, slot_name: str, reason: str, question: str) -> None:
+    slots = payload.get("missing_slots")
+    if not isinstance(slots, list):
+        slots = []
+        payload["missing_slots"] = slots
+    for slot in slots:
+        if isinstance(slot, dict) and slot.get("slot_name") == slot_name:
+            slot["severity"] = "blocking"
+            if not slot.get("reason"):
+                slot["reason"] = reason
+            if not slot.get("suggested_question"):
+                slot["suggested_question"] = question
+            return
+    slots.append(
+        {
+            "slot_name": slot_name,
+            "slot_category": "sequence",
+            "severity": "blocking",
+            "required_for": [],
+            "reason": reason,
+            "suggested_question": question,
+            "evidence": None,
+        }
+    )
+
+
+def _normalize_prompt_sequence_references(
+    payload: dict[str, Any],
+    raw_request_record: dict | None,
+) -> None:
+    """Deterministic backstop for ``id_type="prompt_sequence"`` referenced
+    inputs — applies uniformly to every LLM provider's output (Mock, Gemini,
+    OpenAI, …), never just the Mock.
+
+    Role recognition (is THIS value/file the user's masked generation
+    prompt) is the LLM's job, guided by the system prompt. This function
+    only does what Step 2 can do without reading uploaded-file bytes:
+
+    1. Inline ``id_type="prompt_sequence"`` entries: validate the inline
+       ``value`` contains a mask marker ("_" / "<mask>"). An ordinary
+       complete sequence mistakenly (or hallucinated-ly) labeled
+       ``prompt_sequence`` is dropped here rather than silently downgraded
+       to a plain sequence — it must never count as a usable prompt_sequence.
+    2. ``id_type="uploaded_file"`` entries with ``source="prompt_sequence"``
+       are left untouched: Step 2 has no storage access, so their actual
+       mask-marker content validation is deferred to Step 5.
+    3. If the user's raw text asks for protein generation/completion and no
+       valid ``prompt_sequence`` reference survives, ensures a blocking
+       ``missing_slots`` entry — a safety net independent of whether the
+       LLM already reported it correctly.
+    """
+    refs = payload.get("referenced_inputs")
+    if not isinstance(refs, list):
+        refs = []
+
+    warnings = payload.get("parse_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    payload["parse_warnings"] = warnings
+
+    kept: list[Any] = []
+    dropped = 0
+    for entry in refs:
+        if isinstance(entry, dict) and entry.get("id_type") == "prompt_sequence":
+            if looks_like_masked_prompt_sequence(entry.get("value")):
+                kept.append(entry)
+            else:
+                dropped += 1
+            continue
+        kept.append(entry)
+
+    if dropped:
+        payload["referenced_inputs"] = kept
+        warnings.append(
+            f"dropped {dropped} inline prompt_sequence referenced_input(s) "
+            'missing a mask marker ("_" or "<mask>")'
+        )
+    else:
+        payload["referenced_inputs"] = kept
+
+    if _requests_protein_generation(raw_request_record) and not _has_declared_prompt_sequence(kept):
+        _ensure_blocking_missing_slot(
+            payload,
+            slot_name="prompt_sequence",
+            reason="Protein generation requires an explicit masked prompt_sequence.",
+            question=(
+                'Please provide the masked protein generation prompt '
+                '(containing "_" or "<mask>") you want ESM to complete.'
+            ),
+        )
+
+
 def normalize_llm_payload_for_step2(
     payload: dict,
     raw_request_record: dict | None = None,
@@ -871,6 +997,12 @@ def normalize_llm_payload_for_step2(
     # compacted with a parse_warning. Shares the provider validator's logic
     # so OpenAI/Gemini/Qwen/Mock all agree on the cleaned shape.
     normalize_missing_slots(out)
+    # prompt_sequence backstop: drops inline id_type="prompt_sequence"
+    # entries missing a mask marker (never downgrades them to a plain
+    # sequence), and ensures a blocking missing_slot when protein generation
+    # is requested but no valid prompt_sequence survives. Runs after
+    # `normalize_missing_slots` so the slot it may inject is not re-coerced.
+    _normalize_prompt_sequence_references(out, raw_request_record)
     # response drift: absent -> None, non-string scalar -> str, list/dict ->
     # compact string or None, over-long -> trimmed. Same shared logic as the
     # provider validator so every provider/mock agrees on the cleaned shape.

@@ -20,6 +20,8 @@ from app.agents.step_09_runtime_execution import (
 
 RAW_SEQ = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
 RAW_PDB_BODY = "HEADER TEST PDB\nATOM      1  N   GLY A   1"
+# An explicit masked ESM generation prompt (contains "_" mask positions).
+MASKED_PROMPT = "EVQLVESGGG___PGGSLRLSCAAS___DTYIHWVRQAPGK"
 
 
 def _field(**overrides):
@@ -538,8 +540,14 @@ def test_execution_requests_resolves_real_kwargs_and_redacts_audit(local_storage
     generation prompt, `value_kind="masked_prompt_sequence"` — never an
     ordinary complete sequence; see test_step9_runtime_planner.py for the
     rejection of ordinary sequences), values resolve correctly and the
-    redacted summary never leaks the raw prompt text."""
-    cct = _cct_with_material("cand_a", "mat_seq", "target_sequence", RAW_SEQ)
+    redacted summary never leaks the raw prompt text.
+
+    Production shape: the Step 5 `prompt_sequence` material's `value` is a
+    STORAGE REF (never the raw masked prompt); the resolver reads that ref to
+    recover the real masked prompt."""
+    prompt_key = local_storage.run_key("run1", "inputs/prompt_sequences", "mat_seq.txt")
+    local_storage.write_bytes(prompt_key, MASKED_PROMPT.encode("utf-8"))
+    cct = _cct_with_material("cand_a", "mat_seq", "prompt_sequence", prompt_key)
     contracts = [
         _contract(
             "ESM_generate_protein_sequence",
@@ -580,12 +588,15 @@ def test_execution_requests_resolves_real_kwargs_and_redacts_audit(local_storage
     assert len(requests) == 1
     request = requests[0]
     assert request["can_execute"] is True
-    assert request["kwargs"]["prompt_sequence"] == RAW_SEQ
+    assert request["kwargs"]["prompt_sequence"] == MASKED_PROMPT
     assert request["kwargs"]["task"] == "generate"
     # Redacted summary carries only length/hash for the sequence, and the
-    # literal (safe, fixed-vocabulary) value for the literal arg.
-    assert RAW_SEQ not in json.dumps(request["kwargs_redacted_summary"])
-    assert request["kwargs_redacted_summary"]["prompt_sequence"]["value_length"] == len(RAW_SEQ)
+    # literal (safe, fixed-vocabulary) value for the literal arg. Neither the
+    # raw masked prompt nor the storage ref leaks into the summary.
+    summary_blob = json.dumps(request["kwargs_redacted_summary"])
+    assert MASKED_PROMPT not in summary_blob
+    assert prompt_key not in summary_blob
+    assert request["kwargs_redacted_summary"]["prompt_sequence"]["value_length"] == len(MASKED_PROMPT)
     assert request["kwargs_redacted_summary"]["task"] == {"source": "literal", "value": "generate"}
 
 

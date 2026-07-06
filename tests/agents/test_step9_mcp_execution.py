@@ -705,3 +705,178 @@ def test_esm_generate_never_executes_with_only_ordinary_heavy_chain_sequence(
         local_storage.run_key(run_id, "compound_screening_artifact.json")
     )
     assert HEAVY_CHAIN_SEQ not in json.dumps(normalized_blob)
+
+
+# ── explicit masked prompt_sequence → ESM_generate (production chain) ─────────
+
+# A masked ESM generation prompt (contains "_" mask positions). Distinct from
+# HEAVY_CHAIN_SEQ so leakage assertions are unambiguous.
+MASKED_PROMPT = "EVQLVESGGG___SLRLSCAAS___NIKDTYIHW"
+
+
+def _add_masked_prompt_sequence(local_storage, run_id: str, candidate_id: str) -> tuple[str, str]:
+    """Add a real Step-5-shaped `prompt_sequence` material: value is a STORAGE
+    REF (never the raw masked prompt), the raw masked prompt lives only in
+    storage, and a compact content_descriptor carries the fingerprint. Returns
+    ``(field_ref, storage_key)``."""
+    material_id = "mat_prompt"
+    storage_key = local_storage.run_key(run_id, "inputs/prompt_sequences", f"{material_id}.txt")
+    local_storage.write_bytes(storage_key, MASKED_PROMPT.encode("utf-8"))
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for candidate in cct["candidate_records"]:
+        if candidate["candidate_id"] == candidate_id:
+            candidate.setdefault("materials", []).append(
+                {
+                    "material_id": material_id,
+                    "material_type": "prompt_sequence",
+                    "value": storage_key,
+                    "value_format": "masked_amino_acid_sequence",
+                    "role": "protein_generation_prompt",
+                    "role_status": "explicit",
+                    "content_descriptor": {
+                        "has_mask": True,
+                        "mask_token_style": "underscore",
+                        "prompt_length": len(MASKED_PROMPT),
+                        "sha256_prefix": "deadbeefcafe",
+                        "source_kind": "inline",
+                        "value_is_storage_ref": True,
+                    },
+                }
+            )
+    local_storage.write_json(cct_path, cct)
+    return f"material:{material_id}", storage_key
+
+
+def test_stage2_maps_prompt_sequence_from_masked_field_but_not_ordinary_sequence():
+    """Stage 2 (deterministic Mock standing in for the LLM) maps
+    ESM_generate_protein_sequence's `prompt_sequence` to a
+    `masked_prompt_sequence` field, and leaves it uninvokable when only an
+    ordinary `sequence`-supporting field exists."""
+    from app.agents.step_09_selection_policy import (
+        select_step9_stage1_tools,
+        select_step9_stage2_mappings,
+    )
+    from app.llm.provider import MockLLMProvider
+
+    def _esm(mapped_tools):
+        return next(t for t in mapped_tools if t.tool_name == "ESM_generate_protein_sequence")
+
+    llm = MockLLMProvider()
+
+    masked = {
+        "input_fields": [
+            {
+                "field_ref": "material:mp1",
+                "candidate_id": "c1",
+                "source_step": "step_05",
+                "source_artifact": "candidate_context_table",
+                "source_path": "x",
+                "field_name": "prompt_sequence",
+                "field_type": "protein_sequence",
+                "value_kind": "masked_prompt_sequence",
+                "semantic_role": "protein_generation_prompt",
+                "supports_tool_args": ["prompt_sequence"],
+                "can_resolve_at_runtime": True,
+                "status": "available",
+            }
+        ]
+    }
+    s1 = select_step9_stage1_tools(llm=llm, projection=masked, candidate_id="all")
+    s2 = select_step9_stage2_mappings(
+        llm=llm, projection=masked, selected_tools=s1.selected_tools, candidate_id="all"
+    )
+    esm = _esm(s2.mapped_tools)
+    assert esm.can_invoke is True
+    assert any(m.schema_arg == "prompt_sequence" and m.field_ref == "material:mp1" for m in esm.argument_mappings)
+
+    ordinary = {
+        "input_fields": [
+            {
+                "field_ref": "material:seq1",
+                "candidate_id": "c1",
+                "source_step": "step_05",
+                "source_artifact": "candidate_context_table",
+                "source_path": "x",
+                "field_name": "antibody_heavy_chain_sequence",
+                "field_type": "protein_sequence",
+                "value_kind": "sequence_ref",
+                "supports_tool_args": ["sequence"],
+                "can_resolve_at_runtime": True,
+                "status": "available",
+            }
+        ]
+    }
+    s1b = select_step9_stage1_tools(llm=llm, projection=ordinary, candidate_id="all")
+    s2b = select_step9_stage2_mappings(
+        llm=llm, projection=ordinary, selected_tools=s1b.selected_tools, candidate_id="all"
+    )
+    esm_b = _esm(s2b.mapped_tools)
+    assert esm_b.can_invoke is False
+    assert "prompt_sequence" in esm_b.missing_required_fields
+
+
+def test_esm_generate_resolves_masked_prompt_sequence_end_to_end(
+    local_storage, registry_service, workflow_state_service, install_fake_universe, enable_live
+):
+    """End-to-end: an explicit Step-5 `prompt_sequence` material flows through
+    projection -> Stage 2 mapping -> runtime planning -> real value resolution
+    -> a real MCP call whose `prompt_sequence` arg carries the raw masked
+    prompt — while the normalized artifact never leaks the raw prompt or its
+    storage ref."""
+    run_id = _seed(local_storage, registry_service, workflow_state_service)
+    candidate_id = _target_candidate_id(local_storage, run_id)
+    field_ref, storage_key = _add_masked_prompt_sequence(local_storage, run_id, candidate_id)
+
+    fake = install_fake_universe(
+        tools={
+            "ESM_generate_protein_sequence": lambda args: {
+                "generated_sequence_length": len(args.get("prompt_sequence") or ""),
+            }
+        }
+    )
+    enable_live("ESM_generate_protein_sequence")
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+        llm=_Step9SingleToolLLM(
+            tool_name="ESM_generate_protein_sequence",
+            lane_type="protein_design",
+            field_ref=field_ref,
+            schema_arg="prompt_sequence",
+        ),
+    )
+    artifact = agent.run_step_9(run_id)
+
+    mapped = next(
+        t for t in artifact.step9_stage2_mapped_tools
+        if t["tool_name"] == "ESM_generate_protein_sequence"
+    )
+    assert mapped["can_invoke"] is True
+    assert any(
+        m["schema_arg"] == "prompt_sequence" and m["field_ref"] == field_ref
+        for m in mapped["argument_mappings"]
+    )
+    assert any(
+        (r.get("tool_name") if isinstance(r, dict) else r) == "ESM_generate_protein_sequence"
+        for r in artifact.step9_runtime_resolved_tools
+    )
+    assert "ESM_generate_protein_sequence" in artifact.step9_runtime_executed_tools
+
+    # The REAL MCP call received the raw masked prompt (resolved from storage).
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["arguments"]["prompt_sequence"] == MASKED_PROMPT
+
+    # ...but the normalized artifact never contains the raw masked prompt or
+    # the storage ref — only length/hash/ref fingerprints.
+    artifact_blob = json.dumps(artifact.model_dump())
+    assert MASKED_PROMPT not in artifact_blob
+    normalized = local_storage.read_json(
+        local_storage.run_key(run_id, "compound_screening_artifact.json")
+    )
+    normalized_blob = json.dumps(normalized)
+    assert MASKED_PROMPT not in normalized_blob
+    assert storage_key not in normalized_blob

@@ -41,10 +41,14 @@ file body) passes through unchanged.
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 from typing import Any
 
 from ..services.storage_service import Storage
+from .step_09_input_projection import MASKED_PROMPT_SEQUENCE_VALUE_KIND
+
+_PROMPT_SEQUENCE_MASK_RE = re.compile(r"_|<mask>", re.IGNORECASE)
 
 
 def resolve_step9_execution_requests(
@@ -234,9 +238,54 @@ def resolve_step9_field_value(
         )
 
     if field_ref.startswith("material:"):
+        if str(field.get("value_kind") or "") == MASKED_PROMPT_SEQUENCE_VALUE_KIND:
+            # The material `value` is a STORAGE REF (Step 5 never writes the raw
+            # masked prompt into the artifact); resolve the real masked prompt
+            # by reading that ref, not by returning the ref string itself.
+            return _resolve_masked_prompt_sequence_value(
+                field,
+                candidate_context_table=candidate_context_table,
+                storage=storage,
+            )
         return _resolve_material_value(field, candidate_context_table=candidate_context_table)
 
     return None, "unsupported_field_ref_shape"
+
+
+def _resolve_masked_prompt_sequence_value(
+    field: dict[str, Any],
+    *,
+    candidate_context_table: dict[str, Any],
+    storage: Storage,
+) -> tuple[str | None, str | None]:
+    """Resolve an explicit ESM masked generation prompt to its real text.
+
+    The Step 5 `prompt_sequence` material stores a storage ref (never the raw
+    masked prompt); this reads that ref and returns the normalized masked
+    prompt. A defensive mask-marker check ensures an ordinary complete
+    sequence can never be resolved here even if a ref were mislabeled."""
+    runtime_lookup = field.get("runtime_lookup") or {}
+    candidate_id = str(runtime_lookup.get("candidate_id") or field.get("candidate_id") or "")
+    material_id = str(runtime_lookup.get("material_id") or "")
+    if not candidate_id or not material_id:
+        return None, "runtime_lookup_incomplete"
+    storage_ref = _material_value_by_id(candidate_context_table, candidate_id, material_id)
+    if not storage_ref:
+        return None, "prompt_sequence_material_not_found"
+    try:
+        raw_bytes = storage.read_bytes(storage_ref)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"prompt_sequence_read_failed:{type(exc).__name__}"
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "prompt_sequence_decode_failed"
+    masked = "".join(text.split())
+    if not masked:
+        return None, "prompt_sequence_empty"
+    if not _PROMPT_SEQUENCE_MASK_RE.search(masked):
+        return None, "prompt_sequence_mask_missing"
+    return masked, None
 
 
 # ── tool-specific runtime shape coercion ─────────────────────────────────────
