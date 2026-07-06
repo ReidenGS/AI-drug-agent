@@ -43,12 +43,29 @@ _CONTIG_MATERIAL_TYPES = {"design_contigs", "contigs"}
 
 _STRUCTURE_TOOL_ARGS = ["input_pdb", "pdb_file", "structure", "backbone", "path"]
 _COMPLEX_STRUCTURE_TOOL_ARGS = ["input_pdb", "pdb_file", "structure", "complex_structure", "backbone"]
-_SEQUENCE_TOOL_ARGS = ["sequence", "prompt_sequence"]
+# Ordinary protein sequences (a complete heavy/light/target chain) only ever
+# satisfy a plain `sequence`-shaped arg (e.g. ESM_score_variant_sae_batch's
+# `sequence`). They must NOT satisfy `prompt_sequence`: ToolUniverse's
+# ESM_generate_protein_sequence expects a masked GENERATION PROMPT (a
+# sequence with "_" mask positions to complete), not a full existing chain —
+# mapping an ordinary sequence there causes a real ESM SDK error
+# (`ESMProteinError` has no `.sequence`), not a hallucination. There is
+# currently no Step 5/7 source of an actual masked prompt; `_PROMPT_SEQUENCE_TOOL_ARGS`
+# / `MASKED_PROMPT_SEQUENCE_VALUE_KIND` are scaffolding for a FUTURE field
+# that explicitly carries one — nothing here may synthesize a mask from an
+# ordinary sequence.
+_SEQUENCE_TOOL_ARGS = ["sequence"]
+_PROMPT_SEQUENCE_TOOL_ARGS = ["prompt_sequence"]
 _UNIPROT_TOOL_ARGS = ["uniprot_id", "accession", "uniprot_accession"]
 _VARIANT_TOOL_ARGS = ["variant", "variants", "mutation", "mutations"]
 _CHAIN_TOOL_ARGS = ["chain", "chain_id"]
 _CONTIGS_TOOL_ARGS = ["contigs"]
 _PDB_ID_TOOL_ARGS = ["pdb_id"]
+
+# `value_kind` a Step9InputField must carry to be eligible for `prompt_sequence`.
+# No current Step 5/7 projection path produces this value_kind — it is
+# reserved for a future explicit masked/generation-prompt input source.
+MASKED_PROMPT_SEQUENCE_VALUE_KIND = "masked_prompt_sequence"
 
 _QUERY_SUMMARY_MAX_LEN = 300
 

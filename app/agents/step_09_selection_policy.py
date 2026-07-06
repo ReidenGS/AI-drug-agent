@@ -140,6 +140,7 @@ Rules:
 }
 10. Return one tools[] item for every selected tool.
 11. Do not map storage paths or uploaded file paths as PDB IDs.
+12. ESM_generate_protein_sequence's prompt_sequence is a masked GENERATION PROMPT (contains "_" mask positions to complete), not an ordinary complete protein sequence. Do not map an ordinary heavy/light/target protein_sequence field to prompt_sequence; leave it in missing_required_fields instead.
 
 Example:
 Input situation: selected tool DynaMut2_predict_stability requires pdb_id, chain, mutation. step9_input_fields includes {"field_ref": "identifier:mutation:V777L", "field_type": "variant", "value_kind": "mutation", "supports_tool_args": ["variant","variants","mutation","mutations"]}. No field's supports_tool_args includes "pdb_id" or "chain".
@@ -225,6 +226,30 @@ class Step9Stage2MappingResult(BaseModel):
     prompt_cache_layout_version: str = STEP9_STAGE2_PROMPT_CACHE_LAYOUT_VERSION
 
 
+# `ESM_generate_protein_sequence` currently has no official ToolUniverse spec
+# loaded in this environment's tool inventory, so `signature_schema_for` falls
+# back to introspecting its local Python binding — which gives every arg
+# (including `prompt_sequence`) a default value, so the signature-fallback
+# schema reports `required: []`. Without this override, Stage 2 would report
+# `can_invoke=True` with zero argument mappings whenever no field can satisfy
+# `prompt_sequence` (e.g. only an ordinary heavy/light/target sequence is
+# available), instead of the correct `can_invoke=False` /
+# `missing_required_fields=["prompt_sequence"]`. Scoped to exactly this one
+# tool/arg — it does not change required-field computation for any other
+# Step 9 tool, and it never marks a field as satisfying the arg (that gate is
+# still `_step9_field_can_satisfy_arg`'s `supports_tool_args` check).
+_FALLBACK_REQUIRED_ARGS_OVERRIDE: dict[str, list[str]] = {
+    "ESM_generate_protein_sequence": ["prompt_sequence"],
+}
+
+
+def _required_fields_with_fallback(tool_name: str, schema: dict[str, Any]) -> list[str]:
+    required = [str(arg) for arg in (schema.get("required") or []) if isinstance(arg, str)]
+    if not required:
+        required = list(_FALLBACK_REQUIRED_ARGS_OVERRIDE.get(tool_name, []))
+    return required
+
+
 def _tool_schema_source(tool_name: str) -> str:
     try:
         from ..mcp import tooluniverse_adapter
@@ -275,7 +300,7 @@ def build_step9_stage1_catalog() -> list[dict[str, Any]]:
     for tool_name in sorted_names:
         meta = ACTIVE_STEP9_TOOLS[tool_name]
         schema = signature_schema_for(tool_name) or {}
-        required = [str(arg) for arg in (schema.get("required") or []) if isinstance(arg, str)]
+        required = _required_fields_with_fallback(tool_name, schema)
         short_description = official_descriptions.get(tool_name) or meta["short_description"]
         catalog.append(
             {
@@ -398,12 +423,12 @@ def build_step9_stage2_payload(
     tools: list[dict[str, Any]] = []
     for tool_name, lane_type in sorted(selected_pairs, key=lambda p: (p[1], p[0])):
         schema = signature_schema_for(tool_name) or {}
-        required = [str(arg) for arg in (schema.get("required") or []) if isinstance(arg, str)]
+        required = _required_fields_with_fallback(tool_name, schema)
         tools.append(
             {
                 "tool_name": tool_name,
                 "lane_type": lane_type,
-                "full_schema": _compact_schema(schema),
+                "full_schema": _compact_schema(schema, tool_name=tool_name),
                 "required_fields": required,
                 "schema_source": _tool_schema_source(tool_name),
             }
@@ -522,6 +547,8 @@ def validate_step9_stage2_mapping(
     schema = selected_tool.get("full_schema") if isinstance(selected_tool.get("full_schema"), dict) else {}
     properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
     required = [str(arg) for arg in (selected_tool.get("required_fields") or schema.get("required") or [])]
+    if not required:
+        required = list(_FALLBACK_REQUIRED_ARGS_OVERRIDE.get(tool_name, []))
 
     valid_mappings: list[Step9Stage2ArgumentMapping] = []
     valid_literals: list[Step9Stage2ArgumentLiteral] = []
@@ -670,9 +697,9 @@ def _redact_query_summary(query_summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _compact_schema(schema: dict[str, Any]) -> dict[str, Any]:
+def _compact_schema(schema: dict[str, Any], *, tool_name: str = "") -> dict[str, Any]:
     properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
-    required = [str(arg) for arg in (schema.get("required") or []) if isinstance(arg, str)]
+    required = _required_fields_with_fallback(tool_name, schema)
     compact_props: dict[str, Any] = {}
     for name, prop in sorted(properties.items(), key=lambda item: str(item[0])):
         if not isinstance(name, str) or name.startswith("_") or not isinstance(prop, dict):

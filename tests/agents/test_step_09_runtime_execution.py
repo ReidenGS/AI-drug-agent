@@ -533,6 +533,12 @@ def _contract(tool_name, lane_type, kwargs_plan, *, can_build=True):
 
 
 def test_execution_requests_resolves_real_kwargs_and_redacts_audit(local_storage):
+    """Execution-layer mechanism test: given a contract that ALREADY passed
+    planner-level validation (a field explicitly tagged as a masked
+    generation prompt, `value_kind="masked_prompt_sequence"` — never an
+    ordinary complete sequence; see test_step9_runtime_planner.py for the
+    rejection of ordinary sequences), values resolve correctly and the
+    redacted summary never leaks the raw prompt text."""
     cct = _cct_with_material("cand_a", "mat_seq", "target_sequence", RAW_SEQ)
     contracts = [
         _contract(
@@ -558,7 +564,8 @@ def test_execution_requests_resolves_real_kwargs_and_redacts_audit(local_storage
         _field(
             field_ref="material:mat_seq",
             field_type="protein_sequence",
-            value_kind="sequence_ref",
+            value_kind="masked_prompt_sequence",
+            supports_tool_args=["prompt_sequence"],
             runtime_lookup={"candidate_id": "cand_a", "material_id": "mat_seq"},
         )
     ]

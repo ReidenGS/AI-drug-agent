@@ -572,6 +572,10 @@ def test_dynamut_missing_chain_uninvokable(monkeypatch):
 
 
 def test_esm_generate_sequence_maps_task_literal_and_prompt_sequence(monkeypatch):
+    """A field explicitly marked as a masked generation prompt (value_kind
+    `masked_prompt_sequence`, the ONLY value_kind `prompt_sequence` accepts)
+    maps successfully. See the sibling ordinary-sequence tests below for the
+    (much more common in production today) rejection case."""
     schema = {
         "type": "object",
         "properties": {
@@ -585,11 +589,64 @@ def test_esm_generate_sequence_maps_task_literal_and_prompt_sequence(monkeypatch
         tool_name="ESM_generate_protein_sequence",
         lane_type="protein_design",
         schema=schema,
-        fields={"prompt_sequence": _field(field_ref="material:sequence", value_kind="sequence_ref")},
+        fields={
+            "prompt_sequence": _field(
+                field_ref="material:masked_prompt",
+                value_kind="masked_prompt_sequence",
+                supports_tool_args=["prompt_sequence"],
+            )
+        },
     )
     assert tool.can_invoke is True
     assert tool.argument_mappings[0].schema_arg == "prompt_sequence"
     assert tool.argument_literals[0].literal_value == "generate"
+
+
+def test_esm_generate_ordinary_heavy_chain_sequence_cannot_map_to_prompt_sequence(monkeypatch):
+    """Regression for the reported bug: an ordinary complete antibody
+    heavy-chain sequence (`value_kind="sequence_ref"`, exactly what
+    `Step9InputProjection` emits for a real heavy/light/target chain) must
+    NOT satisfy `prompt_sequence` — even if the LLM (or a Mock) tries to map
+    it there, `_step9_field_can_satisfy_arg`'s `supports_tool_args` gate
+    rejects it because the projection layer never lists "prompt_sequence"
+    for an ordinary sequence field."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "task": {"type": "string", "enum": ["generate"]},
+            "prompt_sequence": {"type": "string"},
+        },
+        "required": ["task", "prompt_sequence"],
+    }
+    heavy_chain_field = _field(
+        field_ref="material:heavy_chain",
+        value_kind="sequence_ref",
+        field_type="protein_sequence",
+        supports_tool_args=["sequence"],  # production Step9InputProjection contract
+    )
+    tool = validate_step9_stage2_mapping(
+        response_item={
+            "tool_name": "ESM_generate_protein_sequence",
+            "lane_type": "protein_design",
+            # An LLM (or a misbehaving Mock) that hallucinates this mapping
+            # anyway must still be overridden by deterministic validation.
+            "can_invoke": True,
+            "argument_mappings": [{"schema_arg": "prompt_sequence", "field_ref": "material:heavy_chain"}],
+            "argument_literals": [{"schema_arg": "task", "literal_value": "generate"}],
+            "missing_required_fields": [],
+        },
+        selected_tool={
+            "tool_name": "ESM_generate_protein_sequence",
+            "lane_type": "protein_design",
+            "full_schema": schema,
+            "required_fields": ["task", "prompt_sequence"],
+        },
+        available_fields=[heavy_chain_field],
+    )
+    assert tool.can_invoke is False
+    assert tool.argument_mappings == []
+    assert "prompt_sequence" in tool.missing_required_fields
+    assert "field_ref_incompatible:prompt_sequence" in tool.argument_mapping_reason
 
 
 def test_no_raw_sequence_pdb_or_tooluniverse_payload_in_mapping_audit(monkeypatch):
@@ -644,3 +701,66 @@ def test_duplicate_field_ref_in_available_fields_raises_not_silent_overwrite():
             selected_tool=tool,
             available_fields=duplicate_fields,
         )
+
+
+def test_select_stage2_mappings_end_to_end_only_ordinary_sequence_marks_esm_generate_uninvokable(
+    monkeypatch,
+):
+    """End-to-end `select_step9_stage2_mappings`: ESM_generate_protein_sequence
+    is selected (Stage 1 correctly judged it relevant to the query), only an
+    ordinary heavy-chain protein_sequence field exists, and the (mock) LLM
+    hallucinates mapping it to prompt_sequence anyway. The final mapped
+    result must still be can_invoke=false with prompt_sequence in
+    missing_required_fields, and the tool must show up in
+    uninvokable_tools/uninvokable_tool_details."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "task": {"type": "string", "enum": ["generate"]},
+            "prompt_sequence": {"type": "string"},
+        },
+        "required": ["task", "prompt_sequence"],
+    }
+    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: schema)
+
+    heavy_chain_field = _field(
+        field_ref="material:heavy_chain",
+        value_kind="sequence_ref",
+        field_type="protein_sequence",
+        supports_tool_args=["sequence"],
+    )
+    llm = _LLM(
+        {
+            "tools": [
+                {
+                    "tool_name": "ESM_generate_protein_sequence",
+                    "lane_type": "protein_design",
+                    "can_invoke": True,
+                    "argument_mappings": [
+                        {"schema_arg": "prompt_sequence", "field_ref": "material:heavy_chain"}
+                    ],
+                    "argument_literals": [{"schema_arg": "task", "literal_value": "generate"}],
+                    "missing_required_fields": [],
+                    "skip_reason": "",
+                    "argument_mapping_reason": "hallucinated: mapped ordinary sequence to prompt_sequence",
+                }
+            ]
+        }
+    )
+    result = select_step9_stage2_mappings(
+        llm=llm,
+        projection=_projection(fields=[heavy_chain_field]),
+        selected_tools=_selected("ESM_generate_protein_sequence", "protein_design"),
+        candidate_id="cand_a",
+    )
+
+    assert len(result.mapped_tools) == 1
+    mapped = result.mapped_tools[0]
+    assert mapped.tool_name == "ESM_generate_protein_sequence"
+    assert mapped.can_invoke is False
+    assert mapped.argument_mappings == []
+    assert "prompt_sequence" in mapped.missing_required_fields
+
+    assert "ESM_generate_protein_sequence" in result.uninvokable_tools
+    details = {d["tool_name"]: d for d in result.uninvokable_tool_details}
+    assert "prompt_sequence" in details["ESM_generate_protein_sequence"]["missing_required_fields"]

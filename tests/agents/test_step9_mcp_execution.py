@@ -26,6 +26,7 @@ from tests.mcp.conftest import FakeUniverse
 
 
 RAW_PDB_BODY = "HEADER TEST PDB\nATOM      1  N   GLY A   1"
+HEAVY_CHAIN_SEQ = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGKGLEWVARIYPTNGYTRYADSVKG"
 
 # A minimal, genuinely PDB-shaped backbone file — production ProteinMPNN/
 # RFdiffusion calls need ATOM-record text, not just any bytes, so the
@@ -189,6 +190,27 @@ def _add_uniprot_variant(local_storage, run_id: str, candidate_id: str) -> None:
                 ]
             )
     local_storage.write_json(cct_path, cct)
+
+
+def _add_ordinary_heavy_chain_sequence(local_storage, run_id: str, candidate_id: str) -> str:
+    """Add an ordinary complete antibody heavy-chain sequence material (the
+    real-world shape Step9InputProjection now restricts to `sequence`,
+    never `prompt_sequence`). Returns the field_ref
+    (`material:<material_id>`) Stage 2 would see for it."""
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    material_id = "mat_heavy_chain"
+    for candidate in cct["candidate_records"]:
+        if candidate["candidate_id"] == candidate_id:
+            candidate.setdefault("materials", []).append(
+                {
+                    "material_id": material_id,
+                    "material_type": "antibody_heavy_chain_sequence",
+                    "value": HEAVY_CHAIN_SEQ,
+                }
+            )
+    local_storage.write_json(cct_path, cct)
+    return f"material:{material_id}"
 
 
 def _mcp_with_bindings(bindings: dict) -> LocalMCPClient:
@@ -631,3 +653,55 @@ def test_privacy_no_raw_pdb_body_or_path_in_normalized_artifact(
     assert backbone_key not in persisted_input
     assert FAKE_PDB_TEXT not in persisted_input
     assert "ATOM" not in persisted_input
+
+
+def test_esm_generate_never_executes_with_only_ordinary_heavy_chain_sequence(
+    local_storage, registry_service, workflow_state_service
+):
+    """End-to-end regression for the reported ESMProteinError bug:
+    ESM_generate_protein_sequence is selected (Stage 1 judged it relevant to
+    the query) and Stage 2 (here, a hostile Mock standing in for an LLM that
+    mapped an ordinary heavy-chain sequence to prompt_sequence) tries to
+    invoke it with only an ordinary complete antibody heavy-chain sequence
+    available. It must end up uninvokable and never actually execute."""
+    run_id = _seed(local_storage, registry_service, workflow_state_service)
+    candidate_id = _target_candidate_id(local_storage, run_id)
+    field_ref = _add_ordinary_heavy_chain_sequence(local_storage, run_id, candidate_id)
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+        llm=_Step9SingleToolLLM(
+            tool_name="ESM_generate_protein_sequence",
+            lane_type="protein_design",
+            field_ref=field_ref,
+            schema_arg="prompt_sequence",
+        ),
+    )
+    artifact = agent.run_step_9(run_id)
+
+    # Stage 1 could still select it (it remains a normal catalog tool);
+    # Stage 2 must mark it uninvokable rather than execute it.
+    assert "ESM_generate_protein_sequence" in artifact.step9_stage2_uninvokable_tools
+    mapped = next(
+        t for t in artifact.step9_stage2_mapped_tools if t["tool_name"] == "ESM_generate_protein_sequence"
+    )
+    assert mapped["can_invoke"] is False
+    assert "prompt_sequence" in mapped["missing_required_fields"]
+
+    assert "ESM_generate_protein_sequence" not in artifact.step9_runtime_executed_tools
+    assert not any(tc.tool_name == "ESM_generate_protein_sequence" for tc in artifact.tool_call_records)
+    assert artifact.screening_status == "skipped"
+
+    # Privacy: the raw heavy-chain sequence must never appear anywhere in
+    # the normalized artifact (projection input_fields, stage2 mapping audit,
+    # runtime plan, or any tool_input_summary).
+    artifact_blob = json.dumps(artifact.model_dump())
+    assert HEAVY_CHAIN_SEQ not in artifact_blob
+
+    normalized_blob = local_storage.read_json(
+        local_storage.run_key(run_id, "compound_screening_artifact.json")
+    )
+    assert HEAVY_CHAIN_SEQ not in json.dumps(normalized_blob)

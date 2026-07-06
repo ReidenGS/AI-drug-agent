@@ -243,7 +243,12 @@ def test_step7_identifier_only_uniprot_sequence_ref_supports_uniprot_not_raw_seq
     assert "sequence" not in fields[0].supports_tool_args
 
 
-def test_step7_inline_sequence_supports_sequence_and_prompt_sequence():
+def test_step7_inline_sequence_supports_sequence_only_not_prompt_sequence():
+    """An ordinary complete protein sequence (e.g. a heavy/light chain) must
+    only satisfy a plain `sequence` arg. ToolUniverse's
+    ESM_generate_protein_sequence `prompt_sequence` expects a masked
+    generation prompt, not a complete existing chain — mapping an ordinary
+    sequence there causes a real ESM SDK error, not just an LLM mistake."""
     prepared = [
         {
             "candidate_id": "cand_t1",
@@ -265,9 +270,33 @@ def test_step7_inline_sequence_supports_sequence_and_prompt_sequence():
         structure_prediction_and_interface_results=None,
     )
     fields = [f for f in projection["input_fields"] if f.candidate_id == "cand_t1"]
-    assert set(fields[0].supports_tool_args) == {"sequence", "prompt_sequence"}
+    assert set(fields[0].supports_tool_args) == {"sequence"}
+    assert "prompt_sequence" not in fields[0].supports_tool_args
     blob = json.dumps(fields[0].model_dump())
     assert RAW_SEQ not in blob
+
+
+def test_step5_material_heavy_light_target_sequence_supports_sequence_only():
+    """Same contract for Step 5 candidate-material-sourced sequences
+    (heavy/light chain, target antigen sequence)."""
+    candidate = _base_candidate(
+        materials=[
+            {
+                "material_id": "mat_heavy",
+                "material_type": "antibody_heavy_chain_sequence",
+                "value": RAW_SEQ,
+            }
+        ]
+    )
+    projection = project_step9_inputs(
+        candidate_context_table=_cct(candidate),
+        prepared_structure_input_package=None,
+        structure_prediction_and_interface_results=None,
+    )
+    fields = [f for f in projection["input_fields"] if f.field_type == "protein_sequence"]
+    assert len(fields) == 1
+    assert set(fields[0].supports_tool_args) == {"sequence"}
+    assert "prompt_sequence" not in fields[0].supports_tool_args
 
 
 def test_step8_complex_structure_ref_supports_complex_and_backbone_args():

@@ -451,3 +451,150 @@ def test_duplicate_field_ref_in_input_fields_raises_not_silent_overwrite():
             duplicate_fields
             + [_field("identifier:variant:V777L", field_type="variant", value_kind="variant", supports_tool_args=["variant", "variants", "mutation", "mutations"])],
         )
+
+
+# ── prompt_sequence vs ordinary sequence (ESM_generate_protein_sequence) ────
+
+def test_prompt_sequence_mapped_to_ordinary_sequence_stays_unresolved():
+    """Even if Stage 2 (an LLM or a misbehaving Mock) maps prompt_sequence to
+    an ordinary complete protein_sequence field (value_kind="sequence_ref",
+    exactly what Step9InputProjection emits for a real heavy/light/target
+    chain), the runtime planner must independently reject it — it must never
+    rely solely on the Stage 2/LLM prompt behaving correctly."""
+    result = _plan(
+        _mapped(
+            "ESM_generate_protein_sequence",
+            "protein_design",
+            {"prompt_sequence": "material:heavy_chain"},
+        ),
+        [
+            _field(
+                "material:heavy_chain",
+                field_type="protein_sequence",
+                value_kind="sequence_ref",
+                supports_tool_args=["sequence", "prompt_sequence"],  # hypothetical stale/bad field
+            )
+        ],
+    )
+    entry = result["step9_runtime_unresolved_tools"][0]
+    assert entry["can_resolve"] is False
+    assert "prompt_sequence_requires_masked_generation_prompt" in entry["unresolved_reasons"]
+    contract = result["step9_runtime_kwargs_contracts"][0]
+    assert contract["can_build_kwargs"] is False
+    assert result["step9_runtime_resolved_tools"] == []
+
+
+def test_prompt_sequence_requires_masked_prompt_value_kind_even_when_supports_tool_args_lists_it():
+    """Belt-and-braces: the planner's own `value_kind` check fires
+    independently of `supports_tool_args` (Stage 2's gate) — a field that
+    (incorrectly) lists "prompt_sequence" in supports_tool_args but is not
+    tagged as a masked prompt must still be rejected."""
+    result = _plan(
+        _mapped(
+            "ESM_generate_protein_sequence",
+            "protein_design",
+            {"prompt_sequence": "material:ordinary_seq"},
+        ),
+        [
+            _field(
+                "material:ordinary_seq",
+                field_type="protein_sequence",
+                value_kind="sequence_ref",
+                supports_tool_args=["sequence", "prompt_sequence"],
+            )
+        ],
+    )
+    assert result["step9_runtime_resolved_tools"] == []
+    entry = result["step9_runtime_unresolved_tools"][0]
+    assert "prompt_sequence_requires_masked_generation_prompt" in entry["unresolved_reasons"]
+
+
+def test_prompt_sequence_resolves_when_field_is_a_true_masked_prompt():
+    """A field explicitly tagged `value_kind="masked_prompt_sequence"`
+    (the only value_kind `prompt_sequence` accepts) resolves normally."""
+    result = _plan(
+        _mapped(
+            "ESM_generate_protein_sequence",
+            "protein_design",
+            {"prompt_sequence": "material:masked_prompt"},
+        ),
+        [
+            _field(
+                "material:masked_prompt",
+                field_type="protein_sequence",
+                value_kind="masked_prompt_sequence",
+                supports_tool_args=["prompt_sequence"],
+            )
+        ],
+    )
+    entry = result["step9_runtime_resolved_tools"][0]
+    assert entry["can_resolve"] is True
+    assert entry["tool_name"] == "ESM_generate_protein_sequence"
+
+
+def test_ordinary_sequence_still_satisfies_esm_score_variant_sae_batch_sequence_arg():
+    """Regression: the prompt_sequence narrowing must not affect
+    ESM_score_variant_sae_batch's ordinary `sequence` arg — an existing
+    complete protein sequence is exactly what variant scoring needs."""
+    result = _plan(
+        _mapped(
+            "ESM_score_variant_sae_batch",
+            "variant_evaluation",
+            {
+                "sequence": "material:heavy_chain",
+                "variants": "identifier:variant:V777L",
+            },
+        ),
+        [
+            _field(
+                "material:heavy_chain",
+                field_type="protein_sequence",
+                value_kind="sequence_ref",
+                supports_tool_args=["sequence"],
+            ),
+            _field(
+                "identifier:variant:V777L",
+                field_type="variant",
+                value_kind="variant",
+                supports_tool_args=["variant", "variants", "mutation", "mutations"],
+            ),
+        ],
+    )
+    entry = result["step9_runtime_resolved_tools"][0]
+    assert entry["tool_name"] == "ESM_score_variant_sae_batch"
+    assert entry["can_resolve"] is True
+    assert set(entry["argument_keys"]) == {"sequence", "variants"}
+
+
+def test_no_raw_heavy_chain_sequence_in_runtime_plan_privacy():
+    """Category E privacy check: the runtime plan / kwargs contract / audit
+    never contains the raw heavy/light-chain sequence text — only
+    field_ref/placeholders — regardless of whether the tool resolves."""
+    result = _plan(
+        _mapped(
+            "ESM_score_variant_sae_batch",
+            "variant_evaluation",
+            {"sequence": "material:heavy_chain", "variants": "identifier:variant:V777L"},
+        ),
+        [
+            _field(
+                "material:heavy_chain",
+                field_type="protein_sequence",
+                value_kind="sequence_ref",
+                supports_tool_args=["sequence"],
+            ),
+            _field(
+                "identifier:variant:V777L",
+                field_type="variant",
+                value_kind="variant",
+                supports_tool_args=["variant", "variants", "mutation", "mutations"],
+            ),
+        ],
+    )
+    blob = json.dumps(result)
+    assert RAW_SEQ not in blob
+    for contract in result["step9_runtime_kwargs_contracts"]:
+        for item in contract["kwargs_plan"]:
+            if item.get("source") == "field_ref":
+                assert item.get("value_placeholder") == "<resolved_at_execution_time>"
+                assert "value" not in item or item.get("source") != "field_ref"

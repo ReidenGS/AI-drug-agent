@@ -12,7 +12,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from .step_09_input_projection import assert_unique_input_field_refs
+from .step_09_input_projection import (
+    MASKED_PROMPT_SEQUENCE_VALUE_KIND,
+    assert_unique_input_field_refs,
+)
 
 
 STEP9_RUNTIME_EXECUTION_MODE = "planning_only"
@@ -346,6 +349,20 @@ def _contract_reason(tool_name: str, schema_arg: str, field: dict[str, Any]) -> 
     if tool_name == "NvidiaNIM_rfdiffusion":
         if arg == "contigs" and field_type != "design_constraint":
             return "contigs_missing_or_not_validated"
+
+    if tool_name == "ESM_generate_protein_sequence":
+        # `prompt_sequence` is ToolUniverse's masked GENERATION PROMPT arg,
+        # never an ordinary complete heavy/light/target chain — a field must
+        # be explicitly marked as a masked prompt (`value_kind ==
+        # MASKED_PROMPT_SEQUENCE_VALUE_KIND`) to satisfy it. This is checked
+        # independently of Stage 2's `supports_tool_args` gate (defense in
+        # depth against a stale/incorrect field or a misbehaving LLM
+        # mapping), and independently of `Step9InputProjection`, which today
+        # never emits that value_kind at all.
+        if arg == "prompt_sequence" and (
+            field_type != "protein_sequence" or value_kind != MASKED_PROMPT_SEQUENCE_VALUE_KIND
+        ):
+            return "prompt_sequence_requires_masked_generation_prompt"
 
     if tool_name in {"ESM_generate_protein_sequence", "ESM_score_variant_sae_batch"}:
         if arg in _SEQUENCE_ARGS and field_type != "protein_sequence":
