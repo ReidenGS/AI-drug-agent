@@ -123,6 +123,41 @@ def test_stage1_catalog_has_no_zinc_or_chembl_tools():
     assert not any(name.startswith(("ZINC_", "ChEMBL_")) for name in names)
 
 
+def test_stage1_catalog_prefers_tooluniverse_official_description(monkeypatch):
+    official = "OFFICIAL TU ProteinMPNN description for Step 9 selection"
+
+    def _fake_specs(names):
+        assert "NvidiaNIM_proteinmpnn" in names
+        return {
+            "NvidiaNIM_proteinmpnn": {
+                "name": "NvidiaNIM_proteinmpnn",
+                "description": official,
+            }
+        }
+
+    from app.mcp import tooluniverse_adapter
+
+    monkeypatch.setattr(tooluniverse_adapter, "get_tool_specifications", _fake_specs)
+    catalog = build_step9_stage1_catalog()
+    by_name = {entry["tool_name"]: entry for entry in catalog}
+
+    assert by_name["NvidiaNIM_proteinmpnn"]["short_description"] == official
+    assert set(by_name) == _ACTIVE_TOOL_NAMES
+
+
+def test_stage1_catalog_falls_back_to_local_description_when_official_missing(monkeypatch):
+    from app.mcp import tooluniverse_adapter
+
+    monkeypatch.setattr(tooluniverse_adapter, "get_tool_specifications", lambda names: {})
+    catalog = build_step9_stage1_catalog()
+    by_name = {entry["tool_name"]: entry for entry in catalog}
+
+    assert by_name["NvidiaNIM_proteinmpnn"]["short_description"] == (
+        ACTIVE_STEP9_TOOLS["NvidiaNIM_proteinmpnn"]["short_description"]
+    )
+    assert set(by_name) == _ACTIVE_TOOL_NAMES
+
+
 def test_same_active_catalog_different_candidate_context_stable_prefix_identical():
     projection_a = _projection(candidate_id="cand_alpha", canonical_query="screen alpha", raw_user_query="alpha query")
     projection_b = _projection(candidate_id="cand_beta", canonical_query="screen beta", raw_user_query="beta query")

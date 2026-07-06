@@ -236,6 +236,29 @@ def _tool_schema_source(tool_name: str) -> str:
     return "signature"
 
 
+def _official_descriptions(tool_names: list[str]) -> dict[str, str]:
+    """Best-effort official ToolUniverse descriptions for Step 9 Stage 1.
+
+    Stage 1 should describe tools with ToolUniverse's own wording when
+    available. Any metadata failure falls back to the local active-tool
+    description without changing the visible tool set.
+    """
+    if not tool_names:
+        return {}
+    try:
+        from ..mcp import tooluniverse_adapter
+
+        specs = tooluniverse_adapter.get_tool_specifications(tool_names)
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, str] = {}
+    for name, spec in (specs or {}).items():
+        desc = (spec or {}).get("description")
+        if isinstance(desc, str) and desc.strip():
+            out[name] = desc.strip()
+    return out
+
+
 def build_step9_stage1_catalog() -> list[dict[str, Any]]:
     """Return the FULL active Step 9 tool catalog — always all 6 active
     tools, sorted by lane then tool name for a stable prompt-cache prefix.
@@ -243,16 +266,22 @@ def build_step9_stage1_catalog() -> list[dict[str, Any]]:
     This is independent of any per-candidate hard-gate/readiness state; the
     hard gate no longer drives which tools Stage 1 sees.
     """
+    sorted_names = sorted(
+        ACTIVE_STEP9_TOOLS,
+        key=lambda name: (ACTIVE_STEP9_TOOLS[name]["lane_type"], name),
+    )
+    official_descriptions = _official_descriptions(sorted_names)
     catalog: list[dict[str, Any]] = []
-    for tool_name in sorted(ACTIVE_STEP9_TOOLS, key=lambda name: (ACTIVE_STEP9_TOOLS[name]["lane_type"], name)):
+    for tool_name in sorted_names:
         meta = ACTIVE_STEP9_TOOLS[tool_name]
         schema = signature_schema_for(tool_name) or {}
         required = [str(arg) for arg in (schema.get("required") or []) if isinstance(arg, str)]
+        short_description = official_descriptions.get(tool_name) or meta["short_description"]
         catalog.append(
             {
                 "tool_name": tool_name,
                 "lane_type": meta["lane_type"],
-                "short_description": meta["short_description"],
+                "short_description": short_description,
                 "required_fields": required,
                 "schema_source": _tool_schema_source(tool_name),
             }
