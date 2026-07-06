@@ -397,6 +397,30 @@ def test_hydrate_env_does_not_overwrite_operator_nvidia_key(monkeypatch):
     assert os.environ["NVIDIA_API_KEY"] == "operator-nvidia-key"
 
 
+def test_hydrate_env_bridges_esm_key_for_esm_tools(monkeypatch):
+    from app.mcp.tooluniverse_adapter import _hydrate_env_from_settings
+    from app.settings import get_settings
+
+    monkeypatch.delenv("ESM_API_KEY", raising=False)
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "esm_api_key", "esm-sentinel-key")
+    _hydrate_env_from_settings()
+    assert os.environ.get("ESM_API_KEY") == "esm-sentinel-key"
+
+
+def test_hydrate_env_does_not_overwrite_operator_esm_key(monkeypatch):
+    from app.mcp.tooluniverse_adapter import _hydrate_env_from_settings
+    from app.settings import get_settings
+
+    monkeypatch.setenv("ESM_API_KEY", "operator-esm-key")
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "esm_api_key", "dotenv-esm-key")
+    _hydrate_env_from_settings()
+    assert os.environ["ESM_API_KEY"] == "operator-esm-key"
+
+
 # ── transient-failure retry policy ─────────────────────────────────────────
 
 

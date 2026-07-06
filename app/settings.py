@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     # (for example Step 8 complex prediction tools). This is bridged into
     # os.environ as NVIDIA_API_KEY immediately before ToolUniverse is built.
     nvidia_api_key: str = ""
+    # EvolutionaryScale Forge credentials used by ToolUniverse ESM wrappers
+    # (for example Step 9 ESM_generate_protein_sequence / ESM_score tools).
+    # This is bridged into os.environ as ESM_API_KEY before ToolUniverse runs.
+    esm_api_key: str = ""
 
     api_key: str = "dev-key"
 
