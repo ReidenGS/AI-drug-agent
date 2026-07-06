@@ -2083,11 +2083,14 @@ def test_admetai_live_upstream_error_envelope_when_universe_returns_error(
     assert "admet-ai" in (env.get("error_message") or "")
 
 
-# ── Step 9 variant batch: AlphaMissense migrated; DynaMut2 / ESM deferred ──
+# ── Step 9 variant batch: all four tools are ToolUniverse adapter bindings ──
 
 from app.mcp.tools.variant import (  # noqa: E402
     BINDINGS as VARIANT_BINDINGS,
     AlphaMissense_get_variant_score,
+    DynaMut2_predict_stability,
+    ESM_generate_protein_sequence,
+    ESM_score_variant_sae_batch,
 )
 
 
@@ -2147,29 +2150,226 @@ def test_alphamissense_live_upstream_error(install_universe):
     assert out["status"] == "upstream_error"
 
 
-_VARIANT_DEFERRED = (
+# Step 9 P2 migration: DynaMut2 / ESM_generate / ESM_score are now thin
+# ToolUniverse adapter bindings (`_call_variant_tu`), same shape as
+# `nvidianim._call_nim`. `_live=False` still raises `NotImplementedError`
+# (no offline mock success added); `_live=True` routes to
+# `tooluniverse_adapter.call_tool`.
+
+_VARIANT_TU_WIRED = (
     "DynaMut2_predict_stability",
     "ESM_generate_protein_sequence",
     "ESM_score_variant_sae_batch",
 )
 
 
-def test_variant_deferred_tools_raise_not_implemented():
+def test_variant_tu_wired_tools_not_live_raise_not_implemented():
     bindings = dict(VARIANT_BINDINGS)
-    for name in _VARIANT_DEFERRED:
-        assert name in bindings, f"missing binding for deferred {name}"
+    for name in _VARIANT_TU_WIRED:
+        assert name in bindings, f"missing binding for {name}"
         with pytest.raises(NotImplementedError):
             bindings[name]()
-        with pytest.raises(NotImplementedError):
-            bindings[name](_live=True)
 
 
-def test_variant_deferred_does_not_touch_universe(install_universe):
+def test_dynamut2_live_routes(install_universe):
     fake = install_universe(
-        tools={name: lambda args: {"ok": True} for name in _VARIANT_DEFERRED}
+        tools={
+            "DynaMut2_predict_stability": lambda args: {
+                "pdb_id": args["pdb_id"],
+                "chain": args["chain"],
+                "mutation": args["mutation"],
+                "ddg": -0.5,
+            }
+        }
     )
-    bindings = dict(VARIANT_BINDINGS)
-    for name in _VARIANT_DEFERRED:
-        with pytest.raises(NotImplementedError):
-            bindings[name](_live=True)
-    assert fake.calls == []
+    out = DynaMut2_predict_stability(
+        operation="predict_stability",
+        pdb_id="1N8Z",
+        chain="A",
+        mutation="V777L",
+        _live=True,
+    )
+    assert out["status"] == "ok"
+    assert out["executor"] == "tooluniverse"
+    assert fake.calls[0]["arguments"] == {
+        "operation": "predict_stability",
+        "pdb_id": "1N8Z",
+        "chain": "A",
+        "mutation": "V777L",
+    }
+
+
+def test_dynamut2_live_upstream_error(install_universe):
+    install_universe(
+        tools={
+            "DynaMut2_predict_stability": lambda args: {
+                "status": "error",
+                "error": "pdb not found",
+            }
+        }
+    )
+    out = DynaMut2_predict_stability(
+        operation="predict_stability", pdb_id="ZZZZ", chain="A", mutation="V777L",
+        _live=True,
+    )
+    assert out["status"] == "upstream_error"
+
+
+def test_esm_generate_protein_sequence_live_routes(install_universe):
+    fake = install_universe(
+        tools={
+            "ESM_generate_protein_sequence": lambda args: {
+                "generated_sequence": "MKTAYIAK",
+            }
+        }
+    )
+    out = ESM_generate_protein_sequence(prompt_sequence="MKT", _live=True)
+    assert out["status"] == "ok"
+    assert out["executor"] == "tooluniverse"
+    assert fake.calls[0]["arguments"] == {"prompt_sequence": "MKT"}
+
+
+def test_esm_generate_protein_sequence_optional_args_forwarded_when_set(install_universe):
+    fake = install_universe(
+        tools={"ESM_generate_protein_sequence": lambda args: {"generated_sequence": "MK"}}
+    )
+    ESM_generate_protein_sequence(
+        prompt_sequence="MKT", model="esm-1", num_steps=10, temperature=0.7, _live=True,
+    )
+    assert fake.calls[0]["arguments"] == {
+        "prompt_sequence": "MKT",
+        "model": "esm-1",
+        "num_steps": 10,
+        "temperature": 0.7,
+    }
+
+
+def test_esm_score_variant_sae_batch_live_routes(install_universe):
+    fake = install_universe(
+        tools={"ESM_score_variant_sae_batch": lambda args: {"scores": [0.1]}}
+    )
+    out = ESM_score_variant_sae_batch(sequence="MKT", variants=["V1L"], _live=True)
+    assert out["status"] == "ok"
+    assert out["executor"] == "tooluniverse"
+    assert fake.calls[0]["arguments"] == {"sequence": "MKT", "variants": ["V1L"]}
+
+
+# ── Step 9 structure batch: NvidiaNIM_rfdiffusion / NvidiaNIM_proteinmpnn ──
+
+from app.mcp.tools.nvidianim import (  # noqa: E402
+    BINDINGS as NVIDIANIM_BINDINGS,
+    NvidiaNIM_proteinmpnn,
+    NvidiaNIM_rfdiffusion,
+)
+
+
+def test_nvidianim_structure_tools_not_wired_to_deferred_stub():
+    bindings = dict(NVIDIANIM_BINDINGS)
+    assert bindings["NvidiaNIM_rfdiffusion"] is NvidiaNIM_rfdiffusion
+    assert bindings["NvidiaNIM_proteinmpnn"] is NvidiaNIM_proteinmpnn
+
+
+def test_nvidianim_structure_tools_not_live_raise_not_implemented():
+    with pytest.raises(NotImplementedError):
+        NvidiaNIM_rfdiffusion(contigs="A:1-10", input_pdb="fake_ref")
+    with pytest.raises(NotImplementedError):
+        NvidiaNIM_proteinmpnn(input_pdb="fake_ref")
+
+
+def test_nvidianim_rfdiffusion_live_routes(install_universe):
+    fake = install_universe(
+        tools={
+            "NvidiaNIM_rfdiffusion": lambda args: {
+                "output_pdb": "designed backbone placeholder",
+            }
+        }
+    )
+    out = NvidiaNIM_rfdiffusion(contigs="A:1-10/0 B:1-10", input_pdb="run/structure.pdb", _live=True)
+    assert out["status"] == "ok"
+    assert out["executor"] == "tooluniverse"
+    assert fake.calls[0]["arguments"] == {
+        "contigs": "A:1-10/0 B:1-10",
+        "input_pdb": "run/structure.pdb",
+    }
+
+
+def test_nvidianim_rfdiffusion_optional_args_forwarded_when_set(install_universe):
+    fake = install_universe(
+        tools={"NvidiaNIM_rfdiffusion": lambda args: {"output_pdb": "x"}}
+    )
+    NvidiaNIM_rfdiffusion(
+        contigs="A:1-10",
+        input_pdb="run/structure.pdb",
+        hotspot_res=["A30", "A33"],
+        diffusion_steps=50,
+        random_seed=7,
+        _live=True,
+    )
+    assert fake.calls[0]["arguments"] == {
+        "contigs": "A:1-10",
+        "input_pdb": "run/structure.pdb",
+        "hotspot_res": ["A30", "A33"],
+        "diffusion_steps": 50,
+        "random_seed": 7,
+    }
+
+
+def test_nvidianim_rfdiffusion_live_upstream_error(install_universe):
+    install_universe(
+        tools={
+            "NvidiaNIM_rfdiffusion": lambda args: {
+                "status": "error",
+                "error": "invalid contigs syntax",
+            }
+        }
+    )
+    out = NvidiaNIM_rfdiffusion(contigs="bad", input_pdb="run/structure.pdb", _live=True)
+    assert out["status"] == "upstream_error"
+
+
+def test_nvidianim_proteinmpnn_live_routes(install_universe):
+    fake = install_universe(
+        tools={
+            "NvidiaNIM_proteinmpnn": lambda args: {
+                "designed_sequences": ["MKTAYIAK"],
+            }
+        }
+    )
+    out = NvidiaNIM_proteinmpnn(input_pdb="run/structure.pdb", _live=True)
+    assert out["status"] == "ok"
+    assert out["executor"] == "tooluniverse"
+    assert fake.calls[0]["arguments"] == {"input_pdb": "run/structure.pdb"}
+
+
+def test_nvidianim_proteinmpnn_optional_args_forwarded_when_set(install_universe):
+    fake = install_universe(
+        tools={"NvidiaNIM_proteinmpnn": lambda args: {"designed_sequences": ["MK"]}}
+    )
+    NvidiaNIM_proteinmpnn(
+        input_pdb="run/structure.pdb",
+        ca_only=True,
+        use_soluble_model=False,
+        sampling_temp=[0.1, 0.2],
+        num_seq_per_target=4,
+        _live=True,
+    )
+    assert fake.calls[0]["arguments"] == {
+        "input_pdb": "run/structure.pdb",
+        "ca_only": True,
+        "use_soluble_model": False,
+        "sampling_temp": [0.1, 0.2],
+        "num_seq_per_target": 4,
+    }
+
+
+def test_nvidianim_proteinmpnn_live_upstream_error(install_universe):
+    install_universe(
+        tools={
+            "NvidiaNIM_proteinmpnn": lambda args: {
+                "status": "error",
+                "error": "invalid structure",
+            }
+        }
+    )
+    out = NvidiaNIM_proteinmpnn(input_pdb="run/structure.pdb", _live=True)
+    assert out["status"] == "upstream_error"

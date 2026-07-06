@@ -326,27 +326,57 @@ def test_step9_alphamissense_live_path(monkeypatch, install_universe):
     }
 
 
-@pytest.mark.parametrize(
-    "tool_name",
-    [
+# P2 migration: DynaMut2 / ESM_generate / ESM_score / NvidiaNIM_rfdiffusion /
+# NvidiaNIM_proteinmpnn are now thin ToolUniverse adapter bindings too (no
+# Step 9 active tool remains deferred). Each `(tool_name, kwargs, echo)` proves
+# the same Agent -> LocalMCPClient -> wrapper -> adapter path AlphaMissense
+# already exercised above — live routes through the fake universe with
+# `executor="tooluniverse"`, never a mocked/deferred shortcut.
+_STEP9_TU_WIRED_CASES = [
+    (
         "DynaMut2_predict_stability",
-        "ESM_generate_protein_sequence",
-        "ESM_score_variant_sae_batch",
-    ],
-)
-def test_step9_deferred_tools_never_reach_universe(
-    monkeypatch, install_universe, tool_name
-):
-    fake = install_universe(tools={tool_name: lambda args: {"silent": "success"}})
+        {"operation": "predict_stability", "pdb_id": "1N8Z", "chain": "A", "mutation": "V777L"},
+    ),
+    ("ESM_generate_protein_sequence", {"prompt_sequence": "MKTAYIAK"}),
+    ("ESM_score_variant_sae_batch", {"sequence": "MKTAYIAK", "variants": ["V1L"]}),
+    ("NvidiaNIM_rfdiffusion", {"contigs": "A:1-10", "input_pdb": "run/structure.pdb"}),
+    ("NvidiaNIM_proteinmpnn", {"input_pdb": "run/structure.pdb"}),
+]
+
+
+@pytest.mark.parametrize("tool_name,kwargs", _STEP9_TU_WIRED_CASES)
+def test_step9_tu_wired_tools_live_path(monkeypatch, install_universe, tool_name, kwargs):
+    fake = install_universe(tools={tool_name: lambda args: {"ok": True, **args}})
     _set_live(monkeypatch, allowlist=tool_name)
     client = LocalMCPClient()
     res = client.call_tool(
         agent_name="structure_and_design_agent",
         step_id="step_09",
         tool_name=tool_name,
+        **kwargs,
+    )
+    assert res["run_status"] == "success"
+    assert res["executor"] == "tooluniverse"
+    assert fake.calls[0]["arguments"] == kwargs
+
+
+@pytest.mark.parametrize("tool_name,kwargs", _STEP9_TU_WIRED_CASES)
+def test_step9_tu_wired_tools_live_disabled_stays_dependency_unavailable(
+    monkeypatch, install_universe, tool_name, kwargs
+):
+    """Live OFF: the wrapper's own `_live=False` guard still fires (via
+    `LocalMCPClient` catching `NotImplementedError`) — no silent mock
+    success, and the fake universe records zero calls."""
+    fake = install_universe(tools={tool_name: lambda args: {"ok": True, **args}})
+    _set_live(monkeypatch, enable=False)
+    client = LocalMCPClient()
+    res = client.call_tool(
+        agent_name="structure_and_design_agent",
+        step_id="step_09",
+        tool_name=tool_name,
+        **kwargs,
     )
     assert res["run_status"] == "dependency_unavailable"
-    assert res["executor"] == "deferred"
     assert fake.calls == []
 
 

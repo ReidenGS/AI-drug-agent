@@ -12,18 +12,55 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 
 import pytest
 
 from app.agents import step_09_selection_policy as step9sel
 from app.agents.structure_and_design_agent import StructureAndDesignAgent
+from app.mcp import tooluniverse_adapter
 from app.mcp.client import LocalMCPClient
 from app.services.tool_inventory_service import ToolInventoryService
+from app.settings import get_settings
 from tests.agents.test_structure_and_design_agent import DEFAULT_XLSX, _mcp, _seed
+from tests.mcp.conftest import FakeUniverse
 
 
 RAW_PDB_BODY = "HEADER TEST PDB\nATOM      1  N   GLY A   1"
+
+
+@pytest.fixture
+def install_fake_universe(monkeypatch):
+    """Install a fake ToolUniverse for the duration of a test (same
+    `FakeUniverse` stand-in `tests/mcp/` uses) so Step 9's now-real
+    `NvidiaNIM_rfdiffusion`/`NvidiaNIM_proteinmpnn`/`DynaMut2_predict_stability`/
+    `ESM_generate_protein_sequence`/`ESM_score_variant_sae_batch` bindings can
+    be exercised end to end through the REAL `tooluniverse_adapter.call_tool`
+    envelope construction, without touching the network."""
+
+    def _install(**kwargs) -> FakeUniverse:
+        fake = FakeUniverse(**kwargs)
+        tooluniverse_adapter._reset_for_tests()
+        monkeypatch.setattr(tooluniverse_adapter, "_get_universe", lambda: fake)
+        return fake
+
+    yield _install
+    tooluniverse_adapter._reset_for_tests()
+
+
+@pytest.fixture
+def enable_live(monkeypatch):
+    """Enable `MCP_LIVE_TOOLS` for exactly the given tool name(s) so
+    `LocalMCPClient` injects `_live=True` for them (production live policy),
+    then restore the settings cache at teardown so this never leaks into
+    other test files."""
+
+    def _enable(*tool_names: str) -> None:
+        monkeypatch.setenv("MCP_LIVE_TOOLS", "true")
+        monkeypatch.setenv("MCP_LIVE_TOOL_ALLOWLIST", ",".join(tool_names))
+        get_settings.cache_clear()
+
+    yield _enable
+    get_settings.cache_clear()
 
 
 # `tests/agents/conftest.py` forces ToolUniverse offline for every test in
@@ -257,28 +294,31 @@ class _Step9TwoToolLLM:
 
 
 def test_selected_mapped_resolved_proteinmpnn_executes_once_with_real_kwargs(
-    local_storage, registry_service, workflow_state_service
+    local_storage, registry_service, workflow_state_service, install_fake_universe, enable_live
 ):
+    """NvidiaNIM_proteinmpnn is now a real ToolUniverse adapter binding (no
+    more `_ni`/`wrapper_not_wired`) — this runs it through the REAL wrapper +
+    REAL `tooluniverse_adapter.call_tool` envelope construction, with only
+    the underlying ToolUniverse installation faked."""
     run_id = _seed(local_storage, registry_service, workflow_state_service)
     candidate_id = _target_candidate_id(local_storage, run_id)
     backbone_key = _write_validated_backbone(local_storage, run_id, candidate_id)
 
-    captured_calls: list[dict] = []
-
-    def _capture_proteinmpnn(**kwargs):
-        captured_calls.append(kwargs)
-        return {"status": "success", "output_pdb_ref": "fake_designed_backbone"}
-
-    from app.mcp.tools._registry import _all_bindings
-
-    bindings = dict(_all_bindings())
-    bindings["NvidiaNIM_proteinmpnn"] = _capture_proteinmpnn
+    fake = install_fake_universe(
+        tools={
+            "NvidiaNIM_proteinmpnn": lambda args: {
+                "designed_sequences": ["MKTAYIAK"],
+                "input_pdb_echo": args["input_pdb"],
+            }
+        }
+    )
+    enable_live("NvidiaNIM_proteinmpnn")
 
     agent = StructureAndDesignAgent(
         storage=local_storage,
         registry=registry_service,
         workflow_state=workflow_state_service,
-        mcp_client=_mcp_with_bindings(bindings),
+        mcp_client=_mcp(),
         llm=_Step9SingleToolLLM(
             tool_name="NvidiaNIM_proteinmpnn",
             lane_type="protein_design",
@@ -287,8 +327,8 @@ def test_selected_mapped_resolved_proteinmpnn_executes_once_with_real_kwargs(
     )
     artifact = agent.run_step_9(run_id)
 
-    assert len(captured_calls) == 1
-    assert captured_calls[0]["input_pdb"] == backbone_key
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["arguments"] == {"input_pdb": backbone_key}
 
     assert artifact.step9_runtime_executed_tools == ["NvidiaNIM_proteinmpnn"]
     assert len(artifact.tool_call_records) == 1
@@ -304,23 +344,25 @@ def test_selected_mapped_resolved_proteinmpnn_executes_once_with_real_kwargs(
 
 
 def test_multiple_selected_mapped_resolved_tools_all_execute(
-    local_storage, registry_service, workflow_state_service
+    local_storage, registry_service, workflow_state_service, install_fake_universe, enable_live
 ):
     run_id = _seed(local_storage, registry_service, workflow_state_service)
     candidate_id = _target_candidate_id(local_storage, run_id)
     _write_validated_backbone(local_storage, run_id, candidate_id)
     _add_uniprot_variant(local_storage, run_id, candidate_id)
 
-    from app.mcp.tools._registry import _all_bindings
-
-    bindings = dict(_all_bindings())
-    bindings["NvidiaNIM_proteinmpnn"] = lambda **kw: {"status": "success", "designed_sequences": ["MK"]}
+    install_fake_universe(
+        tools={"NvidiaNIM_proteinmpnn": lambda args: {"designed_sequences": ["MK"]}}
+    )
+    # AlphaMissense_get_variant_score is left out of the live allowlist —
+    # it keeps its existing non-live mocked-success behavior unchanged.
+    enable_live("NvidiaNIM_proteinmpnn")
 
     agent = StructureAndDesignAgent(
         storage=local_storage,
         registry=registry_service,
         workflow_state=workflow_state_service,
-        mcp_client=_mcp_with_bindings(bindings),
+        mcp_client=_mcp(),
         llm=_Step9TwoToolLLM(candidate_id=candidate_id),
     )
     artifact = agent.run_step_9(run_id)
@@ -335,27 +377,33 @@ def test_multiple_selected_mapped_resolved_tools_all_execute(
 
 
 def test_one_success_one_failure_reports_partial_status_and_both_records(
-    local_storage, registry_service, workflow_state_service
+    local_storage, registry_service, workflow_state_service, install_fake_universe, enable_live
 ):
+    """ProteinMPNN's real ToolUniverse binding surfaces a genuine upstream
+    error envelope (`{"status": "error", ...}` -> `upstream_error` ->
+    `run_status="failed"`); AlphaMissense keeps its unchanged non-live
+    mocked-success behavior. Both records must be preserved and the overall
+    status must honestly report `partial`."""
     run_id = _seed(local_storage, registry_service, workflow_state_service)
     candidate_id = _target_candidate_id(local_storage, run_id)
     _write_validated_backbone(local_storage, run_id, candidate_id)
     _add_uniprot_variant(local_storage, run_id, candidate_id)
 
-    from app.mcp.tools._registry import _all_bindings
-
-    def _fail_proteinmpnn(**kwargs):
-        raise RuntimeError("simulated ToolUniverse upstream failure")
-
-    bindings = dict(_all_bindings())
-    bindings["NvidiaNIM_proteinmpnn"] = _fail_proteinmpnn
-    # AlphaMissense_get_variant_score keeps its real (non-live mocked-success) binding.
+    install_fake_universe(
+        tools={
+            "NvidiaNIM_proteinmpnn": lambda args: {
+                "status": "error",
+                "error": "simulated ToolUniverse upstream failure",
+            }
+        }
+    )
+    enable_live("NvidiaNIM_proteinmpnn")
 
     agent = StructureAndDesignAgent(
         storage=local_storage,
         registry=registry_service,
         workflow_state=workflow_state_service,
-        mcp_client=_mcp_with_bindings(bindings),
+        mcp_client=_mcp(),
         llm=_Step9TwoToolLLM(candidate_id=candidate_id),
     )
     artifact = agent.run_step_9(run_id)
@@ -368,33 +416,31 @@ def test_one_success_one_failure_reports_partial_status_and_both_records(
 
 
 def test_unresolved_tool_does_not_execute_and_gets_skipped_audit(
-    local_storage, registry_service, workflow_state_service
+    local_storage, registry_service, workflow_state_service, install_fake_universe, enable_live
 ):
     """Stage2 maps a tool's required arg to a field_ref that cannot be
     resolved to a real value (points at a nonexistent structure ref) — the
-    tool must never be invoked, and the skip must be explicit."""
+    tool must never be invoked, and the skip must be explicit. Live mode is
+    enabled for the tool so a spurious call would actually reach the fake
+    universe (proving the resolver gate, not the live/mock env gate, is what
+    prevents execution)."""
     run_id = _seed(local_storage, registry_service, workflow_state_service)
     candidate_id = _target_candidate_id(local_storage, run_id)
     # No Step7/Step8 artifacts written at all: step8_validated_structure_ref
     # will not even exist as a projected field, so Stage2's mapping targets a
     # field_ref that is not in the projection.
 
-    captured_calls: list[dict] = []
+    def _fail_if_called(args):
+        raise AssertionError("NvidiaNIM_proteinmpnn must not be invoked when unresolved")
 
-    def _capture_proteinmpnn(**kwargs):
-        captured_calls.append(kwargs)
-        return {"status": "success"}
-
-    from app.mcp.tools._registry import _all_bindings
-
-    bindings = dict(_all_bindings())
-    bindings["NvidiaNIM_proteinmpnn"] = _capture_proteinmpnn
+    fake = install_fake_universe(tools={"NvidiaNIM_proteinmpnn": _fail_if_called})
+    enable_live("NvidiaNIM_proteinmpnn")
 
     agent = StructureAndDesignAgent(
         storage=local_storage,
         registry=registry_service,
         workflow_state=workflow_state_service,
-        mcp_client=_mcp_with_bindings(bindings),
+        mcp_client=_mcp(),
         llm=_Step9SingleToolLLM(
             tool_name="NvidiaNIM_proteinmpnn",
             lane_type="protein_design",
@@ -403,7 +449,7 @@ def test_unresolved_tool_does_not_execute_and_gets_skipped_audit(
     )
     artifact = agent.run_step_9(run_id)
 
-    assert captured_calls == []
+    assert fake.calls == []
     assert artifact.tool_call_records == []
     assert artifact.step9_runtime_executed_tools == []
     assert artifact.screening_status == "skipped"
@@ -502,25 +548,24 @@ def test_zinc_and_chembl_never_execute_even_if_llm_tries_to_select_them(
 
 
 def test_privacy_no_raw_pdb_body_or_path_in_normalized_artifact(
-    local_storage, registry_service, workflow_state_service
+    local_storage, registry_service, workflow_state_service, install_fake_universe, enable_live
 ):
     run_id = _seed(local_storage, registry_service, workflow_state_service)
     candidate_id = _target_candidate_id(local_storage, run_id)
     backbone_key = _write_validated_backbone(local_storage, run_id, candidate_id)
 
-    from app.mcp.tools._registry import _all_bindings
-
-    bindings = dict(_all_bindings())
-    bindings["NvidiaNIM_proteinmpnn"] = lambda **kw: {
-        "status": "success",
-        "raw_pdb_body": RAW_PDB_BODY,
-    }
+    install_fake_universe(
+        tools={
+            "NvidiaNIM_proteinmpnn": lambda args: {"raw_pdb_body": RAW_PDB_BODY}
+        }
+    )
+    enable_live("NvidiaNIM_proteinmpnn")
 
     agent = StructureAndDesignAgent(
         storage=local_storage,
         registry=registry_service,
         workflow_state=workflow_state_service,
-        mcp_client=_mcp_with_bindings(bindings),
+        mcp_client=_mcp(),
         llm=_Step9SingleToolLLM(
             tool_name="NvidiaNIM_proteinmpnn",
             lane_type="protein_design",
@@ -529,6 +574,7 @@ def test_privacy_no_raw_pdb_body_or_path_in_normalized_artifact(
     )
     artifact = agent.run_step_9(run_id)
     tc = artifact.tool_call_records[0]
+    assert tc.run_status == "success"
 
     normalized_blob = local_storage.read_json(
         local_storage.run_key(run_id, "compound_screening_artifact.json")
@@ -539,8 +585,9 @@ def test_privacy_no_raw_pdb_body_or_path_in_normalized_artifact(
     assert "ATOM      1" not in normalized_text
 
     # The raw ToolUniverse payload (including the fake raw PDB body) is only
-    # reachable via tool_outputs/step_09/<tool_call_id>.json.
+    # reachable via tool_outputs/step_09/<tool_call_id>.json — the envelope's
+    # `payload` sub-key carries the real tool's raw return value.
     assert tc.tool_output_ref is not None
     assert "tool_outputs/step_09/" in tc.tool_output_ref.replace("\\", "/")
     raw_output = local_storage.read_json(tc.tool_output_ref)
-    assert raw_output["output"]["raw_pdb_body"] == RAW_PDB_BODY
+    assert raw_output["output"]["payload"]["raw_pdb_body"] == RAW_PDB_BODY
