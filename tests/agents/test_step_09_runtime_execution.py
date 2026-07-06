@@ -665,3 +665,328 @@ def test_execution_requests_multiple_tools_all_evaluated_independently(local_sto
     by_tool = {r["tool_name"]: r for r in requests}
     assert by_tool["ESM_generate_protein_sequence"]["can_execute"] is True
     assert by_tool["NvidiaNIM_rfdiffusion"]["can_execute"] is False
+
+
+# ── NIM input_pdb structure-text coercion (bug fix: ToolUniverse needs raw
+# PDB/CIF ATOM-record TEXT for input_pdb, not a storage path) ──────────────
+
+def test_proteinmpnn_input_pdb_reads_storage_text_via_validated_structure_ref(local_storage):
+    """`step8_validated_structure_ref` resolves to a storage path (via the
+    Step 7 source_ref chain); for NvidiaNIM_proteinmpnn's `input_pdb` arg the
+    execution layer must read that path's bytes and forward the raw
+    structure TEXT, never the path itself."""
+    backbone_key = local_storage.run_key("run1", "uploads", "backbone.pdb")
+    local_storage.write_bytes(backbone_key, RAW_PDB_BODY.encode("utf-8"))
+    step8_result = {
+        "candidate_structure_results": [
+            {
+                "candidate_id": "cand_a",
+                "downstream_handoff": {"validated_structure_ref": "mat_backbone"},
+            }
+        ]
+    }
+    prepared = {
+        "prepared_structure_inputs": [
+            {
+                "candidate_id": "cand_a",
+                "structure_input_id": "si_1",
+                "structure_refs": [{"source_ref": "mat_backbone", "storage_ref": backbone_key}],
+            }
+        ]
+    }
+    contracts = [
+        _contract(
+            "NvidiaNIM_proteinmpnn",
+            "protein_design",
+            [
+                {
+                    "runtime_arg": "input_pdb",
+                    "source": "field_ref",
+                    "schema_arg": "input_pdb",
+                    "field_ref": "step8_validated_structure_ref:cand_a",
+                }
+            ],
+        )
+    ]
+    input_fields = [
+        _field(
+            field_ref="step8_validated_structure_ref:cand_a",
+            field_type="structure",
+            value_kind="validated_structure_ref",
+            supports_tool_args=["input_pdb", "pdb_file", "structure", "backbone", "path"],
+            runtime_lookup={"candidate_id": "cand_a"},
+        )
+    ]
+    requests = resolve_step9_execution_requests(
+        kwargs_contracts=contracts,
+        input_fields=input_fields,
+        candidate_context_table={},
+        prepared_structure_input_package=prepared,
+        structure_prediction_and_interface_results=step8_result,
+        storage=local_storage,
+    )
+    request = requests[0]
+    assert request["can_execute"] is True
+    assert request["kwargs"]["input_pdb"] == RAW_PDB_BODY
+
+    summary = request["kwargs_redacted_summary"]["input_pdb"]
+    assert backbone_key not in json.dumps(summary)
+    assert RAW_PDB_BODY not in json.dumps(summary)
+    assert "ATOM" not in json.dumps(summary)
+    assert summary["runtime_value_kind"] == "structure_text"
+    assert summary["resolved_from"] == "storage_ref_or_local_path"
+    assert summary["value_length"] == len(RAW_PDB_BODY)
+    assert summary["field_ref"] == "step8_validated_structure_ref:cand_a"
+
+
+def test_rfdiffusion_input_pdb_reads_storage_text_via_step7_structure_ref(local_storage):
+    """Same coercion applies to NvidiaNIM_rfdiffusion's `input_pdb`, resolved
+    this time through a direct `step7_structure_ref` field."""
+    structure_key = local_storage.run_key("run1", "uploads", "scaffold.pdb")
+    local_storage.write_bytes(structure_key, RAW_PDB_BODY.encode("utf-8"))
+    prepared = {
+        "prepared_structure_inputs": [
+            {
+                "candidate_id": "cand_a",
+                "structure_input_id": "si_1",
+                "structure_refs": [{"storage_ref": structure_key}],
+            }
+        ]
+    }
+    contracts = [
+        _contract(
+            "NvidiaNIM_rfdiffusion",
+            "protein_design",
+            [
+                {
+                    "runtime_arg": "input_pdb",
+                    "source": "field_ref",
+                    "schema_arg": "input_pdb",
+                    "field_ref": "step7_structure_ref:si_1:0",
+                },
+                {
+                    "runtime_arg": "contigs",
+                    "source": "field_ref",
+                    "schema_arg": "contigs",
+                    "field_ref": "material:mat_contigs",
+                },
+            ],
+        )
+    ]
+    input_fields = [
+        _field(
+            field_ref="step7_structure_ref:si_1:0",
+            field_type="structure",
+            value_kind="structure_ref",
+            supports_tool_args=["input_pdb", "pdb_file", "structure", "backbone", "path"],
+            runtime_lookup={"candidate_id": "cand_a", "structure_input_id": "si_1", "index": 0},
+        ),
+        _field(
+            field_ref="material:mat_contigs",
+            field_type="design_constraint",
+            value_kind="contigs",
+            supports_tool_args=["contigs"],
+            runtime_lookup={"candidate_id": "cand_a", "material_id": "mat_contigs"},
+        ),
+    ]
+    cct = _cct_with_material("cand_a", "mat_contigs", "contigs", "A:1-10;B:1-10")
+    requests = resolve_step9_execution_requests(
+        kwargs_contracts=contracts,
+        input_fields=input_fields,
+        candidate_context_table=cct,
+        prepared_structure_input_package=prepared,
+        structure_prediction_and_interface_results=None,
+        storage=local_storage,
+    )
+    request = requests[0]
+    assert request["can_execute"] is True
+    assert request["kwargs"]["input_pdb"] == RAW_PDB_BODY
+    # contigs is explicit upstream structured input, resolved as-is (never
+    # invented, never coerced — the coercion only applies to input_pdb).
+    assert request["kwargs"]["contigs"] == "A:1-10;B:1-10"
+    assert request["kwargs_redacted_summary"]["contigs"].get("runtime_value_kind") is None
+
+
+def test_rfdiffusion_missing_contigs_stays_unresolved_not_invented(local_storage):
+    """Even though input_pdb resolves cleanly to real structure text, a
+    missing `contigs` mapping must leave the whole tool unresolved — never
+    invented from the query or a default."""
+    structure_key = local_storage.run_key("run1", "uploads", "scaffold.pdb")
+    local_storage.write_bytes(structure_key, RAW_PDB_BODY.encode("utf-8"))
+    prepared = {
+        "prepared_structure_inputs": [
+            {
+                "candidate_id": "cand_a",
+                "structure_input_id": "si_1",
+                "structure_refs": [{"storage_ref": structure_key}],
+            }
+        ]
+    }
+    contracts = [
+        _contract(
+            "NvidiaNIM_rfdiffusion",
+            "protein_design",
+            [
+                {
+                    "runtime_arg": "input_pdb",
+                    "source": "field_ref",
+                    "schema_arg": "input_pdb",
+                    "field_ref": "step7_structure_ref:si_1:0",
+                }
+            ],
+            can_build=False,
+        )
+    ]
+    input_fields = [
+        _field(
+            field_ref="step7_structure_ref:si_1:0",
+            field_type="structure",
+            value_kind="structure_ref",
+            supports_tool_args=["input_pdb", "pdb_file", "structure", "backbone", "path"],
+            runtime_lookup={"candidate_id": "cand_a", "structure_input_id": "si_1", "index": 0},
+        ),
+    ]
+    requests = resolve_step9_execution_requests(
+        kwargs_contracts=contracts,
+        input_fields=input_fields,
+        candidate_context_table={},
+        prepared_structure_input_package=prepared,
+        structure_prediction_and_interface_results=None,
+        storage=local_storage,
+    )
+    assert requests[0]["can_execute"] is False
+    assert requests[0]["skip_reason"] == "runtime_plan_unresolved"
+
+
+def test_proteinmpnn_rejects_non_structure_text_content(local_storage):
+    """A resolved storage path whose bytes don't look like PDB/CIF text
+    (no ATOM/HETATM/HEADER/data_/loop_ marker) must be rejected — never
+    forwarded as-is and never silently treated as success."""
+    junk_key = local_storage.run_key("run1", "uploads", "not_a_structure.txt")
+    local_storage.write_bytes(junk_key, b"just some unrelated notes, not a structure file")
+    prepared = {
+        "prepared_structure_inputs": [
+            {
+                "candidate_id": "cand_a",
+                "structure_input_id": "si_1",
+                "structure_refs": [{"storage_ref": junk_key}],
+            }
+        ]
+    }
+    contracts = [
+        _contract(
+            "NvidiaNIM_proteinmpnn",
+            "protein_design",
+            [
+                {
+                    "runtime_arg": "input_pdb",
+                    "source": "field_ref",
+                    "schema_arg": "input_pdb",
+                    "field_ref": "step7_structure_ref:si_1:0",
+                }
+            ],
+        )
+    ]
+    input_fields = [
+        _field(
+            field_ref="step7_structure_ref:si_1:0",
+            field_type="structure",
+            value_kind="structure_ref",
+            supports_tool_args=["input_pdb", "pdb_file", "structure", "backbone", "path"],
+            runtime_lookup={"candidate_id": "cand_a", "structure_input_id": "si_1", "index": 0},
+        ),
+    ]
+    requests = resolve_step9_execution_requests(
+        kwargs_contracts=contracts,
+        input_fields=input_fields,
+        candidate_context_table={},
+        prepared_structure_input_package=prepared,
+        structure_prediction_and_interface_results=None,
+        storage=local_storage,
+    )
+    request = requests[0]
+    assert request["can_execute"] is False
+    assert any("structure_text_not_found" in reason for reason in request["unresolved_reasons"])
+
+
+def test_dynamut2_pdb_id_not_coerced_stays_true_pdb_id(local_storage):
+    """DynaMut2's `pdb_id` arg must never be routed through the structure-text
+    coercion — it must stay a true 4-char PDB id, never a path or file body,
+    even if (hypothetically) misrouted to a structure-typed field."""
+    contracts = [
+        _contract(
+            "DynaMut2_predict_stability",
+            "variant_evaluation",
+            [
+                {
+                    "runtime_arg": "pdb_id",
+                    "source": "field_ref",
+                    "schema_arg": "pdb_id",
+                    "field_ref": "identifier:pdb_id:1N8Z",
+                }
+            ],
+        )
+    ]
+    input_fields = [
+        _field(
+            field_ref="identifier:pdb_id:1N8Z",
+            field_type="structure_identifier",
+            value_kind="pdb_id",
+            supports_tool_args=["pdb_id"],
+        )
+    ]
+    requests = resolve_step9_execution_requests(
+        kwargs_contracts=contracts,
+        input_fields=input_fields,
+        candidate_context_table={},
+        prepared_structure_input_package=None,
+        structure_prediction_and_interface_results=None,
+        storage=local_storage,
+    )
+    request = requests[0]
+    assert request["can_execute"] is True
+    assert request["kwargs"]["pdb_id"] == "1N8Z"
+    # Untouched by the NIM structure-text coercion: no runtime_value_kind tag.
+    assert "runtime_value_kind" not in request["kwargs_redacted_summary"]["pdb_id"]
+
+
+def test_dynamut2_never_reads_uploaded_path_as_pdb_id(local_storage):
+    """Even if a Stage2 mapping (hypothetically, e.g. a hallucinated LLM
+    response) tried to point DynaMut2's `pdb_id` at a structure field whose
+    resolved value is a storage path, the coercion must NOT fire for
+    DynaMut2 — this arg is only ever a true PDB id extracted from
+    `identifier:pdb_id:...`, and a structure-typed field_ref simply has no
+    matching resolver path that would produce a bare path here in practice.
+    This test documents that `pdb_id` stays out of the NIM-only coercion
+    scope regardless of tool_name."""
+    contracts = [
+        _contract(
+            "DynaMut2_predict_stability",
+            "variant_evaluation",
+            [
+                {
+                    "runtime_arg": "pdb_id",
+                    "source": "field_ref",
+                    "schema_arg": "pdb_id",
+                    "field_ref": "identifier:pdb_id:9XYZ",
+                }
+            ],
+        )
+    ]
+    input_fields = [
+        _field(
+            field_ref="identifier:pdb_id:9XYZ",
+            field_type="structure_identifier",
+            value_kind="pdb_id",
+            supports_tool_args=["pdb_id"],
+        )
+    ]
+    requests = resolve_step9_execution_requests(
+        kwargs_contracts=contracts,
+        input_fields=input_fields,
+        candidate_context_table={},
+        prepared_structure_input_package=None,
+        structure_prediction_and_interface_results=None,
+        storage=local_storage,
+    )
+    assert requests[0]["kwargs"]["pdb_id"] == "9XYZ"

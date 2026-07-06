@@ -27,6 +27,16 @@ from tests.mcp.conftest import FakeUniverse
 
 RAW_PDB_BODY = "HEADER TEST PDB\nATOM      1  N   GLY A   1"
 
+# A minimal, genuinely PDB-shaped backbone file — production ProteinMPNN/
+# RFdiffusion calls need ATOM-record text, not just any bytes, so the
+# runtime coercion layer (`_looks_like_structure_text`) accepts this.
+FAKE_PDB_TEXT = (
+    "HEADER    TEST STRUCTURE\n"
+    "ATOM      1  N   GLY A   1      11.104  13.207   2.428  1.00 20.00           N\n"
+    "ATOM      2  CA  GLY A   1      12.560  13.207   2.428  1.00 20.00           C\n"
+    "END\n"
+)
+
 
 @pytest.fixture
 def install_fake_universe(monkeypatch):
@@ -134,7 +144,7 @@ def _write_validated_backbone(local_storage, run_id: str, candidate_id: str) -> 
     """Write a real backbone file + Step 7/8 artifacts so
     `step8_validated_structure_ref:<candidate_id>` resolves to it."""
     backbone_key = local_storage.run_key(run_id, "uploads", "validated_backbone.pdb")
-    local_storage.write_bytes(backbone_key, b"fake validated backbone bytes")
+    local_storage.write_bytes(backbone_key, FAKE_PDB_TEXT.encode("utf-8"))
     local_storage.write_json(
         local_storage.run_key(run_id, "prepared_structure_input_package.json"),
         {
@@ -299,7 +309,12 @@ def test_selected_mapped_resolved_proteinmpnn_executes_once_with_real_kwargs(
     """NvidiaNIM_proteinmpnn is now a real ToolUniverse adapter binding (no
     more `_ni`/`wrapper_not_wired`) — this runs it through the REAL wrapper +
     REAL `tooluniverse_adapter.call_tool` envelope construction, with only
-    the underlying ToolUniverse installation faked."""
+    the underlying ToolUniverse installation faked.
+
+    Regression for the reported bug: ToolUniverse's official `input_pdb`
+    schema is raw PDB/CIF ATOM-record TEXT, not a storage path — the
+    runtime-execution layer must read the resolved storage path's bytes and
+    forward the actual structure text, never the path itself."""
     run_id = _seed(local_storage, registry_service, workflow_state_service)
     candidate_id = _target_candidate_id(local_storage, run_id)
     backbone_key = _write_validated_backbone(local_storage, run_id, candidate_id)
@@ -328,7 +343,10 @@ def test_selected_mapped_resolved_proteinmpnn_executes_once_with_real_kwargs(
     artifact = agent.run_step_9(run_id)
 
     assert len(fake.calls) == 1
-    assert fake.calls[0]["arguments"] == {"input_pdb": backbone_key}
+    # ToolUniverse received the raw PDB TEXT, not the storage path.
+    assert fake.calls[0]["arguments"] == {"input_pdb": FAKE_PDB_TEXT}
+    assert "ATOM" in fake.calls[0]["arguments"]["input_pdb"]
+    assert backbone_key not in fake.calls[0]["arguments"]["input_pdb"]
 
     assert artifact.step9_runtime_executed_tools == ["NvidiaNIM_proteinmpnn"]
     assert len(artifact.tool_call_records) == 1
@@ -338,9 +356,21 @@ def test_selected_mapped_resolved_proteinmpnn_executes_once_with_real_kwargs(
     assert tc.step_id == "step_09"
     assert artifact.screening_status == "ok"
 
-    # The real backbone storage path never leaks into the persisted summary.
+    # Neither the storage path NOR the raw PDB text leaks into the persisted
+    # summary — only a redacted digest with a length/hash + runtime_value_kind.
     assert backbone_key not in json.dumps(tc.tool_input_summary)
-    assert backbone_key not in json.dumps(artifact.model_dump())
+    assert FAKE_PDB_TEXT not in json.dumps(tc.tool_input_summary)
+    assert "ATOM" not in json.dumps(tc.tool_input_summary)
+    input_pdb_summary = tc.tool_input_summary["input_pdb"]
+    assert input_pdb_summary["runtime_value_kind"] == "structure_text"
+    assert input_pdb_summary["resolved_from"] == "storage_ref_or_local_path"
+    assert input_pdb_summary["value_length"] == len(FAKE_PDB_TEXT)
+    assert "field_ref" in input_pdb_summary
+
+    artifact_blob = json.dumps(artifact.model_dump())
+    assert backbone_key not in artifact_blob
+    assert FAKE_PDB_TEXT not in artifact_blob
+    assert "ATOM" not in artifact_blob
 
 
 def test_multiple_selected_mapped_resolved_tools_all_execute(
@@ -583,6 +613,10 @@ def test_privacy_no_raw_pdb_body_or_path_in_normalized_artifact(
     assert RAW_PDB_BODY not in normalized_text
     assert backbone_key not in normalized_text
     assert "ATOM      1" not in normalized_text
+    # The real structure text sent as input_pdb (read from the resolved
+    # storage path) must not leak into the normalized artifact either.
+    assert FAKE_PDB_TEXT not in normalized_text
+    assert "ATOM" not in normalized_text
 
     # The raw ToolUniverse payload (including the fake raw PDB body) is only
     # reachable via tool_outputs/step_09/<tool_call_id>.json — the envelope's
@@ -591,3 +625,9 @@ def test_privacy_no_raw_pdb_body_or_path_in_normalized_artifact(
     assert "tool_outputs/step_09/" in tc.tool_output_ref.replace("\\", "/")
     raw_output = local_storage.read_json(tc.tool_output_ref)
     assert raw_output["output"]["payload"]["raw_pdb_body"] == RAW_PDB_BODY
+    # The persisted "input" (== kwargs_redacted_summary) must not contain the
+    # storage path or the raw structure text sent as the real MCP arg.
+    persisted_input = json.dumps(raw_output["input"])
+    assert backbone_key not in persisted_input
+    assert FAKE_PDB_TEXT not in persisted_input
+    assert "ATOM" not in persisted_input

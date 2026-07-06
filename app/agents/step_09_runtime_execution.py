@@ -23,6 +23,19 @@ contains a raw sequence, PDB body, storage path, or API key; only
 `field_ref` / `field_type` / `value_kind` / length / sha256 prefix, or (for
 official schema literals, which are fixed non-secret vocabulary) the literal
 value itself.
+
+Tool-specific runtime shape coercion: `resolve_step9_field_value` resolves a
+field to whatever real value its `runtime_lookup` breadcrumb points at —
+for a `structure`/`complex_structure` field that is almost always a storage
+path (e.g. `step8_validated_structure_ref` walked back to Step 7's
+`storage_ref`). But `NvidiaNIM_proteinmpnn`/`NvidiaNIM_rfdiffusion`'s
+official `input_pdb` schema arg is documented as raw PDB/CIF ATOM-record
+TEXT, not a path — ToolUniverse cannot read our local/S3 storage.
+`_coerce_step9_runtime_value_for_tool` is the single place that reads that
+path's bytes and substitutes the raw structure text for exactly that
+(tool_name, runtime_arg) pair; every other tool/arg combination (notably
+DynaMut2's `pdb_id`, which must stay a true 4-char PDB id, never a path or
+file body) passes through unchanged.
 """
 
 from __future__ import annotations
@@ -110,8 +123,28 @@ def resolve_step9_execution_requests(
                 if value is None:
                     unresolved_reasons.append(f"{runtime_arg}:{error or 'value_not_resolvable'}")
                     continue
-                kwargs[runtime_arg] = value
-                redacted[runtime_arg] = _redacted_summary_for_field(field, value)
+                coerced_value, coerce_error, was_coerced = _coerce_step9_runtime_value_for_tool(
+                    tool_name=tool_name,
+                    runtime_arg=runtime_arg,
+                    field=field,
+                    value=value,
+                    storage=storage,
+                )
+                if coerced_value is None:
+                    unresolved_reasons.append(
+                        f"{runtime_arg}:{coerce_error or 'runtime_value_coercion_failed'}"
+                    )
+                    continue
+                kwargs[runtime_arg] = coerced_value
+                if was_coerced:
+                    redacted[runtime_arg] = _redacted_summary_for_runtime_value(
+                        field,
+                        coerced_value,
+                        runtime_value_kind="structure_text",
+                        resolved_from="storage_ref_or_local_path",
+                    )
+                else:
+                    redacted[runtime_arg] = _redacted_summary_for_field(field, coerced_value)
                 continue
 
             unresolved_reasons.append(f"{runtime_arg}:unresolved_in_contract")
@@ -204,6 +237,81 @@ def resolve_step9_field_value(
         return _resolve_material_value(field, candidate_context_table=candidate_context_table)
 
     return None, "unsupported_field_ref_shape"
+
+
+# ── tool-specific runtime shape coercion ─────────────────────────────────────
+#
+# `resolve_step9_field_value` above resolves a field to whatever real value
+# its `runtime_lookup` breadcrumb names — for `structure`/`complex_structure`
+# fields that is a storage path (a local file or an object-storage key), not
+# structure text. NvidiaNIM_rfdiffusion/proteinmpnn's official `input_pdb`
+# schema arg is documented as raw PDB/CIF ATOM-record text; ToolUniverse has
+# no access to our storage, so the path itself is useless to it. This is the
+# ONLY place that turns a resolved structure path into the tool's expected
+# text — scoped to exactly (tool_name, runtime_arg, field_type) so no other
+# tool/arg pair (notably DynaMut2's `pdb_id`, RFdiffusion's `contigs`) is
+# touched.
+
+_NIM_STRUCTURE_TEXT_TOOLS = {"NvidiaNIM_proteinmpnn", "NvidiaNIM_rfdiffusion"}
+_STRUCTURE_TEXT_FIELD_TYPES = {"structure", "complex_structure"}
+_STRUCTURE_TEXT_MARKERS = ("ATOM", "HETATM", "HEADER", "DATA_", "LOOP_")
+
+
+def _coerce_step9_runtime_value_for_tool(
+    *,
+    tool_name: str,
+    runtime_arg: str,
+    field: dict[str, Any],
+    value: str,
+    storage: Storage,
+) -> tuple[str | None, str | None, bool]:
+    """Final tool-specific coercion of an already-resolved field value.
+
+    Returns ``(coerced_value, error, was_coerced)``. ``was_coerced=True``
+    tells the caller the redacted summary must describe the COERCED value
+    (raw structure text), never the original resolved value (a storage
+    path), so the path never reaches any persisted summary.
+    """
+    if (
+        tool_name in _NIM_STRUCTURE_TEXT_TOOLS
+        and runtime_arg == "input_pdb"
+        and str(field.get("field_type") or "") in _STRUCTURE_TEXT_FIELD_TYPES
+    ):
+        text, error = _read_structure_text(value, storage=storage)
+        if text is None:
+            return None, error or "structure_text_not_found", True
+        return text, None, True
+    return value, None, False
+
+
+def _read_structure_text(path: str, *, storage: Storage) -> tuple[str | None, str | None]:
+    try:
+        if Path(path).is_file():
+            raw_bytes = Path(path).read_bytes()
+        else:
+            raw_bytes = storage.read_bytes(path)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"structure_text_read_failed:{type(exc).__name__}"
+
+    text: str | None = None
+    for encoding in ("utf-8", "latin-1"):
+        try:
+            text = raw_bytes.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        return None, "structure_text_decode_failed"
+    if not text.strip():
+        return None, "structure_text_empty"
+    if not _looks_like_structure_text(text):
+        return None, "structure_text_not_found"
+    return text, None
+
+
+def _looks_like_structure_text(text: str) -> bool:
+    sample = text[:5000].upper()
+    return any(marker in sample for marker in _STRUCTURE_TEXT_MARKERS)
 
 
 # ── identifiers embedded directly in field_ref ──────────────────────────────
@@ -536,6 +644,20 @@ def _redacted_summary_for_field(field: dict[str, Any], value: str) -> dict[str, 
         "value_length": len(text),
         "sha256_prefix": hashlib.sha256(text.encode("utf-8")).hexdigest()[:12],
     }
+
+
+def _redacted_summary_for_runtime_value(
+    field: dict[str, Any], value: str, *, runtime_value_kind: str, resolved_from: str
+) -> dict[str, Any]:
+    """Same digest as `_redacted_summary_for_field`, but computed over a
+    tool-coerced runtime value (e.g. raw structure text read from a storage
+    path) rather than the field's originally-resolved value — so a coerced
+    arg's length/hash always describes what was ACTUALLY sent to
+    ToolUniverse, never the storage path that was resolved along the way."""
+    summary = _redacted_summary_for_field(field, value)
+    summary["runtime_value_kind"] = runtime_value_kind
+    summary["resolved_from"] = resolved_from
+    return summary
 
 
 def _model_dump_list(items: list[Any]) -> list[dict[str, Any]]:
