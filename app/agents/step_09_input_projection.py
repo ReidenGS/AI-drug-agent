@@ -343,7 +343,8 @@ def _project_step5_candidate_fields(candidate: dict[str, Any], candidate_id: str
         value = material.get("value")
 
         if m_type in _VARIANT_IDENTIFIER_TYPES:
-            if isinstance(value, str) and value.strip():
+            has_value = isinstance(value, str) and bool(value.strip())
+            if has_value:
                 out.append(
                     Step9InputField(
                         field_ref=f"material:{mat_id}",
@@ -357,6 +358,15 @@ def _project_step5_candidate_fields(candidate: dict[str, Any], candidate_id: str
                         supports_tool_args=list(_VARIANT_TOOL_ARGS),
                         can_resolve_at_runtime=True,
                         llm_safe_metadata={"material_type": str(m_type)},
+                        # The runtime resolver walks this breadcrumb to
+                        # re-fetch the real mutation/variant string from
+                        # Step 5 at execution time; the value is never
+                        # copied into the field itself.
+                        runtime_lookup={
+                            "resolution_path": ["step_05.candidate_records[].materials[].value"],
+                            "candidate_id": candidate_id,
+                            "material_id": mat_id,
+                        },
                         status="available",
                     )
                 )
@@ -375,6 +385,18 @@ def _project_step5_candidate_fields(candidate: dict[str, Any], candidate_id: str
                     supports_tool_args=list(_CONTIGS_TOOL_ARGS),
                     can_resolve_at_runtime=has_value,
                     llm_safe_metadata={"material_type": str(m_type)},
+                    # Contigs are a deterministic upstream design constraint,
+                    # never LLM/heuristic-generated; the resolver re-fetches
+                    # the real contigs string via this breadcrumb.
+                    runtime_lookup=(
+                        {
+                            "resolution_path": ["step_05.candidate_records[].materials[].value"],
+                            "candidate_id": candidate_id,
+                            "material_id": mat_id,
+                        }
+                        if has_value
+                        else {}
+                    ),
                     status="available" if has_value else "missing",
                     missing_reason=None if has_value else "contigs_value_missing",
                 )

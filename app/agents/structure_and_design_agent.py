@@ -42,6 +42,7 @@ from ..agents.step_09_selection_policy import (
     select_step9_stage2_mappings,
 )
 from ..agents.step_09_runtime_planner import plan_step9_runtime_execution
+from ..agents.step_09_runtime_execution import resolve_step9_execution_requests
 from ..llm.provider import LLMProvider, MockLLMProvider
 from ..mcp.client import MCPClient
 from ..schemas.common import ToolCallRecord
@@ -1546,9 +1547,88 @@ class StructureAndDesignAgent:
             input_fields=input_projection["input_fields"],
         )
 
+        # Real MCP execution: resolve the runtime-planner's kwargs CONTRACT
+        # (placeholders/literals only) into real values via each field's
+        # `runtime_lookup`, then invoke every resolved Step 9 active tool.
+        # Gate is exactly: LLM-selected (Stage 1) -> Stage 2 can_invoke=True
+        # -> runtime-plan can_resolve=True -> real value resolution succeeds.
+        # Hard-gate allowed/blocked never participates in this decision.
+        execution_requests = resolve_step9_execution_requests(
+            kwargs_contracts=runtime_plan["step9_runtime_kwargs_contracts"],
+            input_fields=input_projection["input_fields"],
+            candidate_context_table=cct,
+            prepared_structure_input_package=step7_pkg,
+            structure_prediction_and_interface_results=step8_artifact,
+            storage=self.storage,
+        )
+
         tool_calls: list[ToolCallRecord] = []
         hits: list[CompoundHit] = []
-        screening_status = "skipped"
+        executed_tool_names: list[str] = []
+        execution_records: list[dict[str, Any]] = []
+        any_success = False
+        any_failure = False
+        any_attempted = False
+
+        for request in execution_requests:
+            tool_name = request["tool_name"]
+            lane_type = request["lane_type"]
+            if not request["can_execute"]:
+                execution_records.append(
+                    {
+                        "tool_name": tool_name,
+                        "lane_type": lane_type,
+                        "run_status": "skipped",
+                        "skip_reason": request.get("skip_reason") or "runtime_value_resolution_failed",
+                        "unresolved_reasons": list(request.get("unresolved_reasons") or []),
+                        "tool_call_id": None,
+                    }
+                )
+                continue
+
+            any_attempted = True
+            tc = self._call_tool(
+                run_id=run_id,
+                step_id=_STEP_09,
+                tool_name=tool_name,
+                kwargs=request["kwargs"] or {},
+                output_dir="step_09",
+                label=f"step09:{tool_name}",
+                extra_input_summary={"lane_type": lane_type},
+                persisted_input=request["kwargs_redacted_summary"],
+            )
+            tool_calls.append(tc)
+            executed_tool_names.append(tool_name)
+            execution_records.append(
+                {
+                    "tool_name": tool_name,
+                    "lane_type": lane_type,
+                    "run_status": tc.run_status,
+                    "tool_call_id": tc.tool_call_id,
+                    "tool_output_ref": tc.tool_output_ref,
+                }
+            )
+            if tc.run_status == "success":
+                any_success = True
+            elif tc.run_status in {"failed", "dependency_unavailable"}:
+                any_failure = True
+
+        if any_success and not any_failure:
+            screening_status = "ok"
+        elif any_success and any_failure:
+            screening_status = "partial"
+        elif any_attempted:
+            # Attempted (invoked) at least one tool but got zero success —
+            # honest partial, never a misleading clean skip.
+            screening_status = "partial"
+        else:
+            # Nothing was selected, nothing was resolvable, or nothing was
+            # actually invokable this run.
+            screening_status = "skipped"
+
+        runtime_execution_mode = (
+            "executed" if any_attempted else runtime_plan["step9_runtime_execution_mode"]
+        )
 
         artifact = CompoundScreeningArtifact(
             run_id=run_id,
@@ -1586,7 +1666,7 @@ class StructureAndDesignAgent:
             step9_runtime_resolver_audit=runtime_plan["step9_runtime_resolver_audit"],
             step9_runtime_kwargs_contracts=runtime_plan["step9_runtime_kwargs_contracts"],
             step9_runtime_kwargs_contract_audit=runtime_plan["step9_runtime_kwargs_contract_audit"],
-            step9_runtime_execution_mode=runtime_plan["step9_runtime_execution_mode"],
+            step9_runtime_execution_mode=runtime_execution_mode,
             step9_missing_inputs=readiness_projection["step9_missing_inputs"],
             step9_input_fields=input_projection["input_fields"],
             step9_input_projection_summary={
@@ -1595,6 +1675,8 @@ class StructureAndDesignAgent:
                 "query_summary": input_projection["query_summary"],
             },
             step9_projection_missing_inputs=input_projection["missing_inputs"],
+            step9_runtime_executed_tools=executed_tool_names,
+            step9_runtime_execution_records=execution_records,
         )
 
         artifact_id = new_artifact_id("compound_screening_artifact")

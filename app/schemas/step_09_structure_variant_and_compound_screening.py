@@ -253,6 +253,16 @@ class CompoundScreeningArtifact(BaseModel):
     step9_input_fields: list[Step9InputField] = Field(default_factory=list)
     step9_input_projection_summary: dict = Field(default_factory=dict)
     step9_projection_missing_inputs: list[str] = Field(default_factory=list)
+    # ── Step 9 real MCP execution (Turn C) ──────────────────────────────────
+    # Populated once the runtime resolver (`step_09_runtime_execution`)
+    # resolves a Stage 2 kwargs contract to real values and
+    # `StructureAndDesignAgent.run_step_9` actually invokes the tool via
+    # `mcp_client.call_tool`. `tool_call_records` (above) carries the
+    # canonical per-call record (with `tool_output_ref` into
+    # `tool_outputs/step_09/`); these two fields are a compact, redundant
+    # index over the same calls for convenient Step 9 auditing.
+    step9_runtime_executed_tools: list[str] = Field(default_factory=list)
+    step9_runtime_execution_records: list[dict] = Field(default_factory=list)
     protein_design_readiness: Step9LaneReadinessProfile = Field(
         default_factory=Step9LaneReadinessProfile
     )

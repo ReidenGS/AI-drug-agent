@@ -3595,9 +3595,12 @@ class _Step9RuntimePlannerLLM:
         return {}
 
 
-def test_step9_runtime_planner_populates_artifact_without_mcp_execution(
+def test_step9_runtime_planner_executes_resolved_tool_via_mcp_client(
     local_storage, registry_service, workflow_state_service
 ):
+    """Turn C: a selected + Stage2 can_invoke=True + runtime-resolved tool is
+    actually executed via `mcp_client.call_tool`, with real resolved values
+    used only for the call — never persisted into the normalized artifact."""
     raw_sequence = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
     run_id = _seed(
         local_storage,
@@ -3627,7 +3630,7 @@ def test_step9_runtime_planner_populates_artifact_without_mcp_execution(
         llm=_Step9RuntimePlannerLLM(),
     ).run_step_9(run_id)
 
-    assert artifact.step9_runtime_execution_mode == "planning_only"
+    # Planning layer is unchanged: still produces a resolved plan/contract.
     assert artifact.step9_runtime_execution_plan
     assert artifact.step9_runtime_resolved_tools
     entry = artifact.step9_runtime_resolved_tools[0]
@@ -3653,7 +3656,34 @@ def test_step9_runtime_planner_populates_artifact_without_mcp_execution(
         for item in artifact.step9_runtime_kwargs_contract_audit
     )
 
-    forbidden_prefixes = ("NvidiaNIM_", "ESM_", "AlphaMissense_", "DynaMut2_", "ZINC_", "ChEMBL_")
+    # Turn C: the resolved tool is now actually EXECUTED once.
+    assert artifact.step9_runtime_execution_mode == "executed"
+    assert artifact.screening_status == "ok"
+    assert artifact.step9_runtime_executed_tools == ["AlphaMissense_get_variant_score"]
+    assert len(artifact.tool_call_records) == 1
+    tc = artifact.tool_call_records[0]
+    assert tc.tool_name == "AlphaMissense_get_variant_score"
+    assert tc.run_status == "success"
+    assert tc.step_id == "step_09"
+    assert tc.tool_output_ref and "tool_outputs/step_09/" in tc.tool_output_ref.replace("\\", "/")
+    assert len(artifact.step9_runtime_execution_records) == 1
+    record = artifact.step9_runtime_execution_records[0]
+    assert record["run_status"] == "success"
+    assert record["tool_call_id"] == tc.tool_call_id
+
+    # The real resolved values (P04626 / V777L) reached the ToolUniverse call
+    # (visible in the raw tool_outputs/step_09 payload)...
+    raw_output = local_storage.read_json(tc.tool_output_ref)
+    assert raw_output["output"]["uniprot_id"] == "P04626"
+    assert raw_output["output"]["variant"] == "V777L"
+    # ...but the persisted tool_input_summary carries only a redacted digest
+    # (field_ref/field_type/value_kind/length/hash) — never a literal
+    # `value` key holding the resolved string.
+    assert tc.tool_input_summary.get("uniprot_id", {}).get("source") == "field_ref"
+    assert "value" not in (tc.tool_input_summary.get("uniprot_id") or {})
+    assert tc.tool_input_summary["uniprot_id"]["value_length"] == len("P04626")
+
+    forbidden_prefixes = ("NvidiaNIM_", "ESM_", "DynaMut2_", "ZINC_", "ChEMBL_")
     assert not any(tc.tool_name.startswith(forbidden_prefixes) for tc in artifact.tool_call_records)
     runtime_blob = json.dumps(
         {
@@ -3665,8 +3695,9 @@ def test_step9_runtime_planner_populates_artifact_without_mcp_execution(
     )
     assert "ZINC_" not in runtime_blob
     assert "ChEMBL_" not in runtime_blob
-    assert raw_sequence not in json.dumps(artifact.model_dump())
-    assert "CC(=O)NCCC1=CN" not in json.dumps(artifact.model_dump())
+    artifact_blob = json.dumps(artifact.model_dump())
+    assert raw_sequence not in artifact_blob
+    assert "CC(=O)NCCC1=CN" not in artifact_blob
 
 
 def _seed_sequence_only_protein_candidates(
