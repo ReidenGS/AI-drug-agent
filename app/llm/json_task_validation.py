@@ -67,12 +67,78 @@ _PROTEIN_GENERATION_HINTS = (
 )
 
 
+# Negation markers that, when they immediately precede a generation hint,
+# flip its meaning ("do NOT generate protein sequences", "without generating
+# …"). Keeps an explicit opt-out from being read as a generation request.
+_GENERATION_NEGATION_MARKERS = (
+    "do not",
+    "don't",
+    "dont",
+    "not ",
+    "no ",
+    "without",
+    "avoid",
+    "never",
+    "won't",
+    "wont",
+    "skip",
+)
+_GENERATION_NEGATION_WINDOW = 24
+
+
 def requests_protein_generation(text: str) -> bool:
-    """True if `text` asks to generate/complete/fill a protein sequence."""
+    """True if `text` asks to generate/complete/fill a protein sequence.
+
+    Negation-aware: an occurrence immediately preceded by a negation marker
+    (e.g. "do not generate protein sequences") does not count as a request.
+    """
     if not isinstance(text, str) or not text:
         return False
     lowered = text.lower()
-    return any(hint in lowered for hint in _PROTEIN_GENERATION_HINTS)
+    for hint in _PROTEIN_GENERATION_HINTS:
+        start = 0
+        while True:
+            idx = lowered.find(hint, start)
+            if idx == -1:
+                break
+            preceding = lowered[max(0, idx - _GENERATION_NEGATION_WINDOW): idx]
+            if not any(neg in preceding for neg in _GENERATION_NEGATION_MARKERS):
+                return True
+            start = idx + 1
+    return False
+
+
+# Protein point-mutation / variant token, one-letter HGVS-ish form (e.g.
+# V777L or p.V777L). Restricted to the 20 standard amino-acid letters on both
+# ends so ordinary tokens (H1N1, P04626, HER2, 4HER) never match. Shared by
+# the Step 2 Mock detector and the post-LLM variant normalizer backstop so a
+# real-LLM run and the Mock structure the same referenced_input.
+_PROTEIN_VARIANT_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:p\.)?"
+    r"([ACDEFGHIKLMNPQRSTVWY]\d{1,4}[ACDEFGHIKLMNPQRSTVWY])"
+    r"(?![A-Za-z0-9])"
+)
+
+
+def extract_protein_variant_tokens(text: Any) -> list[str]:
+    """Return canonical one-letter variant tokens (e.g. ["V777L"]) found in
+    `text`, de-duplicated in first-seen order. A leading "p." HGVS prefix is
+    stripped; the returned token is the bare `<AA><pos><AA>` form."""
+    if not isinstance(text, str) or not text:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _PROTEIN_VARIANT_RE.finditer(text):
+        token = match.group(1).upper()
+        if token not in seen:
+            seen.add(token)
+            out.append(token)
+    return out
+
+
+def looks_like_protein_variant(value: Any) -> bool:
+    """True if `value` is (or contains) a one-letter protein variant token."""
+    return bool(extract_protein_variant_tokens(value))
 
 
 # ── Prompt construction ────────────────────────────────────────────────────
@@ -407,7 +473,7 @@ def shape_instruction(task: str) -> str:
             '"lane_type":"protein_design|variant_evaluation|compound_screening",'
             '"can_invoke":true,'
             '"argument_mappings":[{"schema_arg":"string","field_ref":"string"}],'
-            '"argument_literals":[{"schema_arg":"string","literal_value":"string|number|boolean|null"}],'
+            '"argument_literals":[{"schema_arg":"string","literal_value_json":"json text"}],'
             '"missing_required_fields":["string"],"skip_reason":"string",'
             '"argument_mapping_reason":"string"}]}'
         )
@@ -799,7 +865,16 @@ def validate_task_shape(data: dict, task: str, *, error_factory: ErrorFactory) -
                 raise error_factory(
                     f"step9_tool_schema_mapping_stage_2 tools[{i}] requires boolean `can_invoke`"
                 )
-            for key in ("argument_mappings", "argument_literals"):
+            if not isinstance(entry.get("argument_mappings"), list):
+                raise error_factory(
+                    f"step9_tool_schema_mapping_stage_2 tools[{i}] requires list `argument_mappings`"
+                )
+            literals = entry.get("argument_literals")
+            if not isinstance(literals, (list, dict)):
+                raise error_factory(
+                    f"step9_tool_schema_mapping_stage_2 tools[{i}] requires list or object `argument_literals`"
+                )
+            for key in ("argument_mappings",):
                 if not isinstance(entry.get(key), list):
                     raise error_factory(
                         f"step9_tool_schema_mapping_stage_2 tools[{i}] requires list `{key}`"
@@ -817,19 +892,38 @@ def validate_task_shape(data: dict, task: str, *, error_factory: ErrorFactory) -
                     raise error_factory(
                         f"step9_tool_schema_mapping_stage_2 tools[{i}].argument_mappings[{j}] requires string `field_ref`"
                     )
-            for j, pair in enumerate(entry.get("argument_literals") or []):
-                if not isinstance(pair, dict):
-                    raise error_factory(
-                        f"step9_tool_schema_mapping_stage_2 tools[{i}].argument_literals[{j}] must be an object"
-                    )
-                if not isinstance(pair.get("schema_arg"), str) or not pair.get("schema_arg"):
-                    raise error_factory(
-                        f"step9_tool_schema_mapping_stage_2 tools[{i}].argument_literals[{j}] requires string `schema_arg`"
-                    )
-                if not isinstance(pair.get("literal_value"), (str, int, float, bool, type(None))):
-                    raise error_factory(
-                        f"step9_tool_schema_mapping_stage_2 tools[{i}].argument_literals[{j}] `literal_value` must be scalar or null"
-                    )
+            if isinstance(literals, dict):
+                for schema_arg in literals:
+                    if not isinstance(schema_arg, str) or not schema_arg:
+                        raise error_factory(
+                            f"step9_tool_schema_mapping_stage_2 tools[{i}].argument_literals requires string keys"
+                        )
+            else:
+                for j, pair in enumerate(literals or []):
+                    if not isinstance(pair, dict):
+                        raise error_factory(
+                            f"step9_tool_schema_mapping_stage_2 tools[{i}].argument_literals[{j}] must be an object"
+                        )
+                    if not isinstance(pair.get("schema_arg"), str) or not pair.get("schema_arg"):
+                        raise error_factory(
+                            f"step9_tool_schema_mapping_stage_2 tools[{i}].argument_literals[{j}] requires string `schema_arg`"
+                        )
+                    has_json = "literal_value_json" in pair
+                    has_legacy = "literal_value" in pair
+                    if has_json:
+                        if not isinstance(pair.get("literal_value_json"), str):
+                            raise error_factory(
+                                f"step9_tool_schema_mapping_stage_2 tools[{i}].argument_literals[{j}] `literal_value_json` must be a string"
+                            )
+                    elif has_legacy:
+                        if not isinstance(pair.get("literal_value"), (str, int, float, bool, type(None))):
+                            raise error_factory(
+                                f"step9_tool_schema_mapping_stage_2 tools[{i}].argument_literals[{j}] `literal_value` must be scalar or null"
+                            )
+                    else:
+                        raise error_factory(
+                            f"step9_tool_schema_mapping_stage_2 tools[{i}].argument_literals[{j}] requires `literal_value_json` or `literal_value`"
+                        )
             if not isinstance(entry.get("missing_required_fields"), list):
                 raise error_factory(
                     f"step9_tool_schema_mapping_stage_2 tools[{i}] requires list `missing_required_fields`"

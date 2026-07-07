@@ -328,8 +328,8 @@ def _classify_executor(payload: Any) -> str:
     discriminator fields.
     """
     if isinstance(payload, dict):
-        if payload.get("executor") == "tooluniverse":
-            return "tooluniverse"
+        if isinstance(payload.get("executor"), str) and payload.get("executor"):
+            return str(payload["executor"])
         if payload.get("status") == "mocked":
             return "mock"
     return "unknown"

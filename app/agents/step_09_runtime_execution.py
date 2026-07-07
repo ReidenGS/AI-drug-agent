@@ -41,6 +41,7 @@ file body) passes through unchanged.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -108,7 +109,7 @@ def resolve_step9_execution_requests(
             if source == "official_schema_literal":
                 literal_value = item.get("literal_value")
                 kwargs[runtime_arg] = literal_value
-                redacted[runtime_arg] = {"source": "literal", "value": literal_value}
+                redacted[runtime_arg] = _redacted_summary_for_literal(literal_value)
                 continue
 
             if source == "field_ref":
@@ -679,6 +680,24 @@ def _extract_fasta_sequences(content: str) -> list[str]:
     if current:
         sequences.append("".join(current))
     return sequences
+
+
+def _redacted_summary_for_literal(value: Any) -> dict[str, Any]:
+    """Audit-safe digest of an official-schema argument literal.
+
+    Scalars (enum/const/default vocabulary — non-sensitive) are kept verbatim.
+    Array/object literals (e.g. ESM `variants`) are compacted to a
+    type/count/hash fingerprint so a large structured literal never bloats or
+    leaks into a persisted `tool_input_summary`."""
+    if isinstance(value, (list, dict)):
+        text = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        return {
+            "source": "literal",
+            "json_type": "array" if isinstance(value, list) else "object",
+            "item_count": len(value),
+            "sha256_prefix": hashlib.sha256(text.encode("utf-8")).hexdigest()[:12],
+        }
+    return {"source": "literal", "value": value}
 
 
 def _redacted_summary_for_field(field: dict[str, Any], value: str) -> dict[str, Any]:

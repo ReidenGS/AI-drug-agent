@@ -720,3 +720,129 @@ def test_mock_prompt_sequence_missing_slots_do_not_leak_raw_tokens():
     )
     blob = str(out["missing_slots"]) + str(out.get("response") or "")
     assert _HEAVY_CHAIN_SEQ not in blob
+
+
+# ── Step 2 protein variant / point mutation structuring ──────────────────────
+
+_VARIANT_QUERY = (
+    "Evaluate the HER2 variant V777L using UniProt P04626. "
+    "Use variant scoring only; do not generate protein sequences."
+)
+
+
+def _refs_by_type(out: dict) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for ref in out.get("referenced_inputs") or []:
+        if isinstance(ref, dict):
+            grouped.setdefault(str(ref.get("id_type")), []).append(ref)
+    return grouped
+
+
+def test_mock_structures_uniprot_and_variant_referenced_inputs():
+    out = _parse(_VARIANT_QUERY)
+    grouped = _refs_by_type(out)
+    assert any(r["value"] == "P04626" for r in grouped.get("uniprot_id", []))
+    variants = grouped.get("variant", [])
+    assert len(variants) == 1
+    assert variants[0]["value"] == "V777L"
+    assert variants[0]["source"] == "user"
+
+
+def test_mock_labels_variant_as_protein_variant_entity():
+    out = _parse(_VARIANT_QUERY)
+    pv = [
+        e for e in out.get("normalized_entities") or []
+        if e.get("entity_type") == "protein_variant"
+    ]
+    assert pv and pv[0]["original_text"] == "V777L"
+
+
+def test_mock_variant_not_placed_in_mentioned_entities():
+    out = _parse(_VARIANT_QUERY)
+    mentioned = out.get("mentioned_entities") or {}
+    blob = str(mentioned)
+    assert "V777L" not in blob
+    # HER2 remains the target; the variant is not the target/antibody/payload.
+    assert mentioned.get("antibody_candidate_text") in (None, "")
+    assert mentioned.get("payload_text") in (None, "")
+
+
+def test_normalizer_does_not_crash_on_protein_variant_entity_and_derives_variant():
+    """A real-LLM payload that labels the mention entity_type="protein_variant"
+    but omits the typed referenced_input must NOT raise, and the normalizer
+    derives the stable id_type="variant" referenced_input."""
+    out = normalize_llm_payload_for_step2(
+        {
+            "task_intent": {"task_type": "structure_analysis"},
+            "normalized_entities": [
+                {
+                    "original_text": "V777L",
+                    "canonical_name": "V777L",
+                    "entity_type": "protein_variant",
+                    "explicit_or_inferred": "explicit",
+                }
+            ],
+            "referenced_inputs": [],
+        }
+    )
+    variants = _refs_by_type(out).get("variant", [])
+    assert variants and variants[0]["value"] == "V777L"
+    # entity_type survives (schema now allows protein_variant).
+    assert out["normalized_entities"][0]["entity_type"] == "protein_variant"
+
+
+def test_normalizer_canonicalizes_variant_id_type_aliases():
+    out = normalize_llm_payload_for_step2(
+        {
+            "task_intent": {"task_type": "structure_analysis"},
+            "referenced_inputs": [
+                {"id_type": "protein_variant", "value": "V777L", "source": "user"},
+            ],
+        }
+    )
+    grouped = _refs_by_type(out)
+    assert "protein_variant" not in grouped
+    assert grouped["variant"][0]["value"] == "V777L"
+
+
+def test_normalizer_variant_derivation_is_idempotent_no_duplicates():
+    payload = {
+        "task_intent": {"task_type": "structure_analysis"},
+        "normalized_entities": [
+            {
+                "original_text": "V777L",
+                "entity_type": "protein_variant",
+                "explicit_or_inferred": "explicit",
+            }
+        ],
+        "referenced_inputs": [
+            {"id_type": "variant", "value": "V777L", "source": "user"},
+        ],
+    }
+    out = normalize_llm_payload_for_step2(payload)
+    assert len(_refs_by_type(out).get("variant", [])) == 1
+
+
+def test_full_supervisor_parse_structures_variant_without_crash():
+    agent = SupervisorAgent(llm=MockLLMProvider())
+    sq = agent.parse_raw_to_structured_query(
+        {
+            "run_id": "run_variant",
+            "run_artifact_registry_id": "reg_variant",
+            "artifact_id": "art_variant",
+            "created_at": "2026-07-06T00:00:00Z",
+            "raw_user_query": _VARIANT_QUERY,
+            "user_provided_context": {},
+            "uploaded_files": [],
+        }
+    )
+    by_type = {r["id_type"]: r for r in sq.referenced_inputs if isinstance(r, dict)}
+    assert by_type["uniprot_id"]["value"] == "P04626"
+    assert by_type["variant"]["value"] == "V777L"
+    # protein_variant entity type is preserved through the strict schema.
+    assert any(e.entity_type == "protein_variant" for e in sq.normalized_entities)
+
+
+def test_step2_prompt_documents_variant_referenced_input():
+    assert '"id_type": "variant"' in SUPERVISOR_SYSTEM_PROMPT
+    assert "V777L" in SUPERVISOR_SYSTEM_PROMPT

@@ -600,6 +600,62 @@ def test_execution_requests_resolves_real_kwargs_and_redacts_audit(local_storage
     assert request["kwargs_redacted_summary"]["task"] == {"source": "literal", "value": "generate"}
 
 
+def test_execution_requests_injects_parsed_json_literal_without_runtime_coercion(local_storage):
+    variants = [{"position": 777, "ref_aa": "V", "alt_aa": "L"}]
+    cct = _cct_with_material("cand_a", "mat_seq", "target_sequence", RAW_SEQ)
+    contracts = [
+        _contract(
+            "ESM_score_variant_sae_batch",
+            "variant_evaluation",
+            [
+                {
+                    "runtime_arg": "sequence",
+                    "source": "field_ref",
+                    "schema_arg": "sequence",
+                    "field_ref": "material:mat_seq",
+                },
+                {
+                    "runtime_arg": "variants",
+                    "source": "official_schema_literal",
+                    "schema_arg": "variants",
+                    "literal_value": variants,
+                },
+            ],
+        )
+    ]
+    input_fields = [
+        _field(
+            field_ref="material:mat_seq",
+            field_type="protein_sequence",
+            value_kind="sequence_ref",
+            supports_tool_args=["sequence"],
+            runtime_lookup={"candidate_id": "cand_a", "material_id": "mat_seq"},
+        )
+    ]
+    requests = resolve_step9_execution_requests(
+        kwargs_contracts=contracts,
+        input_fields=input_fields,
+        candidate_context_table=cct,
+        prepared_structure_input_package=None,
+        structure_prediction_and_interface_results=None,
+        storage=local_storage,
+    )
+    request = requests[0]
+    assert request["can_execute"] is True
+    assert request["kwargs"]["sequence"] == RAW_SEQ
+    assert request["kwargs"]["variants"] == variants
+    assert not isinstance(request["kwargs"]["variants"], str)
+    literal_summary = request["kwargs_redacted_summary"]["variants"]
+    assert literal_summary["source"] == "literal"
+    assert literal_summary["json_type"] == "array"
+    assert literal_summary["item_count"] == 1
+    assert "sha256_prefix" in literal_summary
+    summary_blob = json.dumps(request["kwargs_redacted_summary"])
+    assert RAW_SEQ not in summary_blob
+    assert "EVQL" not in summary_blob
+    assert "V777L" not in summary_blob
+
+
 def test_execution_requests_unresolved_field_ref_skips_with_reason(local_storage):
     contracts = [
         _contract(

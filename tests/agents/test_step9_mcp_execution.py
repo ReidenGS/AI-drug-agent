@@ -122,6 +122,25 @@ _REAL_STEP9_OFFICIAL_SCHEMAS = {
         "properties": {"uniprot_id": {"type": "string"}, "variant": {"type": "string"}},
         "required": ["uniprot_id", "variant"],
     },
+    "ESM_score_variant_sae_batch": {
+        "type": "object",
+        "properties": {
+            "sequence": {"type": "string"},
+            "variants": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "position": {"type": "integer"},
+                        "ref_aa": {"type": "string"},
+                        "alt_aa": {"type": "string"},
+                    },
+                    "required": ["position", "ref_aa", "alt_aa"],
+                },
+            },
+        },
+        "required": ["sequence", "variants"],
+    },
 }
 
 
@@ -320,6 +339,54 @@ class _Step9TwoToolLLM:
                         "skip_reason": "",
                         "argument_mapping_reason": "test mapping",
                     },
+                ]
+            }
+        return {}
+
+
+class _Step9EsmScoreLLM:
+    name = "step9-esm-score"
+    model = "step9-esm-score"
+
+    def __init__(self, *, sequence_ref: str, variants_literal_json: str = '[{"position":2,"ref_aa":"V","alt_aa":"L"}]'):
+        self.sequence_ref = sequence_ref
+        self.variants_literal_json = variants_literal_json
+
+    def generate(self, prompt, *, system=None, **kwargs):
+        raise NotImplementedError
+
+    def generate_json(self, prompt, *, schema, system=None):
+        task = schema.get("task")
+        if task == "step9_tool_selection_stage_1":
+            return {
+                "selections": [
+                    {
+                        "tool_name": "ESM_score_variant_sae_batch",
+                        "lane_type": "variant_evaluation",
+                        "selection_reason": "test",
+                    }
+                ]
+            }
+        if task == "step9_tool_schema_mapping_stage_2":
+            return {
+                "tools": [
+                    {
+                        "tool_name": "ESM_score_variant_sae_batch",
+                        "lane_type": "variant_evaluation",
+                        "can_invoke": True,
+                        "argument_mappings": [
+                            {"schema_arg": "sequence", "field_ref": self.sequence_ref}
+                        ],
+                        "argument_literals": [
+                            {
+                                "schema_arg": "variants",
+                                "literal_value_json": self.variants_literal_json,
+                            }
+                        ],
+                        "missing_required_fields": [],
+                        "skip_reason": "",
+                        "argument_mapping_reason": "test esm score mapping",
+                    }
                 ]
             }
         return {}
@@ -555,6 +622,142 @@ def test_non_selected_tool_never_executes(local_storage, registry_service, workf
     agent.run_step_9(run_id)
 
     assert called_tools == ["NvidiaNIM_proteinmpnn"]
+
+
+def test_esm_score_executes_with_json_variant_array_and_redacted_artifacts(
+    local_storage, registry_service, workflow_state_service, enable_live, monkeypatch
+):
+    from app.mcp.tools import variant as variant_module
+
+    calls: list[tuple[str, object]] = []
+
+    class FakeProtein:
+        def __init__(self, *, sequence):
+            self.sequence = sequence
+
+    class FakeSAEConfig:
+        def __init__(self, *, models, normalize_features):
+            self.models = models
+            self.normalize_features = normalize_features
+
+    class FakeLogitsConfig:
+        def __init__(self, *, sequence, sae_config):
+            self.sequence = sequence
+            self.sae_config = sae_config
+
+    class FakeClient:
+        def __init__(self, *, model, token):
+            calls.append(("client", (model, bool(token))))
+
+        def encode(self, protein):
+            calls.append(("encode", protein.sequence))
+            return {"tensor": protein.sequence}
+
+        def logits(self, tensor, config):
+            calls.append(("logits", (tensor, config.sae_config.models)))
+            matrix = [[0.0, 0.0, 0.0] for _ in range(len(tensor["tensor"]) + 2)]
+            matrix[2][1] = 2.0
+            matrix[2][2] = 4.0
+            return {"logits": {"sequence": matrix}, "features": ["compact"]}
+
+    class FakeTokenizer:
+        def encode(self, value, add_special_tokens=False):
+            return {"V": [1], "L": [2]}[value]
+
+    monkeypatch.setenv("ESM_API_KEY", "secret-esm-key")
+    monkeypatch.setattr(
+        variant_module,
+        "_load_esm_sdk_classes",
+        lambda: (FakeProtein, FakeLogitsConfig, FakeSAEConfig, FakeClient),
+    )
+    monkeypatch.setattr(variant_module, "_load_esm_sequence_tokenizer", lambda: FakeTokenizer())
+
+    run_id = _seed(local_storage, registry_service, workflow_state_service)
+    candidate_id = _target_candidate_id(local_storage, run_id)
+    sequence_ref = _add_ordinary_heavy_chain_sequence(local_storage, run_id, candidate_id)
+    _add_uniprot_variant(local_storage, run_id, candidate_id)
+    enable_live("ESM_score_variant_sae_batch")
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+        llm=_Step9EsmScoreLLM(sequence_ref=sequence_ref),
+    )
+    artifact = agent.run_step_9(run_id)
+
+    assert artifact.screening_status == "ok"
+    assert artifact.step9_runtime_executed_tools == ["ESM_score_variant_sae_batch"]
+    assert [name for name, _ in calls] == ["client", "encode", "logits"]
+    assert calls[1] == ("encode", HEAVY_CHAIN_SEQ)
+    tc = artifact.tool_call_records[0]
+    assert tc.tool_name == "ESM_score_variant_sae_batch"
+    assert tc.run_status == "success"
+    assert tc.tool_input_summary["variants"]["json_type"] == "array"
+    assert tc.tool_input_summary["variants"]["item_count"] == 1
+
+    normalized_blob = local_storage.read_json(
+        local_storage.run_key(run_id, "compound_screening_artifact.json")
+    )
+    normalized_text = json.dumps(normalized_blob)
+    assert HEAVY_CHAIN_SEQ not in normalized_text
+    assert "secret-esm-key" not in normalized_text
+
+    assert tc.tool_output_ref is not None
+    stored_output = local_storage.read_json(tc.tool_output_ref)
+    stored_text = json.dumps(stored_output)
+    assert stored_output["output"]["executor"] == "biohub_esm_sdk"
+    assert stored_output["output"]["variants"] == [
+        {"position": 2, "ref_aa": "V", "alt_aa": "L"}
+    ]
+    assert stored_output["output"]["variant_scores"][0]["delta_logit"] == 2.0
+    assert stored_output["output"]["variant_scores"][0]["ref_matches_sequence"] is True
+    assert HEAVY_CHAIN_SEQ not in stored_text
+    assert "secret-esm-key" not in stored_text
+
+
+def test_esm_score_invalid_variants_literal_does_not_execute(
+    local_storage, registry_service, workflow_state_service, enable_live
+):
+    from app.mcp.tools._registry import _all_bindings
+
+    called: list[dict] = []
+
+    def _fail_if_called(**kwargs):
+        called.append(kwargs)
+        raise AssertionError("ESM_score_variant_sae_batch must not execute invalid variants")
+
+    bindings = dict(_all_bindings())
+    bindings["ESM_score_variant_sae_batch"] = _fail_if_called
+
+    run_id = _seed(local_storage, registry_service, workflow_state_service)
+    candidate_id = _target_candidate_id(local_storage, run_id)
+    sequence_ref = _add_ordinary_heavy_chain_sequence(local_storage, run_id, candidate_id)
+    _add_uniprot_variant(local_storage, run_id, candidate_id)
+    enable_live("ESM_score_variant_sae_batch")
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp_with_bindings(bindings),
+        llm=_Step9EsmScoreLLM(sequence_ref=sequence_ref, variants_literal_json='["V777L"]'),
+    )
+    artifact = agent.run_step_9(run_id)
+
+    assert called == []
+    assert artifact.tool_call_records == []
+    assert artifact.step9_runtime_executed_tools == []
+    assert "ESM_score_variant_sae_batch" in artifact.step9_stage2_uninvokable_tools
+    mapped = next(
+        tool
+        for tool in artifact.step9_stage2_mapped_tools
+        if tool["tool_name"] == "ESM_score_variant_sae_batch"
+    )
+    assert mapped["can_invoke"] is False
+    assert mapped["skip_reason"] == "invalid_argument_literal_schema"
+    assert "invalid_variants_shape:variants" in mapped["argument_mapping_reason"]
 
 
 def test_zinc_and_chembl_never_execute_even_if_llm_tries_to_select_them(

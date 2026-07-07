@@ -8,6 +8,7 @@ never the legacy `step9_available_fields` hard-gate shape.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -73,6 +74,28 @@ RF_DIFFUSION_SCHEMA = {
         "contigs": {"type": "string"},
     },
     "required": ["input_pdb", "contigs"],
+}
+
+
+ESM_SCORE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sequence": {"type": "string"},
+        "variants": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "position": {"type": "integer"},
+                    "ref_aa": {"type": "string"},
+                    "alt_aa": {"type": "string"},
+                },
+                "required": ["position", "ref_aa", "alt_aa"],
+            },
+        },
+        "model": {"type": "string", "enum": ["esmc-6b-2024-12"]},
+    },
+    "required": ["sequence", "variants"],
 }
 
 
@@ -197,6 +220,32 @@ def test_stable_prefix_includes_only_selected_tool_schemas(monkeypatch):
     assert "AlphaMissense_get_variant_score" not in names
 
 
+def test_esm_score_stage2_payload_declares_variants_array_items(monkeypatch):
+    fallback_schema_without_items = {
+        "type": "object",
+        "properties": {
+            "sequence": {"type": "string"},
+            "variants": {"type": "array"},
+        },
+        "required": ["sequence", "variants"],
+    }
+    monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: fallback_schema_without_items)
+
+    payload = build_step9_stage2_payload(
+        candidate_id="cand_a",
+        selected_tools=_selected("ESM_score_variant_sae_batch", "variant_evaluation"),
+        projection=_projection(),
+    )
+
+    variants_schema = payload["tools"][0]["full_schema"]["properties"]["variants"]
+    assert variants_schema["type"] == "array"
+    assert variants_schema["items"]["type"] == "object"
+    assert sorted(variants_schema["items"]["required"]) == ["alt_aa", "position", "ref_aa"]
+    assert variants_schema["items"]["properties"]["position"]["type"] == "integer"
+    assert variants_schema["items"]["properties"]["ref_aa"]["type"] == "string"
+    assert variants_schema["items"]["properties"]["alt_aa"]["type"] == "string"
+
+
 def test_stable_prefix_declares_stage2_output_fields_and_few_shots(monkeypatch):
     monkeypatch.setattr(step9sel, "signature_schema_for", lambda name: ESM_SEQUENCE_SCHEMA)
     stable, dynamic, _ = _sections_for(
@@ -208,15 +257,21 @@ def test_stable_prefix_declares_stage2_output_fields_and_few_shots(monkeypatch):
         '"can_invoke"',
         '"argument_mappings"',
         '"argument_literals"',
+        '"literal_value_json"',
         '"missing_required_fields"',
         '"skip_reason"',
         '"argument_mapping_reason"',
         "DynaMut2_predict_stability",
+        "ESM_score_variant_sae_batch",
+        '"schema_arg": "variants"',
+        '"position\\":777',
         '"field_ref": "identifier:mutation:V777L"',
         "supports_tool_args includes",
         "missing_required_fields",
     ):
         assert needle in stable
+    assert "argument_json_literals" not in stable
+    assert re.search(r"[\u4e00-\u9fff]", stable) is None
     for dynamic_only in ("cand_SENTINEL", "material:field_SENTINEL", "CANONICAL_SENTINEL", "RAW_SENTINEL"):
         assert dynamic_only not in stable
         assert dynamic_only in dynamic
@@ -313,6 +368,240 @@ def test_official_literal_accepted_only_when_schema_permits():
     assert "literal_not_allowed:task" in invalid.argument_mapping_reason
 
 
+def test_json_literal_value_json_accepted_and_parsed_for_array_schema_arg():
+    tool = {
+        "tool_name": "ESM_score_variant_sae_batch",
+        "lane_type": "variant_evaluation",
+        "full_schema": ESM_SCORE_SCHEMA,
+        "required_fields": ["sequence", "variants"],
+    }
+    mapped = validate_step9_stage2_mapping(
+        response_item={
+            "tool_name": "ESM_score_variant_sae_batch",
+            "lane_type": "variant_evaluation",
+            "can_invoke": True,
+            "argument_mappings": [{"schema_arg": "sequence", "field_ref": "material:heavy_chain"}],
+            "argument_literals": [
+                {
+                    "schema_arg": "variants",
+                    "literal_value_json": '[{"position":777,"ref_aa":"V","alt_aa":"L"}]',
+                },
+                {"schema_arg": "model", "literal_value_json": '"esmc-6b-2024-12"'},
+            ],
+            "missing_required_fields": [],
+        },
+        selected_tool=tool,
+        available_fields=[
+            _field(field_ref="material:heavy_chain", supports_tool_args=["sequence"])
+        ],
+    )
+    assert mapped.can_invoke is True
+    literals = {item.schema_arg: item.literal_value for item in mapped.argument_literals}
+    assert literals["variants"] == [{"position": 777, "ref_aa": "V", "alt_aa": "L"}]
+    assert not isinstance(literals["variants"], str)
+    assert literals["model"] == "esmc-6b-2024-12"
+
+
+@pytest.mark.parametrize(
+    "literal_json",
+    [
+        '["V777L"]',
+        '[{"variant":"V777L"}]',
+        '[{"position":777,"ref_aa":"V"}]',
+    ],
+)
+def test_invalid_variants_literal_shape_hard_rejects_tool(literal_json):
+    tool = {
+        "tool_name": "ESM_score_variant_sae_batch",
+        "lane_type": "variant_evaluation",
+        "full_schema": ESM_SCORE_SCHEMA,
+        "required_fields": ["sequence", "variants"],
+    }
+    mapped = validate_step9_stage2_mapping(
+        response_item={
+            "tool_name": "ESM_score_variant_sae_batch",
+            "lane_type": "variant_evaluation",
+            "can_invoke": True,
+            "argument_mappings": [{"schema_arg": "sequence", "field_ref": "material:heavy_chain"}],
+            "argument_literals": [{"schema_arg": "variants", "literal_value_json": literal_json}],
+            "missing_required_fields": [],
+        },
+        selected_tool=tool,
+        available_fields=[
+            _field(field_ref="material:heavy_chain", supports_tool_args=["sequence"])
+        ],
+    )
+    assert mapped.can_invoke is False
+    assert mapped.skip_reason == "invalid_argument_literal_schema"
+    assert "variants" in mapped.missing_required_fields
+    assert mapped.argument_literals == []
+    assert "invalid_variants_shape:variants" in mapped.argument_mapping_reason
+
+
+def test_parsed_dict_argument_literals_from_openai_parser_are_accepted():
+    tool = {
+        "tool_name": "ESM_score_variant_sae_batch",
+        "lane_type": "variant_evaluation",
+        "full_schema": ESM_SCORE_SCHEMA,
+        "required_fields": ["sequence", "variants"],
+    }
+    mapped = validate_step9_stage2_mapping(
+        response_item={
+            "tool_name": "ESM_score_variant_sae_batch",
+            "lane_type": "variant_evaluation",
+            "can_invoke": True,
+            "argument_mappings": [{"schema_arg": "sequence", "field_ref": "material:heavy_chain"}],
+            "argument_literals": {
+                "variants": [{"position": 777, "ref_aa": "V", "alt_aa": "L"}],
+                "model": "esmc-6b-2024-12",
+            },
+            "missing_required_fields": [],
+        },
+        selected_tool=tool,
+        available_fields=[
+            _field(field_ref="material:heavy_chain", supports_tool_args=["sequence"])
+        ],
+    )
+    assert mapped.can_invoke is True
+    assert {item.schema_arg for item in mapped.argument_literals} == {"variants", "model"}
+
+
+def test_invalid_parsed_dict_variants_literal_shape_hard_rejects_tool():
+    tool = {
+        "tool_name": "ESM_score_variant_sae_batch",
+        "lane_type": "variant_evaluation",
+        "full_schema": ESM_SCORE_SCHEMA,
+        "required_fields": ["sequence", "variants"],
+    }
+    mapped = validate_step9_stage2_mapping(
+        response_item={
+            "tool_name": "ESM_score_variant_sae_batch",
+            "lane_type": "variant_evaluation",
+            "can_invoke": True,
+            "argument_mappings": [{"schema_arg": "sequence", "field_ref": "material:heavy_chain"}],
+            "argument_literals": {"variants": [{"variant": "V777L"}]},
+            "missing_required_fields": [],
+        },
+        selected_tool=tool,
+        available_fields=[
+            _field(field_ref="material:heavy_chain", supports_tool_args=["sequence"])
+        ],
+    )
+    assert mapped.can_invoke is False
+    assert mapped.skip_reason == "invalid_argument_literal_schema"
+    assert "invalid_variants_shape:variants" in mapped.argument_mapping_reason
+
+
+def test_invalid_json_literal_value_json_hard_rejects_tool():
+    tool = {
+        "tool_name": "ESM_score_variant_sae_batch",
+        "lane_type": "variant_evaluation",
+        "full_schema": ESM_SCORE_SCHEMA,
+        "required_fields": ["sequence", "variants"],
+    }
+    mapped = validate_step9_stage2_mapping(
+        response_item={
+            "tool_name": "ESM_score_variant_sae_batch",
+            "lane_type": "variant_evaluation",
+            "can_invoke": True,
+            "argument_mappings": [{"schema_arg": "sequence", "field_ref": "material:heavy_chain"}],
+            "argument_literals": [{"schema_arg": "variants", "literal_value_json": "[not-json"}],
+            "missing_required_fields": [],
+        },
+        selected_tool=tool,
+        available_fields=[
+            _field(field_ref="material:heavy_chain", supports_tool_args=["sequence"])
+        ],
+    )
+    assert mapped.can_invoke is False
+    assert mapped.skip_reason == "invalid_argument_literal_json"
+    assert "literal_value_json_invalid:variants" in mapped.argument_mapping_reason
+
+
+def test_duplicate_schema_arg_between_mapping_and_literal_is_audited_no_overwrite():
+    tool = {
+        "tool_name": "ESM_score_variant_sae_batch",
+        "lane_type": "variant_evaluation",
+        "full_schema": ESM_SCORE_SCHEMA,
+        "required_fields": ["sequence", "variants"],
+    }
+    mapped = validate_step9_stage2_mapping(
+        response_item={
+            "tool_name": "ESM_score_variant_sae_batch",
+            "lane_type": "variant_evaluation",
+            "can_invoke": True,
+            "argument_mappings": [
+                {"schema_arg": "sequence", "field_ref": "material:heavy_chain"},
+                {"schema_arg": "variants", "field_ref": "identifier:variant:V777L"},
+            ],
+            "argument_literals": [
+                {
+                    "schema_arg": "variants",
+                    "literal_value_json": '[{"position":777,"ref_aa":"V","alt_aa":"L"}]',
+                }
+            ],
+            "missing_required_fields": [],
+        },
+        selected_tool=tool,
+        available_fields=[
+            _field(field_ref="material:heavy_chain", supports_tool_args=["sequence"]),
+            _field(
+                field_ref="identifier:variant:V777L",
+                value_kind="variant",
+                field_type="variant",
+                supports_tool_args=["variants"],
+            ),
+        ],
+    )
+    assert mapped.can_invoke is False
+    assert mapped.skip_reason == "duplicate_schema_arg"
+    assert [(item.schema_arg, item.field_ref) for item in mapped.argument_mappings] == [
+        ("sequence", "material:heavy_chain"),
+        ("variants", "identifier:variant:V777L"),
+    ]
+    assert mapped.argument_literals == []
+    assert "duplicate_schema_arg:variants" in mapped.argument_mapping_reason
+
+
+def test_duplicate_schema_arg_inside_literals_is_audited_no_silent_overwrite():
+    tool = {
+        "tool_name": "ESM_score_variant_sae_batch",
+        "lane_type": "variant_evaluation",
+        "full_schema": ESM_SCORE_SCHEMA,
+        "required_fields": ["sequence", "variants"],
+    }
+    mapped = validate_step9_stage2_mapping(
+        response_item={
+            "tool_name": "ESM_score_variant_sae_batch",
+            "lane_type": "variant_evaluation",
+            "can_invoke": True,
+            "argument_mappings": [{"schema_arg": "sequence", "field_ref": "material:heavy_chain"}],
+            "argument_literals": [
+                {
+                    "schema_arg": "variants",
+                    "literal_value_json": '[{"position":777,"ref_aa":"V","alt_aa":"L"}]',
+                },
+                {
+                    "schema_arg": "variants",
+                    "literal_value_json": '[{"position":888,"ref_aa":"A","alt_aa":"G"}]',
+                },
+            ],
+            "missing_required_fields": [],
+        },
+        selected_tool=tool,
+        available_fields=[
+            _field(field_ref="material:heavy_chain", supports_tool_args=["sequence"])
+        ],
+    )
+    assert mapped.can_invoke is False
+    assert mapped.skip_reason == "duplicate_schema_arg"
+    assert len(mapped.argument_literals) == 1
+    assert mapped.argument_literals[0].literal_value == [
+        {"position": 777, "ref_aa": "V", "alt_aa": "L"}
+    ]
+    assert "duplicate_schema_arg:variants" in mapped.argument_mapping_reason
+
+
 def test_hallucinated_schema_arg_is_dropped_and_duplicate_does_not_overwrite():
     tool = {
         "tool_name": "ESM_generate_protein_sequence",
@@ -336,10 +625,11 @@ def test_hallucinated_schema_arg_is_dropped_and_duplicate_does_not_overwrite():
         selected_tool=tool,
         available_fields=[_field(field_ref="material:sequence_a"), _field(field_ref="material:sequence_b")],
     )
-    assert mapped.can_invoke is True
     assert [(m.schema_arg, m.field_ref) for m in mapped.argument_mappings] == [
         ("prompt_sequence", "material:sequence_a")
     ]
+    assert mapped.can_invoke is False
+    assert mapped.skip_reason == "duplicate_schema_arg"
     assert "duplicate_schema_arg:prompt_sequence" in mapped.argument_mapping_reason
     assert "schema_arg_not_in_full_schema:not_in_schema" in mapped.argument_mapping_reason
 

@@ -7,6 +7,7 @@ flows through the OpenAI surface the same way it flows through Gemini.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -709,6 +710,85 @@ def test_openai_step9_stage2_uses_structured_parser_and_returns_dict():
     assert out["tools"][0]["argument_mappings"] == [
         {"schema_arg": "smiles", "field_ref": "material:m1"}
     ]
+    assert out["tools"][0]["argument_literals"] == {}
+
+
+def test_openai_step9_stage2_parser_converts_literal_value_json_to_parsed_dict():
+    parsed = _Step9SchemaMappingStage2Response(
+        tools=[{
+            "tool_name": "ESM_score_variant_sae_batch",
+            "lane_type": "variant_evaluation",
+            "can_invoke": True,
+            "argument_mappings": [
+                {"schema_arg": "sequence", "field_ref": "material:heavy_chain"},
+            ],
+            "argument_literals": [
+                {
+                    "schema_arg": "variants",
+                    "literal_value_json": '[{"position":777,"ref_aa":"V","alt_aa":"L"}]',
+                },
+                {"schema_arg": "model", "literal_value_json": '"esmc-6b-2024-12"'},
+            ],
+            "missing_required_fields": [],
+        }]
+    )
+    external = parsed.to_external_dict()
+    literals = external["tools"][0]["argument_literals"]
+    assert literals["variants"] == [{"position": 777, "ref_aa": "V", "alt_aa": "L"}]
+    assert literals["model"] == "esmc-6b-2024-12"
+    assert isinstance(literals["variants"], list)
+    assert not isinstance(literals["variants"], str)
+
+
+def test_openai_step9_stage2_parser_rejects_invalid_literal_value_json():
+    parsed = _Step9SchemaMappingStage2Response(
+        tools=[{
+            "tool_name": "ESM_score_variant_sae_batch",
+            "lane_type": "variant_evaluation",
+            "can_invoke": True,
+            "argument_mappings": [
+                {"schema_arg": "sequence", "field_ref": "material:heavy_chain"},
+            ],
+            "argument_literals": [
+                {"schema_arg": "variants", "literal_value_json": "[not-json"},
+            ],
+            "missing_required_fields": [],
+        }]
+    )
+    with pytest.raises(OpenAIProviderError, match="invalid literal_value_json"):
+        parsed.to_external_dict()
+
+
+def test_openai_step9_stage2_parser_rejects_duplicate_literal_schema_arg():
+    parsed = _Step9SchemaMappingStage2Response(
+        tools=[{
+            "tool_name": "ESM_score_variant_sae_batch",
+            "lane_type": "variant_evaluation",
+            "can_invoke": True,
+            "argument_mappings": [
+                {"schema_arg": "sequence", "field_ref": "material:heavy_chain"},
+            ],
+            "argument_literals": [
+                {"schema_arg": "variants", "literal_value_json": "[]"},
+                {"schema_arg": "variants", "literal_value_json": "[]"},
+            ],
+            "missing_required_fields": [],
+        }]
+    )
+    with pytest.raises(OpenAIProviderError, match="duplicate schema_arg `variants`"):
+        parsed.to_external_dict()
+
+
+def test_step9_stage2_strict_parser_schema_uses_literal_value_json_only():
+    from openai.lib._pydantic import to_strict_json_schema
+
+    schema = to_strict_json_schema(_Step9SchemaMappingStage2Response)
+    blob = json.dumps(schema)
+    assert "literal_value_json" in blob
+    assert "argument_json_literals" not in blob
+    assert '"literal_value"' not in blob
+    violations = _strict_schema_violations(schema)
+    assert not violations
 
 
 def test_openai_step9_stage2_duplicate_schema_arg_raises_then_retry_succeeds():

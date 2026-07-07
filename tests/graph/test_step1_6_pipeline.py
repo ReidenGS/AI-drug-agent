@@ -77,6 +77,57 @@ def test_pipeline_graph_runs_steps_1_to_6(
     assert reg.active_artifacts.structured_liability_summary_id
 
 
+def test_pipeline_graph_runs_steps_1_to_6_for_protein_variant_query(
+    local_storage, registry_service, workflow_state_service, inventory
+):
+    """Regression for the reported protein_variant crash: the Step 2 LLM
+    labels V777L as entity_type="protein_variant"; the pipeline must run
+    Step 1-6 to completion and structure the variant + UniProt so Step 9's
+    variant tools can consume them (identifier:uniprot_id / identifier:variant).
+    """
+    from app.agents.step_09_input_projection import project_step9_inputs
+
+    graph = build_pipeline_graph(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(inventory=inventory),
+    )
+    final = graph.invoke(
+        {
+            "intake_request": {
+                "raw_user_query": (
+                    "Evaluate the HER2 variant V777L using UniProt P04626. "
+                    "Use variant scoring only; do not generate protein sequences."
+                ),
+                "user_provided_context": {},
+            }
+        }
+    )
+    run_id = final["run_id"]
+
+    state = workflow_state_service.get(run_id)
+    for s in ("step_01", "step_02", "step_03", "step_04", "step_05", "step_06"):
+        assert state["steps"][s] == "completed", f"{s} not completed: {state['steps'][s]}"
+
+    # Step 2 structured both the UniProt accession and the variant.
+    sq = local_storage.read_json(local_storage.run_key(run_id, "inputs/structured_query.json"))
+    refs = {r["id_type"]: r for r in sq["referenced_inputs"] if isinstance(r, dict)}
+    assert refs["uniprot_id"]["value"] == "P04626"
+    assert refs["variant"]["value"] == "V777L"
+
+    # Step 5 -> Step 9 projection surfaces both identifier fields.
+    cct = local_storage.read_json(local_storage.run_key(run_id, "candidate_context_table.json"))
+    projection = project_step9_inputs(
+        candidate_context_table=cct,
+        prepared_structure_input_package=None,
+        structure_prediction_and_interface_results=None,
+    )
+    field_refs = {f.field_ref for f in projection["input_fields"]}
+    assert "identifier:uniprot_id:P04626" in field_refs
+    assert "identifier:variant:V777L" in field_refs
+
+
 # ── 2. inventory scope guard ─────────────────────────────────────────────────
 
 def test_pipeline_graph_refuses_non_inventory_scoped_client(

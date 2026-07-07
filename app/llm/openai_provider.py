@@ -15,6 +15,7 @@ bodies, prompts, or API keys.
 from __future__ import annotations
 
 import logging
+import json
 from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -124,7 +125,15 @@ class _Step9Stage2ArgumentMapping(BaseModel):
 class _Step9Stage2ArgumentLiteral(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schema_arg: str
-    literal_value: Optional[Union[str, int, float, bool]] = None
+    # The official-schema literal value, encoded as a JSON *string*. Encoding
+    # as text (not a typed union or an arbitrary dict/list) keeps the parser
+    # schema strict — no `additionalProperties=true`, no unconstrained array
+    # items — while still letting the model express any official value shape
+    # (string / number / bool / null / array / object). The shared Stage 2
+    # validator (`validate_step9_stage2_mapping`) is the single place that
+    # `json.loads` this text; invalid JSON makes the tool uninvokable there
+    # rather than being silently coerced to a string here.
+    literal_value_json: str
 
 
 class _Step9Stage2ToolForParser(BaseModel):
@@ -153,7 +162,7 @@ class _Step9SchemaMappingStage2Response(BaseModel):
             mapping_seen: set[str] = set()
             literal_seen: set[str] = set()
             mappings: list[dict[str, str]] = []
-            literals: list[dict[str, Any]] = []
+            literals: dict[str, Any] = {}
             for pair in tool.argument_mappings:
                 if pair.schema_arg in mapping_seen or pair.schema_arg in literal_seen:
                     raise OpenAIProviderError(
@@ -169,7 +178,13 @@ class _Step9SchemaMappingStage2Response(BaseModel):
                         f"`{pair.schema_arg}`"
                     )
                 literal_seen.add(pair.schema_arg)
-                literals.append(pair.model_dump())
+                try:
+                    literals[pair.schema_arg] = json.loads(pair.literal_value_json)
+                except (TypeError, ValueError) as exc:
+                    raise OpenAIProviderError(
+                        "step9_tool_schema_mapping_stage_2 invalid literal_value_json "
+                        f"for schema_arg `{pair.schema_arg}`"
+                    ) from exc
             out: dict[str, Any] = {
                 "tool_name": tool.tool_name,
                 "lane_type": tool.lane_type,

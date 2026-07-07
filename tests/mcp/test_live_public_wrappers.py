@@ -170,7 +170,7 @@ def test_orange_book_live_upstream_error(install_universe):
 # ── LocalMCPClient live-mode policy injection ──────────────────────────────
 
 def test_local_client_does_not_inject_live_by_default(monkeypatch):
-    monkeypatch.delenv("MCP_LIVE_TOOLS", raising=False)
+    monkeypatch.setenv("MCP_LIVE_TOOLS", "false")
     monkeypatch.delenv("MCP_LIVE_TOOL_ALLOWLIST", raising=False)
     get_settings.cache_clear()
 

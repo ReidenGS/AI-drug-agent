@@ -970,9 +970,16 @@ class CandidateContextAgent:
                 )
             )
 
+        # Protein point-mutation / variant references (Step 2
+        # id_type="variant"/"mutation") are identifierized onto the target
+        # candidate so Step 9's input projection can surface
+        # `identifier:variant:<V777L>` alongside `identifier:uniprot_id:<...>`
+        # for the AlphaMissense / DynaMut2 / ESM variant tools. A variant is
+        # never treated as the target/antibody/payload itself — it is a typed
+        # identifier of the target protein.
         identifiers = _identifiers_for(
             refs_by_type,
-            ("uniprot_id", "pdb_id"),
+            ("uniprot_id", "pdb_id", "variant", "mutation"),
             source_ids=[sq_artifact_id],
         )
         context_notes: list[str] = []

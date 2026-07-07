@@ -566,6 +566,42 @@ def test_ordinary_sequence_still_satisfies_esm_score_variant_sae_batch_sequence_
     assert set(entry["argument_keys"]) == {"sequence", "variants"}
 
 
+def test_esm_score_variant_json_literal_becomes_kwargs_contract_literal():
+    variants = [{"position": 777, "ref_aa": "V", "alt_aa": "L"}]
+    result = _plan(
+        _mapped(
+            "ESM_score_variant_sae_batch",
+            "variant_evaluation",
+            {"sequence": "material:heavy_chain"},
+            literals={"variants": variants},
+        ),
+        [
+            _field(
+                "material:heavy_chain",
+                field_type="protein_sequence",
+                value_kind="sequence_ref",
+                supports_tool_args=["sequence"],
+            ),
+        ],
+    )
+    entry = result["step9_runtime_resolved_tools"][0]
+    assert entry["tool_name"] == "ESM_score_variant_sae_batch"
+    assert entry["can_resolve"] is True
+    contract = result["step9_runtime_kwargs_contracts"][0]
+    literal_items = [
+        item for item in contract["kwargs_plan"]
+        if item.get("source") == "official_schema_literal"
+    ]
+    assert literal_items == [
+        {
+            "runtime_arg": "variants",
+            "source": "official_schema_literal",
+            "schema_arg": "variants",
+            "literal_value": variants,
+        }
+    ]
+
+
 def test_no_raw_heavy_chain_sequence_in_runtime_plan_privacy():
     """Category E privacy check: the runtime plan / kwargs contract / audit
     never contains the raw heavy/light-chain sequence text — only

@@ -17,6 +17,7 @@ fields only and no longer drives catalog/selection/mapping.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -116,7 +117,7 @@ Rules:
 3. Do not output raw values.
 4. Do not invent variants, mutations, contigs, thresholds, tiers, PDB IDs, structures, sequences, or compounds.
 5. Output schema_arg -> field_ref using list-of-pairs.
-6. Use argument_literals only for official enum/singleton/default-like schema literals.
+6. Use argument_literals for official schema literals — enum/singleton/default scalars AND any argument whose official schema type is an array or object. Encode every literal value as a JSON string in `literal_value_json` (a JSON scalar, array, or object). If the official schema requires an array/object argument, do NOT map an ordinary scalar field_ref to it; supply the official value as a JSON array/object in `literal_value_json`.
 7. A field_ref only satisfies a schema_arg when the field's supports_tool_args includes that schema_arg.
 8. If required args cannot be satisfied, can_invoke=false and list missing_required_fields.
 9. Return exactly one valid JSON object with this shape:
@@ -130,7 +131,7 @@ Rules:
         {"schema_arg": "official schema arg", "field_ref": "step9_input_fields field_ref"}
       ],
       "argument_literals": [
-        {"schema_arg": "official schema arg", "literal_value": "official literal"}
+        {"schema_arg": "official schema arg", "literal_value_json": "<official value as JSON text>"}
       ],
       "missing_required_fields": [],
       "skip_reason": "",
@@ -158,6 +159,29 @@ Output:
       "missing_required_fields": ["pdb_id", "chain"],
       "skip_reason": "missing_required_fields",
       "argument_mapping_reason": "Mutation is available, but no field supports pdb_id or chain."
+    }
+  ]
+}
+
+Example (array/object schema argument as a JSON literal):
+Input situation: selected tool ESM_score_variant_sae_batch; official schema requires `sequence` as a string and `variants` as an array of objects with `position`, `ref_aa`, `alt_aa`; available fields include {"field_ref": "step7_sequence:file_her2_p04626_fasta", "field_type": "protein_sequence", "supports_tool_args": ["sequence"]} and {"field_ref": "identifier:variant:V777L", "field_type": "variant", "supports_tool_args": ["variant","variants","mutation","mutations"]}.
+Output:
+{
+  "tools": [
+    {
+      "tool_name": "ESM_score_variant_sae_batch",
+      "lane_type": "variant_evaluation",
+      "can_invoke": true,
+      "argument_mappings": [
+        {"schema_arg": "sequence", "field_ref": "step7_sequence:file_her2_p04626_fasta"}
+      ],
+      "argument_literals": [
+        {"schema_arg": "variants", "literal_value_json": "[{\\"position\\":777,\\"ref_aa\\":\\"V\\",\\"alt_aa\\":\\"L\\"}]"},
+        {"schema_arg": "model", "literal_value_json": "\\"esmc-6b-2024-12\\""}
+      ],
+      "missing_required_fields": [],
+      "skip_reason": "",
+      "argument_mapping_reason": "sequence is mapped from the projected protein sequence field; variants is supplied as the official array-of-objects JSON literal required by the tool schema."
     }
   ]
 }
@@ -199,7 +223,12 @@ class Step9Stage2ArgumentLiteral(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_arg: str
-    literal_value: str | int | float | bool | None = None
+    # The resolved official-schema literal. Scalars come from the legacy
+    # enum/const/default path; array/object values come from a validated
+    # `literal_value_json` (parsed once, in `validate_step9_stage2_mapping`).
+    # This is the post-validation artifact model, not an LLM strict-output
+    # schema, so `Any` is acceptable here.
+    literal_value: Any = None
 
 
 class Step9Stage2MappedTool(BaseModel):
@@ -241,6 +270,46 @@ class Step9Stage2MappingResult(BaseModel):
 _FALLBACK_REQUIRED_ARGS_OVERRIDE: dict[str, list[str]] = {
     "ESM_generate_protein_sequence": ["prompt_sequence"],
 }
+
+_ESM_SCORE_VARIANTS_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "required": ["position", "ref_aa", "alt_aa"],
+        "properties": {
+            "position": {"type": "integer"},
+            "ref_aa": {"type": "string"},
+            "alt_aa": {"type": "string"},
+        },
+    },
+}
+
+
+def _step9_signature_schema_for(tool_name: str) -> dict[str, Any]:
+    schema = signature_schema_for(tool_name) or {}
+    return _apply_step9_schema_overrides(tool_name, schema)
+
+
+def _apply_step9_schema_overrides(tool_name: str, schema: dict[str, Any]) -> dict[str, Any]:
+    if tool_name != "ESM_score_variant_sae_batch":
+        return schema
+    out = dict(schema)
+    properties = dict(out.get("properties") if isinstance(out.get("properties"), dict) else {})
+    existing_variants = (
+        dict(properties.get("variants")) if isinstance(properties.get("variants"), dict) else {}
+    )
+    variants_schema = dict(_ESM_SCORE_VARIANTS_SCHEMA)
+    variants_schema["items"] = dict(_ESM_SCORE_VARIANTS_SCHEMA["items"])
+    variants_schema["items"]["properties"] = dict(_ESM_SCORE_VARIANTS_SCHEMA["items"]["properties"])
+    if "description" in existing_variants:
+        variants_schema["description"] = existing_variants["description"]
+    properties["variants"] = variants_schema
+    out["properties"] = properties
+    required = [str(arg) for arg in (out.get("required") or []) if isinstance(arg, str)]
+    if "variants" not in required:
+        required.append("variants")
+    out["required"] = required
+    return out
 
 
 def _required_fields_with_fallback(tool_name: str, schema: dict[str, Any]) -> list[str]:
@@ -299,7 +368,7 @@ def build_step9_stage1_catalog() -> list[dict[str, Any]]:
     catalog: list[dict[str, Any]] = []
     for tool_name in sorted_names:
         meta = ACTIVE_STEP9_TOOLS[tool_name]
-        schema = signature_schema_for(tool_name) or {}
+        schema = _step9_signature_schema_for(tool_name)
         required = _required_fields_with_fallback(tool_name, schema)
         short_description = official_descriptions.get(tool_name) or meta["short_description"]
         catalog.append(
@@ -422,7 +491,7 @@ def build_step9_stage2_payload(
     }
     tools: list[dict[str, Any]] = []
     for tool_name, lane_type in sorted(selected_pairs, key=lambda p: (p[1], p[0])):
-        schema = signature_schema_for(tool_name) or {}
+        schema = _step9_signature_schema_for(tool_name)
         required = _required_fields_with_fallback(tool_name, schema)
         tools.append(
             {
@@ -563,6 +632,7 @@ def validate_step9_stage2_mapping(
     assert_unique_input_field_refs(available_fields)
     field_refs = {str(field.get("field_ref") or ""): field for field in available_fields}
     seen_args: set[str] = set()
+    duplicate_schema_args: set[str] = set()
     warnings: list[str] = []
 
     for pair in response_item.get("argument_mappings") or []:
@@ -576,6 +646,7 @@ def validate_step9_stage2_mapping(
             continue
         if arg in seen_args:
             warnings.append(f"duplicate_schema_arg:{arg}")
+            duplicate_schema_args.add(arg)
             continue
         if arg not in properties:
             warnings.append(f"schema_arg_not_in_full_schema:{arg}")
@@ -590,7 +661,14 @@ def validate_step9_stage2_mapping(
         seen_args.add(arg)
         valid_mappings.append(Step9Stage2ArgumentMapping(schema_arg=arg, field_ref=ref))
 
-    for pair in response_item.get("argument_literals") or []:
+    # Set when a provided argument literal is structurally unusable. Invalid
+    # JSON and schema-invalid JSON literals both make the whole tool
+    # uninvokable — never a silent drop or a string fallback — so the LLM's
+    # bad structured value can be surfaced and retried, not executed.
+    hard_literal_json_rejections: set[str] = set()
+    hard_literal_schema_rejections: set[str] = set()
+
+    for pair in _normalize_stage2_argument_literals(response_item.get("argument_literals")):
         if not isinstance(pair, dict):
             warnings.append("argument_literal_not_object")
             continue
@@ -599,13 +677,61 @@ def validate_step9_stage2_mapping(
             warnings.append("argument_literal_missing_schema_arg")
             continue
         if arg in seen_args:
+            # Duplicate across argument_mappings/argument_literals or within
+            # argument_literals: audit and keep the first — never overwrite.
             warnings.append(f"duplicate_schema_arg:{arg}")
+            duplicate_schema_args.add(arg)
             continue
         prop = properties.get(arg)
         if not isinstance(prop, dict):
             warnings.append(f"literal_schema_arg_not_in_full_schema:{arg}")
             continue
-        ok, literal = _literal_allowed_by_schema(pair.get("literal_value"), prop)
+        # New path: the model supplies the official value as a JSON string in
+        # `literal_value_json` (lets it express array/object literals such as
+        # ESM's `variants`). We only `json.loads` the model's own text — never
+        # parse a domain value (e.g. "V777L") ourselves. Invalid JSON makes
+        # the tool uninvokable.
+        if "literal_value_json" in pair:
+            raw_json = pair.get("literal_value_json")
+            if not isinstance(raw_json, str):
+                warnings.append(f"literal_value_json_not_string:{arg}")
+                hard_literal_json_rejections.add(arg)
+                continue
+            try:
+                parsed_literal = json.loads(raw_json)
+            except (ValueError, TypeError):
+                warnings.append(f"literal_value_json_invalid:{arg}")
+                hard_literal_json_rejections.add(arg)
+                continue
+            if not _json_literal_allowed_by_schema(parsed_literal, prop):
+                if arg == "variants":
+                    warnings.append(f"invalid_variants_shape:{arg}")
+                else:
+                    warnings.append(f"literal_json_schema_invalid:{arg}")
+                hard_literal_schema_rejections.add(arg)
+                continue
+            seen_args.add(arg)
+            valid_literals.append(
+                Step9Stage2ArgumentLiteral(schema_arg=arg, literal_value=parsed_literal)
+            )
+            continue
+        parsed_literal = pair.get("literal_value")
+        if isinstance(parsed_literal, (list, dict)):
+            if not _json_literal_allowed_by_schema(parsed_literal, prop):
+                if arg == "variants":
+                    warnings.append(f"invalid_variants_shape:{arg}")
+                else:
+                    warnings.append(f"literal_json_schema_invalid:{arg}")
+                hard_literal_schema_rejections.add(arg)
+                continue
+            seen_args.add(arg)
+            valid_literals.append(
+                Step9Stage2ArgumentLiteral(schema_arg=arg, literal_value=parsed_literal)
+            )
+            continue
+        # Legacy path: a scalar official literal gated to the schema's
+        # enum/const/default vocabulary.
+        ok, literal = _literal_allowed_by_schema(parsed_literal, prop)
         if not ok:
             warnings.append(f"literal_not_allowed:{arg}")
             continue
@@ -624,10 +750,32 @@ def validate_step9_stage2_mapping(
             continue
         missing.add(arg)
 
-    can_invoke = bool(response_item.get("can_invoke")) and not missing
+    can_invoke = (
+        bool(response_item.get("can_invoke"))
+        and not missing
+        and not hard_literal_json_rejections
+        and not hard_literal_schema_rejections
+        and not duplicate_schema_args
+    )
     skip_reason = str(response_item.get("skip_reason") or "")
     if not can_invoke and not skip_reason:
-        skip_reason = "missing_required_fields" if missing else "mapping_rejected"
+        if duplicate_schema_args:
+            skip_reason = "duplicate_schema_arg"
+        elif hard_literal_json_rejections:
+            skip_reason = "invalid_argument_literal_json"
+        elif hard_literal_schema_rejections:
+            skip_reason = "invalid_argument_literal_schema"
+        elif missing:
+            skip_reason = "missing_required_fields"
+        else:
+            skip_reason = "mapping_rejected"
+    elif duplicate_schema_args and skip_reason != "duplicate_schema_arg":
+        skip_reason = "duplicate_schema_arg"
+    elif hard_literal_json_rejections and skip_reason != "invalid_argument_literal_json":
+        # Preserve the explicit reason even when the model also set skip_reason.
+        skip_reason = "invalid_argument_literal_json"
+    elif hard_literal_schema_rejections and skip_reason != "invalid_argument_literal_schema":
+        skip_reason = "invalid_argument_literal_schema"
     reason = str(response_item.get("argument_mapping_reason") or "")
     if warnings:
         reason = (reason + "; " if reason else "") + "warnings=" + ",".join(warnings)
@@ -704,16 +852,30 @@ def _compact_schema(schema: dict[str, Any], *, tool_name: str = "") -> dict[str,
     for name, prop in sorted(properties.items(), key=lambda item: str(item[0])):
         if not isinstance(name, str) or name.startswith("_") or not isinstance(prop, dict):
             continue
-        compact: dict[str, Any] = {}
-        for key in ("type", "enum", "const", "default", "description"):
-            if key in prop:
-                compact[key] = prop[key]
-        compact_props[name] = compact
+        compact_props[name] = _compact_schema_property(prop)
     return {
         "type": "object",
         "properties": compact_props,
         "required": sorted(required),
     }
+
+
+def _compact_schema_property(prop: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key in ("type", "enum", "const", "default", "description"):
+        if key in prop:
+            compact[key] = prop[key]
+    if isinstance(prop.get("required"), list):
+        compact["required"] = [str(item) for item in prop["required"] if isinstance(item, str)]
+    if isinstance(prop.get("properties"), dict):
+        nested_props: dict[str, Any] = {}
+        for name, nested in sorted(prop["properties"].items(), key=lambda item: str(item[0])):
+            if isinstance(name, str) and isinstance(nested, dict):
+                nested_props[name] = _compact_schema_property(nested)
+        compact["properties"] = nested_props
+    if isinstance(prop.get("items"), dict):
+        compact["items"] = _compact_schema_property(prop["items"])
+    return compact
 
 
 def _mapping_audit_entries(tool: Step9Stage2MappedTool) -> list[dict[str, Any]]:
@@ -781,6 +943,57 @@ def _literal_allowed_by_schema(value: Any, prop: dict[str, Any]) -> tuple[bool, 
         default = prop.get("default")
         return value == default or str(value) == str(default), default
     return False, value
+
+
+def _json_literal_allowed_by_schema(value: Any, prop: dict[str, Any]) -> bool:
+    expected = prop.get("type")
+    expected_types = {str(item) for item in expected} if isinstance(expected, list) else {str(expected)}
+    if isinstance(value, list):
+        if "array" not in expected_types:
+            return False
+        items_schema = prop.get("items")
+        if not isinstance(items_schema, dict):
+            return True
+        return all(_json_literal_allowed_by_schema(item, items_schema) for item in value)
+    if isinstance(value, dict):
+        if "object" not in expected_types:
+            return False
+        required = [str(item) for item in (prop.get("required") or []) if isinstance(item, str)]
+        if any(key not in value for key in required):
+            return False
+        nested_props = prop.get("properties") if isinstance(prop.get("properties"), dict) else {}
+        for key, nested_prop in nested_props.items():
+            if key in value and isinstance(nested_prop, dict):
+                if not _json_literal_allowed_by_schema(value[key], nested_prop):
+                    return False
+        return True
+    if isinstance(value, bool):
+        return "boolean" in expected_types
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "integer" in expected_types or "number" in expected_types
+    if isinstance(value, float):
+        return "number" in expected_types
+    if isinstance(value, str):
+        return "string" in expected_types
+    return "null" in expected_types and value is None
+
+
+def _normalize_stage2_argument_literals(raw: Any) -> list[Any]:
+    """Accept both Stage 2 literal shapes:
+
+    - json_object/mock path: list-of-pairs with `literal_value_json`.
+    - OpenAI strict parser external path: dict `schema_arg -> parsed literal`.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        return [
+            {"schema_arg": str(schema_arg), "literal_value": literal_value}
+            for schema_arg, literal_value in raw.items()
+        ]
+    if isinstance(raw, list):
+        return raw
+    return [raw]
 
 
 def _deterministic_step9_literal_if_allowed(arg: str, schema: dict[str, Any]) -> Any | None:

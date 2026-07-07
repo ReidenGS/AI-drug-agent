@@ -24,6 +24,7 @@ from app.services.intake_service import IntakeService
 from app.services.structured_query_service import StructuredQueryService
 from app.services.tool_inventory_service import ToolInventoryService
 from app.services.workflow_setup_service import WorkflowSetupService
+from app.settings import get_settings
 from app.utils.errors import WorkflowStateError
 
 
@@ -3596,7 +3597,7 @@ class _Step9RuntimePlannerLLM:
 
 
 def test_step9_runtime_planner_executes_resolved_tool_via_mcp_client(
-    local_storage, registry_service, workflow_state_service
+    local_storage, registry_service, workflow_state_service, monkeypatch
 ):
     """Turn C: a selected + Stage2 can_invoke=True + runtime-resolved tool is
     actually executed via `mcp_client.call_tool`, with real resolved values
@@ -3621,6 +3622,8 @@ def test_step9_runtime_planner_executes_resolved_tool_via_mcp_client(
         ]
     )
     local_storage.write_json(cct_path, cct)
+    monkeypatch.setenv("MCP_LIVE_TOOLS", "false")
+    get_settings.cache_clear()
 
     artifact = StructureAndDesignAgent(
         storage=local_storage,

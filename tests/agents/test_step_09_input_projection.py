@@ -71,6 +71,34 @@ def test_explicit_mutation_creates_variant_field():
     assert set(fields[0].supports_tool_args) == {"variant", "variants", "mutation", "mutations"}
 
 
+def test_uniprot_and_variant_identifiers_project_both_fields():
+    """The Step 2/5 protein-variant chain: a target candidate carrying both a
+    UniProt accession and a `variant` identifier projects both an
+    `identifier:uniprot_id:*` field and an `identifier:variant:*` field, so
+    Step 9's AlphaMissense / DynaMut2 / ESM variant tools can be satisfied."""
+    candidate = _base_candidate(
+        identifiers=[
+            {"id_type": "uniprot_id", "id_value": "P04626"},
+            {"id_type": "variant", "id_value": "V777L"},
+        ]
+    )
+    projection = project_step9_inputs(
+        candidate_context_table=_cct(candidate),
+        prepared_structure_input_package=None,
+        structure_prediction_and_interface_results=None,
+    )
+    by_ref = {f.field_ref: f for f in projection["input_fields"] if f.candidate_id == "cand_t1"}
+    assert "identifier:uniprot_id:P04626" in by_ref
+    assert "identifier:variant:V777L" in by_ref
+    uniprot = by_ref["identifier:uniprot_id:P04626"]
+    variant = by_ref["identifier:variant:V777L"]
+    assert uniprot.value_kind == "uniprot_id"
+    assert "uniprot_id" in uniprot.supports_tool_args
+    assert variant.field_type == "variant"
+    assert variant.value_kind == "variant"
+    assert set(variant.supports_tool_args) == {"variant", "variants", "mutation", "mutations"}
+
+
 def test_chain_identifier_creates_chain_field():
     candidate = _base_candidate(identifiers=[{"id_type": "chain", "id_value": "A"}])
     projection = project_step9_inputs(

@@ -31,6 +31,7 @@ from typing import Any, Optional
 from ..llm.provider import LLMProvider
 from ..schemas.step_01_raw_request_record import RawRequestRecord
 from ..llm.json_task_validation import (
+    extract_protein_variant_tokens,
     looks_like_masked_prompt_sequence,
     normalize_canonical_query,
     normalize_missing_slots,
@@ -82,6 +83,12 @@ Input-to-output mapping:
   "value": "P04626", "source": "user"}`.
 - Explicit PDB ID `7XYZ` -> `{"id_type": "pdb_id", "value": "7XYZ",
   "source": "user"}`.
+- Explicit protein point-mutation / variant such as `V777L` or `p.V777L`
+  -> `{"id_type": "variant", "value": "V777L", "source": "user"}` (strip any
+  leading `p.`). You may also label the mention as
+  `normalized_entities[entity_type="protein_variant"]`, but always ALSO emit
+  the typed `referenced_inputs[id_type="variant"]`. A variant is NOT a
+  target/antibody/payload; never place it in `mentioned_entities`.
 - Uploaded file metadata with `file_id` -> `{"id_type": "uploaded_file",
   "value": "<file_id>", "source": "uploaded_file"}`. Do not use
   filenames or storage paths as `value`.
@@ -836,6 +843,96 @@ def _normalize_antibody_chain_references(payload: dict[str, Any]) -> None:
                     )
 
 
+# referenced_inputs id_type aliases the LLM may use for a protein variant /
+# point mutation. All collapse to the stable ``variant`` id_type so Step 5 /
+# Step 9 only ever consume one form. ``mutation`` is intentionally NOT here —
+# it is already a stable id_type both Step 5 and Step 9 accept as-is.
+_VARIANT_ID_TYPE_ALIASES = {
+    "protein_variant",
+    "variant_sequence",
+    "point_mutation",
+    "amino_acid_variant",
+    "aa_variant",
+    "missense_variant",
+}
+_VARIANT_STABLE_ID_TYPE = "variant"
+
+
+def _normalize_variant_references(payload: dict[str, Any]) -> None:
+    """Structure protein variant / point-mutation mentions for Step 5/9.
+
+    Two deterministic, provider-agnostic passes (Mock, Gemini, OpenAI …):
+
+    1. Canonicalize any ``referenced_inputs`` entry whose ``id_type`` is a
+       variant alias (``protein_variant`` / ``point_mutation`` / …) to the
+       stable ``id_type="variant"`` — never dropping the variant string.
+    2. Backstop: if the LLM labeled a mention as
+       ``normalized_entities[entity_type="protein_variant"]`` but emitted no
+       matching ``referenced_inputs`` entry, derive
+       ``{"id_type": "variant", "value": "<token>", "source": "user"}`` from
+       the entity's ``original_text`` / ``canonical_name`` so the actionable
+       variant still reaches Step 5 / Step 9. Never invents a variant that is
+       not present in the entity text.
+    """
+    refs = payload.get("referenced_inputs")
+    if not isinstance(refs, list):
+        refs = []
+        payload["referenced_inputs"] = refs
+
+    warnings = payload.get("parse_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    payload["parse_warnings"] = warnings
+
+    # Pass 1: canonicalize variant-alias id_types.
+    for entry in refs:
+        if not isinstance(entry, dict):
+            continue
+        id_type = entry.get("id_type")
+        if isinstance(id_type, str) and id_type.lower() in _VARIANT_ID_TYPE_ALIASES:
+            if id_type != _VARIANT_STABLE_ID_TYPE:
+                entry["id_type"] = _VARIANT_STABLE_ID_TYPE
+                entry.setdefault("source", "user")
+                warnings.append(
+                    f"normalized referenced_inputs.id_type from {id_type!r} to "
+                    f"{_VARIANT_STABLE_ID_TYPE!r}"
+                )
+
+    def _has_variant_value(token: str) -> bool:
+        for entry in refs:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("id_type") not in {_VARIANT_STABLE_ID_TYPE, "mutation"}:
+                continue
+            value = entry.get("value")
+            if isinstance(value, str) and value.strip().upper() == token:
+                return True
+        return False
+
+    # Pass 2: derive a variant referenced_input from a protein_variant entity.
+    entities = payload.get("normalized_entities")
+    if not isinstance(entities, list):
+        return
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+        if str(entity.get("entity_type") or "").lower() != "protein_variant":
+            continue
+        tokens: list[str] = []
+        for key in ("original_text", "canonical_name"):
+            tokens.extend(extract_protein_variant_tokens(entity.get(key)))
+        for token in tokens:
+            if _has_variant_value(token):
+                continue
+            refs.append(
+                {"id_type": _VARIANT_STABLE_ID_TYPE, "value": token, "source": "user"}
+            )
+            warnings.append(
+                "derived referenced_inputs[id_type=variant] from "
+                "normalized_entities[entity_type=protein_variant]"
+            )
+
+
 def _requests_protein_generation(raw_request_record: dict | None) -> bool:
     haystack = " ".join(_raw_text_chunks_for_step2(raw_request_record))
     return requests_protein_generation(haystack)
@@ -992,6 +1089,11 @@ def normalize_llm_payload_for_step2(
     _normalize_normalized_entity_types(out)
     _normalize_typed_smiles_fields(out, raw_request_record)
     _normalize_antibody_chain_references(out)
+    # variant drift: canonicalize protein-variant id_type aliases to the
+    # stable id_type="variant", and derive a variant referenced_input from a
+    # normalized_entities[entity_type="protein_variant"] mention when the LLM
+    # labeled it but omitted the typed referenced_input. Provider-agnostic.
+    _normalize_variant_references(out)
     # missing_slots drift: absent -> [], dict -> [dict], string ->
     # [{slot_name:"other", reason:string}], malformed list entries dropped /
     # compacted with a parse_warning. Shares the provider validator's logic

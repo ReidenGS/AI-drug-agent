@@ -13,7 +13,11 @@ from __future__ import annotations
 import re
 from typing import Any, Protocol, runtime_checkable
 
-from .json_task_validation import looks_like_masked_prompt_sequence, requests_protein_generation
+from .json_task_validation import (
+    extract_protein_variant_tokens,
+    looks_like_masked_prompt_sequence,
+    requests_protein_generation,
+)
 
 
 @runtime_checkable
@@ -364,17 +368,22 @@ def _detect_referenced_inputs(text: str) -> list[dict]:
     seen: set[tuple[str, str]] = set()
     refs: list[dict] = []
 
-    def _add(id_type: str, value: str) -> None:
+    def _add(id_type: str, value: str, *, source: str = "raw_request_text") -> None:
         key = (id_type, value.upper())
         if key in seen:
             return
         seen.add(key)
-        refs.append({"id_type": id_type, "value": value, "source": "raw_request_text"})
+        refs.append({"id_type": id_type, "value": value, "source": source})
 
     for m in _RE_PDB.finditer(text):
         _add("pdb_id", m.group(1).upper())
     for m in _RE_UNIPROT.finditer(text):
         _add("uniprot_id", m.group(1).upper())
+    # Protein point-mutation / variant (V777L, p.V777L). Structured as the
+    # stable id_type="variant" so Step 5 / Step 9 (AlphaMissense / DynaMut2 /
+    # ESM variant tools) can consume it without re-parsing the raw query.
+    for token in extract_protein_variant_tokens(text):
+        _add("variant", token, source="user")
     for m in _RE_ZINC.finditer(text):
         _add("zinc_id", m.group(1).upper())
     for m in _RE_CHEMBL.finditer(text):
@@ -513,6 +522,22 @@ class MockLLMProvider:
             haystack, target=target, candidate=candidate, payload=payload,
             linker=linker,
         )
+
+        # Label detected protein variants as first-class normalized_entities
+        # (entity_type="protein_variant") for traceability. The actionable
+        # variant string is ALSO carried in referenced_inputs[id_type="variant"]
+        # above; downstream (Step 5/9) consumes the referenced_input.
+        for ref in referenced:
+            if ref.get("id_type") == "variant":
+                normalized_entities.append(
+                    {
+                        "original_text": ref["value"],
+                        "canonical_name": ref["value"],
+                        "entity_type": "protein_variant",
+                        "explicit_or_inferred": "explicit",
+                        "confidence": 0.9,
+                    }
+                )
 
         # Mentioned candidate/payload from decomposition can fill in gaps
         # the surface text didn't reveal. Mark them inferred via the
@@ -986,6 +1011,10 @@ def _classify_primary_intent(
     has_pdb = "pdb_id" in ref_id_types
     has_zinc = "zinc_id" in ref_id_types
     has_chembl = "chembl_id" in ref_id_types
+    # A concrete protein point-mutation / variant reference (Step 2
+    # id_type="variant"/"mutation") signals a variant-evaluation / structure
+    # analysis task (AlphaMissense / DynaMut2 / ESM variant scoring).
+    has_variant = bool(ref_id_types & {"variant", "mutation"})
 
     primary = "unclear_or_needs_clarification"
     secondary: list[str] = []
@@ -1022,10 +1051,12 @@ def _classify_primary_intent(
         confidence = 0.8
 
     # Structure analysis cues (PDB id, "structure", "validate", "interface")
-    elif has_pdb or any(
+    elif has_pdb or has_variant or any(
         kw in text for kw in (
             "structure analysis", "validate the structure", "structure of",
             "structural analysis", "interface analysis", "binding mode",
+            "variant scoring", "variant effect", "score the variant",
+            "point mutation", "missense",
         )
     ):
         primary = "structure_analysis"
