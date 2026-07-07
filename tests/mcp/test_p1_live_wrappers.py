@@ -2083,11 +2083,14 @@ def test_admetai_live_upstream_error_envelope_when_universe_returns_error(
     assert "admet-ai" in (env.get("error_message") or "")
 
 
-# ── Step 9 variant batch: AlphaMissense migrated; DynaMut2 / ESM deferred ──
+# ── Step 9 variant batch ───────────────────────────────────────────────────
 
 from app.mcp.tools.variant import (  # noqa: E402
     BINDINGS as VARIANT_BINDINGS,
     AlphaMissense_get_variant_score,
+    DynaMut2_predict_stability,
+    ESM_generate_protein_sequence,
+    ESM_score_variant_sae_batch,
 )
 
 
@@ -2147,29 +2150,570 @@ def test_alphamissense_live_upstream_error(install_universe):
     assert out["status"] == "upstream_error"
 
 
-_VARIANT_DEFERRED = (
+# Step 9 P2 migration: DynaMut2 / ESM_generate remain thin ToolUniverse
+# adapter bindings (`_call_variant_tu`), same shape as `nvidianim._call_nim`.
+# ESM_score_variant_sae_batch keeps `_live=False` NotImplementedError but uses
+# the official Biohub ESM SDK directly in `_live=True`.
+
+_VARIANT_TU_WIRED = (
     "DynaMut2_predict_stability",
     "ESM_generate_protein_sequence",
-    "ESM_score_variant_sae_batch",
 )
 
 
-def test_variant_deferred_tools_raise_not_implemented():
+def test_variant_tu_wired_tools_not_live_raise_not_implemented():
     bindings = dict(VARIANT_BINDINGS)
-    for name in _VARIANT_DEFERRED:
-        assert name in bindings, f"missing binding for deferred {name}"
+    for name in _VARIANT_TU_WIRED:
+        assert name in bindings, f"missing binding for {name}"
         with pytest.raises(NotImplementedError):
             bindings[name]()
-        with pytest.raises(NotImplementedError):
-            bindings[name](_live=True)
 
 
-def test_variant_deferred_does_not_touch_universe(install_universe):
+def test_dynamut2_live_routes(install_universe):
     fake = install_universe(
-        tools={name: lambda args: {"ok": True} for name in _VARIANT_DEFERRED}
+        tools={
+            "DynaMut2_predict_stability": lambda args: {
+                "pdb_id": args["pdb_id"],
+                "chain": args["chain"],
+                "mutation": args["mutation"],
+                "ddg": -0.5,
+            }
+        }
     )
-    bindings = dict(VARIANT_BINDINGS)
-    for name in _VARIANT_DEFERRED:
-        with pytest.raises(NotImplementedError):
-            bindings[name](_live=True)
-    assert fake.calls == []
+    out = DynaMut2_predict_stability(
+        operation="predict_stability",
+        pdb_id="1N8Z",
+        chain="A",
+        mutation="V777L",
+        _live=True,
+    )
+    assert out["status"] == "ok"
+    assert out["executor"] == "tooluniverse"
+    assert fake.calls[0]["arguments"] == {
+        "operation": "predict_stability",
+        "pdb_id": "1N8Z",
+        "chain": "A",
+        "mutation": "V777L",
+    }
+
+
+def test_dynamut2_live_upstream_error(install_universe):
+    install_universe(
+        tools={
+            "DynaMut2_predict_stability": lambda args: {
+                "status": "error",
+                "error": "pdb not found",
+            }
+        }
+    )
+    out = DynaMut2_predict_stability(
+        operation="predict_stability", pdb_id="ZZZZ", chain="A", mutation="V777L",
+        _live=True,
+    )
+    assert out["status"] == "upstream_error"
+
+
+def test_esm_generate_protein_sequence_live_routes(install_universe):
+    fake = install_universe(
+        tools={
+            "ESM_generate_protein_sequence": lambda args: {
+                "generated_sequence": "MKTAYIAK",
+            }
+        }
+    )
+    out = ESM_generate_protein_sequence(prompt_sequence="MKT", _live=True)
+    assert out["status"] == "ok"
+    assert out["executor"] == "tooluniverse"
+    assert fake.calls[0]["arguments"] == {"prompt_sequence": "MKT"}
+
+
+def test_esm_generate_protein_sequence_optional_args_forwarded_when_set(install_universe):
+    fake = install_universe(
+        tools={"ESM_generate_protein_sequence": lambda args: {"generated_sequence": "MK"}}
+    )
+    ESM_generate_protein_sequence(
+        prompt_sequence="MKT", model="esm-1", num_steps=10, temperature=0.7, _live=True,
+    )
+    assert fake.calls[0]["arguments"] == {
+        "prompt_sequence": "MKT",
+        "model": "esm-1",
+        "num_steps": 10,
+        "temperature": 0.7,
+    }
+
+
+def test_esm_score_variant_sae_batch_not_live_raises_not_implemented():
+    with pytest.raises(NotImplementedError):
+        ESM_score_variant_sae_batch(sequence="MKT", variants=[{"position": 1}], _live=False)
+
+
+def test_esm_score_variant_sae_batch_live_uses_biohub_sdk_encode_then_logits(
+    monkeypatch, capsys
+):
+    from app.mcp.tools import variant as variant_module
+
+    calls: list[tuple[str, object]] = []
+
+    class FakeProtein:
+        def __init__(self, *, sequence):
+            self.sequence = sequence
+            calls.append(("protein", sequence))
+
+    class FakeSAEConfig:
+        def __init__(self, *, models, normalize_features):
+            self.models = models
+            self.normalize_features = normalize_features
+            calls.append(("sae_config", (tuple(models), normalize_features)))
+
+    class FakeLogitsConfig:
+        def __init__(self, *, sequence, sae_config):
+            self.sequence = sequence
+            self.sae_config = sae_config
+            calls.append(("logits_config", (sequence, sae_config)))
+
+    class FakeClient:
+        def __init__(self, *, model, token):
+            self.model = model
+            self.token = token
+            calls.append(("client", (model, token)))
+
+        def encode(self, protein):
+            calls.append(("encode", protein.sequence))
+            return {"encoded": protein.sequence}
+
+        def logits(self, tensor, config):
+            calls.append(("logits", (tensor, config.sae_config.models)))
+            matrix = [[0.0, 0.0, 0.0] for _ in range(len(raw_sequence) + 2)]
+            matrix[2][1] = 2.0  # K at 1-based position 2, BOS/EOS layout row=2
+            matrix[2][2] = 5.5  # L
+            logits = type("FakeLogits", (), {"sequence": matrix})()
+            return type("FakeLogitsOutput", (), {"logits": logits, "sae": object()})()
+
+    class FakeTokenizer:
+        def encode(self, value, add_special_tokens=False):
+            return {"K": [1], "L": [2]}[value]
+
+    monkeypatch.setenv("ESM_API_KEY", "secret-esm-key")
+    monkeypatch.setattr(
+        variant_module,
+        "_load_esm_sdk_classes",
+        lambda: (FakeProtein, FakeLogitsConfig, FakeSAEConfig, FakeClient),
+    )
+    monkeypatch.setattr(variant_module, "_load_esm_sequence_tokenizer", lambda: FakeTokenizer())
+
+    raw_sequence = "MKTLLIL"
+    variants = [{"position": 2, "ref_aa": "K", "alt_aa": "L"}]
+    out = ESM_score_variant_sae_batch(sequence=raw_sequence, variants=variants, _live=True)
+    assert out["status"] == "ok"
+    assert out["executor"] == "biohub_esm_sdk"
+    assert out["source"] == "ESM_score_variant_sae_batch"
+    assert [name for name, _ in calls] == [
+        "client",
+        "protein",
+        "encode",
+        "sae_config",
+        "logits_config",
+        "logits",
+    ]
+    assert calls[0] == ("client", ("esmc-6b-2024-12", "secret-esm-key"))
+    assert calls[2] == ("encode", raw_sequence)
+    assert out["sequence_length"] == len(raw_sequence)
+    assert out["variant_count"] == 1
+    assert out["variants"] == variants
+    assert out["logits_layout"] == "bos_eos"
+    assert out["variant_scores"] == [
+        {
+            "position": 2,
+            "ref_aa": "K",
+            "alt_aa": "L",
+            "ref_matches_sequence": True,
+            "scoring_status": "ok",
+            "ref_logit": 2.0,
+            "alt_logit": 5.5,
+            "delta_logit": 3.5,
+            "logits_row": 2,
+            "logits_vocab_size": 3,
+        }
+    ]
+    assert out["arguments"]["sequence"]["redacted"] is True
+    blob = repr(out)
+    assert raw_sequence not in blob
+    assert "secret-esm-key" not in blob
+
+
+def test_esm_score_variant_sae_batch_scores_invalid_position_and_ref_mismatch(monkeypatch):
+    from app.mcp.tools import variant as variant_module
+
+    class FakeProtein:
+        def __init__(self, *, sequence):
+            self.sequence = sequence
+
+    class FakeSAEConfig:
+        def __init__(self, *, models, normalize_features):
+            self.models = models
+            self.normalize_features = normalize_features
+
+    class FakeLogitsConfig:
+        def __init__(self, *, sequence, sae_config):
+            self.sequence = sequence
+            self.sae_config = sae_config
+
+    class FakeClient:
+        def __init__(self, *, model, token):
+            pass
+
+        def encode(self, protein):
+            return {"encoded": protein.sequence}
+
+        def logits(self, tensor, config):
+            # No BOS/EOS layout: 3 residues -> 3 rows.
+            matrix = [[0.0, 0.0, 0.0] for _ in range(3)]
+            matrix[1][1] = 1.25
+            matrix[1][2] = -0.75
+            logits = type("FakeLogits", (), {"sequence": matrix})()
+            return type("FakeLogitsOutput", (), {"logits": logits})()
+
+    class FakeTokenizer:
+        def encode(self, value, add_special_tokens=False):
+            return {"K": [1], "L": [2], "M": [1]}[value]
+
+    monkeypatch.setenv("ESM_API_KEY", "secret-esm-key")
+    monkeypatch.setattr(
+        variant_module,
+        "_load_esm_sdk_classes",
+        lambda: (FakeProtein, FakeLogitsConfig, FakeSAEConfig, FakeClient),
+    )
+    monkeypatch.setattr(variant_module, "_load_esm_sequence_tokenizer", lambda: FakeTokenizer())
+
+    out = ESM_score_variant_sae_batch(
+        sequence="MKT",
+        variants=[
+            {"position": 2, "ref_aa": "M", "alt_aa": "L"},
+            {"position": 9, "ref_aa": "K", "alt_aa": "L"},
+        ],
+        _live=True,
+    )
+    assert out["status"] == "ok"
+    assert out["logits_layout"] == "residue_only"
+    assert out["variant_scores"][0]["ref_matches_sequence"] is False
+    assert out["variant_scores"][0]["scoring_status"] == "ok"
+    assert out["variant_scores"][0]["delta_logit"] == -2.0
+    assert out["variant_scores"][1] == {
+        "position": 9,
+        "ref_aa": "K",
+        "alt_aa": "L",
+        "ref_matches_sequence": False,
+        "scoring_status": "invalid_position",
+        "error": "position_out_of_range",
+    }
+    blob = repr(out)
+    assert "secret-esm-key" not in blob
+    assert "MKT" not in blob
+
+
+def test_esm_score_variant_sae_batch_retries_encode_401_then_scores(monkeypatch):
+    from app.mcp.tools import variant as variant_module
+
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    class ESMProteinError:
+        def __str__(self):
+            return "401 Unauthorized Failure in encode for MKTLLIL secret-esm-key"
+
+    class FakeProtein:
+        def __init__(self, *, sequence):
+            self.sequence = sequence
+
+    class FakeSAEConfig:
+        def __init__(self, *, models, normalize_features):
+            self.models = models
+            self.normalize_features = normalize_features
+
+    class FakeLogitsConfig:
+        def __init__(self, *, sequence, sae_config):
+            self.sequence = sequence
+            self.sae_config = sae_config
+
+    attempts = {"encode": 0}
+
+    class FakeClient:
+        def __init__(self, *, model, token):
+            calls.append("client")
+
+        def encode(self, protein):
+            attempts["encode"] += 1
+            calls.append("encode")
+            if attempts["encode"] == 1:
+                return ESMProteinError()
+            return {"encoded": protein.sequence}
+
+        def logits(self, tensor, config):
+            calls.append("logits")
+            matrix = [[0.0, 0.0, 0.0] for _ in range(9)]
+            matrix[2][1] = 1.0
+            matrix[2][2] = 4.0
+            return {"logits": {"sequence": matrix}}
+
+    class FakeTokenizer:
+        def encode(self, value, add_special_tokens=False):
+            return {"K": [1], "L": [2]}[value]
+
+    monkeypatch.setenv("ESM_API_KEY", "secret-esm-key")
+    monkeypatch.setattr(
+        variant_module,
+        "_load_esm_sdk_classes",
+        lambda: (FakeProtein, FakeLogitsConfig, FakeSAEConfig, FakeClient),
+    )
+    monkeypatch.setattr(variant_module, "_load_esm_sequence_tokenizer", lambda: FakeTokenizer())
+    monkeypatch.setattr(variant_module, "_esm_score_sleep", lambda seconds: sleeps.append(seconds))
+
+    out = ESM_score_variant_sae_batch(
+        sequence="MKTLLIL",
+        variants=[{"position": 2, "ref_aa": "K", "alt_aa": "L"}],
+        _live=True,
+    )
+    assert out["status"] == "ok"
+    assert out["retry_count"] == 1
+    assert out["recovered_after_transient_error"] is True
+    assert out["variant_scores"][0]["delta_logit"] == 3.0
+    assert calls == ["client", "encode", "client", "encode", "logits"]
+    assert sleeps == [0.2]
+    blob = repr(out)
+    assert "MKTLLIL" not in blob
+    assert "secret-esm-key" not in blob
+
+
+def test_esm_score_variant_sae_batch_retries_then_returns_upstream_error(monkeypatch):
+    from app.mcp.tools import variant as variant_module
+
+    sleeps: list[float] = []
+
+    class ESMProteinError:
+        def __str__(self):
+            return "401 Unauthorized Failure in encode for MKTLLIL secret-esm-key"
+
+    class FakeProtein:
+        def __init__(self, *, sequence):
+            self.sequence = sequence
+
+    class FakeSAEConfig:
+        def __init__(self, *, models, normalize_features):
+            self.models = models
+            self.normalize_features = normalize_features
+
+    class FakeLogitsConfig:
+        def __init__(self, *, sequence, sae_config):
+            self.sequence = sequence
+            self.sae_config = sae_config
+
+    class FakeClient:
+        def __init__(self, *, model, token):
+            pass
+
+        def encode(self, protein):
+            return ESMProteinError()
+
+    monkeypatch.setenv("ESM_API_KEY", "secret-esm-key")
+    monkeypatch.setattr(
+        variant_module,
+        "_load_esm_sdk_classes",
+        lambda: (FakeProtein, FakeLogitsConfig, FakeSAEConfig, FakeClient),
+    )
+    monkeypatch.setattr(variant_module, "_esm_score_sleep", lambda seconds: sleeps.append(seconds))
+
+    out = ESM_score_variant_sae_batch(
+        sequence="MKTLLIL",
+        variants=[{"position": 2, "ref_aa": "K", "alt_aa": "L"}],
+        _live=True,
+    )
+    assert out["status"] == "upstream_error"
+    assert out["retry_count"] == 2
+    assert out["retryable"] is True
+    assert out["final_error_type"] == "ESMProteinError"
+    assert sleeps == [0.2, 0.4]
+    blob = repr(out)
+    assert "MKTLLIL" not in blob
+    assert "secret-esm-key" not in blob
+
+
+def test_esm_score_variant_sae_batch_invalid_input_does_not_retry(monkeypatch):
+    from app.mcp.tools import variant as variant_module
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(variant_module, "_esm_score_sleep", lambda seconds: sleeps.append(seconds))
+    out = ESM_score_variant_sae_batch(
+        sequence="",
+        variants=[{"position": 2, "ref_aa": "K", "alt_aa": "L"}],
+        _live=True,
+    )
+    assert out["status"] == "upstream_error"
+    assert out["retry_count"] == 0
+    assert out["retryable"] is False
+    assert sleeps == []
+
+
+def test_esm_score_variant_sae_batch_live_error_redacts_sequence_and_key(monkeypatch):
+    from app.mcp.tools import variant as variant_module
+
+    class FakeProtein:
+        def __init__(self, *, sequence):
+            self.sequence = sequence
+
+    class FakeSAEConfig:
+        def __init__(self, *, models, normalize_features):
+            self.models = models
+            self.normalize_features = normalize_features
+
+    class FakeLogitsConfig:
+        def __init__(self, *, sequence, sae_config):
+            self.sequence = sequence
+            self.sae_config = sae_config
+
+    class FakeClient:
+        def __init__(self, *, model, token):
+            self.token = token
+
+        def encode(self, protein):
+            raise ValueError("401 Failure in encode for upstream")
+
+    monkeypatch.setenv("ESM_API_KEY", "secret-esm-key")
+    monkeypatch.setattr(
+        variant_module,
+        "_load_esm_sdk_classes",
+        lambda: (FakeProtein, FakeLogitsConfig, FakeSAEConfig, FakeClient),
+    )
+
+    raw_sequence = "MKTLLIL"
+    out = ESM_score_variant_sae_batch(
+        sequence=raw_sequence,
+        variants=[{"position": 2, "ref_aa": "K", "alt_aa": "L"}],
+        _live=True,
+    )
+    assert out["status"] == "upstream_error"
+    assert out["executor"] == "biohub_esm_sdk"
+    assert out["final_error_type"] == "ValueError"
+    blob = repr(out)
+    assert raw_sequence not in blob
+    assert "secret-esm-key" not in blob
+
+
+# ── Step 9 structure batch: NvidiaNIM_rfdiffusion / NvidiaNIM_proteinmpnn ──
+
+from app.mcp.tools.nvidianim import (  # noqa: E402
+    BINDINGS as NVIDIANIM_BINDINGS,
+    NvidiaNIM_proteinmpnn,
+    NvidiaNIM_rfdiffusion,
+)
+
+
+def test_nvidianim_structure_tools_not_wired_to_deferred_stub():
+    bindings = dict(NVIDIANIM_BINDINGS)
+    assert bindings["NvidiaNIM_rfdiffusion"] is NvidiaNIM_rfdiffusion
+    assert bindings["NvidiaNIM_proteinmpnn"] is NvidiaNIM_proteinmpnn
+
+
+def test_nvidianim_structure_tools_not_live_raise_not_implemented():
+    with pytest.raises(NotImplementedError):
+        NvidiaNIM_rfdiffusion(contigs="A:1-10", input_pdb="fake_ref")
+    with pytest.raises(NotImplementedError):
+        NvidiaNIM_proteinmpnn(input_pdb="fake_ref")
+
+
+def test_nvidianim_rfdiffusion_live_routes(install_universe):
+    fake = install_universe(
+        tools={
+            "NvidiaNIM_rfdiffusion": lambda args: {
+                "output_pdb": "designed backbone placeholder",
+            }
+        }
+    )
+    out = NvidiaNIM_rfdiffusion(contigs="A:1-10/0 B:1-10", input_pdb="run/structure.pdb", _live=True)
+    assert out["status"] == "ok"
+    assert out["executor"] == "tooluniverse"
+    assert fake.calls[0]["arguments"] == {
+        "contigs": "A:1-10/0 B:1-10",
+        "input_pdb": "run/structure.pdb",
+    }
+
+
+def test_nvidianim_rfdiffusion_optional_args_forwarded_when_set(install_universe):
+    fake = install_universe(
+        tools={"NvidiaNIM_rfdiffusion": lambda args: {"output_pdb": "x"}}
+    )
+    NvidiaNIM_rfdiffusion(
+        contigs="A:1-10",
+        input_pdb="run/structure.pdb",
+        hotspot_res=["A30", "A33"],
+        diffusion_steps=50,
+        random_seed=7,
+        _live=True,
+    )
+    assert fake.calls[0]["arguments"] == {
+        "contigs": "A:1-10",
+        "input_pdb": "run/structure.pdb",
+        "hotspot_res": ["A30", "A33"],
+        "diffusion_steps": 50,
+        "random_seed": 7,
+    }
+
+
+def test_nvidianim_rfdiffusion_live_upstream_error(install_universe):
+    install_universe(
+        tools={
+            "NvidiaNIM_rfdiffusion": lambda args: {
+                "status": "error",
+                "error": "invalid contigs syntax",
+            }
+        }
+    )
+    out = NvidiaNIM_rfdiffusion(contigs="bad", input_pdb="run/structure.pdb", _live=True)
+    assert out["status"] == "upstream_error"
+
+
+def test_nvidianim_proteinmpnn_live_routes(install_universe):
+    fake = install_universe(
+        tools={
+            "NvidiaNIM_proteinmpnn": lambda args: {
+                "designed_sequences": ["MKTAYIAK"],
+            }
+        }
+    )
+    out = NvidiaNIM_proteinmpnn(input_pdb="run/structure.pdb", _live=True)
+    assert out["status"] == "ok"
+    assert out["executor"] == "tooluniverse"
+    assert fake.calls[0]["arguments"] == {"input_pdb": "run/structure.pdb"}
+
+
+def test_nvidianim_proteinmpnn_optional_args_forwarded_when_set(install_universe):
+    fake = install_universe(
+        tools={"NvidiaNIM_proteinmpnn": lambda args: {"designed_sequences": ["MK"]}}
+    )
+    NvidiaNIM_proteinmpnn(
+        input_pdb="run/structure.pdb",
+        ca_only=True,
+        use_soluble_model=False,
+        sampling_temp=[0.1, 0.2],
+        num_seq_per_target=4,
+        _live=True,
+    )
+    assert fake.calls[0]["arguments"] == {
+        "input_pdb": "run/structure.pdb",
+        "ca_only": True,
+        "use_soluble_model": False,
+        "sampling_temp": [0.1, 0.2],
+        "num_seq_per_target": 4,
+    }
+
+
+def test_nvidianim_proteinmpnn_live_upstream_error(install_universe):
+    install_universe(
+        tools={
+            "NvidiaNIM_proteinmpnn": lambda args: {
+                "status": "error",
+                "error": "invalid structure",
+            }
+        }
+    )
+    out = NvidiaNIM_proteinmpnn(input_pdb="run/structure.pdb", _live=True)
+    assert out["status"] == "upstream_error"

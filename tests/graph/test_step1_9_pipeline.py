@@ -17,11 +17,16 @@ DEFAULT_XLSX = PROJECT_ROOT / "\u9879\u76ee\u6587\u4ef6" / "ToolUniversity_inven
 
 
 @pytest.fixture
-def inventory():
+def inventory(monkeypatch):
+    monkeypatch.setenv("MCP_LIVE_TOOLS", "false")
+    from app.settings import get_settings
+
+    get_settings.cache_clear()
     xlsx = os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))
     if not Path(xlsx).exists():
         pytest.skip(f"Inventory xlsx not at {xlsx}")
-    return ToolInventoryService(xlsx)
+    yield ToolInventoryService(xlsx)
+    get_settings.cache_clear()
 
 
 def test_step1_9_pipeline_happy_path(

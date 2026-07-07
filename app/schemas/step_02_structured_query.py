@@ -69,6 +69,11 @@ EntityType = Literal[
     "linker_payload",  # composite linker+payload reagent (vc-MMAE, deruxtecan)
     "drug",            # an entire ADC product (T-DM1, T-DXd, Enhertu, …)
     "compound",        # generic small molecule
+    # A protein point-mutation / variant mention (e.g. V777L, p.V777L). Kept
+    # as a first-class entity_type so the Step 2 LLM can label variant
+    # mentions without a Pydantic failure; the actionable variant string is
+    # ALSO carried as referenced_inputs[id_type="variant"] for Step 5 / Step 9.
+    "protein_variant",
     "other",
 ]
 
@@ -138,6 +143,10 @@ MissingSlotName = Literal[
     "pdb_id",
     "uniprot_id",
     "smiles",
+    # Explicit ESM protein-generation masked prompt (contains "_" / "<mask>"
+    # mask positions). Distinct from `structure_or_sequence` / `sequence_role`
+    # — an ordinary complete heavy/light/target sequence never satisfies it.
+    "prompt_sequence",
     "task_intent",
     "constraint",
     "other",

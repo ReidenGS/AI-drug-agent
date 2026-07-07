@@ -22,6 +22,7 @@ def client(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("STORAGE_MODE", "local")
     monkeypatch.setenv("LOCAL_STORAGE_ROOT", str(tmp_path / "store"))
     monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("MCP_LIVE_TOOLS", "false")
     from app.settings import get_settings
 
     for fn in (

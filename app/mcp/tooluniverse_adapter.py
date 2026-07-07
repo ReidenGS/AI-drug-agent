@@ -267,8 +267,9 @@ def _bounded_live_call(timeout_seconds: float):
 # ── env hydration ──────────────────────────────────────────────────────────
 #
 # ToolUniverse's tools read selected credentials directly from
-# `os.environ` (e.g. `GEMINI_API_KEY`, `NVIDIA_API_KEY`). Our codebase loads `.env` via
-# `pydantic-settings`, which populates the `Settings` object but does NOT
+# `os.environ` (e.g. `GEMINI_API_KEY`, `NVIDIA_API_KEY`, `ESM_API_KEY`).
+# Our codebase loads `.env` via `pydantic-settings`, which populates the
+# `Settings` object but does NOT
 # write to `os.environ`. Without bridging, TU sees no key and silently
 # fails to load the agentic sub-tools (`IntentAnalyzerAgent`,
 # `KeywordExtractorAgent`, …) used by `MultiAgentLiteratureSearch` etc.
@@ -294,6 +295,7 @@ def _hydrate_env_from_settings() -> None:
         ("gemini_model", "GEMINI_MODEL_ID"),
         ("gemini_model", "TOOLUNIVERSE_LLM_MODEL_DEFAULT"),
         ("nvidia_api_key", "NVIDIA_API_KEY"),
+        ("esm_api_key", "ESM_API_KEY"),
     )
     for attr, env_name in bridges:
         if os.environ.get(env_name):

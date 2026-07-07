@@ -7,12 +7,22 @@ flows through the OpenAI surface the same way it flows through Gemini.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from app.llm.openai_provider import OpenAIProvider, OpenAIProviderError
+from app.llm.openai_provider import (
+    OpenAIProvider,
+    OpenAIProviderError,
+    _RESPONSE_MODEL_FOR_TASK,
+    _ToolSelectionStage1Response,
+    _Step6SchemaMappingStage1Response,
+    _Step6SchemaMappingStage2ParserResponse,
+    _Step9SchemaMappingStage2Response,
+    _Step9ToolSelectionStage1Response,
+)
 
 
 def _provider_with_responses(responses: list[Any]) -> OpenAIProvider:
@@ -138,6 +148,36 @@ def test_step6_schema_mapping_stage2_passes_without_task_intent():
         "map", schema={"task": "step6_schema_mapping_stage_2"}
     )
     assert out["tools"][0]["argument_mapping"]["smiles"].startswith("candidate:")
+
+
+def test_step9_tool_selection_stage1_passes_without_task_intent():
+    provider = _provider_with_responses([
+        _chat_response(
+            '{"selections":[{"tool_name":"ZINC_search_by_smiles",'
+            '"lane_type":"compound_screening",'
+            '"selection_reason":"smiles available"}]}'
+        )
+    ])
+    out = provider.generate_json(
+        "pick", schema={"task": "step9_tool_selection_stage_1"}
+    )
+    assert out["selections"][0]["lane_type"] == "compound_screening"
+
+
+def test_step9_schema_mapping_stage2_passes_without_task_intent():
+    provider = _provider_with_responses([
+        _chat_response(
+            '{"tools":[{"tool_name":"ZINC_search_by_smiles",'
+            '"lane_type":"compound_screening","can_invoke":true,'
+            '"argument_mappings":[{"schema_arg":"smiles","field_ref":"material:m1"}],'
+            '"argument_literals":[],"missing_required_fields":[],'
+            '"skip_reason":"","argument_mapping_reason":"mapped"}]}'
+        )
+    ])
+    out = provider.generate_json(
+        "map", schema={"task": "step9_tool_schema_mapping_stage_2"}
+    )
+    assert out["tools"][0]["argument_mappings"][0]["schema_arg"] == "smiles"
 
 
 # ── error paths ───────────────────────────────────────────────────────────
@@ -470,6 +510,605 @@ def test_openai_handles_none_system_without_embedding_anything():
     assert captured["system"] is None
     assert "System instructions" not in captured["prompt"]
     assert user_prompt_body in captured["prompt"]
+
+
+# ── official structured-output parser path + json_object fallback ─────────
+
+
+def _fake_openai_client(*, parse=None, create=None, has_parse: bool = True):
+    """Build a fake OpenAI client exposing `beta.chat.completions.parse` and
+    `chat.completions.create`, recording calls to each."""
+    calls: dict[str, list[dict[str, Any]]] = {"parse": [], "create": []}
+    completions = SimpleNamespace()
+
+    if has_parse:
+        def _parse(**kw: Any) -> Any:
+            calls["parse"].append(kw)
+            return parse(**kw) if callable(parse) else parse
+        completions.parse = _parse
+
+    def _create(**kw: Any) -> Any:
+        calls["create"].append(kw)
+        return create(**kw) if callable(create) else create
+    completions.create = _create
+
+    chat = SimpleNamespace(completions=completions)
+    client = SimpleNamespace(beta=SimpleNamespace(chat=chat), chat=chat)
+    client._calls = calls  # type: ignore[attr-defined]
+    return client
+
+
+def _parsed_response(parsed_obj: Any, *, usage: Any = None) -> Any:
+    message = SimpleNamespace(parsed=parsed_obj, content=None, refusal=None)
+    choice = SimpleNamespace(message=message)
+    return SimpleNamespace(choices=[choice], usage=usage)
+
+
+def _provider_with_client(client: Any, *, max_retries: int = 2) -> OpenAIProvider:
+    provider = OpenAIProvider(api_key="sk-fake-parser", max_retries=max_retries)
+    provider._client = client  # type: ignore[assignment]  # bypass real SDK construction
+    return provider
+
+
+# ── strict-schema compliance (real production requirement, not fake client) ─
+
+
+def _strict_schema_violations(schema: Any, path: str = "root") -> list[str]:
+    """Return object/array nodes that violate OpenAI strict structured output:
+    an object with `additionalProperties` != False, or an array with an
+    unconstrained (empty) `items`."""
+    problems: list[str] = []
+    if isinstance(schema, dict):
+        if schema.get("type") == "object" and "properties" in schema:
+            if schema.get("additionalProperties") is not False:
+                problems.append(f"{path}: additionalProperties={schema.get('additionalProperties')!r}")
+        if schema.get("type") == "array" and not schema.get("items"):
+            problems.append(f"{path}: unconstrained items={schema.get('items')!r}")
+        for key, value in schema.items():
+            problems += _strict_schema_violations(value, f"{path}.{key}")
+    elif isinstance(schema, list):
+        for i, value in enumerate(schema):
+            problems += _strict_schema_violations(value, f"{path}[{i}]")
+    return problems
+
+
+def test_parser_models_produce_real_strict_schema():
+    """Every parser-supported response model must yield a genuinely strict
+    schema via the SDK's own `to_strict_json_schema`: no `additionalProperties:
+    true` and no unconstrained array items anywhere. This is the real
+    production gate — not a fake-client assertion that `parse` was called."""
+    from openai.lib._pydantic import to_strict_json_schema
+
+    # Currently ACTIVE parser tasks. step6_schema_mapping_stage_2 is
+    # temporarily disabled from the parser path (json_object instead) while
+    # the Step 6 Stage 2 prompt still asks for the legacy dynamic-dict shape.
+    assert set(_RESPONSE_MODEL_FOR_TASK) == {
+        "tool_selection_stage_1",
+        "step6_schema_mapping_stage_1",
+        "step9_tool_selection_stage_1",
+        "step9_tool_schema_mapping_stage_2",
+    }
+    assert "step6_schema_mapping_stage_2" not in _RESPONSE_MODEL_FOR_TASK
+    for task, model in _RESPONSE_MODEL_FOR_TASK.items():
+        schema = to_strict_json_schema(model)
+        violations = _strict_schema_violations(schema)
+        assert not violations, f"{task}/{model.__name__} strict-schema violations: {violations}"
+
+
+def test_disabled_step6_stage2_parser_model_is_still_strict_for_future_use():
+    """The Step 6 Stage 2 list-of-pairs parser model is TEMPORARILY DISABLED
+    from the active parser path but kept for future re-enable. It must still
+    produce a genuinely strict schema so re-enabling is a one-line change."""
+    from openai.lib._pydantic import to_strict_json_schema
+
+    schema = to_strict_json_schema(_Step6SchemaMappingStage2ParserResponse)
+    violations = _strict_schema_violations(schema)
+    assert not violations, f"disabled step6 stage2 model strict-schema violations: {violations}"
+
+
+def test_step6_stage2_uses_json_object_path_not_parser():
+    """Even when the parser IS available, step6_schema_mapping_stage_2 must go
+    through the json_object path (returning the legacy dynamic-dict shape),
+    because it is disabled from the parser registry."""
+    client = _fake_openai_client(
+        has_parse=True,
+        create=_chat_response(
+            '{"tools":[{"tool_name":"DrugProps_pains_filter","can_invoke":true,'
+            '"argument_mapping":{"smiles":"candidate:c1:material:m1:value"},'
+            '"missing_required_fields":[],"argument_mapping_reason":"mapped"}]}'
+        ),
+    )
+    provider = _provider_with_client(client)
+    out = provider.generate_json("map", schema={"task": "step6_schema_mapping_stage_2"})
+    assert client._calls["parse"] == []  # parser NOT used for disabled task
+    assert len(client._calls["create"]) == 1
+    assert out["tools"][0]["argument_mapping"] == {"smiles": "candidate:c1:material:m1:value"}
+
+
+def test_structured_query_not_routed_to_strict_parser():
+    """structured_query (deeply-nested / variant fields) must NOT be routed to
+    the strict parser — it stays on the json_object path."""
+    assert "structured_query" not in _RESPONSE_MODEL_FOR_TASK
+
+
+# ── behavioral parser tests (supported tasks: stage_1 / step6 stage_1) ─────
+
+
+def test_openai_stage1_uses_structured_parser_and_returns_dict():
+    parsed = _ToolSelectionStage1Response(
+        selections=[{"tool_name": "DrugProps_calculate_qed"}]
+    )
+    client = _fake_openai_client(parse=_parsed_response(parsed))
+    provider = _provider_with_client(client)
+
+    out = provider.generate_json("pick", schema={"task": "tool_selection_stage_1"})
+
+    assert len(client._calls["parse"]) == 1
+    assert client._calls["create"] == []  # parser succeeded → no fallback
+    assert client._calls["parse"][0]["response_format"] is _ToolSelectionStage1Response
+    assert isinstance(out, dict)
+    assert not isinstance(out, _ToolSelectionStage1Response)
+    assert out["selections"][0]["tool_name"] == "DrugProps_calculate_qed"
+
+
+def test_openai_step6_stage1_uses_structured_parser_and_validated():
+    parsed = _Step6SchemaMappingStage1Response(
+        selections=[{"tool_name": "DrugProps_pains_filter", "selection_reason": "smiles"}]
+    )
+    client = _fake_openai_client(parse=_parsed_response(parsed))
+    provider = _provider_with_client(client)
+    out = provider.generate_json("pick", schema={"task": "step6_schema_mapping_stage_1"})
+    assert client._calls["parse"] and not client._calls["create"]
+    assert client._calls["parse"][0]["response_format"] is _Step6SchemaMappingStage1Response
+    assert out["selections"][0]["tool_name"] == "DrugProps_pains_filter"
+
+
+def test_openai_step9_stage1_uses_structured_parser_and_returns_dict():
+    parsed = _Step9ToolSelectionStage1Response(
+        selections=[{
+            "tool_name": "ZINC_search_by_smiles",
+            "lane_type": "compound_screening",
+            "selection_reason": "smiles available",
+        }]
+    )
+    client = _fake_openai_client(parse=_parsed_response(parsed))
+    provider = _provider_with_client(client)
+    out = provider.generate_json(
+        "pick", schema={"task": "step9_tool_selection_stage_1"}
+    )
+    assert client._calls["parse"] and not client._calls["create"]
+    assert client._calls["parse"][0]["response_format"] is _Step9ToolSelectionStage1Response
+    assert isinstance(out, dict)
+    assert not isinstance(out, _Step9ToolSelectionStage1Response)
+    assert out["selections"][0]["tool_name"] == "ZINC_search_by_smiles"
+
+
+def test_openai_step9_stage2_uses_structured_parser_and_returns_dict():
+    parsed = _Step9SchemaMappingStage2Response(
+        tools=[{
+            "tool_name": "ZINC_search_by_smiles",
+            "lane_type": "compound_screening",
+            "can_invoke": True,
+            "argument_mappings": [
+                {"schema_arg": "smiles", "field_ref": "material:m1"},
+            ],
+            "argument_literals": [],
+            "missing_required_fields": [],
+            "skip_reason": "",
+            "argument_mapping_reason": "mapped",
+        }]
+    )
+    client = _fake_openai_client(parse=_parsed_response(parsed))
+    provider = _provider_with_client(client)
+    out = provider.generate_json(
+        "map", schema={"task": "step9_tool_schema_mapping_stage_2"}
+    )
+    assert client._calls["parse"] and not client._calls["create"]
+    assert client._calls["parse"][0]["response_format"] is _Step9SchemaMappingStage2Response
+    assert isinstance(out, dict)
+    assert not isinstance(out, _Step9SchemaMappingStage2Response)
+    assert out["tools"][0]["argument_mappings"] == [
+        {"schema_arg": "smiles", "field_ref": "material:m1"}
+    ]
+    assert out["tools"][0]["argument_literals"] == {}
+
+
+def test_openai_step9_stage2_parser_converts_literal_value_json_to_parsed_dict():
+    parsed = _Step9SchemaMappingStage2Response(
+        tools=[{
+            "tool_name": "ESM_score_variant_sae_batch",
+            "lane_type": "variant_evaluation",
+            "can_invoke": True,
+            "argument_mappings": [
+                {"schema_arg": "sequence", "field_ref": "material:heavy_chain"},
+            ],
+            "argument_literals": [
+                {
+                    "schema_arg": "variants",
+                    "literal_value_json": '[{"position":777,"ref_aa":"V","alt_aa":"L"}]',
+                },
+                {"schema_arg": "model", "literal_value_json": '"esmc-6b-2024-12"'},
+            ],
+            "missing_required_fields": [],
+        }]
+    )
+    external = parsed.to_external_dict()
+    literals = external["tools"][0]["argument_literals"]
+    assert literals["variants"] == [{"position": 777, "ref_aa": "V", "alt_aa": "L"}]
+    assert literals["model"] == "esmc-6b-2024-12"
+    assert isinstance(literals["variants"], list)
+    assert not isinstance(literals["variants"], str)
+
+
+def test_openai_step9_stage2_parser_rejects_invalid_literal_value_json():
+    parsed = _Step9SchemaMappingStage2Response(
+        tools=[{
+            "tool_name": "ESM_score_variant_sae_batch",
+            "lane_type": "variant_evaluation",
+            "can_invoke": True,
+            "argument_mappings": [
+                {"schema_arg": "sequence", "field_ref": "material:heavy_chain"},
+            ],
+            "argument_literals": [
+                {"schema_arg": "variants", "literal_value_json": "[not-json"},
+            ],
+            "missing_required_fields": [],
+        }]
+    )
+    with pytest.raises(OpenAIProviderError, match="invalid literal_value_json"):
+        parsed.to_external_dict()
+
+
+def test_openai_step9_stage2_parser_rejects_duplicate_literal_schema_arg():
+    parsed = _Step9SchemaMappingStage2Response(
+        tools=[{
+            "tool_name": "ESM_score_variant_sae_batch",
+            "lane_type": "variant_evaluation",
+            "can_invoke": True,
+            "argument_mappings": [
+                {"schema_arg": "sequence", "field_ref": "material:heavy_chain"},
+            ],
+            "argument_literals": [
+                {"schema_arg": "variants", "literal_value_json": "[]"},
+                {"schema_arg": "variants", "literal_value_json": "[]"},
+            ],
+            "missing_required_fields": [],
+        }]
+    )
+    with pytest.raises(OpenAIProviderError, match="duplicate schema_arg `variants`"):
+        parsed.to_external_dict()
+
+
+def test_step9_stage2_strict_parser_schema_uses_literal_value_json_only():
+    from openai.lib._pydantic import to_strict_json_schema
+
+    schema = to_strict_json_schema(_Step9SchemaMappingStage2Response)
+    blob = json.dumps(schema)
+    assert "literal_value_json" in blob
+    assert "argument_json_literals" not in blob
+    assert '"literal_value"' not in blob
+    violations = _strict_schema_violations(schema)
+    assert not violations
+
+
+def test_openai_step9_stage2_duplicate_schema_arg_raises_then_retry_succeeds():
+    dup = _Step9SchemaMappingStage2Response(
+        tools=[{
+            "tool_name": "ZINC_search_by_smiles",
+            "lane_type": "compound_screening",
+            "can_invoke": True,
+            "argument_mappings": [
+                {"schema_arg": "smiles", "field_ref": "material:m1"},
+                {"schema_arg": "smiles", "field_ref": "material:m2"},
+            ],
+            "argument_literals": [],
+            "missing_required_fields": [],
+        }]
+    )
+    good = _Step9SchemaMappingStage2Response(
+        tools=[{
+            "tool_name": "ZINC_search_by_smiles",
+            "lane_type": "compound_screening",
+            "can_invoke": True,
+            "argument_mappings": [
+                {"schema_arg": "smiles", "field_ref": "material:m1"},
+            ],
+            "argument_literals": [],
+            "missing_required_fields": [],
+        }]
+    )
+    seq = iter([_parsed_response(dup), _parsed_response(good)])
+    client = _fake_openai_client(parse=lambda **kw: next(seq))
+    provider = _provider_with_client(client, max_retries=1)
+    out = provider.generate_json(
+        "map", schema={"task": "step9_tool_schema_mapping_stage_2"}
+    )
+    assert len(client._calls["parse"]) == 2
+    assert out["tools"][0]["argument_mappings"] == [
+        {"schema_arg": "smiles", "field_ref": "material:m1"}
+    ]
+
+
+def test_openai_parser_output_flows_through_validate_task_shape():
+    """Parser output still runs the shared per-task validator: a stage_1 entry
+    missing tool_name is rejected (with retry) rather than silently accepted."""
+    bad = _ToolSelectionStage1Response()  # empty selections is valid-empty
+    # Build a parsed object whose model_dump omits tool_name by using a dict.
+    bad_dict = {"selections": [{"selection_reason": "no tool_name here"}]}
+    client = _fake_openai_client(parse=_parsed_response(bad_dict))
+    provider = _provider_with_client(client, max_retries=0)
+    with pytest.raises(OpenAIProviderError, match="tool_selection_stage_1.*tool_name"):
+        provider.generate_json("pick", schema={"task": "tool_selection_stage_1"})
+    del bad
+
+
+def test_openai_parser_accepts_dict_parsed_shape():
+    """Some SDK/proxy variants set `message.parsed` to a dict; still a dict out."""
+    client = _fake_openai_client(
+        parse=_parsed_response({"selections": [{"tool_name": "DrugProps_calculate_qed"}]})
+    )
+    provider = _provider_with_client(client)
+    out = provider.generate_json("pick", schema={"task": "tool_selection_stage_1"})
+    assert isinstance(out, dict)
+    assert out["selections"][0]["tool_name"] == "DrugProps_calculate_qed"
+
+
+def test_openai_falls_back_to_json_object_when_no_parser_api():
+    """SDK without a `parse` method → fall back to json_object create."""
+    client = _fake_openai_client(
+        has_parse=False,
+        create=_chat_response('{"selections":[{"tool_name":"DrugProps_calculate_qed"}]}'),
+    )
+    provider = _provider_with_client(client)
+    out = provider.generate_json("pick", schema={"task": "tool_selection_stage_1"})
+    assert client._calls["parse"] == []  # no parse method existed
+    assert len(client._calls["create"]) == 1  # fell back to json_object
+    assert out["selections"][0]["tool_name"] == "DrugProps_calculate_qed"
+
+
+def test_openai_falls_back_on_parser_incompatibility_error():
+    """Parser raising an incompatibility error → json_object fallback."""
+    def _parse_boom(**kw: Any) -> Any:
+        raise TypeError("invalid schema for response_format: additionalProperties")
+
+    client = _fake_openai_client(
+        parse=_parse_boom,
+        create=_chat_response('{"selections":[{"tool_name":"DrugProps_calculate_qed"}]}'),
+    )
+    provider = _provider_with_client(client)
+    out = provider.generate_json("pick", schema={"task": "tool_selection_stage_1"})
+    assert len(client._calls["parse"]) == 1  # attempted
+    assert len(client._calls["create"]) == 1  # then fell back
+    assert out["selections"][0]["tool_name"] == "DrugProps_calculate_qed"
+
+
+def test_openai_fallback_records_usage_events_and_no_leak():
+    """Fallback path still records compact usage and leaks nothing."""
+    client = _fake_openai_client(
+        has_parse=False,
+        create=_chat_response_with_usage(
+            '{"selections":[{"tool_name":"DrugProps_calculate_qed"}]}',
+            prompt=70, completion=15, total=85,
+        ),
+    )
+    provider = _provider_with_client(client)
+    provider.generate_json(
+        "USER_PROMPT_SECRET", schema={"task": "tool_selection_stage_1"}, system="SYS_SECRET",
+    )
+    assert len(provider.usage_events) == 1
+    evt = provider.usage_events[0]
+    assert evt["task"] == "tool_selection_stage_1"
+    assert evt["total_tokens"] == 85
+    import json as _json
+    blob = _json.dumps(evt)
+    for secret in ("sk-fake-parser", "USER_PROMPT_SECRET", "SYS_SECRET"):
+        assert secret not in blob
+
+
+def test_openai_parser_records_usage_events_and_no_leak():
+    parsed = _ToolSelectionStage1Response(selections=[{"tool_name": "DrugProps_calculate_qed"}])
+    usage = SimpleNamespace(prompt_tokens=200, completion_tokens=30, total_tokens=230)
+    client = _fake_openai_client(parse=_parsed_response(parsed, usage=usage))
+    provider = _provider_with_client(client)
+    provider.generate_json(
+        "USER_PROMPT_SECRET", schema={"task": "tool_selection_stage_1"}, system="SYS_SECRET",
+    )
+    assert len(provider.usage_events) == 1
+    evt = provider.usage_events[0]
+    assert evt["prompt_tokens"] == 200 and evt["total_tokens"] == 230
+    import json as _json
+    blob = _json.dumps(evt)
+    for secret in ("sk-fake-parser", "USER_PROMPT_SECRET", "SYS_SECRET"):
+        assert secret not in blob
+
+
+def test_openai_parser_genuine_error_propagates_no_silent_fallback():
+    """A non-incompatibility error from the parser is NOT masked as a
+    fallback — it propagates (no fake success), and create is never called."""
+    def _parse_network(**kw: Any) -> Any:
+        raise RuntimeError("connection reset by peer")
+
+    client = _fake_openai_client(
+        parse=_parse_network,
+        create=_chat_response('{"selections":[{"tool_name":"DrugProps_calculate_qed"}]}'),
+    )
+    provider = _provider_with_client(client, max_retries=0)
+    with pytest.raises(RuntimeError, match="connection reset"):
+        provider.generate_json("pick", schema={"task": "tool_selection_stage_1"})
+    assert client._calls["create"] == []  # never silently fell back
+
+
+def test_openai_structured_query_stays_on_json_object_path():
+    """structured_query is NOT strict-parser-routed: it uses json_object and
+    still runs validate + normalize (adc_candidate → ranked_candidates)."""
+    client = _fake_openai_client(
+        parse=_parsed_response({"should": "not be used"}),
+        create=_chat_response(
+            '{"task_intent":{"task_type":"adc_design"},"mentioned_entities":{},'
+            '"requested_outputs":["adc_candidate","report"]}'
+        ),
+    )
+    provider = _provider_with_client(client)
+    out = provider.generate_json("parse", schema={"task": "structured_query"})
+    assert client._calls["parse"] == []  # parser NOT used for structured_query
+    assert len(client._calls["create"]) == 1
+    assert out["requested_outputs"] == ["ranked_candidates", "report"]
+
+
+# ── Step 6 Stage 2 parser model: TEMPORARILY DISABLED, kept for future ──────
+# These exercise the KEPT list-of-pairs parser model + `to_external_dict`
+# directly (NOT the provider routing, which is json_object for this task now),
+# so the conversion + duplicate-guard code stays covered for a future
+# re-enable. See `test_step6_stage2_uses_json_object_path_not_parser` for the
+# active routing behavior.
+
+
+def test_future_step6_stage2_model_list_of_pairs_converts_to_dynamic_dict():
+    parsed = _Step6SchemaMappingStage2ParserResponse(
+        tools=[{
+            "tool_name": "SwissADME_calculate_adme",
+            "can_invoke": True,
+            "argument_mappings": [
+                {"schema_arg": "smiles", "field_ref": "candidate:c1:material:m1:value"},
+            ],
+            "argument_literals": [
+                {"schema_arg": "operation", "literal_value": "calculate_adme"},
+            ],
+            "missing_required_fields": [],
+            "argument_mapping_reason": "smiles mapped; operation is a schema literal",
+        }]
+    )
+    external = parsed.to_external_dict()
+    tool = external["tools"][0]
+    assert tool["argument_mapping"] == {"smiles": "candidate:c1:material:m1:value"}
+    assert tool["argument_literals"] == {"operation": "calculate_adme"}
+    assert tool["can_invoke"] is True
+    assert tool["missing_required_fields"] == []
+    assert tool["argument_mapping_reason"].startswith("smiles mapped")
+
+
+def test_future_step6_stage2_model_empty_literals_becomes_empty_dict():
+    parsed = _Step6SchemaMappingStage2ParserResponse(
+        tools=[{
+            "tool_name": "DrugProps_pains_filter",
+            "can_invoke": True,
+            "argument_mappings": [
+                {"schema_arg": "smiles", "field_ref": "candidate:c1:material:m1:value"},
+            ],
+            "argument_literals": [],
+            "missing_required_fields": [],
+        }]
+    )
+    external = parsed.to_external_dict()
+    assert external["tools"][0]["argument_literals"] == {}
+    assert external["tools"][0]["argument_mapping"] == {"smiles": "candidate:c1:material:m1:value"}
+
+
+def test_future_step6_stage2_model_can_invoke_false_empty_mappings_missing_fields():
+    parsed = _Step6SchemaMappingStage2ParserResponse(
+        tools=[{
+            "tool_name": "PDBePISA_get_interfaces",
+            "can_invoke": False,
+            "argument_mappings": [],
+            "argument_literals": [],
+            "missing_required_fields": ["pdb_id"],
+            "argument_mapping_reason": "no pdb_id available",
+        }]
+    )
+    external = parsed.to_external_dict()
+    tool = external["tools"][0]
+    assert tool["can_invoke"] is False
+    assert tool["argument_mapping"] == {}
+    assert tool["argument_literals"] == {}
+    assert tool["missing_required_fields"] == ["pdb_id"]
+
+
+def test_future_step6_stage2_model_duplicate_schema_arg_raises_no_silent_overwrite():
+    """Duplicate argument_mapping schema_arg raises (never a silent overwrite)
+    at conversion time, so a future re-enable keeps that guarantee."""
+    dup = _Step6SchemaMappingStage2ParserResponse(
+        tools=[{
+            "tool_name": "SwissADME_calculate_adme",
+            "can_invoke": True,
+            "argument_mappings": [
+                {"schema_arg": "smiles", "field_ref": "ref_a"},
+                {"schema_arg": "smiles", "field_ref": "ref_b"},
+            ],
+            "argument_literals": [],
+            "missing_required_fields": [],
+        }]
+    )
+    with pytest.raises(OpenAIProviderError, match="duplicate argument_mapping"):
+        dup.to_external_dict()
+
+
+def test_openai_step6_stage2_fallback_json_object_accepts_old_dict_shape():
+    """When the parser is unavailable, the json_object fallback still returns
+    the existing dynamic-dict shape unchanged (no list-of-pairs conversion)."""
+    client = _fake_openai_client(
+        has_parse=False,
+        create=_chat_response(
+            '{"tools":[{"tool_name":"DrugProps_pains_filter","can_invoke":true,'
+            '"argument_mapping":{"smiles":"candidate:c1:material:m1:value"},'
+            '"missing_required_fields":[],"argument_mapping_reason":"mapped"}]}'
+        ),
+    )
+    provider = _provider_with_client(client)
+    out = provider.generate_json("map", schema={"task": "step6_schema_mapping_stage_2"})
+    assert client._calls["parse"] == []
+    assert len(client._calls["create"]) == 1
+    assert out["tools"][0]["argument_mapping"] == {"smiles": "candidate:c1:material:m1:value"}
+
+
+def test_openai_step6_stage2_output_passes_validate_task_shape():
+    """The converted external dict passes the shared step6 stage2 validator
+    (bad shape would raise). Here a valid tool round-trips."""
+    from app.llm.json_task_validation import validate_task_shape
+    parsed = _Step6SchemaMappingStage2ParserResponse(
+        tools=[{
+            "tool_name": "SwissADME_calculate_adme",
+            "can_invoke": True,
+            "argument_mappings": [{"schema_arg": "smiles", "field_ref": "candidate:x"}],
+            "argument_literals": [{"schema_arg": "operation", "literal_value": "calculate_adme"}],
+            "missing_required_fields": [],
+        }]
+    )
+    external = parsed.to_external_dict()
+    # Direct validator round-trip (same call the provider makes).
+    validated = validate_task_shape(external, "step6_schema_mapping_stage_2", error_factory=OpenAIProviderError)
+    assert validated["tools"][0]["can_invoke"] is True
+
+
+def test_openai_unsupported_task_skips_parser_uses_json_object():
+    """A task without a structured-output model goes straight to json_object;
+    the parser is never attempted."""
+    client = _fake_openai_client(
+        parse=_parsed_response(_ToolSelectionStage1Response()),  # would be wrong if used
+        create=_chat_response(
+            '{"tools":[{"lane_type":"payload_linker_compound_liability",'
+            '"tool_name":"DrugProps_pains_filter","arguments":{"smiles":"CCO"}}]}'
+        ),
+    )
+    provider = _provider_with_client(client)
+    out = provider.generate_json("args", schema={"task": "tool_selection_stage_2_multi_tool"})
+    assert client._calls["parse"] == []  # unsupported task → no parser
+    assert len(client._calls["create"]) == 1
+    assert out["tools"][0]["arguments"] == {"smiles": "CCO"}
+
+
+def test_openai_parser_refusal_is_surfaced_then_retried():
+    """A structured-output refusal raises a compact error and is retried."""
+    refusal_msg = SimpleNamespace(parsed=None, content=None, refusal="I can't help with that")
+    refusal_resp = SimpleNamespace(choices=[SimpleNamespace(message=refusal_msg)], usage=None)
+    good = _parsed_response(_ToolSelectionStage1Response(selections=[{"tool_name": "DrugProps_calculate_qed"}]))
+    parse_seq = iter([refusal_resp, good])
+    client = _fake_openai_client(parse=lambda **kw: next(parse_seq))
+    provider = _provider_with_client(client, max_retries=1)
+    out = provider.generate_json("pick", schema={"task": "tool_selection_stage_1"})
+    assert len(client._calls["parse"]) == 2  # retried after refusal
+    assert out["selections"][0]["tool_name"] == "DrugProps_calculate_qed"
+    # both attempts recorded in usage_events
+    assert [e["attempt"] for e in provider.usage_events] == [0, 1]
 
 
 def test_openai_usage_events_shape_unchanged_after_dedup():

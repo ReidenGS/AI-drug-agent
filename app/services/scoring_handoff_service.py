@@ -88,8 +88,6 @@ class ScoringHandoffService:
 
         candidate_summaries: list[CandidateSummary] = []
         missing: list[str] = []
-        if not compound_hits:
-            missing.append("compound_screening_artifact.compound_hits is empty")
         if not spi:
             missing.append("structure_prediction_and_interface_results is missing")
 

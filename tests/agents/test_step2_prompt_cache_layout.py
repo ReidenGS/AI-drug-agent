@@ -288,6 +288,37 @@ def test_build_json_prompt_still_equals_stable_plus_dynamic_concatenation():
     assert _step2_full_prompt(raw) == stable + dynamic
 
 
+def test_stable_prefix_contains_prompt_sequence_rule():
+    """The new prompt_sequence rule is static text — it must live in the
+    stable prefix (byte-identical across queries), never in the dynamic
+    per-run suffix."""
+    stable, _ = _step2_sections(_raw())
+    assert '"id_type": "prompt_sequence"' in stable
+    assert "masked generation prompt" in stable
+    assert "conditional prompt_sequence" in stable
+
+
+def test_stable_prefix_prompt_sequence_rule_identical_across_queries_and_files():
+    raw1 = _raw(query="Please generate a protein sequence for HER2 target.")
+    raw2 = _raw(
+        query="Evaluate a TROP2 ADC.",
+        files=[{
+            "file_id": "f_prompt",
+            "original_filename": "generation_prompt.fasta",
+            "storage_path": "/store/x/generation_prompt.fasta",
+        }],
+    )
+    stable1, dynamic1 = _step2_sections(raw1)
+    stable2, dynamic2 = _step2_sections(raw2)
+    assert stable1 == stable2
+    # The user's actual generation request / uploaded file metadata stays
+    # in the dynamic suffix, never in the (identical) stable prefix.
+    assert "Please generate a protein sequence for HER2 target." not in stable1
+    assert "Please generate a protein sequence for HER2 target." in dynamic1
+    assert "generation_prompt.fasta" not in stable2
+    assert "generation_prompt.fasta" in dynamic2
+
+
 def test_build_json_prompt_sections_unaffected_for_non_structured_query_tasks():
     """Other tasks (Step 5/6 selectors, etc.) must render exactly like
     before: the full schema dict dumped into the dynamic suffix, unaffected

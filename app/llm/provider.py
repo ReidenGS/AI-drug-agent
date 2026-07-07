@@ -13,6 +13,12 @@ from __future__ import annotations
 import re
 from typing import Any, Protocol, runtime_checkable
 
+from .json_task_validation import (
+    extract_protein_variant_tokens,
+    looks_like_masked_prompt_sequence,
+    requests_protein_generation,
+)
+
 
 @runtime_checkable
 class LLMProvider(Protocol):
@@ -233,6 +239,80 @@ def _mock_step6_schema_mapping_stage2(schema: dict) -> dict:
     return {"tools": out}
 
 
+def _mock_step9_tool_selection_stage1(schema: dict) -> dict:
+    catalog = schema.get("compact_catalog") or []
+    return {
+        "selections": [
+            {
+                "tool_name": entry.get("tool_name"),
+                "lane_type": entry.get("lane_type"),
+                "selection_reason": "mock selected hard-gate allowed Step 9 tool",
+            }
+            for entry in catalog
+            if isinstance(entry, dict) and entry.get("tool_name") and entry.get("lane_type")
+        ]
+    }
+
+
+def _mock_step9_tool_schema_mapping_stage2(schema: dict) -> dict:
+    fields = schema.get("step9_input_fields") or []
+    tools = schema.get("tools") or []
+
+    def match(arg_name: str) -> dict | None:
+        lowered = arg_name.lower()
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            supports = {str(a).lower() for a in (field.get("supports_tool_args") or [])}
+            if lowered in supports:
+                return field
+        return None
+
+    def literal(arg_name: str, full_schema: dict) -> Any | None:
+        prop = (full_schema.get("properties") or {}).get(arg_name)
+        if not isinstance(prop, dict):
+            return None
+        if "const" in prop:
+            return prop.get("const")
+        enum_values = prop.get("enum")
+        if isinstance(enum_values, list) and len(enum_values) == 1:
+            return enum_values[0]
+        if "default" in prop:
+            return prop.get("default")
+        return None
+
+    out: list[dict] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        full_schema = tool.get("full_schema") or {}
+        required = [str(arg) for arg in (tool.get("required_fields") or full_schema.get("required") or [])]
+        mappings: list[dict] = []
+        literals: list[dict] = []
+        missing: list[str] = []
+        for arg in required:
+            field = match(arg)
+            if field is not None:
+                mappings.append({"schema_arg": arg, "field_ref": field["field_ref"]})
+                continue
+            lit = literal(arg, full_schema)
+            if lit is not None:
+                literals.append({"schema_arg": arg, "literal_value": lit})
+                continue
+            missing.append(arg)
+        out.append({
+            "tool_name": tool.get("tool_name"),
+            "lane_type": tool.get("lane_type"),
+            "can_invoke": not missing,
+            "argument_mappings": mappings,
+            "argument_literals": literals,
+            "missing_required_fields": missing,
+            "skip_reason": "" if not missing else "missing_required_fields",
+            "argument_mapping_reason": "mock mapped Step 9 schema args to available field refs",
+        })
+    return {"tools": out}
+
+
 _TARGET_HINTS = (
     "HER2", "EGFR", "TROP2", "BCMA", "CD19", "CD20", "CD22", "CD33", "CD30", "CD79",
     "Nectin-4", "B7-H3", "FOLR1", "MET", "MUC1", "ROR1", "PSMA", "Claudin18.2",
@@ -288,17 +368,22 @@ def _detect_referenced_inputs(text: str) -> list[dict]:
     seen: set[tuple[str, str]] = set()
     refs: list[dict] = []
 
-    def _add(id_type: str, value: str) -> None:
+    def _add(id_type: str, value: str, *, source: str = "raw_request_text") -> None:
         key = (id_type, value.upper())
         if key in seen:
             return
         seen.add(key)
-        refs.append({"id_type": id_type, "value": value, "source": "raw_request_text"})
+        refs.append({"id_type": id_type, "value": value, "source": source})
 
     for m in _RE_PDB.finditer(text):
         _add("pdb_id", m.group(1).upper())
     for m in _RE_UNIPROT.finditer(text):
         _add("uniprot_id", m.group(1).upper())
+    # Protein point-mutation / variant (V777L, p.V777L). Structured as the
+    # stable id_type="variant" so Step 5 / Step 9 (AlphaMissense / DynaMut2 /
+    # ESM variant tools) can consume it without re-parsing the raw query.
+    for token in extract_protein_variant_tokens(text):
+        _add("variant", token, source="user")
     for m in _RE_ZINC.finditer(text):
         _add("zinc_id", m.group(1).upper())
     for m in _RE_CHEMBL.finditer(text):
@@ -347,6 +432,10 @@ class MockLLMProvider:
             return _mock_step6_schema_mapping_stage1(schema)
         if task == "step6_schema_mapping_stage_2":
             return _mock_step6_schema_mapping_stage2(schema)
+        if task == "step9_tool_selection_stage_1":
+            return _mock_step9_tool_selection_stage1(schema)
+        if task == "step9_tool_schema_mapping_stage_2":
+            return _mock_step9_tool_schema_mapping_stage2(schema)
 
         raw = (schema or {}).get("raw_request_record") or {}
         ctx = raw.get("user_provided_context") or {}
@@ -410,6 +499,10 @@ class MockLLMProvider:
 
         referenced = _detect_referenced_inputs(haystack)
         referenced.extend(_uploaded_file_refs(uploaded_files))
+        prompt_sequence_ref = _detect_prompt_sequence_referenced_input(haystack, uploaded_files)
+        if prompt_sequence_ref:
+            referenced.append(prompt_sequence_ref)
+        wants_protein_generation = requests_protein_generation(haystack)
 
         # Constraint preservation: keep the user's explicit constraints
         # verbatim. Don't try to interpret numeric tolerances here.
@@ -429,6 +522,22 @@ class MockLLMProvider:
             haystack, target=target, candidate=candidate, payload=payload,
             linker=linker,
         )
+
+        # Label detected protein variants as first-class normalized_entities
+        # (entity_type="protein_variant") for traceability. The actionable
+        # variant string is ALSO carried in referenced_inputs[id_type="variant"]
+        # above; downstream (Step 5/9) consumes the referenced_input.
+        for ref in referenced:
+            if ref.get("id_type") == "variant":
+                normalized_entities.append(
+                    {
+                        "original_text": ref["value"],
+                        "canonical_name": ref["value"],
+                        "entity_type": "protein_variant",
+                        "explicit_or_inferred": "explicit",
+                        "confidence": 0.9,
+                    }
+                )
 
         # Mentioned candidate/payload from decomposition can fill in gaps
         # the surface text didn't reveal. Mark them inferred via the
@@ -494,6 +603,7 @@ class MockLLMProvider:
             referenced=referenced,
             normalized_entities=normalized_entities,
             mentioned_drugs=mentioned_drugs,
+            wants_protein_generation=wants_protein_generation,
         )
         response = _compose_missing_slots_response(missing_slots)
         canonical_query = _compose_canonical_query(
@@ -901,6 +1011,10 @@ def _classify_primary_intent(
     has_pdb = "pdb_id" in ref_id_types
     has_zinc = "zinc_id" in ref_id_types
     has_chembl = "chembl_id" in ref_id_types
+    # A concrete protein point-mutation / variant reference (Step 2
+    # id_type="variant"/"mutation") signals a variant-evaluation / structure
+    # analysis task (AlphaMissense / DynaMut2 / ESM variant scoring).
+    has_variant = bool(ref_id_types & {"variant", "mutation"})
 
     primary = "unclear_or_needs_clarification"
     secondary: list[str] = []
@@ -937,10 +1051,12 @@ def _classify_primary_intent(
         confidence = 0.8
 
     # Structure analysis cues (PDB id, "structure", "validate", "interface")
-    elif has_pdb or any(
+    elif has_pdb or has_variant or any(
         kw in text for kw in (
             "structure analysis", "validate the structure", "structure of",
             "structural analysis", "interface analysis", "binding mode",
+            "variant scoring", "variant effect", "score the variant",
+            "point mutation", "missense",
         )
     ):
         primary = "structure_analysis"
@@ -1232,6 +1348,7 @@ def _compute_missing_slots(
     referenced: list[dict],
     normalized_entities: list[dict],
     mentioned_drugs: list[str],
+    wants_protein_generation: bool = False,
 ) -> list[dict]:
     """Mock missing_slots that follow the prompt's required_slot_schema.
 
@@ -1312,6 +1429,29 @@ def _compute_missing_slots(
                 "Which target, drug, or compound should we search for?",
             )
 
+    # Cross-cutting: protein generation requires an explicit prompt_sequence
+    # regardless of primary_intent. An ordinary heavy/light/target sequence
+    # (or any other referenced input) never satisfies it.
+    if wants_protein_generation:
+        has_valid_prompt_sequence = any(
+            isinstance(r, dict)
+            and (
+                (
+                    r.get("id_type") == "prompt_sequence"
+                    and looks_like_masked_prompt_sequence(r.get("value"))
+                )
+                or (r.get("id_type") == "uploaded_file" and r.get("source") == "prompt_sequence")
+            )
+            for r in referenced
+        )
+        if not has_valid_prompt_sequence:
+            _add(
+                "prompt_sequence", "sequence", "blocking", [primary_intent],
+                "Protein generation requires an explicit masked prompt_sequence.",
+                'Please provide the masked protein generation prompt '
+                '(containing "_" or "<mask>") you want ESM to complete.',
+            )
+
     return slots
 
 
@@ -1324,6 +1464,7 @@ _SLOT_PHRASES = {
     "pdb_id": "PDB ID",
     "uniprot_id": "UniProt ID",
     "smiles": "SMILES",
+    "prompt_sequence": 'masked protein generation prompt (containing "_" or "<mask>")',
     "task_intent": "workflow you want to run",
     "constraint": "constraints",
     "other": "additional details",
@@ -1418,6 +1559,66 @@ def _compose_canonical_query(
     detail = "; ".join(p for p in parts if p)
     text = head if not detail else f"{head} ({detail})."
     return text[:800]
+
+
+_PROMPT_SEQUENCE_LABEL_RE = re.compile(
+    r"prompt[_ ]sequence|masked\s+(?:protein\s+)?prompt|generation\s+prompt|"
+    r"sequence[_ ]completion\s+prompt",
+    re.IGNORECASE,
+)
+_PROTEIN_LIKE_TOKEN_RE = re.compile(r"\b[ACDEFGHIKLMNPQRSTVWY_]{6,}\b", re.IGNORECASE)
+
+
+def _detect_prompt_sequence_referenced_input(haystack: str, uploaded_files: list) -> dict | None:
+    """Mock stand-in for LLM semantic role recognition: does the user's own
+    text explicitly label an inline sequence or an uploaded file as the ESM
+    generation prompt_sequence / masked protein prompt?
+
+    Never inspects uploaded-file bytes — only query/context text (already in
+    `haystack`) and filename metadata. Mask-marker content validation for the
+    inline candidate is a separate, deterministic step
+    (`looks_like_masked_prompt_sequence`) applied uniformly to every
+    provider's output in
+    `supervisor_agent._normalize_prompt_sequence_references` — this function
+    only recognizes that a role was declared, exactly like every other
+    referenced-input detector in this mock.
+    """
+    if _PROMPT_SEQUENCE_LABEL_RE.search(haystack):
+        for token_match in _PROTEIN_LIKE_TOKEN_RE.finditer(haystack):
+            token = token_match.group(0)
+            has_mask = "_" in token or "<mask>" in token.lower()
+            letters_only = token.replace("_", "")
+            if not letters_only or not re.fullmatch(
+                r"[ACDEFGHIKLMNPQRSTVWY]+", letters_only, re.IGNORECASE
+            ):
+                continue
+            # A masked token (contains "_"/"<mask>") is unambiguous even
+            # short; an unmasked token must be long enough to not collide
+            # with ordinary short English words that happen to use only
+            # amino-acid letters (e.g. "Please", "Capitals").
+            min_len = 6 if has_mask else 12
+            if len(token) < min_len:
+                continue
+            return {"id_type": "prompt_sequence", "value": token, "source": "user"}
+        for f in uploaded_files or []:
+            if isinstance(f, dict) and f.get("file_id"):
+                return {
+                    "id_type": "uploaded_file",
+                    "value": f["file_id"],
+                    "source": "prompt_sequence",
+                }
+        return None
+    for f in uploaded_files or []:
+        if not isinstance(f, dict):
+            continue
+        filename = str(f.get("original_filename") or "").lower()
+        if "prompt" in filename and f.get("file_id"):
+            return {
+                "id_type": "uploaded_file",
+                "value": f["file_id"],
+                "source": "prompt_sequence",
+            }
+    return None
 
 
 def _uploaded_file_refs(files: list) -> list[dict]:

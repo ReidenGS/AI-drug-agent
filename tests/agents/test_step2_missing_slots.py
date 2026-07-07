@@ -546,3 +546,303 @@ def test_mock_canonical_query_no_leakage():
     cq = out.get("canonical_query") or ""
     assert heavy not in cq
     assert "api_key" not in cq.lower()
+
+
+# ── Step 2 prompt_sequence (ESM masked generation prompt) ──────────────────
+
+_HEAVY_CHAIN_SEQ = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
+_UNMASKED_TOKEN = "MKTAYIAKQNNVGA"
+_MASKED_TOKEN = "MKT_YIAKQNNVGA"
+
+
+def test_schema_accepts_prompt_sequence_missing_slot():
+    sq = _sq(
+        missing_slots=[
+            MissingSlot(
+                slot_name="prompt_sequence",
+                slot_category="sequence",
+                severity="blocking",
+                required_for=["unclear_or_needs_clarification"],
+                reason="Protein generation requires an explicit masked prompt_sequence.",
+                suggested_question="Please provide the masked protein generation prompt.",
+            )
+        ]
+    )
+    assert sq.missing_slots[0].slot_name == "prompt_sequence"
+    assert sq.missing_slots[0].severity == "blocking"
+
+
+def test_normalizer_accepts_prompt_sequence_slot_name_without_downgrading_to_other():
+    """`prompt_sequence` must survive `normalize_missing_slots` as itself —
+    it must never be coerced to the generic `other` slot_name."""
+    out = normalize_llm_payload_for_step2(
+        {
+            "missing_slots": [
+                {
+                    "slot_name": "prompt_sequence",
+                    "severity": "blocking",
+                    "reason": "no masked prompt provided",
+                }
+            ]
+        }
+    )
+    assert out["missing_slots"][0]["slot_name"] == "prompt_sequence"
+    assert out["missing_slots"][0]["slot_category"] == "sequence"
+
+
+def test_normalizer_keeps_uploaded_file_prompt_sequence_reference_untouched():
+    """Step 2 has no storage access — an uploaded_file entry explicitly
+    labeled `source="prompt_sequence"` is passed through unchanged; its
+    content (mask-marker presence) is validated later at Step 5."""
+    out = normalize_llm_payload_for_step2(
+        {
+            "referenced_inputs": [
+                {"id_type": "uploaded_file", "value": "f_prompt_1", "source": "prompt_sequence"},
+            ],
+        }
+    )
+    assert out["referenced_inputs"] == [
+        {"id_type": "uploaded_file", "value": "f_prompt_1", "source": "prompt_sequence"},
+    ]
+    assert not any(s["slot_name"] == "prompt_sequence" for s in out["missing_slots"])
+
+
+def test_normalizer_drops_inline_prompt_sequence_without_mask_marker_and_blocks():
+    """An inline `id_type="prompt_sequence"` value without "_"/"<mask>" must
+    never be treated as usable — it is dropped (never downgraded to a plain
+    sequence id_type) and a blocking missing_slot is raised."""
+    out = normalize_llm_payload_for_step2(
+        {"referenced_inputs": [{"id_type": "prompt_sequence", "value": _UNMASKED_TOKEN, "source": "user"}]},
+        {"raw_user_query": "Please generate a protein sequence.", "user_provided_context": {}},
+    )
+    assert out["referenced_inputs"] == []
+    slots = {s["slot_name"]: s for s in out["missing_slots"]}
+    assert slots["prompt_sequence"]["severity"] == "blocking"
+    assert any("dropped" in w and "prompt_sequence" in w for w in out["parse_warnings"])
+    assert _UNMASKED_TOKEN not in str(out["parse_warnings"])
+
+
+def test_normalizer_keeps_inline_prompt_sequence_with_mask_marker():
+    out = normalize_llm_payload_for_step2(
+        {"referenced_inputs": [{"id_type": "prompt_sequence", "value": _MASKED_TOKEN, "source": "user"}]},
+        {"raw_user_query": "Please generate a protein sequence.", "user_provided_context": {}},
+    )
+    assert out["referenced_inputs"] == [
+        {"id_type": "prompt_sequence", "value": _MASKED_TOKEN, "source": "user"}
+    ]
+    assert not any(s["slot_name"] == "prompt_sequence" for s in out["missing_slots"])
+
+
+def test_normalizer_no_blocking_slot_when_generation_not_requested():
+    out = normalize_llm_payload_for_step2(
+        {"referenced_inputs": []},
+        {"raw_user_query": "Assess developability of this antibody.", "user_provided_context": {}},
+    )
+    assert not any(s["slot_name"] == "prompt_sequence" for s in out["missing_slots"])
+
+
+def test_mock_ordinary_heavy_chain_sequence_with_generation_request_blocks_prompt_sequence():
+    out = _parse(
+        f"Please generate a protein sequence using this heavy chain {_HEAVY_CHAIN_SEQ} as reference"
+    )
+    slots = _slots_by_name(out)
+    assert slots["prompt_sequence"]["severity"] == "blocking"
+    assert not any(r.get("id_type") == "prompt_sequence" for r in out["referenced_inputs"])
+
+
+def test_mock_explicit_masked_inline_prompt_sequence_satisfies_slot():
+    out = _parse(f"Please generate a protein sequence. Use {_MASKED_TOKEN} as the prompt_sequence.")
+    slots = _slots_by_name(out)
+    assert "prompt_sequence" not in slots
+    refs = {(r["id_type"], r["value"]) for r in out["referenced_inputs"]}
+    assert ("prompt_sequence", _MASKED_TOKEN) in refs
+
+
+def test_mock_ordinary_developability_assessment_does_not_require_prompt_sequence():
+    out = _parse(f"Assess developability of this antibody heavy chain {_HEAVY_CHAIN_SEQ}")
+    slots = _slots_by_name(out)
+    assert "prompt_sequence" not in slots
+
+
+def test_full_supervisor_parse_uploaded_file_declared_prompt_sequence_not_blocking():
+    """Step 2 cannot read uploaded-file bytes; declaring a file as the
+    masked prompt is enough to satisfy the slot without inspecting it."""
+    agent = SupervisorAgent(llm=MockLLMProvider())
+    sq = agent.parse_raw_to_structured_query(
+        {
+            "run_id": "run_prompt_seq_file",
+            "run_artifact_registry_id": "reg_prompt_seq_file",
+            "artifact_id": "art_prompt_seq_file",
+            "created_at": "2026-07-06T00:00:00Z",
+            "raw_user_query": "Please generate a protein sequence using the attached masked prompt file.",
+            "user_provided_context": {},
+            "uploaded_files": [
+                {
+                    "file_id": "f_prompt_1",
+                    "original_filename": "generation_prompt.fasta",
+                    "storage_path": "adc_pilot/runs/x/inputs/files/f_prompt_1.fasta",
+                    "content_type": "text/x-fasta",
+                    "sha256": "d" * 64,
+                    "size_bytes": 128,
+                }
+            ],
+        }
+    )
+    blocking = [m for m in sq.missing_slots if m.severity == "blocking"]
+    assert not any(m.slot_name == "prompt_sequence" for m in blocking)
+    assert any(
+        r.get("id_type") == "uploaded_file" and r.get("source") == "prompt_sequence"
+        for r in sq.referenced_inputs
+    )
+
+
+def test_full_supervisor_parse_inline_prompt_sequence_without_mask_stays_blocking():
+    agent = SupervisorAgent(llm=MockLLMProvider())
+    sq = agent.parse_raw_to_structured_query(
+        {
+            "run_id": "run_prompt_seq_nomask",
+            "run_artifact_registry_id": "reg_prompt_seq_nomask",
+            "artifact_id": "art_prompt_seq_nomask",
+            "created_at": "2026-07-06T00:00:00Z",
+            "raw_user_query": f"Please generate a protein sequence. Use {_UNMASKED_TOKEN} as the prompt_sequence.",
+            "user_provided_context": {},
+            "uploaded_files": [],
+        }
+    )
+    blocking = [m for m in sq.missing_slots if m.severity == "blocking"]
+    assert any(m.slot_name == "prompt_sequence" for m in blocking)
+    assert not any(r.get("id_type") == "prompt_sequence" for r in sq.referenced_inputs)
+
+
+def test_mock_prompt_sequence_missing_slots_do_not_leak_raw_tokens():
+    out = _parse(
+        f"Please generate a protein sequence using this heavy chain {_HEAVY_CHAIN_SEQ} as reference"
+    )
+    blob = str(out["missing_slots"]) + str(out.get("response") or "")
+    assert _HEAVY_CHAIN_SEQ not in blob
+
+
+# ── Step 2 protein variant / point mutation structuring ──────────────────────
+
+_VARIANT_QUERY = (
+    "Evaluate the HER2 variant V777L using UniProt P04626. "
+    "Use variant scoring only; do not generate protein sequences."
+)
+
+
+def _refs_by_type(out: dict) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for ref in out.get("referenced_inputs") or []:
+        if isinstance(ref, dict):
+            grouped.setdefault(str(ref.get("id_type")), []).append(ref)
+    return grouped
+
+
+def test_mock_structures_uniprot_and_variant_referenced_inputs():
+    out = _parse(_VARIANT_QUERY)
+    grouped = _refs_by_type(out)
+    assert any(r["value"] == "P04626" for r in grouped.get("uniprot_id", []))
+    variants = grouped.get("variant", [])
+    assert len(variants) == 1
+    assert variants[0]["value"] == "V777L"
+    assert variants[0]["source"] == "user"
+
+
+def test_mock_labels_variant_as_protein_variant_entity():
+    out = _parse(_VARIANT_QUERY)
+    pv = [
+        e for e in out.get("normalized_entities") or []
+        if e.get("entity_type") == "protein_variant"
+    ]
+    assert pv and pv[0]["original_text"] == "V777L"
+
+
+def test_mock_variant_not_placed_in_mentioned_entities():
+    out = _parse(_VARIANT_QUERY)
+    mentioned = out.get("mentioned_entities") or {}
+    blob = str(mentioned)
+    assert "V777L" not in blob
+    # HER2 remains the target; the variant is not the target/antibody/payload.
+    assert mentioned.get("antibody_candidate_text") in (None, "")
+    assert mentioned.get("payload_text") in (None, "")
+
+
+def test_normalizer_does_not_crash_on_protein_variant_entity_and_derives_variant():
+    """A real-LLM payload that labels the mention entity_type="protein_variant"
+    but omits the typed referenced_input must NOT raise, and the normalizer
+    derives the stable id_type="variant" referenced_input."""
+    out = normalize_llm_payload_for_step2(
+        {
+            "task_intent": {"task_type": "structure_analysis"},
+            "normalized_entities": [
+                {
+                    "original_text": "V777L",
+                    "canonical_name": "V777L",
+                    "entity_type": "protein_variant",
+                    "explicit_or_inferred": "explicit",
+                }
+            ],
+            "referenced_inputs": [],
+        }
+    )
+    variants = _refs_by_type(out).get("variant", [])
+    assert variants and variants[0]["value"] == "V777L"
+    # entity_type survives (schema now allows protein_variant).
+    assert out["normalized_entities"][0]["entity_type"] == "protein_variant"
+
+
+def test_normalizer_canonicalizes_variant_id_type_aliases():
+    out = normalize_llm_payload_for_step2(
+        {
+            "task_intent": {"task_type": "structure_analysis"},
+            "referenced_inputs": [
+                {"id_type": "protein_variant", "value": "V777L", "source": "user"},
+            ],
+        }
+    )
+    grouped = _refs_by_type(out)
+    assert "protein_variant" not in grouped
+    assert grouped["variant"][0]["value"] == "V777L"
+
+
+def test_normalizer_variant_derivation_is_idempotent_no_duplicates():
+    payload = {
+        "task_intent": {"task_type": "structure_analysis"},
+        "normalized_entities": [
+            {
+                "original_text": "V777L",
+                "entity_type": "protein_variant",
+                "explicit_or_inferred": "explicit",
+            }
+        ],
+        "referenced_inputs": [
+            {"id_type": "variant", "value": "V777L", "source": "user"},
+        ],
+    }
+    out = normalize_llm_payload_for_step2(payload)
+    assert len(_refs_by_type(out).get("variant", [])) == 1
+
+
+def test_full_supervisor_parse_structures_variant_without_crash():
+    agent = SupervisorAgent(llm=MockLLMProvider())
+    sq = agent.parse_raw_to_structured_query(
+        {
+            "run_id": "run_variant",
+            "run_artifact_registry_id": "reg_variant",
+            "artifact_id": "art_variant",
+            "created_at": "2026-07-06T00:00:00Z",
+            "raw_user_query": _VARIANT_QUERY,
+            "user_provided_context": {},
+            "uploaded_files": [],
+        }
+    )
+    by_type = {r["id_type"]: r for r in sq.referenced_inputs if isinstance(r, dict)}
+    assert by_type["uniprot_id"]["value"] == "P04626"
+    assert by_type["variant"]["value"] == "V777L"
+    # protein_variant entity type is preserved through the strict schema.
+    assert any(e.entity_type == "protein_variant" for e in sq.normalized_entities)
+
+
+def test_step2_prompt_documents_variant_referenced_input():
+    assert '"id_type": "variant"' in SUPERVISOR_SYSTEM_PROMPT
+    assert "V777L" in SUPERVISOR_SYSTEM_PROMPT

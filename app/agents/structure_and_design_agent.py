@@ -13,14 +13,14 @@ tool-calling agent. The three entry points are:
   validation/refinement lookup, and deferred complex-prediction audit.
   Raw outputs are referenced via `output_artifacts[]` and stored under
   `tool_outputs/step_08/{tool_call_id}.json`.
-- `run_step_9(run_id)` — compound library screening for compound-component
-  candidates. Routes to ZINC tools when SMILES, ZINC id, or compound name is
-  present. **No record claims `ZINC22` confirmation**; `source_library` stays
-  `"ZINC"` and `source_database_version` stays `"unknown"`.
+- `run_step_9(run_id)` — structural variant generation/evaluation planning
+  audit for protein-design and variant-evaluation lanes. Legacy compound
+  artifact fields are retained for compatibility.
 
 Hard constraints (architecture v0.1):
-- RFdiffusion `contigs_dsl` is NOT generated freely by this agent. Step 9
-  protein-design lane is not part of the MVP; see TODO at bottom.
+- RFdiffusion `contigs_dsl` is NOT generated freely by this agent.
+- Step 9 currently records readiness and Stage 1/2 audit only; it does not
+  execute protein/variant MCP tools yet.
 - All MCP calls go through the inventory-scoped client. Raw payloads NEVER
   appear inside normalized records.
 """
@@ -35,11 +35,14 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Optional
 
-from ..agents.tool_selection_policy import (
-    SelectionContext,
-    ToolInvocationPlan,
-    select_and_build_invocations,
+from ..agents.step_09_available_fields import project_step9_readiness
+from ..agents.step_09_input_projection import project_step9_inputs
+from ..agents.step_09_selection_policy import (
+    select_step9_stage1_tools,
+    select_step9_stage2_mappings,
 )
+from ..agents.step_09_runtime_planner import plan_step9_runtime_execution
+from ..agents.step_09_runtime_execution import resolve_step9_execution_requests
 from ..llm.provider import LLMProvider, MockLLMProvider
 from ..mcp.client import MCPClient
 from ..schemas.common import ToolCallRecord
@@ -1476,75 +1479,156 @@ class StructureAndDesignAgent:
         cct = self.storage.read_json(
             self.storage.run_key(run_id, "candidate_context_table.json")
         )
-        compound_candidates = [
-            c for c in cct.get("candidate_records") or []
-            if c.get("candidate_type") == "compound_component"
-        ]
+        try:
+            step7_pkg = self.storage.read_json(
+                self.storage.run_key(run_id, "prepared_structure_input_package.json")
+            )
+        except FileNotFoundError:
+            step7_pkg = {}
+        try:
+            step8_artifact = self.storage.read_json(
+                self.storage.run_key(run_id, "structure_prediction_and_interface_results.json")
+            )
+        except FileNotFoundError:
+            step8_artifact = None
+
+        try:
+            raw_request = self.storage.read_json(self.storage.run_key(run_id, "inputs/raw_request_record.json"))
+        except FileNotFoundError:
+            raw_request = {}
+        try:
+            structured_query = self.storage.read_json(
+                self.storage.run_key(run_id, "inputs/structured_query.json")
+            )
+        except FileNotFoundError:
+            structured_query = {}
+
+        compound_context_text = str(
+            structured_query.get("canonical_query")
+            or raw_request.get("raw_user_query")
+            or ""
+        )
+
+        # Legacy hard-gate readiness projection: retained for backward-
+        # compatible audit fields only (step9_hard_gate_*, step9_available_fields,
+        # readiness summaries). It no longer drives Stage 1 catalog, Stage 2
+        # mapping, or runtime planning — see `step9_input_projection` below.
+        readiness_projection = project_step9_readiness(
+            candidate_context_table=cct,
+            prepared_structure_input_package=step7_pkg,
+            structure_prediction_and_interface_results=step8_artifact,
+            compound_context_text=compound_context_text,
+        )
+
+        # Step9InputProjection: the SINGLE centralized, deterministic layer
+        # that understands raw Step 5/7/8/query artifact shapes for Step 9.
+        # Stage 1, Stage 2, and the runtime planner consume only this
+        # projection's `input_fields` / summaries from here on.
+        input_projection = project_step9_inputs(
+            candidate_context_table=cct,
+            prepared_structure_input_package=step7_pkg,
+            structure_prediction_and_interface_results=step8_artifact,
+            structured_query=structured_query,
+            raw_request=raw_request,
+        )
+        stage1_selection = select_step9_stage1_tools(
+            llm=self.llm,
+            projection=input_projection,
+            candidate_id="all_candidates",
+        )
+        stage2_mapping = select_step9_stage2_mappings(
+            llm=self.llm,
+            projection=input_projection,
+            selected_tools=stage1_selection.selected_tools,
+            candidate_id="all_candidates",
+        )
+        runtime_plan = plan_step9_runtime_execution(
+            mapped_tools=stage2_mapping.mapped_tools,
+            input_fields=input_projection["input_fields"],
+        )
+
+        # Real MCP execution: resolve the runtime-planner's kwargs CONTRACT
+        # (placeholders/literals only) into real values via each field's
+        # `runtime_lookup`, then invoke every resolved Step 9 active tool.
+        # Gate is exactly: LLM-selected (Stage 1) -> Stage 2 can_invoke=True
+        # -> runtime-plan can_resolve=True -> real value resolution succeeds.
+        # Hard-gate allowed/blocked never participates in this decision.
+        execution_requests = resolve_step9_execution_requests(
+            kwargs_contracts=runtime_plan["step9_runtime_kwargs_contracts"],
+            input_fields=input_projection["input_fields"],
+            candidate_context_table=cct,
+            prepared_structure_input_package=step7_pkg,
+            structure_prediction_and_interface_results=step8_artifact,
+            storage=self.storage,
+        )
 
         tool_calls: list[ToolCallRecord] = []
         hits: list[CompoundHit] = []
-        any_real_attempt = False
-        any_partial = False
+        executed_tool_names: list[str] = []
+        execution_records: list[dict[str, Any]] = []
+        any_success = False
+        any_failure = False
+        any_attempted = False
 
-        for cand in compound_candidates:
-            smiles_mats = _materials_by_type(cand, {"payload_smiles", "linker_smiles", "compound_smiles"})
-            name_mats = _materials_by_type(cand, {"payload_name", "linker_name", "compound_name"})
-            zinc_idents = _identifiers_by_type(cand, {"zinc_id"})
-            chembl_idents = _identifiers_by_type(cand, {"chembl_id"})
-            pubchem_idents = _identifiers_by_type(cand, {"pubchem_cid"})
-
-            if not (smiles_mats or name_mats or zinc_idents or chembl_idents or pubchem_idents):
+        for request in execution_requests:
+            tool_name = request["tool_name"]
+            lane_type = request["lane_type"]
+            if not request["can_execute"]:
+                execution_records.append(
+                    {
+                        "tool_name": tool_name,
+                        "lane_type": lane_type,
+                        "run_status": "skipped",
+                        "skip_reason": request.get("skip_reason") or "runtime_value_resolution_failed",
+                        "unresolved_reasons": list(request.get("unresolved_reasons") or []),
+                        "tool_call_id": None,
+                    }
+                )
                 continue
 
-            context = _compound_selection_context(cand)
-            plans = select_and_build_invocations(
-                agent_name=_AGENT_NAME,
+            any_attempted = True
+            tc = self._call_tool(
+                run_id=run_id,
                 step_id=_STEP_09,
-                mcp_client=self.mcp_client,
-                llm=self.llm,
-                context=context,
-                deterministic_fallback=lambda c=cand: _compound_fallback_plans(c),
-                deterministic_argument_mapping=_compound_argument_mapping,
+                tool_name=tool_name,
+                kwargs=request["kwargs"] or {},
+                output_dir="step_09",
+                label=f"step09:{tool_name}",
+                extra_input_summary={"lane_type": lane_type},
+                persisted_input=request["kwargs_redacted_summary"],
             )
-            if not plans:
-                plans = _compound_fallback_plans(cand)
+            tool_calls.append(tc)
+            executed_tool_names.append(tool_name)
+            execution_records.append(
+                {
+                    "tool_name": tool_name,
+                    "lane_type": lane_type,
+                    "run_status": tc.run_status,
+                    "tool_call_id": tc.tool_call_id,
+                    "tool_output_ref": tc.tool_output_ref,
+                }
+            )
+            if tc.run_status == "success":
+                any_success = True
+            elif tc.run_status in {"failed", "dependency_unavailable"}:
+                any_failure = True
 
-            for plan in plans:
-                if plan.validation_status == "skipped":
-                    tc = _skipped_tool_record(
-                        tool_name=plan.tool_name,
-                        agent_name=_AGENT_NAME,
-                        step_id=_STEP_09,
-                        summary={
-                            "label": f"compound:{cand.get('candidate_label')}",
-                            **_selection_summary(plan),
-                        },
-                    )
-                    tool_calls.append(tc)
-                    any_partial = True
-                    continue
-                tc = self._call_tool(
-                    run_id=run_id,
-                    step_id=_STEP_09,
-                    tool_name=plan.tool_name,
-                    kwargs=plan.arguments,
-                    output_dir="step_09",
-                    label=f"compound:{cand.get('candidate_label')}",
-                    extra_input_summary=_selection_summary(plan),
-                )
-                tool_calls.append(tc)
-                any_real_attempt = True
-                if tc.run_status == "success":
-                    hits.append(_compound_hit_from_call(cand, tc, plan.arguments, plan.tool_name))
-                else:
-                    any_partial = True
-
-        if not any_real_attempt:
-            screening_status = "skipped"
-        elif any_partial or not hits:
+        if any_success and not any_failure:
+            screening_status = "ok"
+        elif any_success and any_failure:
+            screening_status = "partial"
+        elif any_attempted:
+            # Attempted (invoked) at least one tool but got zero success —
+            # honest partial, never a misleading clean skip.
             screening_status = "partial"
         else:
-            screening_status = "ok"
+            # Nothing was selected, nothing was resolvable, or nothing was
+            # actually invokable this run.
+            screening_status = "skipped"
+
+        runtime_execution_mode = (
+            "executed" if any_attempted else runtime_plan["step9_runtime_execution_mode"]
+        )
 
         artifact = CompoundScreeningArtifact(
             run_id=run_id,
@@ -1552,6 +1636,47 @@ class StructureAndDesignAgent:
             screening_status=screening_status,  # type: ignore[arg-type]
             compound_hits=hits,
             tool_call_records=tool_calls,
+            step9_available_fields=readiness_projection["step9_available_fields"],
+            step9_readiness_summary=readiness_projection["step9_readiness_summary"],
+            step9_lane_statuses=readiness_projection["step9_lane_statuses"],
+            protein_design_readiness=readiness_projection["protein_design_readiness"],
+            variant_evaluation_readiness=readiness_projection["variant_evaluation_readiness"],
+            compound_screening_readiness=readiness_projection["compound_screening_readiness"],
+            step9_hard_gate_allowed_tools=readiness_projection["step9_hard_gate_allowed_tools"],
+            step9_hard_gate_blocked_tools_with_reason=readiness_projection["step9_hard_gate_blocked_tools_with_reason"],
+            step9_tool_schema_requirements=readiness_projection["step9_tool_schema_requirements"],
+            step9_stage1_catalog_tool_names=stage1_selection.catalog_tool_names,
+            step9_stage1_selected_tools=[
+                item.model_dump() for item in stage1_selection.selected_tools
+            ],
+            step9_stage1_rejected_tools_with_reason=stage1_selection.rejected_tools_with_reason,
+            step9_stage1_selection_source=stage1_selection.selection_source,
+            step9_stage1_prompt_cache_layout_version=stage1_selection.prompt_cache_layout_version,
+            step9_stage2_schema_survivors=stage2_mapping.schema_survivors,
+            step9_stage2_mapped_tools=[
+                item.model_dump() for item in stage2_mapping.mapped_tools
+            ],
+            step9_stage2_uninvokable_tools=stage2_mapping.uninvokable_tools,
+            step9_stage2_uninvokable_tool_details=stage2_mapping.uninvokable_tool_details,
+            step9_stage2_argument_mapping_audit=stage2_mapping.argument_mapping_audit,
+            step9_stage2_prompt_cache_layout_version=stage2_mapping.prompt_cache_layout_version,
+            step9_runtime_execution_plan=runtime_plan["step9_runtime_execution_plan"],
+            step9_runtime_resolved_tools=runtime_plan["step9_runtime_resolved_tools"],
+            step9_runtime_unresolved_tools=runtime_plan["step9_runtime_unresolved_tools"],
+            step9_runtime_resolver_audit=runtime_plan["step9_runtime_resolver_audit"],
+            step9_runtime_kwargs_contracts=runtime_plan["step9_runtime_kwargs_contracts"],
+            step9_runtime_kwargs_contract_audit=runtime_plan["step9_runtime_kwargs_contract_audit"],
+            step9_runtime_execution_mode=runtime_execution_mode,
+            step9_missing_inputs=readiness_projection["step9_missing_inputs"],
+            step9_input_fields=input_projection["input_fields"],
+            step9_input_projection_summary={
+                "candidate_summaries": input_projection["candidate_summaries"],
+                "handoff_summary": input_projection["handoff_summary"],
+                "query_summary": input_projection["query_summary"],
+            },
+            step9_projection_missing_inputs=input_projection["missing_inputs"],
+            step9_runtime_executed_tools=executed_tool_names,
+            step9_runtime_execution_records=execution_records,
         )
 
         artifact_id = new_artifact_id("compound_screening_artifact")
@@ -3940,102 +4065,10 @@ def _compact_structure_refs_for_audit(structure_refs: list[Any]) -> list[dict[st
     return out
 
 
-def _compound_hit_from_call(candidate: dict, tc: ToolCallRecord, kwargs: dict, tool_name: str) -> CompoundHit:
-    """Build a normalized CompoundHit. Raw payload stays at `tool_output_ref`."""
-    smiles = kwargs.get("smiles") or _materials_by_type(candidate, {"payload_smiles", "linker_smiles", "compound_smiles"})
-    if isinstance(smiles, list):
-        smiles = (smiles[0] if smiles else {}).get("value", "")
-    return CompoundHit(
-        compound_id=new_artifact_id("compound_hit"),
-        # Wrapper currently hits ZINC15 (per architecture audit). We record
-        # the family (`ZINC`) and an honest version (`unknown`) so no record
-        # ever claims `ZINC22` confirmation.
-        source_library="ZINC",
-        smiles=str(smiles or ""),
-        similarity_score=None,
-        source_database_version="unknown",
-        source_tool_name=tool_name,
-        source_runtime_status="success",
-        notes=f"raw payload at tool_output_ref={tc.tool_output_ref}",
-    )
-
-
 def _short(v: Any) -> Any:
     if isinstance(v, str) and len(v) > 200:
         return v[:200] + "…"
     return v
-
-
-def _compound_selection_context(candidate: dict) -> SelectionContext:
-    smiles = _first_material_value(candidate.get("materials") or [], {"payload_smiles", "linker_smiles", "compound_smiles"})
-    name = _first_material_value(candidate.get("materials") or [], {"payload_name", "linker_name", "compound_name"})
-    zinc_id = _first_identifier_value(candidate.get("identifiers") or [], {"zinc_id"})
-    chembl_id = _first_identifier_value(candidate.get("identifiers") or [], {"chembl_id"})
-    pubchem_cid = _first_identifier_value(candidate.get("identifiers") or [], {"pubchem_cid"})
-    return SelectionContext(
-        signals={
-            "smiles": bool(smiles),
-            "compound_name": bool(name),
-            "zinc_id": bool(zinc_id),
-            "chembl_id": bool(chembl_id),
-            "pubchem_cid": bool(pubchem_cid),
-        },
-        arg_hints={
-            k: v for k, v in {
-                "smiles": smiles,
-                "query": name or smiles,
-                "zinc_id": zinc_id,
-                "chembl_id": chembl_id,
-                "pubchem_cid": pubchem_cid,
-                "compound_name": name,
-            }.items() if v
-        },
-        note=f"step_09 compound candidate_id={candidate.get('candidate_id', '')}",
-    )
-
-
-def _compound_fallback_plans(candidate: dict) -> list[ToolInvocationPlan]:
-    smiles = _first_material_value(candidate.get("materials") or [], {"payload_smiles", "linker_smiles", "compound_smiles"})
-    name = _first_material_value(candidate.get("materials") or [], {"payload_name", "linker_name", "compound_name"})
-    zinc_id = _first_identifier_value(candidate.get("identifiers") or [], {"zinc_id"})
-    raw: list[tuple[str, dict[str, Any]]] = []
-    if smiles:
-        raw.append(("ZINC_search_by_smiles", {"smiles": smiles}))
-    if zinc_id:
-        raw.append(("ZINC_get_compound", {"zinc_id": zinc_id}))
-    if not raw and name:
-        raw.append(("ZINC_search_compounds", {"query": name}))
-    return [
-        ToolInvocationPlan(
-            tool_name=tool,
-            selection_reason="deterministic Step 9 compound fallback",
-            arguments=args,
-            argument_construction_reason="deterministic compound argument mapping",
-            selected_by="deterministic_fallback",
-        )
-        for tool, args in raw
-    ]
-
-
-def _compound_argument_mapping(tool_name: str, arg_hints: dict) -> dict[str, Any]:
-    if tool_name == "ZINC_search_by_smiles":
-        return {"smiles": arg_hints.get("smiles") or ""}
-    if tool_name == "ZINC_get_compound":
-        return {"zinc_id": arg_hints.get("zinc_id") or ""}
-    if tool_name == "ZINC_search_compounds":
-        return {"query": arg_hints.get("query") or arg_hints.get("compound_name") or ""}
-    return {"query": arg_hints.get("query") or arg_hints.get("compound_name") or arg_hints.get("smiles") or ""}
-
-
-def _selection_summary(plan: ToolInvocationPlan) -> dict[str, Any]:
-    return {
-        "selected_by": plan.selected_by,
-        "selection_reason": plan.selection_reason,
-        "selection_policy_version": plan.selection_policy_version,
-        "argument_construction_reason": plan.argument_construction_reason,
-        "validation_status": plan.validation_status,
-        "validation_warnings": plan.validation_warnings,
-    }
 
 
 def _apply_step7_tool_output_metadata(
@@ -4402,17 +4435,3 @@ def _nonexecuted_tool_record(
         tool_input_summary=summary,
         error_message=f"tool invocation not executed: {run_status}",
     )
-
-
-
-def _first_material_value(materials: list[dict], types: set[str]) -> Optional[str]:
-    for m in materials:
-        if m.get("material_type") in types and m.get("value"):
-            return str(m.get("value"))
-    return None
-
-def _first_identifier_value(identifiers: list[dict], types: set[str]) -> Optional[str]:
-    for i in identifiers:
-        if i.get("id_type") in types and i.get("id_value"):
-            return str(i.get("id_value"))
-    return None

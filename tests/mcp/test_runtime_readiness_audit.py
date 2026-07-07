@@ -326,27 +326,115 @@ def test_step9_alphamissense_live_path(monkeypatch, install_universe):
     }
 
 
-@pytest.mark.parametrize(
-    "tool_name",
-    [
+# P2 migration: DynaMut2 / ESM_generate / NvidiaNIM_rfdiffusion /
+# NvidiaNIM_proteinmpnn are thin ToolUniverse adapter bindings. ESM_score uses
+# a direct official Biohub ESM SDK wrapper and is tested separately below.
+_STEP9_TU_WIRED_CASES = [
+    (
         "DynaMut2_predict_stability",
-        "ESM_generate_protein_sequence",
-        "ESM_score_variant_sae_batch",
-    ],
-)
-def test_step9_deferred_tools_never_reach_universe(
-    monkeypatch, install_universe, tool_name
-):
-    fake = install_universe(tools={tool_name: lambda args: {"silent": "success"}})
+        {"operation": "predict_stability", "pdb_id": "1N8Z", "chain": "A", "mutation": "V777L"},
+    ),
+    ("ESM_generate_protein_sequence", {"prompt_sequence": "MKTAYIAK"}),
+    ("NvidiaNIM_rfdiffusion", {"contigs": "A:1-10", "input_pdb": "run/structure.pdb"}),
+    ("NvidiaNIM_proteinmpnn", {"input_pdb": "run/structure.pdb"}),
+]
+
+
+@pytest.mark.parametrize("tool_name,kwargs", _STEP9_TU_WIRED_CASES)
+def test_step9_tu_wired_tools_live_path(monkeypatch, install_universe, tool_name, kwargs):
+    fake = install_universe(tools={tool_name: lambda args: {"ok": True, **args}})
     _set_live(monkeypatch, allowlist=tool_name)
     client = LocalMCPClient()
     res = client.call_tool(
         agent_name="structure_and_design_agent",
         step_id="step_09",
         tool_name=tool_name,
+        **kwargs,
+    )
+    assert res["run_status"] == "success"
+    assert res["executor"] == "tooluniverse"
+    assert fake.calls[0]["arguments"] == kwargs
+
+
+def test_step9_esm_score_live_path_uses_biohub_sdk(monkeypatch):
+    from app.mcp.tools import variant as variant_module
+
+    calls: list[str] = []
+
+    class FakeProtein:
+        def __init__(self, *, sequence):
+            self.sequence = sequence
+
+    class FakeSAEConfig:
+        def __init__(self, *, models, normalize_features):
+            self.models = models
+            self.normalize_features = normalize_features
+
+    class FakeLogitsConfig:
+        def __init__(self, *, sequence, sae_config):
+            self.sequence = sequence
+            self.sae_config = sae_config
+
+    class FakeClient:
+        def __init__(self, *, model, token):
+            calls.append(f"client:{model}:{bool(token)}")
+
+        def encode(self, protein):
+            calls.append("encode")
+            return {"tensor": protein.sequence}
+
+        def logits(self, tensor, config):
+            calls.append("logits")
+            matrix = [[0.0, 0.0, 0.0] for _ in range(len(tensor["tensor"]) + 2)]
+            matrix[2][1] = 1.0
+            matrix[2][2] = 3.0
+            return {"logits": {"sequence": matrix}}
+
+    class FakeTokenizer:
+        def encode(self, value, add_special_tokens=False):
+            return {"K": [1], "L": [2]}[value]
+
+    monkeypatch.setenv("ESM_API_KEY", "secret-esm-key")
+    monkeypatch.setattr(
+        variant_module,
+        "_load_esm_sdk_classes",
+        lambda: (FakeProtein, FakeLogitsConfig, FakeSAEConfig, FakeClient),
+    )
+    monkeypatch.setattr(variant_module, "_load_esm_sequence_tokenizer", lambda: FakeTokenizer())
+    _set_live(monkeypatch, allowlist="ESM_score_variant_sae_batch")
+    res = LocalMCPClient().call_tool(
+        agent_name="structure_and_design_agent",
+        step_id="step_09",
+        tool_name="ESM_score_variant_sae_batch",
+        sequence="MKTAYIAK",
+        variants=[{"position": 2, "ref_aa": "K", "alt_aa": "L"}],
+    )
+    assert res["run_status"] == "success"
+    assert res["executor"] == "biohub_esm_sdk"
+    assert calls == ["client:esmc-6b-2024-12:True", "encode", "logits"]
+    assert res["payload"]["variant_scores"][0]["delta_logit"] == 2.0
+    payload_blob = repr(res["payload"])
+    assert "MKTAYIAK" not in payload_blob
+    assert "secret-esm-key" not in payload_blob
+
+
+@pytest.mark.parametrize("tool_name,kwargs", _STEP9_TU_WIRED_CASES)
+def test_step9_tu_wired_tools_live_disabled_stays_dependency_unavailable(
+    monkeypatch, install_universe, tool_name, kwargs
+):
+    """Live OFF: the wrapper's own `_live=False` guard still fires (via
+    `LocalMCPClient` catching `NotImplementedError`) — no silent mock
+    success, and the fake universe records zero calls."""
+    fake = install_universe(tools={tool_name: lambda args: {"ok": True, **args}})
+    _set_live(monkeypatch, enable=False)
+    client = LocalMCPClient()
+    res = client.call_tool(
+        agent_name="structure_and_design_agent",
+        step_id="step_09",
+        tool_name=tool_name,
+        **kwargs,
     )
     assert res["run_status"] == "dependency_unavailable"
-    assert res["executor"] == "deferred"
     assert fake.calls == []
 
 
@@ -546,7 +634,7 @@ def test_executor_unknown_when_wrapper_returns_non_dict(install_universe):
 
     sf.AGENT_STEP_MAP.setdefault("__audit__", set()).add("step_99")
     try:
-        client._bindings["NonDictTool"] = lambda: "plain-string"
+        client._bindings["NonDictTool"] = lambda **kw: "plain-string"
         res = client.call_tool(
             agent_name="__audit__",
             step_id="step_99",

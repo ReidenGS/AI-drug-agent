@@ -12,9 +12,15 @@ from app.services.workflow_state_service import WorkflowStateService
 
 
 @pytest.fixture(autouse=True)
-def _default_test_llm_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep tests deterministic even when a local .env enables Gemini."""
+def _default_test_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep tests deterministic even when a local .env enables live providers."""
+    from app.settings import get_settings
+
     monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("MCP_LIVE_TOOLS", "false")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture

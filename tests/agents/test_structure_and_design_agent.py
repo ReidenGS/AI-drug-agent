@@ -24,6 +24,7 @@ from app.services.intake_service import IntakeService
 from app.services.structured_query_service import StructuredQueryService
 from app.services.tool_inventory_service import ToolInventoryService
 from app.services.workflow_setup_service import WorkflowSetupService
+from app.settings import get_settings
 from app.utils.errors import WorkflowStateError
 
 
@@ -3455,17 +3456,16 @@ def test_step8_prediction_model_ref_rejects_raw_or_generic_outputs(local_storage
 
 # ── Step 9 ──────────────────────────────────────────────────────────────────
 
-def test_step9_smiles_triggers_zinc_search_by_smiles(
+def test_step9_smiles_does_not_trigger_zinc_or_chembl(
     local_storage, registry_service, workflow_state_service
 ):
-    """Step 5 picks up a SMILES referenced_input → payload_smiles material;
-    Step 9 routes that to ZINC_search_by_smiles. The normalized record stays
-    raw-free and never claims ZINC22."""
+    """Compound payloads are legacy context, not active Step 9 tools."""
     run_id = _seed(
         local_storage, registry_service, workflow_state_service,
         referenced_inputs=[
             {"id_type": "smiles", "value": "CC(=O)NCCC1=CN(c2ccc(O)cc2)C(=O)C1",
              "source": "raw_request_text"},
+            {"id_type": "compound_name", "value": "example payload", "source": "raw_request_text"},
         ],
     )
     agent = StructureAndDesignAgent(
@@ -3475,24 +3475,21 @@ def test_step9_smiles_triggers_zinc_search_by_smiles(
     artifact = agent.run_step_9(run_id)
 
     tool_names = {tc.tool_name for tc in artifact.tool_call_records}
-    assert "ZINC_search_by_smiles" in tool_names
+    assert not any(name.startswith(("ZINC_", "ChEMBL_")) for name in tool_names)
+    assert artifact.tool_call_records == []
+    assert artifact.compound_hits == []
+    assert artifact.screening_status == "skipped"
+    assert artifact.compound_screening_readiness.status == "not_applicable"
 
-    # No record claims ZINC22.
-    for hit in artifact.compound_hits:
-        assert hit.source_library in {"ZINC", "ZINC15"}  # never "ZINC22"
-        assert hit.source_database_version != "ZINC22"
-        # The mock wrapper records its source as ZINC15 family; the agent's
-        # honest default for unverified upstream is `unknown`.
-        assert hit.source_database_version in {"unknown", "ZINC15"}
-
-    # Raw payload (mocked envelope contains "status: mocked", "hits: ...")
-    # must not bleed into compound_hits.
-    cand_blob = json.dumps([h.model_dump() for h in artifact.compound_hits])
-    assert "mocked" not in cand_blob
-    assert "ZINC_search_by_smiles" not in cand_blob or True  # source_tool_name is allowed
+    exposed_names = set(artifact.step9_stage1_catalog_tool_names)
+    exposed_names.update(item.get("tool_name", "") for item in artifact.step9_stage1_selected_tools)
+    exposed_names.update(artifact.step9_stage2_schema_survivors)
+    exposed_names.update(item.get("tool_name", "") for item in artifact.step9_stage2_mapped_tools)
+    assert not any(name.startswith(("ZINC_", "ChEMBL_")) for name in exposed_names)
+    assert "CC(=O)NCCC1=CN" not in json.dumps(artifact.model_dump())
 
 
-def test_step9_zinc_id_triggers_zinc_get_compound(
+def test_step9_zinc_id_does_not_trigger_zinc_get_compound(
     local_storage, registry_service, workflow_state_service
 ):
     run_id = _seed(
@@ -3507,14 +3504,17 @@ def test_step9_zinc_id_triggers_zinc_get_compound(
     )
     artifact = agent.run_step_9(run_id)
     tool_names = {tc.tool_name for tc in artifact.tool_call_records}
-    assert "ZINC_get_compound" in tool_names
+    assert "ZINC_get_compound" not in tool_names
+    assert not any(name.startswith(("ZINC_", "ChEMBL_")) for name in tool_names)
+    assert artifact.tool_call_records == []
+    assert artifact.compound_hits == []
+    assert artifact.compound_screening_readiness.status == "not_applicable"
 
-    # No record defaults to ZINC22.
     blob = json.dumps(artifact.model_dump())
     assert "ZINC22" not in blob
 
 
-def test_step9_dependency_unavailable_marks_partial_not_crash(
+def test_step9_compound_tool_dependencies_are_not_called(
     local_storage, registry_service, workflow_state_service
 ):
     from app.mcp.tools._registry import _all_bindings
@@ -3544,10 +3544,336 @@ def test_step9_dependency_unavailable_marks_partial_not_crash(
         workflow_state=workflow_state_service, mcp_client=mcp,
     )
     artifact = agent.run_step_9(run_id)
-    assert artifact.screening_status in {"partial", "failed", "skipped"}
-    statuses = [tc.run_status for tc in artifact.tool_call_records]
-    assert "dependency_unavailable" in statuses
+    assert artifact.screening_status == "skipped"
+    assert artifact.tool_call_records == []
+    assert artifact.compound_hits == []
+    assert artifact.compound_screening_readiness.status == "not_applicable"
 
+
+class _Step9RuntimePlannerLLM:
+    name = "step9-runtime-planner-test"
+    model = "step9-runtime-planner-test"
+
+    def generate(self, prompt: str, *, system: str | None = None, **kwargs):
+        raise NotImplementedError
+
+    def generate_json(self, prompt: str, *, schema: dict, system: str | None = None) -> dict:
+        task = schema.get("task")
+        if task == "step9_tool_selection_stage_1":
+            return {
+                "selections": [
+                    {
+                        "tool_name": "AlphaMissense_get_variant_score",
+                        "lane_type": "variant_evaluation",
+                        "selection_reason": "variant score requested",
+                    }
+                ]
+            }
+        if task == "step9_tool_schema_mapping_stage_2":
+            return {
+                "tools": [
+                    {
+                        "tool_name": "AlphaMissense_get_variant_score",
+                        "lane_type": "variant_evaluation",
+                        "can_invoke": True,
+                        "argument_mappings": [
+                            {
+                                "schema_arg": "uniprot_id",
+                                "field_ref": "identifier:uniprot_id:P04626",
+                            },
+                            {
+                                "schema_arg": "variant",
+                                "field_ref": "identifier:variant:V777L",
+                            },
+                        ],
+                        "argument_literals": [],
+                        "missing_required_fields": [],
+                        "skip_reason": "",
+                        "argument_mapping_reason": "test stage2 mapping",
+                    }
+                ]
+            }
+        return {}
+
+
+def test_step9_runtime_planner_executes_resolved_tool_via_mcp_client(
+    local_storage, registry_service, workflow_state_service, monkeypatch
+):
+    """Turn C: a selected + Stage2 can_invoke=True + runtime-resolved tool is
+    actually executed via `mcp_client.call_tool`, with real resolved values
+    used only for the call — never persisted into the normalized artifact."""
+    raw_sequence = "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK"
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        referenced_inputs=[
+            {"id_type": "target_sequence", "value": raw_sequence, "source": "raw_request_text"},
+            {"id_type": "smiles", "value": "CC(=O)NCCC1=CN(c2ccc(O)cc2)C(=O)C1", "source": "raw_request_text"},
+        ],
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    target = next(c for c in cct["candidate_records"] if c.get("candidate_type") == "target_antigen")
+    target.setdefault("identifiers", []).extend(
+        [
+            {"id_type": "uniprot_id", "id_value": "P04626"},
+            {"id_type": "variant", "id_value": "V777L"},
+        ]
+    )
+    local_storage.write_json(cct_path, cct)
+    monkeypatch.setenv("MCP_LIVE_TOOLS", "false")
+    get_settings.cache_clear()
+
+    artifact = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+        llm=_Step9RuntimePlannerLLM(),
+    ).run_step_9(run_id)
+
+    # Planning layer is unchanged: still produces a resolved plan/contract.
+    assert artifact.step9_runtime_execution_plan
+    assert artifact.step9_runtime_resolved_tools
+    entry = artifact.step9_runtime_resolved_tools[0]
+    assert entry["tool_name"] == "AlphaMissense_get_variant_score"
+    assert entry["lane_type"] == "variant_evaluation"
+    assert entry["can_resolve"] is True
+    assert entry["would_execute"] is False
+    assert set(entry["argument_keys"]) == {"uniprot_id", "variant"}
+    assert artifact.step9_runtime_kwargs_contracts
+    contract = artifact.step9_runtime_kwargs_contracts[0]
+    assert contract["tool_name"] == "AlphaMissense_get_variant_score"
+    assert contract["can_build_kwargs"] is True
+    assert contract["execution_mode"] == "planning_only"
+    assert set(contract["kwargs_keys"]) == {"uniprot_id", "variant"}
+    assert all(
+        item.get("value_placeholder") == "<resolved_at_execution_time>"
+        for item in contract["kwargs_plan"]
+        if item.get("source") == "field_ref"
+    )
+    assert artifact.step9_runtime_kwargs_contract_audit
+    assert all(
+        item["candidate_value_persisted"] is False
+        for item in artifact.step9_runtime_kwargs_contract_audit
+    )
+
+    # Turn C: the resolved tool is now actually EXECUTED once.
+    assert artifact.step9_runtime_execution_mode == "executed"
+    assert artifact.screening_status == "ok"
+    assert artifact.step9_runtime_executed_tools == ["AlphaMissense_get_variant_score"]
+    assert len(artifact.tool_call_records) == 1
+    tc = artifact.tool_call_records[0]
+    assert tc.tool_name == "AlphaMissense_get_variant_score"
+    assert tc.run_status == "success"
+    assert tc.step_id == "step_09"
+    assert tc.tool_output_ref and "tool_outputs/step_09/" in tc.tool_output_ref.replace("\\", "/")
+    assert len(artifact.step9_runtime_execution_records) == 1
+    record = artifact.step9_runtime_execution_records[0]
+    assert record["run_status"] == "success"
+    assert record["tool_call_id"] == tc.tool_call_id
+
+    # The real resolved values (P04626 / V777L) reached the ToolUniverse call
+    # (visible in the raw tool_outputs/step_09 payload)...
+    raw_output = local_storage.read_json(tc.tool_output_ref)
+    assert raw_output["output"]["uniprot_id"] == "P04626"
+    assert raw_output["output"]["variant"] == "V777L"
+    # ...but the persisted tool_input_summary carries only a redacted digest
+    # (field_ref/field_type/value_kind/length/hash) — never a literal
+    # `value` key holding the resolved string.
+    assert tc.tool_input_summary.get("uniprot_id", {}).get("source") == "field_ref"
+    assert "value" not in (tc.tool_input_summary.get("uniprot_id") or {})
+    assert tc.tool_input_summary["uniprot_id"]["value_length"] == len("P04626")
+
+    forbidden_prefixes = ("NvidiaNIM_", "ESM_", "DynaMut2_", "ZINC_", "ChEMBL_")
+    assert not any(tc.tool_name.startswith(forbidden_prefixes) for tc in artifact.tool_call_records)
+    runtime_blob = json.dumps(
+        {
+            "plan": artifact.step9_runtime_execution_plan,
+            "audit": artifact.step9_runtime_resolver_audit,
+            "kwargs_contracts": artifact.step9_runtime_kwargs_contracts,
+            "kwargs_contract_audit": artifact.step9_runtime_kwargs_contract_audit,
+        }
+    )
+    assert "ZINC_" not in runtime_blob
+    assert "ChEMBL_" not in runtime_blob
+    artifact_blob = json.dumps(artifact.model_dump())
+    assert raw_sequence not in artifact_blob
+    assert "CC(=O)NCCC1=CN" not in artifact_blob
+
+
+def _seed_sequence_only_protein_candidates(
+    local_storage, registry_service, workflow_state_service, *, include_antibody_light=True
+) -> str:
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        referenced_inputs=[
+            {
+                "id_type": "target_sequence",
+                "value": "MKTAYIAKQNNVG",
+                "source": "raw_request_text",
+            },
+            {
+                "id_type": "antibody_heavy_chain_sequence",
+                "value": "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK",
+                "source": "raw_request_text",
+            },
+        ] + (
+            [
+                {
+                    "id_type": "antibody_light_chain_sequence",
+                    "value": "QSALTQPASVSGSPGQSITISCT",
+                    "source": "raw_request_text",
+                }
+            ]
+            if include_antibody_light
+            else []
+        ),
+    )
+    cct_path = local_storage.run_key(run_id, "candidate_context_table.json")
+    cct = local_storage.read_json(cct_path)
+    for candidate in cct.get("candidate_records") or []:
+        if not isinstance(candidate, dict):
+            continue
+        ctype = candidate.get("candidate_type")
+        if ctype == "target_antigen":
+            candidate["materials"] = [
+                {
+                    "material_id": "target_seq_for_step9",
+                    "material_type": "target_sequence",
+                    "value": "MKTAYIAKQNNVG",
+                }
+            ]
+        elif ctype == "antibody":
+            candidate["materials"] = [
+                {
+                    "material_id": "heavy_seq_for_step9",
+                    "material_type": "antibody_heavy_chain_sequence",
+                    "value": "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK",
+                },
+                {
+                    "material_id": "light_seq_for_step9",
+                    "material_type": "antibody_light_chain_sequence",
+                    "value": "QSALTQPASVSGSPGQSITISCT",
+                },
+            ]
+    local_storage.write_json(cct_path, cct)
+    return run_id
+
+
+def _write_step8_complex_handoff(local_storage, run_id: str, candidate_ids: list[str]) -> None:
+    results = []
+    for candidate_id in candidate_ids:
+        results.append(
+            {
+                "candidate_id": candidate_id,
+                "structure_input_id": f"si_{candidate_id}",
+                "run_case": "existing_complex_interface_evaluation",
+                "run_status": "ok",
+                "complex_structure_refs": [
+                    {
+                        "source_kind": "existing_pdb_complex",
+                        "source_ref": "1N8Z",
+                        "pdb_id": "1N8Z",
+                        "structure_format": "pdb",
+                        "source_tool_call_id": f"tc_setup_{candidate_id}",
+                    }
+                ],
+                "interface_analysis_records": [],
+                "downstream_handoff": {
+                    "has_complex_structure": True,
+                    "structure_for_variant_generation_ref": "s3://bucket/complex.pdb",
+                    "has_interface_features": False,
+                    "validation_available": False,
+                    "has_validated_structure": False,
+                    "missing_for_step9": [],
+                },
+            }
+        )
+    local_storage.write_json(
+        local_storage.run_key(run_id, "structure_prediction_and_interface_results.json"),
+        {
+            "candidate_structure_results": results,
+        },
+    )
+
+
+def test_step9_readiness_projection_blocks_protein_candidates_without_true_complex(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_only_protein_candidates(local_storage, registry_service, workflow_state_service)
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    artifact = agent.run_step_9(run_id)
+
+    summary = artifact.step9_readiness_summary
+    assert summary.protein_design_candidates >= 2
+    assert summary.protein_design_ready_candidates == 0
+    assert summary.protein_design_blocked_candidates >= 2
+
+    blocked_tools = {tool.tool_name for tool in artifact.step9_hard_gate_blocked_tools_with_reason}
+    assert "NvidiaNIM_rfdiffusion" in blocked_tools
+    assert "NvidiaNIM_proteinmpnn" in blocked_tools
+    assert any(entry.reason == "complex_structure_missing" for entry in artifact.step9_hard_gate_blocked_tools_with_reason)
+
+    # No raw sequence appears in readiness projections.
+    blob = json.dumps(artifact.model_dump())
+    assert "MKTAYIAKQNNVG" not in blob
+    assert "EVQLVESGGGLVQPGGSLRLSCAASGFNIKDTYIHWVRQAPGK" not in blob
+    assert "QSALTQPASVSGSPGQSITISCT" not in blob
+
+
+def test_step9_readiness_projection_allows_protein_design_when_true_complex_present(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_sequence_only_protein_candidates(local_storage, registry_service, workflow_state_service)
+    cct = local_storage.read_json(local_storage.run_key(run_id, "candidate_context_table.json"))
+    candidate_ids = [c["candidate_id"] for c in cct.get("candidate_records") or [] if c.get("candidate_type") in {"target_antigen", "antibody"}]
+    # Add minimal rfdiffusion-ready contigs evidence for this test lane.
+    for candidate in cct.get("candidate_records") or []:
+        if not isinstance(candidate, dict):
+            continue
+        if candidate.get("candidate_type") in {"target_antigen", "antibody"}:
+            candidate.setdefault("materials", []).append(
+                {
+                    "material_id": "rfdiffusion_test_contigs",
+                    "material_type": "contigs",
+                    "value": "A:1-10;B:1-10",
+                }
+            )
+    local_storage.write_json(local_storage.run_key(run_id, "candidate_context_table.json"), cct)
+    _write_step8_complex_handoff(local_storage, run_id, candidate_ids)
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    )
+    artifact = agent.run_step_9(run_id)
+
+    assert artifact.step9_readiness_summary.protein_design_ready_candidates >= 2
+    allowed_tools = {tool.tool_name for tool in artifact.step9_hard_gate_allowed_tools}
+    assert "NvidiaNIM_proteinmpnn" in allowed_tools
+    assert not any(
+        entry.tool_name in {"NvidiaNIM_rfdiffusion", "NvidiaNIM_proteinmpnn"} and entry.reason == "complex_structure_missing"
+        for entry in artifact.step9_hard_gate_blocked_tools_with_reason
+    )
+
+    profile = artifact.protein_design_readiness
+    assert profile.ready_tool_count >= 1
+    assert profile.status == "ready"
+
+    # Keep raw-sequence secrecy.
+    assert "HEADER" not in json.dumps(artifact.model_dump())
+    assert "ATOM" not in json.dumps(artifact.model_dump())
 
 # ── precondition errors ─────────────────────────────────────────────────────
 

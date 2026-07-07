@@ -100,8 +100,60 @@ def NvidiaNIM_msa_search(
     return _call_nim("NvidiaNIM_msa_search", args, _live=_live)
 
 
-def _ni(*_a, **_kw):
-    raise NotImplementedError
+def NvidiaNIM_rfdiffusion(
+    contigs: str = "",
+    input_pdb: str = "",
+    *,
+    hotspot_res: list[Any] | None = None,
+    diffusion_steps: int | None = None,
+    random_seed: int | None = None,
+    _live: bool = False,
+) -> dict[str, Any]:
+    """RFdiffusion backbone-conditioned structure generation (Step 9).
+
+    Official ToolUniverse required args: ``contigs``, ``input_pdb``. Optional
+    args (``hotspot_res``, ``diffusion_steps``, ``random_seed``) are only
+    forwarded when the caller set them, so ToolUniverse applies its own
+    documented defaults otherwise. No direct NVIDIA client and no offline
+    mock success — this is a thin adapter binding.
+    """
+    args: dict[str, Any] = {"contigs": contigs or "", "input_pdb": input_pdb or ""}
+    if hotspot_res is not None:
+        args["hotspot_res"] = hotspot_res
+    if diffusion_steps is not None:
+        args["diffusion_steps"] = diffusion_steps
+    if random_seed is not None:
+        args["random_seed"] = random_seed
+    return _call_nim("NvidiaNIM_rfdiffusion", args, _live=_live)
+
+
+def NvidiaNIM_proteinmpnn(
+    input_pdb: str = "",
+    *,
+    ca_only: bool | None = None,
+    use_soluble_model: bool | None = None,
+    sampling_temp: list[Any] | None = None,
+    num_seq_per_target: int | None = None,
+    _live: bool = False,
+) -> dict[str, Any]:
+    """ProteinMPNN backbone-conditioned sequence design (Step 9).
+
+    Official ToolUniverse required arg: ``input_pdb``. Optional args
+    (``ca_only``, ``use_soluble_model``, ``sampling_temp``,
+    ``num_seq_per_target``) are only forwarded when the caller set them. No
+    direct NVIDIA client and no offline mock success — this is a thin
+    adapter binding.
+    """
+    args: dict[str, Any] = {"input_pdb": input_pdb or ""}
+    if ca_only is not None:
+        args["ca_only"] = ca_only
+    if use_soluble_model is not None:
+        args["use_soluble_model"] = use_soluble_model
+    if sampling_temp is not None:
+        args["sampling_temp"] = sampling_temp
+    if num_seq_per_target is not None:
+        args["num_seq_per_target"] = num_seq_per_target
+    return _call_nim("NvidiaNIM_proteinmpnn", args, _live=_live)
 
 
 BINDINGS = [
@@ -109,6 +161,6 @@ BINDINGS = [
     ("NvidiaNIM_openfold3", NvidiaNIM_openfold3),
     ("NvidiaNIM_boltz2", NvidiaNIM_boltz2),
     ("NvidiaNIM_msa_search", NvidiaNIM_msa_search),
-    ("NvidiaNIM_rfdiffusion", _ni),
-    ("NvidiaNIM_proteinmpnn", _ni),
+    ("NvidiaNIM_rfdiffusion", NvidiaNIM_rfdiffusion),
+    ("NvidiaNIM_proteinmpnn", NvidiaNIM_proteinmpnn),
 ]
