@@ -291,12 +291,29 @@ class _Step6SchemaMappingStage2ParserResponse(BaseModel):
         return {"tools": tools_out}
 
 
+# ── Step 14 patent tool selection: strict parser shape ──────────────────────
+
+
+class _Step14SelectedToolPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tool_name: str
+    input_ref_ids: list[str] = Field(default_factory=list)
+    selection_reason: Optional[str] = None
+    missing_required_args: list[str] = Field(default_factory=list)
+
+
+class _Step14PatentToolSelectionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    selected_tool_plans: list[_Step14SelectedToolPlan] = Field(default_factory=list)
+
+
 # Tasks whose output uses the official structured-output parser. Every other
 # task (structured_query, tool_selection_stage_2, *_multi_lane, *_multi_tool)
 # keeps the json_object path unchanged.
 _RESPONSE_MODEL_FOR_TASK: dict[str, type[BaseModel]] = {
     "tool_selection_stage_1": _ToolSelectionStage1Response,
     "step6_schema_mapping_stage_1": _Step6SchemaMappingStage1Response,
+    "step14_patent_tool_selection": _Step14PatentToolSelectionResponse,
     # step6_schema_mapping_stage_2 is TEMPORARILY DISABLED from the official
     # parser path. The current Step 6 Stage 2 prompt still asks for the legacy
     # dynamic-dict shape ({"argument_mapping": {schema_arg: field_ref},

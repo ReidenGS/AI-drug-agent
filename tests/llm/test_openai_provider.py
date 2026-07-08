@@ -587,6 +587,7 @@ def test_parser_models_produce_real_strict_schema():
         "step6_schema_mapping_stage_1",
         "step9_tool_selection_stage_1",
         "step9_tool_schema_mapping_stage_2",
+        "step14_patent_tool_selection",
     }
     assert "step6_schema_mapping_stage_2" not in _RESPONSE_MODEL_FOR_TASK
     for task, model in _RESPONSE_MODEL_FOR_TASK.items():

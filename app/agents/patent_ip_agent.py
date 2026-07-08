@@ -68,6 +68,16 @@ from ..agents.step_14_prior_art import (
     dedup_and_sort_by_relevance,
     extract_hits,
 )
+from ..agents.step_14_runtime_resolver import (
+    Step14ResolvedRef,
+    resolve_step14_input_ref,
+)
+from ..agents.step_14_selection_policy import (
+    Step14SelectedToolPlan,
+    acceptable_supports_for,
+    schema_arg_for_support,
+    select_step14_tool_plans,
+)
 from ..llm.provider import LLMProvider, MockLLMProvider
 from ..mcp.client import MCPClient
 from ..schemas.common import ToolCallRecord
@@ -75,6 +85,7 @@ from ..schemas.step_14_patent_prior_art_table import (
     PatentPriorArtTable,
     PatentRecord,
 )
+from ..schemas.step_14_patent_request import Step14PatentRequest
 from ..services.artifact_registry_service import ArtifactRegistryService
 from ..services.storage_service import Storage
 from ..services.workflow_state_service import WorkflowStateService
@@ -254,6 +265,7 @@ class PatentIPAgent:
                 "tool_call_records[].tool_output_ref / "
                 "patent_records[].source_refs."
             ),
+            step14_request_source="discovery_run",
         )
 
         artifact_id = new_artifact_id("patent_prior_art_table")
@@ -264,6 +276,183 @@ class PatentIPAgent:
         self.registry.update_active(run_id, patent_prior_art_table_id=artifact_id)
         self.workflow_state.mark(run_id, "step_14", "completed")
         return table
+
+    # ── request-based entrypoint (Step 14 Turn A) ───────────────────────────
+    def run_from_request(
+        self,
+        request: Step14PatentRequest,
+        *,
+        total_limit: int = DEFAULT_TOTAL_LIMIT,
+        per_query_limit: int = DEFAULT_PER_QUERY_LIMIT,
+    ) -> PatentPriorArtTable:
+        """Request-driven Step 14 routing.
+
+        The LLM selects tools purely from the request's ``input_refs``
+        (roles / supports_tool_args) — it discovers no extra Step 2 / Step 5
+        fields. The runtime resolver then resolves each selected input ref to a
+        real value and builds real tool arguments; unresolved refs become
+        compact ``skipped`` / ``input_missing`` tool-call records (never a fake
+        success). Raw payloads stay in ``tool_output_ref``; extraction / dedup /
+        scoring reuse the same helpers as ``run``. Step 14 never writes
+        ``ranking_table``.
+        """
+        total_limit = max(1, min(int(total_limit), MAX_TOTAL_LIMIT))
+        per_query_limit = max(1, min(int(per_query_limit), MAX_TOTAL_LIMIT))
+        run_id = request.run_id
+
+        selection = select_step14_tool_plans(llm=self.llm, request=request)
+        ref_by_id = {ref.ref_id: ref for ref in request.input_refs}
+
+        tool_calls: list[ToolCallRecord] = []
+        resolver_audit: list[dict] = []
+        all_raw_hits: list = []
+        productive_tc_ids: set[str] = set()
+        resolved_cache: dict[str, Step14ResolvedRef] = {}
+
+        def _resolve(ref_id: str) -> Step14ResolvedRef:
+            if ref_id not in resolved_cache:
+                resolved = resolve_step14_input_ref(self.storage, request, ref_by_id[ref_id])
+                resolved_cache[ref_id] = resolved
+                resolver_audit.append(resolved.audit_entry())
+            return resolved_cache[ref_id]
+
+        for plan in selection.selected_tool_plans[: max(1, total_limit)]:
+            resolved_refs = [_resolve(rid) for rid in plan.input_ref_ids]
+            tool_args, primary = _build_request_tool_args(plan.tool_name, resolved_refs)
+            if tool_args is None or primary is None:
+                tool_calls.append(_skipped_input_missing_record(plan, resolved_refs))
+                continue
+            tc, hits = self._call_and_extract_request(
+                run_id=run_id, plan=plan, tool_args=tool_args, primary=primary,
+            )
+            tool_calls.append(tc)
+            if hits:
+                productive_tc_ids.add(tc.tool_call_id)
+                all_raw_hits.extend(hits)
+
+        merged_hits = dedup_and_sort_by_relevance(all_raw_hits)[:total_limit]
+        patent_records: list[PatentRecord] = [_record_from_merged(m) for m in merged_hits]
+        for tc in tool_calls:
+            if tc.run_status != "success":
+                continue
+            if tc.tool_call_id in productive_tc_ids:
+                continue
+            patent_records.append(_record_from_receipt(tc))
+
+        review_status = self._status(tool_calls, patent_records)
+        table = PatentPriorArtTable(
+            run_id=run_id,
+            created_at=now_iso(),
+            patent_review_status=review_status,  # type: ignore[arg-type]
+            patent_records=patent_records,
+            tool_call_records=tool_calls,
+            patent_review_notes=(
+                "Step 14 request-based routing. Tools were LLM-selected from "
+                "request input refs; real values were resolved by the runtime "
+                "resolver. Raw payloads remain in tool_call_records[]."
+                "tool_output_ref."
+            ),
+            step14_request_refs=[
+                {
+                    "ref_id": ref.ref_id,
+                    "role": ref.role,
+                    "source_artifact": ref.source_artifact,
+                    "source_path": ref.source_path,
+                    "candidate_id": ref.candidate_id,
+                    "supports_tool_args": list(ref.supports_tool_args),
+                }
+                for ref in request.input_refs
+            ],
+            step14_patent_scope=request.patent_scope.model_dump(),
+            step14_llm_selected_tool_plans=[
+                p.model_dump() for p in selection.selected_tool_plans
+            ],
+            step14_llm_rejected_tool_plans=[
+                p.model_dump() for p in selection.rejected_tool_plans
+            ],
+            step14_runtime_resolver_audit=resolver_audit,
+            step14_request_source="request",
+        )
+
+        artifact_id = new_artifact_id("patent_prior_art_table")
+        self.storage.write_json(
+            self.storage.run_key(run_id, _ARTIFACT_KEY),
+            {"artifact_id": artifact_id, **table.model_dump()},
+        )
+        self.registry.update_active(run_id, patent_prior_art_table_id=artifact_id)
+        self.workflow_state.mark(run_id, "step_14", "completed")
+        return table
+
+    def _call_and_extract_request(
+        self,
+        *,
+        run_id: str,
+        plan: Step14SelectedToolPlan,
+        tool_args: dict[str, Any],
+        primary: Step14ResolvedRef,
+    ) -> tuple[ToolCallRecord, list]:
+        tc_id = new_tool_call_id()
+        started = now_iso()
+        result = self.mcp_client.call_tool(
+            agent_name=_AGENT_NAME, step_id=_STEP_ID,
+            tool_name=plan.tool_name, **tool_args,
+        )
+        finished = now_iso()
+
+        role = primary.role
+        term = primary.value or ""
+        term_source = f"request_input_ref:{primary.ref_id}"
+        label = f"{role}:{term}"
+
+        output_ref = None
+        output_artifact_id = None
+        if "payload" in result:
+            output_artifact_id = new_artifact_id("tool_output")
+            output_key = self.storage.run_key(
+                run_id, "tool_outputs", "step_14", f"{tc_id}.json"
+            )
+            self.storage.write_json(output_key, {
+                "tool_call_id": tc_id, "tool_name": plan.tool_name,
+                "label": label, "input": tool_args, "output": result["payload"],
+            })
+            output_ref = output_key
+
+        summary: dict[str, Any] = {
+            "label": label,
+            **tool_args,
+            "candidate_id": primary.candidate_id,
+            "shortlist_source": "step_14_request",
+            "query_role": role,
+            "query_term": term,
+            "query_term_source": term_source,
+            "selected_by": "llm_step14",
+            "selection_reason": plan.selection_reason,
+            "input_ref_ids": list(plan.input_ref_ids),
+        }
+        tc = ToolCallRecord(
+            tool_call_id=tc_id, tool_name=plan.tool_name,
+            agent_name=_AGENT_NAME, step_id=_STEP_ID,
+            run_status=result.get("run_status", "pending"),
+            started_at=started, finished_at=finished,
+            tool_input_summary=summary,
+            tool_output_artifact_id=output_artifact_id,
+            tool_output_ref=output_ref,
+            error_message=result.get("error_message"),
+        )
+
+        hits: list = []
+        if tc.run_status == "success" and "payload" in result:
+            hits = extract_hits(
+                result["payload"],
+                source_tool=plan.tool_name,
+                source_database=_TOOL_SOURCE_DB.get(plan.tool_name, "other"),
+                source_ref=output_ref,
+                query_role=role,
+                query_term=term,
+                query_term_source=term_source,
+                candidate_id=primary.candidate_id or "",
+            )
+        return tc, hits
 
     # ── helpers ─────────────────────────────────────────────────────────
     def _call_and_extract(
@@ -382,6 +571,68 @@ class PatentIPAgent:
         if any_success or records:
             return "completed_with_warnings"
         return "partial"
+
+
+# ── request-based tool-arg construction ─────────────────────────────────────
+
+
+def _build_request_tool_args(
+    tool_name: str, resolved_refs: list[Step14ResolvedRef]
+) -> tuple[Optional[dict[str, Any]], Optional[Step14ResolvedRef]]:
+    """Build real tool args from the first resolved ref that satisfies the
+    tool's required/primary argument. The argument name is the OFFICIAL schema
+    arg the matched supports token maps to (via `schema_arg_for_support`), so
+    the constructed args stay aligned with the sourced tool schema. Returns
+    ``(None, None)`` when no selected ref resolved to a usable value (→ a
+    skipped/input_missing record)."""
+    acceptable = acceptable_supports_for(tool_name)
+    spec_order = [
+        t for t in _support_priority(tool_name)
+    ]
+    for ref in resolved_refs:
+        if not ref.resolved or not ref.value:
+            continue
+        matched = {s.lower() for s in ref.supports_tool_args} & acceptable
+        if not matched:
+            continue
+        # Deterministic: pick the first supports token (in spec order) the ref
+        # carries, then fill the official schema arg it maps to.
+        for token in spec_order:
+            if token in matched:
+                arg = schema_arg_for_support(tool_name, token)
+                if arg:
+                    return {arg: ref.value}, ref
+    return None, None
+
+
+def _support_priority(tool_name: str) -> list[str]:
+    from ..agents.step_14_selection_policy import STEP14_TOOL_SPECS
+
+    return [s.lower() for s in STEP14_TOOL_SPECS[tool_name].acceptable_supports]
+
+
+def _skipped_input_missing_record(
+    plan: Step14SelectedToolPlan, resolved_refs: list[Step14ResolvedRef]
+) -> ToolCallRecord:
+    reasons = [r.unresolved_reason for r in resolved_refs if r.unresolved_reason]
+    reason = ",".join(reasons) if reasons else "input_missing"
+    return ToolCallRecord(
+        tool_call_id=new_tool_call_id(),
+        tool_name=plan.tool_name,
+        agent_name=_AGENT_NAME,
+        step_id=_STEP_ID,
+        run_status="skipped",
+        started_at=now_iso(),
+        finished_at=now_iso(),
+        tool_input_summary={
+            "skip_reason": "input_missing",
+            "unresolved_reason": reason,
+            "input_ref_ids": list(plan.input_ref_ids),
+            "query_role": resolved_refs[0].role if resolved_refs else None,
+            "selected_by": "llm_step14",
+        },
+        error_message=f"input_missing: {reason}",
+    )
 
 
 # ── query-plan construction ─────────────────────────────────────────────────

@@ -86,3 +86,15 @@ class PatentPriorArtTable(BaseModel):
     patent_records: list[PatentRecord] = Field(default_factory=list)
     tool_call_records: list[ToolCallRecord] = Field(default_factory=list)
     patent_review_notes: Optional[str] = None
+    # ── Step 14 request-based routing audit (additive) ─────────────────────
+    # Populated by `PatentIPAgent.run_from_request`. These carry ONLY compact
+    # references / roles / plans / compact resolver audit — never resolved raw
+    # values, raw tool payloads, or raw LLM responses. `step14_request_source`
+    # distinguishes the request-based path ("request") from the legacy
+    # discovery `run()` path (left at its default there).
+    step14_request_refs: list[dict] = Field(default_factory=list)
+    step14_patent_scope: dict = Field(default_factory=dict)
+    step14_llm_selected_tool_plans: list[dict] = Field(default_factory=list)
+    step14_llm_rejected_tool_plans: list[dict] = Field(default_factory=list)
+    step14_runtime_resolver_audit: list[dict] = Field(default_factory=list)
+    step14_request_source: str = "request"
