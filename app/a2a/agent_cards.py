@@ -1,0 +1,543 @@
+"""AgentCard builders + adc_agent_contract validator + compact card catalog.
+
+Turn A of the Multi-Agent A2A v1 plan. This module publishes worker
+capabilities as ``python_a2a.AgentCard`` objects (never a custom A2A card
+format) and attaches the ADC-specific routing contract under
+``AgentCard.capabilities["adc_agent_contract"]``.
+
+Design references:
+
+- ``A2A 方案/agent_card_design.md``
+- ``A2A 方案/orchestrator_routing_design.md``
+- ``项目文件/multi_agent_a2a_v1_implementation_plan.md``
+
+HARD CONSTRAINTS:
+
+- The AgentCard input/output artifact contract mirrors the CURRENT production
+  DB/storage read/write paths of Step 5 / Step 6 / structure worker — it does
+  not invent idealized inputs. Every ``storage_path`` below is verified against
+  the live agent code.
+- Turn A adds schema + builders + validator + compact catalog only. It does not
+  start an HTTP server, dispatch A2A tasks, change Step 4 routing, or touch MCP
+  scope / ToolUniverse inventory / registry / tool names.
+- The compact catalog is the LLM-safe view: it excludes endpoint URL, auth,
+  API keys, raw artifact bodies, raw biological material, raw ToolUniverse
+  payloads, full prompts, and raw LLM responses.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from python_a2a import AgentCard, AgentSkill
+
+
+_FORBID = ConfigDict(extra="forbid")
+
+# Capability id constants (stable routing identifiers used by Turn B/C/D).
+CAP_STEP5_CANDIDATE_CONTEXT = "step_05_candidate_context"
+CAP_STEP6_DEVELOPABILITY = "step_06_developability"
+CAP_STEP7_STRUCTURE_INPUT = "step_07_structure_input"
+CAP_STEP8_STRUCTURE_EVALUATION = "step_08_structure_evaluation"
+CAP_STEP9_STRUCTURE_DESIGN = "step_09_structure_design"
+
+# Agent id constants (match the design docs' stable snake ids).
+AGENT_ID_STEP5 = "step_05_candidate_context_agent"
+AGENT_ID_STEP6 = "step_06_developability_agent"
+AGENT_ID_STRUCTURE = "structure_and_design_agent"
+
+_VALID_DISPATCH_MODES = {"python_a2a", "http_a2a"}
+_CONTRACT_KEY = "adc_agent_contract"
+
+
+class AgentContractError(ValueError):
+    """Raised when an AgentCard's adc_agent_contract is missing or malformed."""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# adc_agent_contract shape (stored as a plain dict under capabilities)
+# ─────────────────────────────────────────────────────────────────────────────
+class ContractArtifactRef(BaseModel):
+    """A named artifact and its concrete run-scoped storage path."""
+
+    model_config = _FORBID
+
+    artifact_name: str = Field(min_length=1)
+    storage_path: str = Field(min_length=1)
+
+
+class AgentCapabilityContract(BaseModel):
+    model_config = _FORBID
+
+    capability_id: str = Field(min_length=1)
+    skill_name: str = Field(min_length=1)
+    capability_summary: str = Field(min_length=1)
+    supported_step_ids: list[str] = Field(default_factory=list)
+    supported_intents: list[str] = Field(default_factory=list)
+    supported_lane_flags: list[str] = Field(default_factory=list)
+    required_input_artifacts: list[ContractArtifactRef] = Field(default_factory=list)
+    optional_input_artifacts: list[ContractArtifactRef] = Field(default_factory=list)
+    required_control_context: list[str] = Field(default_factory=list)
+    output_artifacts: list[ContractArtifactRef] = Field(min_length=1)
+    uses_llm: bool
+    uses_mcp: bool
+
+
+class AdcAgentContract(BaseModel):
+    model_config = _FORBID
+
+    agent_id: str = Field(min_length=1)
+    agent_role: Literal["orchestrator", "worker"]
+    step_id: Optional[str] = None
+    display_name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    capabilities: list[AgentCapabilityContract] = Field(min_length=1)
+    dispatch_modes: list[str] = Field(min_length=1)
+    routable: bool
+    status: Literal["active", "planned", "disabled"] = "active"
+    uses_llm: bool
+    uses_mcp: bool
+    privacy_notes: list[str] = Field(default_factory=list)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Contract data — verified against production agent code
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared storage paths (must match the live agents byte-for-byte).
+_RAW_REQUEST_RECORD = ContractArtifactRef(
+    artifact_name="raw_request_record",
+    storage_path="inputs/raw_request_record.json",
+)
+_STRUCTURED_QUERY = ContractArtifactRef(
+    artifact_name="structured_query",
+    storage_path="inputs/structured_query.json",
+)
+_RUN_STEP_PLAN = ContractArtifactRef(
+    artifact_name="run_step_plan",
+    storage_path="inputs/run_step_plan.json",
+)
+_CANDIDATE_CONTEXT_TABLE = ContractArtifactRef(
+    artifact_name="candidate_context_table",
+    storage_path="candidate_context_table.json",
+)
+_PREPARED_STRUCTURE_INPUT = ContractArtifactRef(
+    artifact_name="prepared_structure_input_package",
+    storage_path="prepared_structure_input_package.json",
+)
+_STRUCTURE_PREDICTION = ContractArtifactRef(
+    artifact_name="structure_prediction_and_interface_results",
+    storage_path="structure_prediction_and_interface_results.json",
+)
+
+
+def _build_agent_card(*, contract: AdcAgentContract, url: str) -> AgentCard:
+    """Assemble a ``python_a2a.AgentCard`` from an ADC contract.
+
+    One ``python_a2a.AgentSkill`` is published per capability; the ADC routing
+    contract is attached under ``capabilities["adc_agent_contract"]``.
+    """
+    skills = [
+        AgentSkill(
+            id=cap.capability_id,
+            name=cap.skill_name,
+            description=cap.capability_summary,
+            tags=sorted(set([*cap.supported_step_ids, *cap.supported_lane_flags])),
+            examples=[],
+        )
+        for cap in contract.capabilities
+    ]
+    return AgentCard(
+        name=contract.display_name,
+        description=contract.description,
+        url=url,
+        version="1.0.0",
+        capabilities={_CONTRACT_KEY: contract.model_dump()},
+        skills=skills,
+    )
+
+
+def build_step5_agent_card(url: str) -> AgentCard:
+    """Step 5 CandidateContextAgent card.
+
+    Verified against ``app/agents/candidate_context_agent.py``:
+    reads ``inputs/structured_query.json`` + ``inputs/raw_request_record.json``,
+    requires ``run_step_plan`` in the registry, writes
+    ``candidate_context_table.json``.
+    """
+    contract = AdcAgentContract(
+        agent_id=AGENT_ID_STEP5,
+        agent_role="worker",
+        step_id="step_05_candidate_context",
+        display_name="Candidate Context Agent",
+        description=(
+            "Builds normalized candidate / material / identifier records from "
+            "raw request metadata, structured query entities, referenced inputs, "
+            "uploaded file metadata, and scoped context-enrichment MCP tools."
+        ),
+        capabilities=[
+            AgentCapabilityContract(
+                capability_id=CAP_STEP5_CANDIDATE_CONTEXT,
+                skill_name="Candidate context build",
+                capability_summary=(
+                    "Assemble the run's candidate context table from request "
+                    "records, structured query, and scoped enrichment tools."
+                ),
+                supported_step_ids=["step_05_candidate_context"],
+                supported_intents=[
+                    "new_adc_design",
+                    "existing_adc_evaluation",
+                    "developability_assessment",
+                    "structure_analysis",
+                    "compound_screening",
+                ],
+                required_input_artifacts=[
+                    _RAW_REQUEST_RECORD,
+                    _STRUCTURED_QUERY,
+                    _RUN_STEP_PLAN,
+                ],
+                required_control_context=["orchestrator_routing_decision"],
+                output_artifacts=[_CANDIDATE_CONTEXT_TABLE],
+                uses_llm=True,
+                uses_mcp=True,
+            )
+        ],
+        dispatch_modes=["python_a2a"],
+        routable=True,
+        status="active",
+        uses_llm=True,
+        uses_mcp=True,
+        privacy_notes=[
+            "Reads raw_request_record and structured_query by reference from run storage.",
+            "Persisted candidate_context_table must not embed raw ToolUniverse "
+            "payloads, API keys, full prompts, raw LLM responses, or raw file contents.",
+        ],
+    )
+    return _build_agent_card(contract=contract, url=url)
+
+
+def build_step6_agent_card(url: str) -> AgentCard:
+    """Step 6 DevelopabilityAgent card.
+
+    Verified against ``app/agents/developability_agent.py``: reads
+    ``candidate_context_table.json``, requires ``run_step_plan``, writes
+    ``structured_liability_summary.json``.
+    """
+    contract = AdcAgentContract(
+        agent_id=AGENT_ID_STEP6,
+        agent_role="worker",
+        step_id="step_06_developability",
+        display_name="Developability Agent",
+        description=(
+            "Runs lane-based developability and liability pre-filtering using "
+            "candidate context, scoped MCP tools, progressive disclosure, and "
+            "deterministic runtime resolution."
+        ),
+        capabilities=[
+            AgentCapabilityContract(
+                capability_id=CAP_STEP6_DEVELOPABILITY,
+                skill_name="Developability pre-filtering",
+                capability_summary=(
+                    "Assess ADC candidate developability liabilities across "
+                    "lanes using candidate context and scoped MCP tools."
+                ),
+                supported_step_ids=["step_06_developability"],
+                supported_intents=[
+                    "new_adc_design",
+                    "existing_adc_evaluation",
+                    "developability_assessment",
+                    "optimization",
+                ],
+                supported_lane_flags=[
+                    "payload_linker_compound_liability",
+                    "antibody_protein_sequence_liability",
+                    "antigen_protein_feature_context",
+                    "structure_interface_quality",
+                    "compound_bioactivity_prior_context",
+                ],
+                required_input_artifacts=[
+                    _CANDIDATE_CONTEXT_TABLE,
+                    _RUN_STEP_PLAN,
+                ],
+                required_control_context=["orchestrator_routing_decision"],
+                output_artifacts=[
+                    ContractArtifactRef(
+                        artifact_name="structured_liability_summary",
+                        storage_path="structured_liability_summary.json",
+                    )
+                ],
+                uses_llm=True,
+                uses_mcp=True,
+            )
+        ],
+        dispatch_modes=["python_a2a"],
+        routable=True,
+        status="active",
+        uses_llm=True,
+        uses_mcp=True,
+        privacy_notes=[
+            "Reads candidate_context_table by reference from run storage.",
+            "Persisted structured_liability_summary must reference compact "
+            "tool_call_records and must not embed raw ToolUniverse payloads, raw "
+            "protein sequence, PDB/CIF/FASTA content, API keys, full prompts, or "
+            "raw LLM responses.",
+        ],
+    )
+    return _build_agent_card(contract=contract, url=url)
+
+
+def build_structure_agent_card(url: str) -> AgentCard:
+    """Structure and Design worker card (Step 7 / 8 / 9 capabilities).
+
+    Verified against ``app/agents/structure_and_design_agent.py``:
+    - Step 7 reads raw_request_record + structured_query + candidate_context_table
+      (requires run_step_plan) and writes ``prepared_structure_input_package.json``.
+    - Step 8 reads ``prepared_structure_input_package.json`` (requires
+      run_step_plan) and writes ``structure_prediction_and_interface_results.json``.
+    - Step 9 reads ``candidate_context_table.json`` (requires run_step_plan),
+      optionally reads the Step 7/8 packages + request records, and writes
+      ``compound_screening_artifact.json``.
+    """
+    contract = AdcAgentContract(
+        agent_id=AGENT_ID_STRUCTURE,
+        agent_role="worker",
+        step_id="structure_and_design",
+        display_name="Structure and Design Agent",
+        description=(
+            "Prepares structure-relevant inputs, evaluates structure/interface "
+            "context, and runs controlled structure design or variant / compound "
+            "screening when inputs allow."
+        ),
+        capabilities=[
+            AgentCapabilityContract(
+                capability_id=CAP_STEP7_STRUCTURE_INPUT,
+                skill_name="Structure input preparation",
+                capability_summary=(
+                    "Prepare the structure input package from request records, "
+                    "structured query, and candidate context."
+                ),
+                supported_step_ids=["step_07_structure_input"],
+                supported_lane_flags=["structure_lane"],
+                required_input_artifacts=[
+                    _RAW_REQUEST_RECORD,
+                    _STRUCTURED_QUERY,
+                    _CANDIDATE_CONTEXT_TABLE,
+                    _RUN_STEP_PLAN,
+                ],
+                required_control_context=["orchestrator_routing_decision"],
+                output_artifacts=[_PREPARED_STRUCTURE_INPUT],
+                uses_llm=True,
+                uses_mcp=True,
+            ),
+            AgentCapabilityContract(
+                capability_id=CAP_STEP8_STRUCTURE_EVALUATION,
+                skill_name="Structure prediction and interface evaluation",
+                capability_summary=(
+                    "Run structure/complex prediction and interface evaluation "
+                    "from the prepared structure input package."
+                ),
+                supported_step_ids=["step_08_structure_evaluation"],
+                supported_lane_flags=["structure_lane"],
+                required_input_artifacts=[
+                    _PREPARED_STRUCTURE_INPUT,
+                    _RUN_STEP_PLAN,
+                ],
+                required_control_context=["orchestrator_routing_decision"],
+                output_artifacts=[_STRUCTURE_PREDICTION],
+                uses_llm=True,
+                uses_mcp=True,
+            ),
+            AgentCapabilityContract(
+                capability_id=CAP_STEP9_STRUCTURE_DESIGN,
+                skill_name="Structure variant and compound screening",
+                capability_summary=(
+                    "Run structure variant evaluation and compound screening "
+                    "using candidate context and, when available, prepared "
+                    "structure inputs and prediction results."
+                ),
+                supported_step_ids=["step_09_structure_design"],
+                supported_lane_flags=[
+                    "structure_lane",
+                    "protein_design_lane",
+                    "variant_evaluation_lane",
+                ],
+                required_input_artifacts=[
+                    _CANDIDATE_CONTEXT_TABLE,
+                    _RUN_STEP_PLAN,
+                ],
+                optional_input_artifacts=[
+                    _PREPARED_STRUCTURE_INPUT,
+                    _STRUCTURE_PREDICTION,
+                    _RAW_REQUEST_RECORD,
+                    _STRUCTURED_QUERY,
+                ],
+                required_control_context=["orchestrator_routing_decision"],
+                output_artifacts=[
+                    ContractArtifactRef(
+                        artifact_name="structure_variant_and_compound_screening",
+                        storage_path="compound_screening_artifact.json",
+                    )
+                ],
+                uses_llm=True,
+                uses_mcp=True,
+            ),
+        ],
+        dispatch_modes=["python_a2a"],
+        routable=True,
+        status="active",
+        uses_llm=True,
+        uses_mcp=True,
+        privacy_notes=[
+            "Reads raw_request_record, structured_query, and candidate_context_table "
+            "by reference from run storage.",
+            "Persisted artifacts must not embed raw sequence, FASTA, PDB/CIF, A3M, "
+            "API keys, raw ToolUniverse payloads, full prompts, or raw LLM responses.",
+        ],
+    )
+    return _build_agent_card(contract=contract, url=url)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Validation
+# ─────────────────────────────────────────────────────────────────────────────
+def parse_adc_agent_contract(card: AgentCard) -> AdcAgentContract:
+    """Extract and validate the adc_agent_contract embedded in ``card``.
+
+    Raises :class:`AgentContractError` (never a silent pass) when the contract
+    is missing, malformed, or inconsistent with the card's skills / url.
+    """
+    caps = getattr(card, "capabilities", None)
+    if not isinstance(caps, dict) or _CONTRACT_KEY not in caps:
+        raise AgentContractError(
+            f"AgentCard is missing capabilities['{_CONTRACT_KEY}']"
+        )
+    raw = caps[_CONTRACT_KEY]
+    if not isinstance(raw, dict):
+        raise AgentContractError(
+            f"capabilities['{_CONTRACT_KEY}'] must be an object, got {type(raw).__name__}"
+        )
+
+    try:
+        contract = AdcAgentContract.model_validate(raw)
+    except ValidationError as exc:  # explicit, not silent
+        raise AgentContractError(
+            f"adc_agent_contract failed schema validation: {exc}"
+        ) from exc
+
+    # agent_id / agent_role presence is already enforced by the schema (min_length
+    # / Literal). Below are the cross-field checks the schema cannot express.
+
+    # dispatch_modes must include a real A2A transport mode.
+    if not (_VALID_DISPATCH_MODES & set(contract.dispatch_modes)):
+        raise AgentContractError(
+            "dispatch_modes must include one of "
+            f"{sorted(_VALID_DISPATCH_MODES)}; got {contract.dispatch_modes}"
+        )
+
+    # Every required/output artifact ref must carry artifact_name + storage_path.
+    # (min_length=1 on both fields already guarantees this; assert defensively so
+    # a future edit that loosens the field constraint still fails loudly.)
+    for cap in contract.capabilities:
+        for ref in (*cap.required_input_artifacts, *cap.optional_input_artifacts, *cap.output_artifacts):
+            if not ref.artifact_name or not ref.storage_path:
+                raise AgentContractError(
+                    f"capability '{cap.capability_id}' has an artifact ref missing "
+                    "artifact_name or storage_path"
+                )
+
+    # Skills published on the card must line up 1:1 with contract capabilities.
+    skill_ids = {getattr(s, "id", None) for s in (getattr(card, "skills", None) or [])}
+    capability_ids = {cap.capability_id for cap in contract.capabilities}
+    if skill_ids != capability_ids:
+        raise AgentContractError(
+            "AgentCard.skills do not align with adc_agent_contract capabilities: "
+            f"skills={sorted(str(s) for s in skill_ids)} "
+            f"capabilities={sorted(capability_ids)}"
+        )
+
+    # A routable worker must expose a usable dispatch URL.
+    if contract.routable and not str(getattr(card, "url", "") or "").strip():
+        raise AgentContractError(
+            f"routable agent '{contract.agent_id}' must have a non-empty AgentCard url"
+        )
+
+    return contract
+
+
+def validate_adc_agent_contract(card: AgentCard) -> AdcAgentContract:
+    """Alias for :func:`parse_adc_agent_contract` (validate-and-return)."""
+    return parse_adc_agent_contract(card)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Compact card catalog (LLM-safe view)
+# ─────────────────────────────────────────────────────────────────────────────
+def build_compact_card_for_agent(card: AgentCard) -> dict[str, Any]:
+    """Return the LLM-safe compact summary for a single AgentCard.
+
+    Includes only routing-relevant fields. Excludes endpoint URL, auth, API
+    keys, raw artifact bodies, raw biological material, raw ToolUniverse
+    payloads, full prompts, and raw LLM responses.
+    """
+    contract = parse_adc_agent_contract(card)
+    return {
+        "agent_id": contract.agent_id,
+        "agent_role": contract.agent_role,
+        "display_name": contract.display_name,
+        "name": contract.display_name,
+        "description": contract.description,
+        "status": contract.status,
+        "routable": contract.routable,
+        "uses_llm": contract.uses_llm,
+        "uses_mcp": contract.uses_mcp,
+        "dispatch_modes": list(contract.dispatch_modes),
+        "capabilities": [
+            {
+                "capability_id": cap.capability_id,
+                "capability_summary": cap.capability_summary,
+                "supported_step_ids": list(cap.supported_step_ids),
+                "supported_intents": list(cap.supported_intents),
+                "supported_lane_flags": list(cap.supported_lane_flags),
+                "required_input_artifact_names": [
+                    ref.artifact_name for ref in cap.required_input_artifacts
+                ],
+                "optional_input_artifact_names": [
+                    ref.artifact_name for ref in cap.optional_input_artifacts
+                ],
+                "output_artifact_names": [
+                    ref.artifact_name for ref in cap.output_artifacts
+                ],
+                "uses_llm": cap.uses_llm,
+                "uses_mcp": cap.uses_mcp,
+            }
+            for cap in contract.capabilities
+        ],
+    }
+
+
+def build_compact_card_catalog(cards: list[AgentCard]) -> list[dict[str, Any]]:
+    """Build the LLM-safe compact catalog from a list of AgentCards."""
+    return [build_compact_card_for_agent(card) for card in cards]
+
+
+__all__ = [
+    "AgentContractError",
+    "ContractArtifactRef",
+    "AgentCapabilityContract",
+    "AdcAgentContract",
+    "build_step5_agent_card",
+    "build_step6_agent_card",
+    "build_structure_agent_card",
+    "parse_adc_agent_contract",
+    "validate_adc_agent_contract",
+    "build_compact_card_for_agent",
+    "build_compact_card_catalog",
+    "CAP_STEP5_CANDIDATE_CONTEXT",
+    "CAP_STEP6_DEVELOPABILITY",
+    "CAP_STEP7_STRUCTURE_INPUT",
+    "CAP_STEP8_STRUCTURE_EVALUATION",
+    "CAP_STEP9_STRUCTURE_DESIGN",
+    "AGENT_ID_STEP5",
+    "AGENT_ID_STEP6",
+    "AGENT_ID_STRUCTURE",
+]
