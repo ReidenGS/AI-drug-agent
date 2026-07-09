@@ -22,6 +22,7 @@ search is disabled — recording every rejection with a compact reason.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -36,7 +37,7 @@ from .tool_selection_policy import (
 )
 
 
-STEP14_SELECTION_PROMPT_CACHE_LAYOUT_VERSION = "step14_selection_v2"
+STEP14_SELECTION_PROMPT_CACHE_LAYOUT_VERSION = "step14_selection_v3"
 
 
 # ── Step 14 tool specs (the only 3 allowed tools) ───────────────────────────
@@ -148,99 +149,201 @@ def schema_arg_for_support(tool_name: str, token: str) -> Optional[str]:
     return lowered.get(token.lower())
 
 
-STEP14_SELECTION_SYSTEM_PROMPT = """You select Step 14 patent-search tools.
+# Per-tool identity requirement: a tuple of OR-groups. A tool is invocable when
+# EVERY group has at least one satisfied schema arg. FDA Orange Book's single
+# group encodes its brand_name-OR-application_number semantics even though the
+# official schema marks neither as `required`.
+_STEP14_IDENTITY_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "PubChem_get_associated_patents_by_CID": (("cid",),),
+    "FDA_OrangeBook_get_patent_info": (("brand_name", "application_number"),),
+    "drugbank_get_drug_references_by_drug_name_or_id": (("query",),),
+}
 
-You only choose WHICH patent tools to run. You never resolve real values and
-never construct raw tool arguments; a separate runtime resolver builds real
-arguments from the selected input refs.
+
+def _identity_args(tool_name: str) -> set[str]:
+    return {a for group in _STEP14_IDENTITY_GROUPS.get(tool_name, ()) for a in group}
+
+
+def _identity_missing(tool_name: str, satisfied_args: set[str]) -> list[str]:
+    missing: list[str] = []
+    for group in _STEP14_IDENTITY_GROUPS.get(tool_name, ()):
+        if not (set(group) & satisfied_args):
+            missing.append("|".join(group))
+    return missing
+
+
+def _tool_schema_props(tool_name: str) -> set[str]:
+    schema, _ = _step14_schema_and_source(tool_name)
+    return {str(k) for k in (schema or {}).get("properties") or {}}
+
+
+def _ref_can_satisfy_schema_arg(
+    tool_name: str, supports_tool_args: list[str], schema_arg: str
+) -> Optional[str]:
+    """Return the support token that lets an input ref fill ``schema_arg`` under
+    the Step 14 mapping, or ``None`` if none of its tokens can."""
+    for token in supports_tool_args:
+        if schema_arg_for_support(tool_name, token) == schema_arg:
+            return token
+    return None
+
+
+def _literal_allowed(tool_name: str, schema_arg: str, value: Any) -> bool:
+    """Allow a static config literal only when the sourced schema supports it
+    (enum/const/default match, or a boolean/integer/number type). Identity args
+    are never fillable by a literal — those must be argument_mappings — so the
+    LLM can never smuggle a runtime CID / brand name / query text as a literal.
+    """
+    if schema_arg in _identity_args(tool_name):
+        return False
+    schema, _ = _step14_schema_and_source(tool_name)
+    prop = ((schema or {}).get("properties") or {}).get(schema_arg)
+    if not isinstance(prop, dict):
+        return False
+    if "const" in prop:
+        return value == prop["const"]
+    if isinstance(prop.get("enum"), list):
+        return value in prop["enum"]
+    if "default" in prop:
+        return value == prop["default"]
+    ptype = prop.get("type")
+    if ptype == "boolean":
+        return isinstance(value, bool)
+    if ptype == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if ptype == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return False
+
+
+STEP14_SELECTION_SYSTEM_PROMPT = """You plan Step 14 patent-search tool calls.
+
+You choose WHICH of the 3 patent tools to run AND map each tool's official
+schema arguments to the request's input refs. You never see or invent runtime
+values (CIDs, brand names, application numbers, drug / payload / linker text);
+you only reference input_ref_ids and the tools' official schema arg names. A
+separate runtime resolver reads the real values from storage after you plan.
+
+For every selected tool, output one plan:
+- tool_name: one of the 3 catalog tool names.
+- can_invoke: true only when the tool's required/identity argument is satisfied
+  by argument_mappings.
+- argument_mappings: list of {"schema_arg","input_ref_id"} pairs. schema_arg
+  MUST be one of the tool's official schema_arg_names. input_ref_id MUST be a
+  ref in input_refs whose supports_tool_args can fill that schema_arg.
+- argument_literals: list of {"schema_arg","literal_value_json"} pairs, ONLY
+  for static schema-supported config args (e.g. booleans / limits).
+  literal_value_json is the value encoded as a JSON string, e.g. "25", "true",
+  or "\\"some_enum\\"". The runtime decodes it to a real literal_value before
+  validation. NEVER put a runtime identity value (cid, brand_name,
+  application_number, query text) in a literal — those must be
+  argument_mappings.
+- missing_required_args: identity/required args you could not satisfy.
+- selection_reason: short reason.
 
 Rules:
-1. Select only from the given tool catalog (exactly the 3 allowed tools).
-2. Refer only to input_ref_ids present in the request's input_refs. Never
-   invent an input_ref_id.
-3. Never invent runtime values (CIDs, brand names, drug names, payload text).
-4. PubChem_get_associated_patents_by_CID requires an input ref whose
-   supports_tool_args includes cid or pubchem_cid.
-5. FDA_OrangeBook_get_patent_info requires an input ref whose
-   supports_tool_args includes brand_name or application_number.
-6. drugbank_get_drug_references_by_drug_name_or_id requires an input ref whose
-   supports_tool_args includes drug_name_or_id or query.
-7. Text roles (payload, linker, linker_payload, compound, target,
-   complete_adc) may drive DrugBank or FDA text lookup ONLY when their
-   supports_tool_args include query / drug_name_or_id / brand_name.
-8. An input ref with role=antibody may only be used when
-   patent_scope.antibody_search_allowed is true. Otherwise do not select it.
-9. If no valid tool can be selected, return an empty selected_tool_plans list.
-   Never fabricate a fallback call.
-10. Return exactly one valid JSON object with this shape:
+1. Use only the 3 catalog tools; never invent a tool.
+2. Reference only input_ref_ids present in input_refs; never invent one.
+3. Use only official schema args (each tool lists schema_arg_names).
+4. Never invent runtime values; identity values come only from argument_mappings.
+5. No duplicate schema_arg within a plan.
+6. PubChem_get_associated_patents_by_CID identity arg is `cid`; refs whose
+   supports_tool_args include cid or pubchem_cid fill it.
+7. FDA_OrangeBook_get_patent_info is satisfied by `brand_name` OR
+   `application_number` (either invokes it, even though official required is
+   empty).
+8. drugbank_get_drug_references_by_drug_name_or_id identity arg is `query`;
+   refs whose supports_tool_args include query or drug_name_or_id fill it.
+9. An input ref with role=antibody may be used ONLY when
+   patent_scope.antibody_search_allowed is true.
+10. If a tool cannot be satisfied, either omit it or set can_invoke=false and
+    list missing_required_args. Never fabricate a call.
+11. Return exactly one JSON object with this shape:
 {
-  "selected_tool_plans": [
+  "tool_plans": [
     {
       "tool_name": "one of the catalog tool names",
-      "input_ref_ids": ["ref id from input_refs"],
-      "selection_reason": "short reason",
-      "missing_required_args": []
+      "can_invoke": true,
+      "argument_mappings": [{"schema_arg": "cid", "input_ref_id": "r_cid"}],
+      "argument_literals": [],
+      "missing_required_args": [],
+      "selection_reason": "short reason"
     }
   ]
 }
 
 Example:
-Input situation: input_refs contains {"ref_id": "r1", "role": "pubchem_cid",
-"supports_tool_args": ["cid", "pubchem_cid"]} and {"ref_id": "r2",
-"role": "payload", "supports_tool_args": ["query"]}.
+input_refs = [{"ref_id":"r_cid","role":"pubchem_cid",
+"supports_tool_args":["cid","pubchem_cid"]},
+{"ref_id":"r_payload","role":"payload","supports_tool_args":["query"]}].
 Output:
 {
-  "selected_tool_plans": [
-    {
-      "tool_name": "PubChem_get_associated_patents_by_CID",
-      "input_ref_ids": ["r1"],
-      "selection_reason": "r1 supports cid",
-      "missing_required_args": []
-    },
-    {
-      "tool_name": "drugbank_get_drug_references_by_drug_name_or_id",
-      "input_ref_ids": ["r2"],
-      "selection_reason": "r2 supports query text lookup",
-      "missing_required_args": []
-    }
+  "tool_plans": [
+    {"tool_name":"PubChem_get_associated_patents_by_CID","can_invoke":true,
+     "argument_mappings":[{"schema_arg":"cid","input_ref_id":"r_cid"}],
+     "argument_literals":[],"missing_required_args":[],
+     "selection_reason":"CID ref satisfies PubChem cid"},
+    {"tool_name":"drugbank_get_drug_references_by_drug_name_or_id",
+     "can_invoke":true,
+     "argument_mappings":[{"schema_arg":"query","input_ref_id":"r_payload"}],
+     "argument_literals":[],"missing_required_args":[],
+     "selection_reason":"payload ref fills DrugBank query"}
   ]
 }
 
-No-valid-tool example:
+No-usable-tool example:
 Output:
-{"selected_tool_plans": []}
+{"tool_plans": []}
 """.strip()
 
 
 STEP14_SELECTION_USER_PROMPT = (
-    "Select Step 14 patent tools from the catalog using only the input refs' "
-    "roles and supports_tool_args. Do not construct arguments or invent values."
+    "Plan Step 14 patent tool calls: for each usable tool, map its official "
+    "schema args to input_ref_ids. Do not invent tools, refs, schema args, or "
+    "runtime values."
 )
 
 
-class Step14SelectedToolPlan(BaseModel):
+class Step14ArgumentMapping(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_arg: str
+    input_ref_id: str
+
+
+class Step14ArgumentLiteral(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_arg: str
+    literal_value: Any = None
+
+
+class Step14ToolPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tool_name: str
-    input_ref_ids: list[str] = Field(default_factory=list)
-    selection_reason: str = ""
+    can_invoke: bool = False
+    argument_mappings: list[Step14ArgumentMapping] = Field(default_factory=list)
+    argument_literals: list[Step14ArgumentLiteral] = Field(default_factory=list)
     missing_required_args: list[str] = Field(default_factory=list)
+    selection_reason: str = ""
 
 
 class Step14RejectedToolPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tool_name: str
-    input_ref_ids: list[str] = Field(default_factory=list)
     reason: str
+    argument_mappings: list[dict] = Field(default_factory=list)
 
 
-class Step14SelectionResult(BaseModel):
+class Step14PlanningResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     catalog_tool_names: list[str] = Field(default_factory=list)
-    selected_tool_plans: list[Step14SelectedToolPlan] = Field(default_factory=list)
+    tool_plans: list[Step14ToolPlan] = Field(default_factory=list)
     rejected_tool_plans: list[Step14RejectedToolPlan] = Field(default_factory=list)
+    argument_mapping_audit: list[dict] = Field(default_factory=list)
     selection_source: str = "llm_step14"
     prompt_cache_layout_version: str = STEP14_SELECTION_PROMPT_CACHE_LAYOUT_VERSION
 
@@ -316,14 +419,21 @@ def build_step14_selection_payload(
     }
 
 
-def select_step14_tool_plans(
+def plan_step14_tool_calls(
     *, llm: LLMProvider, request: Step14PatentRequest
-) -> Step14SelectionResult:
-    """Run Step 14 tool selection and validate the plans against the request.
+) -> Step14PlanningResult:
+    """Single-stage Step 14 planner: one LLM call returns tool plans with
+    schema_arg → input_ref_id mappings; this function validates each plan
+    against the sourced tool schema and the request's input refs.
 
-    Validation drops/records: unknown tools, unknown input_ref_ids,
-    unsatisfiable plans (no selected ref satisfies the tool's required args),
-    and antibody plans when ``antibody_search_allowed`` is false.
+    A plan is REJECTED (structural violation, audited compactly) when it
+    references an unknown tool / schema_arg / input_ref_id, duplicates a
+    schema_arg, uses an antibody ref while antibody search is off, maps an
+    input ref that cannot fill the schema_arg, or supplies a disallowed literal.
+    A structurally-valid plan whose identity arg is not covered is KEPT with
+    ``can_invoke=false`` + ``missing_required_args`` (the runtime will not call
+    it). The runtime builds kwargs strictly from the accepted mappings/literals
+    — it never re-derives a mapping.
     """
     catalog = build_step14_selection_catalog()
     allowed_tools = set(STEP14_TOOL_SPECS)
@@ -337,10 +447,11 @@ def select_step14_tool_plans(
         system=STEP14_SELECTION_SYSTEM_PROMPT,
     )
 
-    selected: list[Step14SelectedToolPlan] = []
+    tool_plans: list[Step14ToolPlan] = []
     rejected: list[Step14RejectedToolPlan] = []
+    audit: list[dict] = []
 
-    for i, entry in enumerate((response or {}).get("selected_tool_plans") or []):
+    for i, entry in enumerate((response or {}).get("tool_plans") or []):
         if not isinstance(entry, dict):
             rejected.append(
                 Step14RejectedToolPlan(tool_name=f"index:{i}", reason="plan_not_object")
@@ -352,75 +463,141 @@ def select_step14_tool_plans(
                 Step14RejectedToolPlan(tool_name=f"index:{i}", reason="missing_tool_name")
             )
             continue
-        raw_ref_ids = entry.get("input_ref_ids") or []
-        ref_ids = [r for r in raw_ref_ids if isinstance(r, str) and r]
+        raw_maps = entry.get("argument_mappings") or []
+        raw_lits = entry.get("argument_literals") or []
+        echo = [
+            {"schema_arg": m.get("schema_arg"), "input_ref_id": m.get("input_ref_id")}
+            for m in raw_maps
+            if isinstance(m, dict)
+        ]
         if tool_name not in allowed_tools:
             rejected.append(
                 Step14RejectedToolPlan(
-                    tool_name=tool_name, input_ref_ids=ref_ids, reason="unknown_tool"
+                    tool_name=tool_name, reason="unknown_tool", argument_mappings=echo
                 )
             )
             continue
 
-        # Unknown input_ref_ids: reject the whole plan (never invent refs).
-        unknown = [r for r in ref_ids if r not in ref_by_id]
-        if unknown:
+        props = _tool_schema_props(tool_name)
+        errors: list[str] = []
+        seen_args: set[str] = set()
+        valid_maps: list[tuple[str, str, str]] = []  # (schema_arg, input_ref_id, token)
+
+        for m in raw_maps:
+            if not isinstance(m, dict):
+                errors.append("mapping_not_object")
+                continue
+            arg = m.get("schema_arg")
+            rid = m.get("input_ref_id")
+            if not isinstance(arg, str) or not arg:
+                errors.append("mapping_missing_schema_arg")
+                continue
+            if not isinstance(rid, str) or not rid:
+                errors.append("mapping_missing_input_ref_id")
+                continue
+            if arg not in props:
+                errors.append(f"unknown_schema_arg:{arg}")
+                continue
+            if arg in seen_args:
+                errors.append(f"duplicate_schema_arg:{arg}")
+                continue
+            if rid not in ref_by_id:
+                errors.append(f"unknown_input_ref_id:{rid}")
+                continue
+            ref = ref_by_id[rid]
+            if ref.role == "antibody" and not antibody_allowed:
+                errors.append("antibody_search_not_allowed")
+                continue
+            token = _ref_can_satisfy_schema_arg(tool_name, list(ref.supports_tool_args), arg)
+            if token is None:
+                errors.append(f"input_ref_cannot_satisfy_schema_arg:{arg}")
+                continue
+            seen_args.add(arg)
+            valid_maps.append((arg, rid, token))
+
+        valid_lits: list[tuple[str, Any]] = []
+        for lit in raw_lits:
+            if not isinstance(lit, dict):
+                errors.append("literal_not_object")
+                continue
+            arg = lit.get("schema_arg")
+            if not isinstance(arg, str) or not arg:
+                errors.append("literal_missing_schema_arg")
+                continue
+            if arg not in props:
+                errors.append(f"unknown_schema_arg:{arg}")
+                continue
+            if arg in seen_args:
+                errors.append(f"duplicate_schema_arg:{arg}")
+                continue
+            # Parser-facing shape encodes the value as a JSON string in
+            # `literal_value_json` (OpenAI strict / Gemini / Qwen). The OpenAI
+            # provider already decodes it to `literal_value`; the json_object
+            # path leaves it as `literal_value_json`, so decode it here. Accept
+            # both so no provider needs a different shape.
+            if "literal_value_json" in lit:
+                raw_json = lit.get("literal_value_json")
+                if not isinstance(raw_json, str):
+                    errors.append(f"literal_value_json_not_string:{arg}")
+                    continue
+                try:
+                    value = json.loads(raw_json)
+                except (TypeError, ValueError):
+                    errors.append(f"literal_value_json_invalid:{arg}")
+                    continue
+            else:
+                value = lit.get("literal_value")
+            if not _literal_allowed(tool_name, arg, value):
+                errors.append(f"literal_not_allowed:{arg}")
+                continue
+            seen_args.add(arg)
+            valid_lits.append((arg, value))
+
+        if errors:
             rejected.append(
                 Step14RejectedToolPlan(
                     tool_name=tool_name,
-                    input_ref_ids=ref_ids,
-                    reason=f"unknown_input_ref_ids:{','.join(unknown)}",
+                    reason=";".join(errors),
+                    argument_mappings=echo,
                 )
             )
             continue
 
-        refs = [ref_by_id[r] for r in ref_ids]
+        satisfied_args = {a for a, _, _ in valid_maps} | {a for a, _ in valid_lits}
+        missing = _identity_missing(tool_name, satisfied_args)
+        # Authoritative can_invoke = identity satisfied, unless the LLM
+        # explicitly refused (can_invoke=false) — never fabricated to true.
+        can_invoke = (not missing) and (entry.get("can_invoke") is not False)
 
-        # Antibody gate: any antibody ref is rejected unless explicitly allowed.
-        antibody_refs = [ref for ref in refs if ref.role == "antibody"]
-        if antibody_refs and not antibody_allowed:
-            rejected.append(
-                Step14RejectedToolPlan(
-                    tool_name=tool_name,
-                    input_ref_ids=ref_ids,
-                    reason="antibody_search_not_allowed",
-                )
-            )
-            continue
-
-        # Required-arg satisfaction: at least one selected ref must support the
-        # tool's required/primary argument.
-        acceptable = acceptable_supports_for(tool_name)
-        satisfying = [
-            ref
-            for ref in refs
-            if {s.lower() for s in ref.supports_tool_args} & acceptable
-        ]
-        if not satisfying:
-            rejected.append(
-                Step14RejectedToolPlan(
-                    tool_name=tool_name,
-                    input_ref_ids=ref_ids,
-                    reason="no_input_ref_satisfies_required_args",
-                )
-            )
-            continue
-
-        selected.append(
-            Step14SelectedToolPlan(
-                tool_name=tool_name,
-                input_ref_ids=ref_ids,
-                selection_reason=str(entry.get("selection_reason") or ""),
-                missing_required_args=[
-                    str(a)
-                    for a in (entry.get("missing_required_args") or [])
-                    if isinstance(a, str)
-                ],
-            )
+        plan = Step14ToolPlan(
+            tool_name=tool_name,
+            can_invoke=can_invoke,
+            argument_mappings=[
+                Step14ArgumentMapping(schema_arg=a, input_ref_id=r)
+                for a, r, _ in valid_maps
+            ],
+            argument_literals=[
+                Step14ArgumentLiteral(schema_arg=a, literal_value=v)
+                for a, v in valid_lits
+            ],
+            missing_required_args=missing,
+            selection_reason=str(entry.get("selection_reason") or ""),
         )
+        tool_plans.append(plan)
+        for a, r, tok in valid_maps:
+            audit.append(
+                {
+                    "tool_name": tool_name,
+                    "schema_arg": a,
+                    "input_ref_id": r,
+                    "satisfied_by_support": tok,
+                    "can_invoke": can_invoke,
+                }
+            )
 
-    return Step14SelectionResult(
+    return Step14PlanningResult(
         catalog_tool_names=[entry["tool_name"] for entry in catalog],
-        selected_tool_plans=selected,
+        tool_plans=tool_plans,
         rejected_tool_plans=rejected,
+        argument_mapping_audit=audit,
     )

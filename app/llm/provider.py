@@ -240,14 +240,15 @@ def _mock_step6_schema_mapping_stage2(schema: dict) -> dict:
 
 
 def _mock_step14_patent_tool_selection(schema: dict) -> dict:
-    """Deterministic Step 14 patent tool-selection mock.
+    """Deterministic Step 14 single-stage patent planner mock.
 
-    Selects tools purely from each input ref's ``supports_tool_args`` against
-    the catalog's ``acceptable_supports`` — never from a resolved value (the
-    request carries none). Emits one plan per (input_ref, matching tool) so the
-    validator can gate each independently (e.g. antibody refs). Antibody refs
-    are still emitted when they support a tool; the selection validator applies
-    the ``antibody_search_allowed`` gate.
+    For each input ref + tool whose ``acceptable_supports`` intersects the
+    ref's ``supports_tool_args``, emits ONE plan mapping the tool's official
+    schema arg (via the catalog's ``supports_to_schema_arg``) to that
+    ``input_ref_id``. It works purely from the catalog + input-ref metadata —
+    never a resolved value (the request carries none). ``can_invoke`` is true
+    because the emitted mapping fills the tool's identity arg; antibody refs are
+    still emitted so the planner validator applies the scope gate.
     """
     catalog = schema.get("tool_catalog") or []
     input_refs = schema.get("input_refs") or []
@@ -255,23 +256,39 @@ def _mock_step14_patent_tool_selection(schema: dict) -> dict:
     for ref in input_refs:
         if not isinstance(ref, dict):
             continue
-        supports = {str(s).lower() for s in (ref.get("supports_tool_args") or [])}
-        if not supports:
+        supports = [str(s) for s in (ref.get("supports_tool_args") or [])]
+        supports_lower = {s.lower() for s in supports}
+        if not supports_lower:
             continue
         for tool in catalog:
             if not isinstance(tool, dict):
                 continue
-            acceptable = {str(s).lower() for s in (tool.get("acceptable_supports") or [])}
-            matched = sorted(supports & acceptable)
-            if not matched:
+            acceptable_order = [str(s) for s in (tool.get("acceptable_supports") or [])]
+            s2a = {
+                str(k).lower(): v
+                for k, v in (tool.get("supports_to_schema_arg") or {}).items()
+            }
+            # Deterministic: first acceptable token (in catalog order) the ref
+            # carries → its official schema arg.
+            token = next(
+                (t for t in acceptable_order if t.lower() in supports_lower), None
+            )
+            if token is None:
+                continue
+            schema_arg = s2a.get(token.lower())
+            if not schema_arg:
                 continue
             plans.append({
                 "tool_name": tool.get("tool_name"),
-                "input_ref_ids": [ref.get("ref_id")],
-                "selection_reason": f"ref supports {matched}",
+                "can_invoke": True,
+                "argument_mappings": [
+                    {"schema_arg": schema_arg, "input_ref_id": ref.get("ref_id")}
+                ],
+                "argument_literals": [],
                 "missing_required_args": [],
+                "selection_reason": f"ref {ref.get('ref_id')} fills {schema_arg}",
             })
-    return {"selected_tool_plans": plans}
+    return {"tool_plans": plans}
 
 
 def _mock_step9_tool_selection_stage1(schema: dict) -> dict:

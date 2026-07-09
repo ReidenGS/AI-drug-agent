@@ -73,10 +73,8 @@ from ..agents.step_14_runtime_resolver import (
     resolve_step14_input_ref,
 )
 from ..agents.step_14_selection_policy import (
-    Step14SelectedToolPlan,
-    acceptable_supports_for,
-    schema_arg_for_support,
-    select_step14_tool_plans,
+    Step14ToolPlan,
+    plan_step14_tool_calls,
 )
 from ..llm.provider import LLMProvider, MockLLMProvider
 from ..mcp.client import MCPClient
@@ -277,7 +275,7 @@ class PatentIPAgent:
         self.workflow_state.mark(run_id, "step_14", "completed")
         return table
 
-    # ── request-based entrypoint (Step 14 Turn A) ───────────────────────────
+    # ── request-based entrypoint (Step 14 single-stage planner) ─────────────
     def run_from_request(
         self,
         request: Step14PatentRequest,
@@ -285,22 +283,24 @@ class PatentIPAgent:
         total_limit: int = DEFAULT_TOTAL_LIMIT,
         per_query_limit: int = DEFAULT_PER_QUERY_LIMIT,
     ) -> PatentPriorArtTable:
-        """Request-driven Step 14 routing.
+        """Request-driven Step 14 routing (single-stage LLM planner).
 
-        The LLM selects tools purely from the request's ``input_refs``
-        (roles / supports_tool_args) — it discovers no extra Step 2 / Step 5
-        fields. The runtime resolver then resolves each selected input ref to a
-        real value and builds real tool arguments; unresolved refs become
-        compact ``skipped`` / ``input_missing`` tool-call records (never a fake
-        success). Raw payloads stay in ``tool_output_ref``; extraction / dedup /
-        scoring reuse the same helpers as ``run``. Step 14 never writes
-        ``ranking_table``.
+        One LLM call returns tool plans with schema_arg → input_ref_id
+        mappings. The runtime builds kwargs STRICTLY from the LLM's accepted
+        ``argument_mappings`` / ``argument_literals`` — it never re-derives a
+        mapping from ``supports_to_schema_arg``. For each mapped input ref the
+        runtime resolver reads the real value from storage. A plan the planner
+        marked ``can_invoke=false`` is not called (uninvokable record); a plan
+        whose mapped ref cannot be resolved is not called
+        (skipped / input_missing). No fake success. Raw payloads stay in
+        ``tool_output_ref``; extraction / dedup / scoring reuse ``run``'s
+        helpers. Step 14 never writes ``ranking_table``.
         """
         total_limit = max(1, min(int(total_limit), MAX_TOTAL_LIMIT))
         per_query_limit = max(1, min(int(per_query_limit), MAX_TOTAL_LIMIT))
         run_id = request.run_id
 
-        selection = select_step14_tool_plans(llm=self.llm, request=request)
+        planning = plan_step14_tool_calls(llm=self.llm, request=request)
         ref_by_id = {ref.ref_id: ref for ref in request.input_refs}
 
         tool_calls: list[ToolCallRecord] = []
@@ -316,14 +316,30 @@ class PatentIPAgent:
                 resolver_audit.append(resolved.audit_entry())
             return resolved_cache[ref_id]
 
-        for plan in selection.selected_tool_plans[: max(1, total_limit)]:
-            resolved_refs = [_resolve(rid) for rid in plan.input_ref_ids]
-            tool_args, primary = _build_request_tool_args(plan.tool_name, resolved_refs)
-            if tool_args is None or primary is None:
-                tool_calls.append(_skipped_input_missing_record(plan, resolved_refs))
+        for plan in planning.tool_plans[: max(1, total_limit)]:
+            if not plan.can_invoke:
+                tool_calls.append(_uninvokable_record(plan))
                 continue
+            # Build kwargs STRICTLY from the LLM's accepted mappings/literals.
+            kwargs: dict[str, Any] = {}
+            primary: Optional[Step14ResolvedRef] = None
+            unresolved_reason: Optional[str] = None
+            for mapping in plan.argument_mappings:
+                resolved = _resolve(mapping.input_ref_id)
+                if not resolved.resolved or not resolved.value:
+                    unresolved_reason = resolved.unresolved_reason or "input_missing"
+                    break
+                kwargs[mapping.schema_arg] = resolved.value
+                primary = primary or resolved
+            if unresolved_reason is not None or primary is None or not kwargs:
+                tool_calls.append(
+                    _skipped_input_missing_record(plan, unresolved_reason or "input_missing")
+                )
+                continue
+            for literal in plan.argument_literals:
+                kwargs[literal.schema_arg] = literal.literal_value
             tc, hits = self._call_and_extract_request(
-                run_id=run_id, plan=plan, tool_args=tool_args, primary=primary,
+                run_id=run_id, plan=plan, tool_args=kwargs, primary=primary,
             )
             tool_calls.append(tc)
             if hits:
@@ -347,10 +363,10 @@ class PatentIPAgent:
             patent_records=patent_records,
             tool_call_records=tool_calls,
             patent_review_notes=(
-                "Step 14 request-based routing. Tools were LLM-selected from "
-                "request input refs; real values were resolved by the runtime "
-                "resolver. Raw payloads remain in tool_call_records[]."
-                "tool_output_ref."
+                "Step 14 request-based routing (single-stage planner). Tools + "
+                "schema_arg→input_ref_id mappings were LLM-planned; real values "
+                "were resolved by the runtime resolver. Raw payloads remain in "
+                "tool_call_records[].tool_output_ref."
             ),
             step14_request_refs=[
                 {
@@ -364,12 +380,12 @@ class PatentIPAgent:
                 for ref in request.input_refs
             ],
             step14_patent_scope=request.patent_scope.model_dump(),
-            step14_llm_selected_tool_plans=[
-                p.model_dump() for p in selection.selected_tool_plans
-            ],
+            step14_llm_tool_plans=[p.model_dump() for p in planning.tool_plans],
             step14_llm_rejected_tool_plans=[
-                p.model_dump() for p in selection.rejected_tool_plans
+                p.model_dump() for p in planning.rejected_tool_plans
             ],
+            step14_argument_mapping_audit=list(planning.argument_mapping_audit),
+            step14_prompt_cache_layout_version=planning.prompt_cache_layout_version,
             step14_runtime_resolver_audit=resolver_audit,
             step14_request_source="request",
         )
@@ -387,7 +403,7 @@ class PatentIPAgent:
         self,
         *,
         run_id: str,
-        plan: Step14SelectedToolPlan,
+        plan: Step14ToolPlan,
         tool_args: dict[str, Any],
         primary: Step14ResolvedRef,
     ) -> tuple[ToolCallRecord, list]:
@@ -427,7 +443,11 @@ class PatentIPAgent:
             "query_term_source": term_source,
             "selected_by": "llm_step14",
             "selection_reason": plan.selection_reason,
-            "input_ref_ids": list(plan.input_ref_ids),
+            "input_ref_ids": [m.input_ref_id for m in plan.argument_mappings],
+            "argument_mappings": [
+                {"schema_arg": m.schema_arg, "input_ref_id": m.input_ref_id}
+                for m in plan.argument_mappings
+            ],
         }
         tc = ToolCallRecord(
             tool_call_id=tc_id, tool_name=plan.tool_name,
@@ -573,49 +593,43 @@ class PatentIPAgent:
         return "partial"
 
 
-# ── request-based tool-arg construction ─────────────────────────────────────
+# ── request-based skipped / uninvokable records ─────────────────────────────
 
 
-def _build_request_tool_args(
-    tool_name: str, resolved_refs: list[Step14ResolvedRef]
-) -> tuple[Optional[dict[str, Any]], Optional[Step14ResolvedRef]]:
-    """Build real tool args from the first resolved ref that satisfies the
-    tool's required/primary argument. The argument name is the OFFICIAL schema
-    arg the matched supports token maps to (via `schema_arg_for_support`), so
-    the constructed args stay aligned with the sourced tool schema. Returns
-    ``(None, None)`` when no selected ref resolved to a usable value (→ a
-    skipped/input_missing record)."""
-    acceptable = acceptable_supports_for(tool_name)
-    spec_order = [
-        t for t in _support_priority(tool_name)
-    ]
-    for ref in resolved_refs:
-        if not ref.resolved or not ref.value:
-            continue
-        matched = {s.lower() for s in ref.supports_tool_args} & acceptable
-        if not matched:
-            continue
-        # Deterministic: pick the first supports token (in spec order) the ref
-        # carries, then fill the official schema arg it maps to.
-        for token in spec_order:
-            if token in matched:
-                arg = schema_arg_for_support(tool_name, token)
-                if arg:
-                    return {arg: ref.value}, ref
-    return None, None
+def _plan_ref_ids(plan: Step14ToolPlan) -> list[str]:
+    return [m.input_ref_id for m in plan.argument_mappings]
 
 
-def _support_priority(tool_name: str) -> list[str]:
-    from ..agents.step_14_selection_policy import STEP14_TOOL_SPECS
-
-    return [s.lower() for s in STEP14_TOOL_SPECS[tool_name].acceptable_supports]
+def _uninvokable_record(plan: Step14ToolPlan) -> ToolCallRecord:
+    """Compact record for a plan the planner marked ``can_invoke=false`` — the
+    tool is NOT called (no fake success)."""
+    return ToolCallRecord(
+        tool_call_id=new_tool_call_id(),
+        tool_name=plan.tool_name,
+        agent_name=_AGENT_NAME,
+        step_id=_STEP_ID,
+        run_status="skipped",
+        started_at=now_iso(),
+        finished_at=now_iso(),
+        tool_input_summary={
+            "skip_reason": "uninvokable",
+            "missing_required_args": list(plan.missing_required_args),
+            "input_ref_ids": _plan_ref_ids(plan),
+            "selected_by": "llm_step14",
+            "selection_reason": plan.selection_reason,
+        },
+        error_message=(
+            "uninvokable: missing_required_args="
+            + ",".join(plan.missing_required_args)
+        ),
+    )
 
 
 def _skipped_input_missing_record(
-    plan: Step14SelectedToolPlan, resolved_refs: list[Step14ResolvedRef]
+    plan: Step14ToolPlan, unresolved_reason: str
 ) -> ToolCallRecord:
-    reasons = [r.unresolved_reason for r in resolved_refs if r.unresolved_reason]
-    reason = ",".join(reasons) if reasons else "input_missing"
+    """Compact record when a mapped input ref could not be resolved — the tool
+    is NOT called (no fake success)."""
     return ToolCallRecord(
         tool_call_id=new_tool_call_id(),
         tool_name=plan.tool_name,
@@ -626,12 +640,11 @@ def _skipped_input_missing_record(
         finished_at=now_iso(),
         tool_input_summary={
             "skip_reason": "input_missing",
-            "unresolved_reason": reason,
-            "input_ref_ids": list(plan.input_ref_ids),
-            "query_role": resolved_refs[0].role if resolved_refs else None,
+            "unresolved_reason": unresolved_reason,
+            "input_ref_ids": _plan_ref_ids(plan),
             "selected_by": "llm_step14",
         },
-        error_message=f"input_missing: {reason}",
+        error_message=f"input_missing: {unresolved_reason}",
     )
 
 

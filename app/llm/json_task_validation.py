@@ -499,9 +499,10 @@ def _split_prompt_schema(schema: dict, task: str) -> tuple[dict | None, dict]:
 def shape_instruction(task: str) -> str:
     if task == "step14_patent_tool_selection":
         return (
-            '{"selected_tool_plans":[{"tool_name":"string",'
-            '"input_ref_ids":["string"],"selection_reason":"string",'
-            '"missing_required_args":["string"]}]}'
+            '{"tool_plans":[{"tool_name":"string","can_invoke":true,'
+            '"argument_mappings":[{"schema_arg":"string","input_ref_id":"string"}],'
+            '"argument_literals":[{"schema_arg":"string","literal_value_json":"json text"}],'
+            '"missing_required_args":["string"],"selection_reason":"string"}]}'
         )
     if task == "step9_tool_schema_mapping_stage_2":
         return (
@@ -689,34 +690,77 @@ def _strip_markdown_fence(text: str) -> str:
 
 def validate_task_shape(data: dict, task: str, *, error_factory: ErrorFactory) -> dict:
     if task == "step14_patent_tool_selection":
-        plans = data.get("selected_tool_plans")
+        plans = data.get("tool_plans")
         if not isinstance(plans, list):
             raise error_factory(
-                "step14_patent_tool_selection response requires list `selected_tool_plans`"
+                "step14_patent_tool_selection response requires list `tool_plans`"
             )
         for i, entry in enumerate(plans):
             if not isinstance(entry, dict):
                 raise error_factory(
-                    f"step14_patent_tool_selection selected_tool_plans[{i}] must be an object"
+                    f"step14_patent_tool_selection tool_plans[{i}] must be an object"
                 )
             if not isinstance(entry.get("tool_name"), str) or not entry.get("tool_name"):
                 raise error_factory(
-                    f"step14_patent_tool_selection selected_tool_plans[{i}] requires string `tool_name`"
+                    f"step14_patent_tool_selection tool_plans[{i}] requires string `tool_name`"
                 )
-            ref_ids = entry.get("input_ref_ids")
-            if not isinstance(ref_ids, list) or not all(isinstance(r, str) for r in ref_ids):
+            if "can_invoke" in entry and not isinstance(entry["can_invoke"], bool):
                 raise error_factory(
-                    f"step14_patent_tool_selection selected_tool_plans[{i}] requires string list `input_ref_ids`"
+                    f"step14_patent_tool_selection tool_plans[{i}] `can_invoke` must be a boolean"
                 )
-            if "selection_reason" in entry and not isinstance(entry["selection_reason"], str):
-                raise error_factory(
-                    f"step14_patent_tool_selection selected_tool_plans[{i}] `selection_reason` must be a string"
-                )
+            mappings = entry.get("argument_mappings")
+            if mappings is not None:
+                if not isinstance(mappings, list):
+                    raise error_factory(
+                        f"step14_patent_tool_selection tool_plans[{i}] `argument_mappings` must be a list"
+                    )
+                for j, pair in enumerate(mappings):
+                    if not isinstance(pair, dict):
+                        raise error_factory(
+                            f"step14_patent_tool_selection tool_plans[{i}].argument_mappings[{j}] must be an object"
+                        )
+                    if not isinstance(pair.get("schema_arg"), str) or not pair.get("schema_arg"):
+                        raise error_factory(
+                            f"step14_patent_tool_selection tool_plans[{i}].argument_mappings[{j}] requires string `schema_arg`"
+                        )
+                    if not isinstance(pair.get("input_ref_id"), str) or not pair.get("input_ref_id"):
+                        raise error_factory(
+                            f"step14_patent_tool_selection tool_plans[{i}].argument_mappings[{j}] requires string `input_ref_id`"
+                        )
+            literals = entry.get("argument_literals")
+            if literals is not None:
+                if not isinstance(literals, list):
+                    raise error_factory(
+                        f"step14_patent_tool_selection tool_plans[{i}] `argument_literals` must be a list"
+                    )
+                for j, pair in enumerate(literals):
+                    if not isinstance(pair, dict):
+                        raise error_factory(
+                            f"step14_patent_tool_selection tool_plans[{i}].argument_literals[{j}] must be an object"
+                        )
+                    if not isinstance(pair.get("schema_arg"), str) or not pair.get("schema_arg"):
+                        raise error_factory(
+                            f"step14_patent_tool_selection tool_plans[{i}].argument_literals[{j}] requires string `schema_arg`"
+                        )
+                    # The parser-facing shape encodes the config literal as a
+                    # JSON string in `literal_value_json`; the planner decodes it
+                    # to `literal_value` before validation. Accept either so the
+                    # OpenAI (decoded) and Gemini/Qwen (json_object) paths agree.
+                    if "literal_value_json" in pair and not isinstance(
+                        pair.get("literal_value_json"), str
+                    ):
+                        raise error_factory(
+                            f"step14_patent_tool_selection tool_plans[{i}].argument_literals[{j}] `literal_value_json` must be a string"
+                        )
             if "missing_required_args" in entry and not isinstance(
                 entry["missing_required_args"], list
             ):
                 raise error_factory(
-                    f"step14_patent_tool_selection selected_tool_plans[{i}] `missing_required_args` must be a list"
+                    f"step14_patent_tool_selection tool_plans[{i}] `missing_required_args` must be a list"
+                )
+            if "selection_reason" in entry and not isinstance(entry["selection_reason"], str):
+                raise error_factory(
+                    f"step14_patent_tool_selection tool_plans[{i}] `selection_reason` must be a string"
                 )
         return data
 

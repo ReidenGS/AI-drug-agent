@@ -291,20 +291,63 @@ class _Step6SchemaMappingStage2ParserResponse(BaseModel):
         return {"tools": tools_out}
 
 
-# ── Step 14 patent tool selection: strict parser shape ──────────────────────
+# ── Step 14 patent tool planning (single-stage): strict parser shape ────────
 
 
-class _Step14SelectedToolPlan(BaseModel):
+class _Step14ArgumentMapping(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    schema_arg: str
+    input_ref_id: str
+
+
+class _Step14ArgumentLiteral(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    schema_arg: str
+    # The static config literal, encoded as a JSON *string* (like Step 9) so the
+    # parser schema stays strict — no unconstrained dict/list/Any. The shared
+    # validator (`plan_step14_tool_calls`) is the single place that gates it
+    # against the sourced schema; invalid JSON makes the literal drop out.
+    literal_value_json: str
+
+
+class _Step14ToolPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
     tool_name: str
-    input_ref_ids: list[str] = Field(default_factory=list)
-    selection_reason: Optional[str] = None
+    can_invoke: bool
+    argument_mappings: list[_Step14ArgumentMapping] = Field(default_factory=list)
+    argument_literals: list[_Step14ArgumentLiteral] = Field(default_factory=list)
     missing_required_args: list[str] = Field(default_factory=list)
+    selection_reason: Optional[str] = None
 
 
 class _Step14PatentToolSelectionResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    selected_tool_plans: list[_Step14SelectedToolPlan] = Field(default_factory=list)
+    tool_plans: list[_Step14ToolPlan] = Field(default_factory=list)
+
+    def to_external_dict(self) -> dict:
+        plans_out: list[dict[str, Any]] = []
+        for plan in self.tool_plans:
+            literals: list[dict[str, Any]] = []
+            for pair in plan.argument_literals:
+                try:
+                    value = json.loads(pair.literal_value_json)
+                except (TypeError, ValueError) as exc:
+                    raise OpenAIProviderError(
+                        "step14_patent_tool_selection invalid literal_value_json "
+                        f"for schema_arg `{pair.schema_arg}`"
+                    ) from exc
+                literals.append({"schema_arg": pair.schema_arg, "literal_value": value})
+            out: dict[str, Any] = {
+                "tool_name": plan.tool_name,
+                "can_invoke": plan.can_invoke,
+                "argument_mappings": [m.model_dump() for m in plan.argument_mappings],
+                "argument_literals": literals,
+                "missing_required_args": list(plan.missing_required_args),
+            }
+            if plan.selection_reason is not None:
+                out["selection_reason"] = plan.selection_reason
+            plans_out.append(out)
+        return {"tool_plans": plans_out}
 
 
 # Tasks whose output uses the official structured-output parser. Every other

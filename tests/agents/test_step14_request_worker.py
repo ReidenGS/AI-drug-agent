@@ -60,12 +60,29 @@ def _bind_fixed(canned: dict[str, dict]) -> dict:
     return {name: make(p) for name, p in canned.items()}
 
 
-def _agent(local_storage, registry_service, workflow_state_service, *, bindings=None):
+def _agent(local_storage, registry_service, workflow_state_service, *, bindings=None, llm=None):
     mcp = LocalMCPClient(bindings=bindings) if bindings else LocalMCPClient()
     return PatentIPAgent(
         storage=local_storage, registry=registry_service,
-        workflow_state=workflow_state_service, mcp_client=mcp,
+        workflow_state=workflow_state_service, mcp_client=mcp, llm=llm,
     )
+
+
+class _StubPlannerLLM:
+    """Returns a fixed step14 planner response (proves runtime uses ONLY the
+    LLM-provided argument_mappings, never re-derived ones)."""
+
+    name = "stub"
+    model = "stub"
+
+    def __init__(self, response: dict):
+        self.response = response
+
+    def generate(self, prompt: str, *, system=None, **kwargs):
+        raise NotImplementedError
+
+    def generate_json(self, prompt: str, *, schema: dict, system=None) -> dict:
+        return self.response
 
 
 def _cct(local_storage, run_id):
@@ -324,6 +341,84 @@ def test_run_from_request_drugbank_uses_official_query_arg(
     assert "drug_name_or_id" not in summary
 
 
+# ── runtime kwargs come ONLY from LLM mappings ──────────────────────────────
+
+
+def test_run_from_request_kwargs_come_only_from_llm_mappings(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_through_step_5(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "pubchem_cid", "value": "123456", "source": "raw_request_text"}],
+    )
+    cand_id, cid = _pubchem_candidate(_cct(local_storage, run_id))
+    assert cid
+
+    captured: dict = {}
+
+    def _pubchem(**kwargs):
+        captured.update(kwargs)
+        return {"status": "ok", "source": "PubChem_get_associated_patents_by_CID",
+                "patents": [{"patent_number": "US-CID", "title": "Compound"}]}
+
+    ref = Step14InputRef(
+        ref_id="r_cid", source_artifact="candidate_context_table",
+        source_path="candidate_records[].identifiers[].id_value",
+        role="pubchem_cid", candidate_id=cand_id,
+        supports_tool_args=["cid", "pubchem_cid"],
+    )
+    # The planner LLM returns exactly one mapping cid -> r_cid.
+    stub = _StubPlannerLLM({"tool_plans": [
+        {"tool_name": "PubChem_get_associated_patents_by_CID", "can_invoke": True,
+         "argument_mappings": [{"schema_arg": "cid", "input_ref_id": "r_cid"}],
+         "argument_literals": [], "missing_required_args": [],
+         "selection_reason": "cid ref"},
+    ]})
+    table = _agent(
+        local_storage, registry_service, workflow_state_service,
+        bindings={"PubChem_get_associated_patents_by_CID": _pubchem}, llm=stub,
+    ).run_from_request(_request(run_id, [ref]))
+
+    # kwargs contain ONLY the LLM-mapped schema_arg → resolved value. No extra
+    # invented args.
+    assert captured == {"cid": str(cid)}
+    calls = [tc for tc in table.tool_call_records
+             if tc.tool_name == "PubChem_get_associated_patents_by_CID"]
+    assert calls and calls[0].run_status == "success"
+
+
+def test_run_from_request_uninvokable_plan_is_not_called(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_through_step_5(local_storage, registry_service, workflow_state_service)
+    called: dict = {"n": 0}
+
+    def _pubchem(**kwargs):
+        called["n"] += 1
+        return {"status": "ok", "source": "PubChem_get_associated_patents_by_CID", "patents": []}
+
+    ref = Step14InputRef(
+        ref_id="r_cid", source_artifact="candidate_context_table",
+        source_path="candidate_records[].identifiers[].id_value",
+        role="pubchem_cid", supports_tool_args=["cid"],
+    )
+    # Planner returns a plan with NO mapping → identity unsatisfied →
+    # can_invoke=false → runtime must not call the tool.
+    stub = _StubPlannerLLM({"tool_plans": [
+        {"tool_name": "PubChem_get_associated_patents_by_CID", "can_invoke": True,
+         "argument_mappings": [], "argument_literals": [], "missing_required_args": []},
+    ]})
+    table = _agent(
+        local_storage, registry_service, workflow_state_service,
+        bindings={"PubChem_get_associated_patents_by_CID": _pubchem}, llm=stub,
+    ).run_from_request(_request(run_id, [ref]))
+
+    assert called["n"] == 0, "uninvokable plan must not call the tool"
+    skipped = [tc for tc in table.tool_call_records if tc.run_status == "skipped"]
+    assert skipped and (skipped[0].tool_input_summary or {}).get("skip_reason") == "uninvokable"
+    assert (skipped[0].tool_input_summary or {}).get("missing_required_args") == ["cid"]
+
+
 # ── test 16: Step 14 never writes ranking_table ─────────────────────────────
 
 
@@ -360,6 +455,24 @@ def test_run_from_request_records_selected_and_scope(
     table = _agent(
         local_storage, registry_service, workflow_state_service,
     ).run_from_request(_request(run_id, [ref]))
-    assert table.step14_llm_selected_tool_plans
+    # Single-stage planner audit fields.
+    assert table.step14_llm_tool_plans
+    assert table.step14_prompt_cache_layout_version == "step14_selection_v3"
+    # DrugBank plan maps official `query` arg to the payload ref.
+    db_plans = [
+        p for p in table.step14_llm_tool_plans
+        if p["tool_name"] == "drugbank_get_drug_references_by_drug_name_or_id"
+    ]
+    assert db_plans and db_plans[0]["argument_mappings"] == [
+        {"schema_arg": "query", "input_ref_id": "r_payload"}
+    ]
+    # argument_mapping_audit records the accepted mapping + support token.
+    assert any(
+        a["schema_arg"] == "query" and a["input_ref_id"] == "r_payload"
+        and a["satisfied_by_support"] in {"query", "drug_name_or_id"}
+        for a in table.step14_argument_mapping_audit
+    )
+    # Turn A BC field is left empty by the single-stage planner.
+    assert table.step14_llm_selected_tool_plans == []
     assert table.step14_patent_scope.get("antibody_search_allowed") is False
     assert [r["ref_id"] for r in table.step14_request_refs] == ["r_payload"]
