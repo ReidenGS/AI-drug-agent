@@ -176,6 +176,55 @@ def test_run_from_request_calls_fda_from_application_number_ref(
     assert (calls[0].tool_input_summary or {}).get("application_number") == "NDA761139"
 
 
+def test_run_from_request_fda_upstream_error_is_not_success(
+    local_storage, registry_service, workflow_state_service
+):
+    # Envelope-aware: a wrapper envelope carrying status="upstream_error" must
+    # NOT be recorded as success even though the outer MCP call returned ok.
+    run_id = _seed_through_step_5(
+        local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[{"id_type": "application_number", "value": "NDA761139", "source": "user"}],
+    )
+    ref = Step14InputRef(
+        ref_id="r_app", source_artifact="structured_query",
+        source_path="referenced_inputs[].value",
+        role="application_number", supports_tool_args=["application_number"],
+    )
+    canned = _bind_fixed({
+        "FDA_OrangeBook_get_patent_info": {
+            "status": "upstream_error",
+            "source": "FDA_OrangeBook_get_patent_info",
+            "error_message": "compact failure",
+            "records": [{"patent_number": "US-SHOULD-NOT-EXTRACT", "title": "leaked"}],
+            "raw_debug": "RAW_ENVELOPE_BODY_MUST_NOT_LEAK",
+        },
+    })
+    table = _agent(
+        local_storage, registry_service, workflow_state_service, bindings=canned,
+    ).run_from_request(_request(run_id, [ref]))
+
+    calls = [tc for tc in table.tool_call_records if tc.tool_name == "FDA_OrangeBook_get_patent_info"]
+    assert calls, "expected an FDA tool call record"
+    tc = calls[0]
+    # 1) status is not success (upstream_error → failed).
+    assert tc.run_status != "success"
+    assert tc.run_status == "failed"
+    # 2) overall review status is not completed.
+    assert table.patent_review_status != "completed"
+    # 3) no patent hit extracted from a failed envelope.
+    assert not any(r.patent_number == "US-SHOULD-NOT-EXTRACT" for r in table.patent_records)
+    # 4) raw envelope persisted under tool_output_ref for traceability.
+    assert tc.tool_output_ref and local_storage.exists(tc.tool_output_ref)
+    raw = local_storage.read_json(tc.tool_output_ref)
+    assert "RAW_ENVELOPE_BODY_MUST_NOT_LEAK" in json.dumps(raw)
+    # 5) normalized artifact + summary only carry a compact error, no raw body.
+    blob = json.dumps(table.model_dump())
+    assert "RAW_ENVELOPE_BODY_MUST_NOT_LEAK" not in blob
+    assert "US-SHOULD-NOT-EXTRACT" not in blob
+    assert (tc.error_message or "") and "compact failure" in (tc.error_message or "")
+    assert (tc.tool_input_summary or {}).get("output_envelope_status") == "upstream_error"
+
+
 def test_run_from_request_calls_fda_from_brand_name_ref(
     local_storage, registry_service, workflow_state_service
 ):
@@ -205,6 +254,81 @@ def test_run_from_request_calls_fda_from_brand_name_ref(
     calls = [tc for tc in table.tool_call_records if tc.tool_name == "FDA_OrangeBook_get_patent_info"]
     assert calls and calls[0].run_status == "success"
     assert (calls[0].tool_input_summary or {}).get("brand_name")
+
+
+# ── EuropePMC literature / prior-art evidence tool ──────────────────────────
+
+
+def test_run_from_request_calls_europepmc_from_query_ref(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_through_step_5(local_storage, registry_service, workflow_state_service)
+    ref = Step14InputRef(
+        ref_id="r_lit", source_artifact="structured_query",
+        source_path="mentioned_entities.payload_text",
+        role="payload", supports_tool_args=["query"],
+    )
+    # Fake EuropePMC binding: ok envelope with literature results (title +
+    # a big abstract that must NOT land in the normalized artifact).
+    canned = {
+        "EuropePMC_search_articles": lambda **kw: {
+            "status": "ok", "source": "EuropePMC_search_articles",
+            "query": kw.get("query"),
+            "results": [{
+                "title": "MMAE ADC prior-art article",
+                "abstract": "RAW_ABSTRACT_MUST_NOT_LEAK " * 40,
+            }],
+        },
+    }
+    table = _agent(
+        local_storage, registry_service, workflow_state_service, bindings=canned,
+    ).run_from_request(_request(run_id, [ref]))
+
+    calls = [tc for tc in table.tool_call_records if tc.tool_name == "EuropePMC_search_articles"]
+    assert calls, "expected an EuropePMC tool call"
+    tc = calls[0]
+    assert tc.run_status == "success"
+    s = tc.tool_input_summary or {}
+    # runtime resolved the real value into the LLM-mapped `query` arg.
+    assert s.get("query") == "MMAE"
+    assert s.get("selected_by") == "llm_step14"
+    assert s.get("argument_mappings") == [{"schema_arg": "query", "input_ref_id": "r_lit"}]
+    # raw output persisted only under tool_output_ref.
+    assert tc.tool_output_ref and local_storage.exists(tc.tool_output_ref)
+    assert "RAW_ABSTRACT_MUST_NOT_LEAK" in json.dumps(local_storage.read_json(tc.tool_output_ref))
+    # normalized artifact carries compact provenance (EuropePMC source), no raw abstract.
+    blob = json.dumps(table.model_dump())
+    assert "RAW_ABSTRACT_MUST_NOT_LEAK" not in blob
+    lit_records = [r for r in table.patent_records if "EuropePMC" in (r.sources or [])]
+    assert lit_records, "expected a record tagged with EuropePMC provenance"
+    # Literature record must NOT claim a fabricated patent_number.
+    assert lit_records[0].patent_number is None
+    # source_database Literal is not mislabeled as a patent DB.
+    assert lit_records[0].source_database == "other"
+
+
+def test_run_from_request_europepmc_upstream_error_not_success(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id = _seed_through_step_5(local_storage, registry_service, workflow_state_service)
+    ref = Step14InputRef(
+        ref_id="r_lit", source_artifact="structured_query",
+        source_path="mentioned_entities.payload_text",
+        role="payload", supports_tool_args=["query"],
+    )
+    canned = _bind_fixed({
+        "EuropePMC_search_articles": {
+            "status": "upstream_error", "source": "EuropePMC_search_articles",
+            "error_message": "europepmc timeout",
+        },
+    })
+    table = _agent(
+        local_storage, registry_service, workflow_state_service, bindings=canned,
+    ).run_from_request(_request(run_id, [ref]))
+    calls = [tc for tc in table.tool_call_records if tc.tool_name == "EuropePMC_search_articles"]
+    assert calls and calls[0].run_status == "failed"
+    assert table.patent_review_status != "completed"
+    assert (calls[0].tool_input_summary or {}).get("output_envelope_status") == "upstream_error"
 
 
 # ── test 12: unresolved ref → skipped / input_missing ───────────────────────

@@ -59,3 +59,16 @@ def test_local_client_list_tools_respects_agent_scope():
     assert sup_tools == []  # supervisor is not mapped to step_05
     cca_tools = client.list_tools(agent_name="candidate_context_agent", step_id="step_05")
     assert "ChEMBL_search_molecules" in cca_tools
+
+
+def test_local_client_europepmc_callable_for_patent_ip_step_14():
+    # EuropePMC is exposed to patent_ip_agent/step_14 (Enola literature/prior-art
+    # evidence) via the scope override; the binding is reachable end-to-end.
+    client = LocalMCPClient()
+    res = client.call_tool(
+        agent_name="patent_ip_agent", step_id="step_14",
+        tool_name="EuropePMC_search_articles", query="HER2 ADC prior art",
+    )
+    assert res["run_status"] == "success"
+    assert res["payload"]["source"] == "EuropePMC_search_articles"
+    assert res["payload"]["query"] == "HER2 ADC prior art"

@@ -124,6 +124,12 @@ _TOOL_SOURCE_DB: dict[str, str] = {
     "PubChem_get_associated_patents_by_CID": "PubChem",
     "drugbank_get_drug_references_by_drug_name_or_id": "DrugBank",
     "FDA_OrangeBook_get_patent_info": "FDA_OrangeBook",
+    # EuropePMC is a literature / prior-art evidence source. It is NOT one of
+    # the PatentSourceDatabase Literal values, so its provenance is preserved
+    # in `PatentRecord.sources` / `source_refs` (compact) while the
+    # `source_database` Literal field falls back to "other" — we never mislabel
+    # a literature hit as PubChem/FDA/DrugBank/USPTO.
+    "EuropePMC_search_articles": "EuropePMC",
 }
 
 
@@ -420,6 +426,17 @@ class PatentIPAgent:
         term_source = f"request_input_ref:{primary.ref_id}"
         label = f"{role}:{term}"
 
+        payload = result.get("payload")
+        # Envelope-aware status: a wrapper / ToolUniverse envelope that carries
+        # a failure `status` (e.g. upstream_error) must NOT be recorded as a
+        # success even when the outer MCP call returned run_status="success".
+        run_status = result.get("run_status", "pending")
+        error_message = result.get("error_message")
+        envelope_status = payload.get("status") if isinstance(payload, dict) else None
+        if envelope_status in _ENVELOPE_FAILURE_STATUS:
+            run_status = _ENVELOPE_FAILURE_STATUS[envelope_status]
+            error_message = _compact_envelope_error(plan.tool_name, envelope_status, payload)
+
         output_ref = None
         output_artifact_id = None
         if "payload" in result:
@@ -449,15 +466,17 @@ class PatentIPAgent:
                 for m in plan.argument_mappings
             ],
         }
+        if envelope_status:
+            summary["output_envelope_status"] = envelope_status
         tc = ToolCallRecord(
             tool_call_id=tc_id, tool_name=plan.tool_name,
             agent_name=_AGENT_NAME, step_id=_STEP_ID,
-            run_status=result.get("run_status", "pending"),
+            run_status=run_status,
             started_at=started, finished_at=finished,
             tool_input_summary=summary,
             tool_output_artifact_id=output_artifact_id,
             tool_output_ref=output_ref,
-            error_message=result.get("error_message"),
+            error_message=error_message,
         )
 
         hits: list = []
@@ -591,6 +610,33 @@ class PatentIPAgent:
         if any_success or records:
             return "completed_with_warnings"
         return "partial"
+
+
+# ── request-based envelope-aware status ─────────────────────────────────────
+
+# A wrapper / ToolUniverse envelope `status` in these values is an upstream
+# failure and must override an outer run_status="success". `ToolCallRunStatus`
+# has no `upstream_error` literal, so it maps onto the canonical `failed`.
+_ENVELOPE_FAILURE_STATUS: dict[str, str] = {
+    "upstream_error": "failed",
+    "dependency_unavailable": "dependency_unavailable",
+    "failed": "failed",
+    "error": "failed",
+}
+
+
+def _compact_envelope_error(tool_name: str, envelope_status: str, payload: Any) -> str:
+    """Compact, raw-payload-free error message for an envelope failure.
+
+    Uses the envelope's own short `error_message` field when present (truncated),
+    never the raw payload body — the raw envelope stays in ``tool_output_ref``.
+    """
+    detail = ""
+    if isinstance(payload, dict):
+        raw = payload.get("error_message")
+        if isinstance(raw, str) and raw.strip():
+            detail = ": " + " ".join(raw.split())[:200]
+    return f"{tool_name} envelope status={envelope_status}{detail}"
 
 
 # ── request-based skipped / uninvokable records ─────────────────────────────

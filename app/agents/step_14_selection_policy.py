@@ -113,6 +113,19 @@ STEP14_TOOL_SPECS: dict[str, Step14ToolSpec] = {
             "by drug name or DrugBank ID / free-text query."
         ),
     ),
+    # EuropePMC is a literature / prior-art SCIENTIFIC EVIDENCE search (the
+    # ToolUniverse tool the Enola workflow used), NOT a patent-number-specific
+    # database. Its official identity arg is `query`.
+    "EuropePMC_search_articles": Step14ToolSpec(
+        tool_name="EuropePMC_search_articles",
+        acceptable_supports=("query",),
+        supports_to_schema_arg={"query": "query"},
+        arg_mapping_notes={},
+        fallback_description=(
+            "Search Europe PMC scientific literature / prior-art evidence by a "
+            "free-text query (literature evidence, not a patent-number lookup)."
+        ),
+    ),
 }
 
 
@@ -157,6 +170,7 @@ _STEP14_IDENTITY_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
     "PubChem_get_associated_patents_by_CID": (("cid",),),
     "FDA_OrangeBook_get_patent_info": (("brand_name", "application_number"),),
     "drugbank_get_drug_references_by_drug_name_or_id": (("query",),),
+    "EuropePMC_search_articles": (("query",),),
 }
 
 
@@ -216,16 +230,16 @@ def _literal_allowed(tool_name: str, schema_arg: str, value: Any) -> bool:
     return False
 
 
-STEP14_SELECTION_SYSTEM_PROMPT = """You plan Step 14 patent-search tool calls.
+STEP14_SELECTION_SYSTEM_PROMPT = """You plan Step 14 patent / prior-art tool calls.
 
-You choose WHICH of the 3 patent tools to run AND map each tool's official
+You choose WHICH catalog tools to run AND map each tool's official
 schema arguments to the request's input refs. You never see or invent runtime
 values (CIDs, brand names, application numbers, drug / payload / linker text);
 you only reference input_ref_ids and the tools' official schema arg names. A
 separate runtime resolver reads the real values from storage after you plan.
 
 For every selected tool, output one plan:
-- tool_name: one of the 3 catalog tool names.
+- tool_name: one of the catalog tool names.
 - can_invoke: true only when the tool's required/identity argument is satisfied
   by argument_mappings.
 - argument_mappings: list of {"schema_arg","input_ref_id"} pairs. schema_arg
@@ -242,7 +256,7 @@ For every selected tool, output one plan:
 - selection_reason: short reason.
 
 Rules:
-1. Use only the 3 catalog tools; never invent a tool.
+1. Use only the catalog tools; never invent a tool.
 2. Reference only input_ref_ids present in input_refs; never invent one.
 3. Use only official schema args (each tool lists schema_arg_names).
 4. Never invent runtime values; identity values come only from argument_mappings.
@@ -254,11 +268,14 @@ Rules:
    empty).
 8. drugbank_get_drug_references_by_drug_name_or_id identity arg is `query`;
    refs whose supports_tool_args include query or drug_name_or_id fill it.
-9. An input ref with role=antibody may be used ONLY when
-   patent_scope.antibody_search_allowed is true.
-10. If a tool cannot be satisfied, either omit it or set can_invoke=false and
+9. EuropePMC_search_articles is a literature / prior-art SCIENTIFIC EVIDENCE
+   search (not a patent-number database); its identity arg is `query`, filled
+   by refs whose supports_tool_args include query.
+10. An input ref with role=antibody may be used ONLY when
+    patent_scope.antibody_search_allowed is true.
+11. If a tool cannot be satisfied, either omit it or set can_invoke=false and
     list missing_required_args. Never fabricate a call.
-11. Return exactly one JSON object with this shape:
+12. Return exactly one JSON object with this shape:
 {
   "tool_plans": [
     {

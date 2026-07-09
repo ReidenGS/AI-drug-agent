@@ -145,6 +145,49 @@ def test_drugbank_plan_maps_to_official_query_arg():
     assert _plan(result, "FDA_OrangeBook_get_patent_info") is None
 
 
+def test_europepmc_plan_maps_query_to_ref():
+    ref = _ref("r_lit", "payload", ["query"], source="structured_query")
+    result = plan_step14_tool_calls(llm=MockLLMProvider(), request=_req([ref]))
+    plan = _plan(result, "EuropePMC_search_articles")
+    assert plan is not None and plan.can_invoke is True
+    assert _maps(plan) == {("query", "r_lit")}
+    assert plan.missing_required_args == []
+
+
+def test_europepmc_required_schema_has_query():
+    catalog = {e["tool_name"]: e for e in build_step14_selection_catalog()}
+    e = catalog["EuropePMC_search_articles"]
+    assert "query" in e["official_required_args"]
+    assert "query" in e["schema_arg_names"]
+    # literature / prior-art evidence description, sourced (not a hardcoded
+    # patent-db line); no invented output fields.
+    assert isinstance(e["description"], str) and e["description"]
+    assert "output" not in e and "returns" not in e
+
+
+def test_europepmc_stub_unknown_schema_arg_rejected():
+    ref = _ref("r_lit", "payload", ["query"], source="structured_query")
+    llm = _StubLLM({"tool_plans": [
+        {"tool_name": "EuropePMC_search_articles", "can_invoke": True,
+         "argument_mappings": [{"schema_arg": "not_a_real_arg", "input_ref_id": "r_lit"}]},
+    ]})
+    result = plan_step14_tool_calls(llm=llm, request=_req([ref]))
+    assert result.tool_plans == []
+    assert any("unknown_schema_arg:not_a_real_arg" in p.reason for p in result.rejected_tool_plans)
+
+
+def test_europepmc_missing_query_ref_is_uninvokable():
+    ref = _ref("r_lit", "payload", ["query"], source="structured_query")
+    llm = _StubLLM({"tool_plans": [
+        {"tool_name": "EuropePMC_search_articles", "can_invoke": True,
+         "argument_mappings": []},
+    ]})
+    result = plan_step14_tool_calls(llm=llm, request=_req([ref]))
+    plan = _plan(result, "EuropePMC_search_articles")
+    assert plan is not None and plan.can_invoke is False
+    assert plan.missing_required_args == ["query"]
+
+
 def test_argument_mapping_audit_records_support_token():
     ref = _ref("r_cid", "pubchem_cid", ["pubchem_cid"])
     result = plan_step14_tool_calls(llm=MockLLMProvider(), request=_req([ref]))
@@ -360,10 +403,11 @@ _EXPECTED_TOOLS = {
     "PubChem_get_associated_patents_by_CID",
     "FDA_OrangeBook_get_patent_info",
     "drugbank_get_drug_references_by_drug_name_or_id",
+    "EuropePMC_search_articles",
 }
 
 
-def test_catalog_contains_exactly_the_three_tools():
+def test_catalog_contains_exactly_the_allowed_tools():
     names = {e["tool_name"] for e in build_step14_selection_catalog()}
     assert names == _EXPECTED_TOOLS
     assert set(STEP14_TOOL_SPECS) == _EXPECTED_TOOLS
@@ -479,9 +523,10 @@ def test_stable_prefix_excludes_run_specific_input_refs():
         schema=payload,
         system=STEP14_SELECTION_SYSTEM_PROMPT,
     )
-    # The 3 tool names + sourced schema metadata live in the stable prefix;
-    # run-specific data does not.
+    # The catalog tool names + sourced schema metadata live in the stable
+    # prefix; run-specific data does not.
     assert "PubChem_get_associated_patents_by_CID" in stable
+    assert "EuropePMC_search_articles" in stable  # literature/prior-art tool
     assert "schema_source" in stable
     assert "r_SENTINEL" not in stable
     assert "r_SENTINEL" in dynamic
