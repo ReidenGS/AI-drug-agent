@@ -239,6 +239,58 @@ def _mock_step6_schema_mapping_stage2(schema: dict) -> dict:
     return {"tools": out}
 
 
+def _mock_step14_patent_tool_selection(schema: dict) -> dict:
+    """Deterministic Step 14 single-stage patent planner mock.
+
+    For each input ref + tool whose ``acceptable_supports`` intersects the
+    ref's ``supports_tool_args``, emits ONE plan mapping the tool's official
+    schema arg (via the catalog's ``supports_to_schema_arg``) to that
+    ``input_ref_id``. It works purely from the catalog + input-ref metadata —
+    never a resolved value (the request carries none). ``can_invoke`` is true
+    because the emitted mapping fills the tool's identity arg; antibody refs are
+    still emitted so the planner validator applies the scope gate.
+    """
+    catalog = schema.get("tool_catalog") or []
+    input_refs = schema.get("input_refs") or []
+    plans: list[dict] = []
+    for ref in input_refs:
+        if not isinstance(ref, dict):
+            continue
+        supports = [str(s) for s in (ref.get("supports_tool_args") or [])]
+        supports_lower = {s.lower() for s in supports}
+        if not supports_lower:
+            continue
+        for tool in catalog:
+            if not isinstance(tool, dict):
+                continue
+            acceptable_order = [str(s) for s in (tool.get("acceptable_supports") or [])]
+            s2a = {
+                str(k).lower(): v
+                for k, v in (tool.get("supports_to_schema_arg") or {}).items()
+            }
+            # Deterministic: first acceptable token (in catalog order) the ref
+            # carries → its official schema arg.
+            token = next(
+                (t for t in acceptable_order if t.lower() in supports_lower), None
+            )
+            if token is None:
+                continue
+            schema_arg = s2a.get(token.lower())
+            if not schema_arg:
+                continue
+            plans.append({
+                "tool_name": tool.get("tool_name"),
+                "can_invoke": True,
+                "argument_mappings": [
+                    {"schema_arg": schema_arg, "input_ref_id": ref.get("ref_id")}
+                ],
+                "argument_literals": [],
+                "missing_required_args": [],
+                "selection_reason": f"ref {ref.get('ref_id')} fills {schema_arg}",
+            })
+    return {"tool_plans": plans}
+
+
 def _mock_step9_tool_selection_stage1(schema: dict) -> dict:
     catalog = schema.get("compact_catalog") or []
     return {
@@ -436,6 +488,8 @@ class MockLLMProvider:
             return _mock_step9_tool_selection_stage1(schema)
         if task == "step9_tool_schema_mapping_stage_2":
             return _mock_step9_tool_schema_mapping_stage2(schema)
+        if task == "step14_patent_tool_selection":
+            return _mock_step14_patent_tool_selection(schema)
 
         raw = (schema or {}).get("raw_request_record") or {}
         ctx = raw.get("user_provided_context") or {}

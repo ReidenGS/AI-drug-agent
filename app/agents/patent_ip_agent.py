@@ -68,6 +68,14 @@ from ..agents.step_14_prior_art import (
     dedup_and_sort_by_relevance,
     extract_hits,
 )
+from ..agents.step_14_runtime_resolver import (
+    Step14ResolvedRef,
+    resolve_step14_input_ref,
+)
+from ..agents.step_14_selection_policy import (
+    Step14ToolPlan,
+    plan_step14_tool_calls,
+)
 from ..llm.provider import LLMProvider, MockLLMProvider
 from ..mcp.client import MCPClient
 from ..schemas.common import ToolCallRecord
@@ -75,6 +83,7 @@ from ..schemas.step_14_patent_prior_art_table import (
     PatentPriorArtTable,
     PatentRecord,
 )
+from ..schemas.step_14_patent_request import Step14PatentRequest
 from ..services.artifact_registry_service import ArtifactRegistryService
 from ..services.storage_service import Storage
 from ..services.workflow_state_service import WorkflowStateService
@@ -115,6 +124,12 @@ _TOOL_SOURCE_DB: dict[str, str] = {
     "PubChem_get_associated_patents_by_CID": "PubChem",
     "drugbank_get_drug_references_by_drug_name_or_id": "DrugBank",
     "FDA_OrangeBook_get_patent_info": "FDA_OrangeBook",
+    # EuropePMC is a literature / prior-art evidence source. It is NOT one of
+    # the PatentSourceDatabase Literal values, so its provenance is preserved
+    # in `PatentRecord.sources` / `source_refs` (compact) while the
+    # `source_database` Literal field falls back to "other" — we never mislabel
+    # a literature hit as PubChem/FDA/DrugBank/USPTO.
+    "EuropePMC_search_articles": "EuropePMC",
 }
 
 
@@ -254,6 +269,7 @@ class PatentIPAgent:
                 "tool_call_records[].tool_output_ref / "
                 "patent_records[].source_refs."
             ),
+            step14_request_source="discovery_run",
         )
 
         artifact_id = new_artifact_id("patent_prior_art_table")
@@ -264,6 +280,218 @@ class PatentIPAgent:
         self.registry.update_active(run_id, patent_prior_art_table_id=artifact_id)
         self.workflow_state.mark(run_id, "step_14", "completed")
         return table
+
+    # ── request-based entrypoint (Step 14 single-stage planner) ─────────────
+    def run_from_request(
+        self,
+        request: Step14PatentRequest,
+        *,
+        total_limit: int = DEFAULT_TOTAL_LIMIT,
+        per_query_limit: int = DEFAULT_PER_QUERY_LIMIT,
+    ) -> PatentPriorArtTable:
+        """Request-driven Step 14 routing (single-stage LLM planner).
+
+        One LLM call returns tool plans with schema_arg → input_ref_id
+        mappings. The runtime builds kwargs STRICTLY from the LLM's accepted
+        ``argument_mappings`` / ``argument_literals`` — it never re-derives a
+        mapping from ``supports_to_schema_arg``. For each mapped input ref the
+        runtime resolver reads the real value from storage. A plan the planner
+        marked ``can_invoke=false`` is not called (uninvokable record); a plan
+        whose mapped ref cannot be resolved is not called
+        (skipped / input_missing). No fake success. Raw payloads stay in
+        ``tool_output_ref``; extraction / dedup / scoring reuse ``run``'s
+        helpers. Step 14 never writes ``ranking_table``.
+        """
+        total_limit = max(1, min(int(total_limit), MAX_TOTAL_LIMIT))
+        per_query_limit = max(1, min(int(per_query_limit), MAX_TOTAL_LIMIT))
+        run_id = request.run_id
+
+        planning = plan_step14_tool_calls(llm=self.llm, request=request)
+        ref_by_id = {ref.ref_id: ref for ref in request.input_refs}
+
+        tool_calls: list[ToolCallRecord] = []
+        resolver_audit: list[dict] = []
+        all_raw_hits: list = []
+        productive_tc_ids: set[str] = set()
+        resolved_cache: dict[str, Step14ResolvedRef] = {}
+
+        def _resolve(ref_id: str) -> Step14ResolvedRef:
+            if ref_id not in resolved_cache:
+                resolved = resolve_step14_input_ref(self.storage, request, ref_by_id[ref_id])
+                resolved_cache[ref_id] = resolved
+                resolver_audit.append(resolved.audit_entry())
+            return resolved_cache[ref_id]
+
+        for plan in planning.tool_plans[: max(1, total_limit)]:
+            if not plan.can_invoke:
+                tool_calls.append(_uninvokable_record(plan))
+                continue
+            # Build kwargs STRICTLY from the LLM's accepted mappings/literals.
+            kwargs: dict[str, Any] = {}
+            primary: Optional[Step14ResolvedRef] = None
+            unresolved_reason: Optional[str] = None
+            for mapping in plan.argument_mappings:
+                resolved = _resolve(mapping.input_ref_id)
+                if not resolved.resolved or not resolved.value:
+                    unresolved_reason = resolved.unresolved_reason or "input_missing"
+                    break
+                kwargs[mapping.schema_arg] = resolved.value
+                primary = primary or resolved
+            if unresolved_reason is not None or primary is None or not kwargs:
+                tool_calls.append(
+                    _skipped_input_missing_record(plan, unresolved_reason or "input_missing")
+                )
+                continue
+            for literal in plan.argument_literals:
+                kwargs[literal.schema_arg] = literal.literal_value
+            tc, hits = self._call_and_extract_request(
+                run_id=run_id, plan=plan, tool_args=kwargs, primary=primary,
+            )
+            tool_calls.append(tc)
+            if hits:
+                productive_tc_ids.add(tc.tool_call_id)
+                all_raw_hits.extend(hits)
+
+        merged_hits = dedup_and_sort_by_relevance(all_raw_hits)[:total_limit]
+        patent_records: list[PatentRecord] = [_record_from_merged(m) for m in merged_hits]
+        for tc in tool_calls:
+            if tc.run_status != "success":
+                continue
+            if tc.tool_call_id in productive_tc_ids:
+                continue
+            patent_records.append(_record_from_receipt(tc))
+
+        review_status = self._status(tool_calls, patent_records)
+        table = PatentPriorArtTable(
+            run_id=run_id,
+            created_at=now_iso(),
+            patent_review_status=review_status,  # type: ignore[arg-type]
+            patent_records=patent_records,
+            tool_call_records=tool_calls,
+            patent_review_notes=(
+                "Step 14 request-based routing (single-stage planner). Tools + "
+                "schema_arg→input_ref_id mappings were LLM-planned; real values "
+                "were resolved by the runtime resolver. Raw payloads remain in "
+                "tool_call_records[].tool_output_ref."
+            ),
+            step14_request_refs=[
+                {
+                    "ref_id": ref.ref_id,
+                    "role": ref.role,
+                    "source_artifact": ref.source_artifact,
+                    "source_path": ref.source_path,
+                    "candidate_id": ref.candidate_id,
+                    "supports_tool_args": list(ref.supports_tool_args),
+                }
+                for ref in request.input_refs
+            ],
+            step14_patent_scope=request.patent_scope.model_dump(),
+            step14_llm_tool_plans=[p.model_dump() for p in planning.tool_plans],
+            step14_llm_rejected_tool_plans=[
+                p.model_dump() for p in planning.rejected_tool_plans
+            ],
+            step14_argument_mapping_audit=list(planning.argument_mapping_audit),
+            step14_prompt_cache_layout_version=planning.prompt_cache_layout_version,
+            step14_runtime_resolver_audit=resolver_audit,
+            step14_request_source="request",
+        )
+
+        artifact_id = new_artifact_id("patent_prior_art_table")
+        self.storage.write_json(
+            self.storage.run_key(run_id, _ARTIFACT_KEY),
+            {"artifact_id": artifact_id, **table.model_dump()},
+        )
+        self.registry.update_active(run_id, patent_prior_art_table_id=artifact_id)
+        self.workflow_state.mark(run_id, "step_14", "completed")
+        return table
+
+    def _call_and_extract_request(
+        self,
+        *,
+        run_id: str,
+        plan: Step14ToolPlan,
+        tool_args: dict[str, Any],
+        primary: Step14ResolvedRef,
+    ) -> tuple[ToolCallRecord, list]:
+        tc_id = new_tool_call_id()
+        started = now_iso()
+        result = self.mcp_client.call_tool(
+            agent_name=_AGENT_NAME, step_id=_STEP_ID,
+            tool_name=plan.tool_name, **tool_args,
+        )
+        finished = now_iso()
+
+        role = primary.role
+        term = primary.value or ""
+        term_source = f"request_input_ref:{primary.ref_id}"
+        label = f"{role}:{term}"
+
+        payload = result.get("payload")
+        # Envelope-aware status: a wrapper / ToolUniverse envelope that carries
+        # a failure `status` (e.g. upstream_error) must NOT be recorded as a
+        # success even when the outer MCP call returned run_status="success".
+        run_status = result.get("run_status", "pending")
+        error_message = result.get("error_message")
+        envelope_status = payload.get("status") if isinstance(payload, dict) else None
+        if envelope_status in _ENVELOPE_FAILURE_STATUS:
+            run_status = _ENVELOPE_FAILURE_STATUS[envelope_status]
+            error_message = _compact_envelope_error(plan.tool_name, envelope_status, payload)
+
+        output_ref = None
+        output_artifact_id = None
+        if "payload" in result:
+            output_artifact_id = new_artifact_id("tool_output")
+            output_key = self.storage.run_key(
+                run_id, "tool_outputs", "step_14", f"{tc_id}.json"
+            )
+            self.storage.write_json(output_key, {
+                "tool_call_id": tc_id, "tool_name": plan.tool_name,
+                "label": label, "input": tool_args, "output": result["payload"],
+            })
+            output_ref = output_key
+
+        summary: dict[str, Any] = {
+            "label": label,
+            **tool_args,
+            "candidate_id": primary.candidate_id,
+            "shortlist_source": "step_14_request",
+            "query_role": role,
+            "query_term": term,
+            "query_term_source": term_source,
+            "selected_by": "llm_step14",
+            "selection_reason": plan.selection_reason,
+            "input_ref_ids": [m.input_ref_id for m in plan.argument_mappings],
+            "argument_mappings": [
+                {"schema_arg": m.schema_arg, "input_ref_id": m.input_ref_id}
+                for m in plan.argument_mappings
+            ],
+        }
+        if envelope_status:
+            summary["output_envelope_status"] = envelope_status
+        tc = ToolCallRecord(
+            tool_call_id=tc_id, tool_name=plan.tool_name,
+            agent_name=_AGENT_NAME, step_id=_STEP_ID,
+            run_status=run_status,
+            started_at=started, finished_at=finished,
+            tool_input_summary=summary,
+            tool_output_artifact_id=output_artifact_id,
+            tool_output_ref=output_ref,
+            error_message=error_message,
+        )
+
+        hits: list = []
+        if tc.run_status == "success" and "payload" in result:
+            hits = extract_hits(
+                result["payload"],
+                source_tool=plan.tool_name,
+                source_database=_TOOL_SOURCE_DB.get(plan.tool_name, "other"),
+                source_ref=output_ref,
+                query_role=role,
+                query_term=term,
+                query_term_source=term_source,
+                candidate_id=primary.candidate_id or "",
+            )
+        return tc, hits
 
     # ── helpers ─────────────────────────────────────────────────────────
     def _call_and_extract(
@@ -382,6 +610,88 @@ class PatentIPAgent:
         if any_success or records:
             return "completed_with_warnings"
         return "partial"
+
+
+# ── request-based envelope-aware status ─────────────────────────────────────
+
+# A wrapper / ToolUniverse envelope `status` in these values is an upstream
+# failure and must override an outer run_status="success". `ToolCallRunStatus`
+# has no `upstream_error` literal, so it maps onto the canonical `failed`.
+_ENVELOPE_FAILURE_STATUS: dict[str, str] = {
+    "upstream_error": "failed",
+    "dependency_unavailable": "dependency_unavailable",
+    "failed": "failed",
+    "error": "failed",
+}
+
+
+def _compact_envelope_error(tool_name: str, envelope_status: str, payload: Any) -> str:
+    """Compact, raw-payload-free error message for an envelope failure.
+
+    Uses the envelope's own short `error_message` field when present (truncated),
+    never the raw payload body — the raw envelope stays in ``tool_output_ref``.
+    """
+    detail = ""
+    if isinstance(payload, dict):
+        raw = payload.get("error_message")
+        if isinstance(raw, str) and raw.strip():
+            detail = ": " + " ".join(raw.split())[:200]
+    return f"{tool_name} envelope status={envelope_status}{detail}"
+
+
+# ── request-based skipped / uninvokable records ─────────────────────────────
+
+
+def _plan_ref_ids(plan: Step14ToolPlan) -> list[str]:
+    return [m.input_ref_id for m in plan.argument_mappings]
+
+
+def _uninvokable_record(plan: Step14ToolPlan) -> ToolCallRecord:
+    """Compact record for a plan the planner marked ``can_invoke=false`` — the
+    tool is NOT called (no fake success)."""
+    return ToolCallRecord(
+        tool_call_id=new_tool_call_id(),
+        tool_name=plan.tool_name,
+        agent_name=_AGENT_NAME,
+        step_id=_STEP_ID,
+        run_status="skipped",
+        started_at=now_iso(),
+        finished_at=now_iso(),
+        tool_input_summary={
+            "skip_reason": "uninvokable",
+            "missing_required_args": list(plan.missing_required_args),
+            "input_ref_ids": _plan_ref_ids(plan),
+            "selected_by": "llm_step14",
+            "selection_reason": plan.selection_reason,
+        },
+        error_message=(
+            "uninvokable: missing_required_args="
+            + ",".join(plan.missing_required_args)
+        ),
+    )
+
+
+def _skipped_input_missing_record(
+    plan: Step14ToolPlan, unresolved_reason: str
+) -> ToolCallRecord:
+    """Compact record when a mapped input ref could not be resolved — the tool
+    is NOT called (no fake success)."""
+    return ToolCallRecord(
+        tool_call_id=new_tool_call_id(),
+        tool_name=plan.tool_name,
+        agent_name=_AGENT_NAME,
+        step_id=_STEP_ID,
+        run_status="skipped",
+        started_at=now_iso(),
+        finished_at=now_iso(),
+        tool_input_summary={
+            "skip_reason": "input_missing",
+            "unresolved_reason": unresolved_reason,
+            "input_ref_ids": _plan_ref_ids(plan),
+            "selected_by": "llm_step14",
+        },
+        error_message=f"input_missing: {unresolved_reason}",
+    )
 
 
 # ── query-plan construction ─────────────────────────────────────────────────

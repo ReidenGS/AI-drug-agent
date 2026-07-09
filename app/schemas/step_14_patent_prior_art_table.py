@@ -86,3 +86,26 @@ class PatentPriorArtTable(BaseModel):
     patent_records: list[PatentRecord] = Field(default_factory=list)
     tool_call_records: list[ToolCallRecord] = Field(default_factory=list)
     patent_review_notes: Optional[str] = None
+    # ── Step 14 request-based routing audit (additive) ─────────────────────
+    # Populated by `PatentIPAgent.run_from_request`. These carry ONLY compact
+    # references / roles / plans / compact resolver audit — never resolved raw
+    # values, raw tool payloads, or raw LLM responses. `step14_request_source`
+    # distinguishes the request-based path ("request") from the legacy
+    # discovery `run()` path (left at its default there).
+    step14_request_refs: list[dict] = Field(default_factory=list)
+    step14_patent_scope: dict = Field(default_factory=dict)
+    # Single-stage Step 14 planner output (Turn B). `step14_llm_tool_plans`
+    # holds the validated tool plans (tool_name + argument_mappings +
+    # argument_literals + can_invoke + missing_required_args);
+    # `step14_argument_mapping_audit` records each accepted schema_arg →
+    # input_ref_id mapping and which support token satisfied it. No raw LLM
+    # response, no resolved values.
+    step14_llm_tool_plans: list[dict] = Field(default_factory=list)
+    step14_argument_mapping_audit: list[dict] = Field(default_factory=list)
+    step14_prompt_cache_layout_version: Optional[str] = None
+    # Retained for backward compatibility with the Turn A shape (unused by the
+    # single-stage planner; left empty by `run_from_request`).
+    step14_llm_selected_tool_plans: list[dict] = Field(default_factory=list)
+    step14_llm_rejected_tool_plans: list[dict] = Field(default_factory=list)
+    step14_runtime_resolver_audit: list[dict] = Field(default_factory=list)
+    step14_request_source: str = "request"

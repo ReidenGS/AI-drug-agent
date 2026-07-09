@@ -35,6 +35,15 @@ AGENT_TOOL_OVERRIDES: dict[tuple[str, str], set[str]] = {
         "ChEMBL_search_substructure",
         "ChEMBL_search_similarity",
     },
+    # EuropePMC_search_articles is the ToolUniverse literature / prior-art
+    # evidence search the Enola workflow used. The v0.2 inventory tags it as a
+    # Step 13 (evidence_agent) row; this override additionally routes it to
+    # Step 14 so the request-based PatentIPAgent can select it as a
+    # literature / prior-art evidence tool. Evidence_agent / Step 13 behavior
+    # is unchanged (this only adds the tool for patent_ip_agent / step_14).
+    ("patent_ip_agent", "step_14"): {
+        "EuropePMC_search_articles",
+    },
 }
 
 

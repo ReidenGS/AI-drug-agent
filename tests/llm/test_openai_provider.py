@@ -22,6 +22,7 @@ from app.llm.openai_provider import (
     _Step6SchemaMappingStage2ParserResponse,
     _Step9SchemaMappingStage2Response,
     _Step9ToolSelectionStage1Response,
+    _Step14PatentToolSelectionResponse,
 )
 
 
@@ -587,6 +588,7 @@ def test_parser_models_produce_real_strict_schema():
         "step6_schema_mapping_stage_1",
         "step9_tool_selection_stage_1",
         "step9_tool_schema_mapping_stage_2",
+        "step14_patent_tool_selection",
     }
     assert "step6_schema_mapping_stage_2" not in _RESPONSE_MODEL_FOR_TASK
     for task, model in _RESPONSE_MODEL_FOR_TASK.items():
@@ -661,6 +663,41 @@ def test_openai_step6_stage1_uses_structured_parser_and_validated():
     assert client._calls["parse"] and not client._calls["create"]
     assert client._calls["parse"][0]["response_format"] is _Step6SchemaMappingStage1Response
     assert out["selections"][0]["tool_name"] == "DrugProps_pains_filter"
+
+
+def test_openai_step14_uses_structured_parser_and_normalizes_literals():
+    # The single-stage step14 planner parser returns tool_plans with
+    # argument_mappings; literal_value_json is decoded to literal_value in the
+    # external dict the validator/runtime consume.
+    parsed = _Step14PatentToolSelectionResponse(
+        tool_plans=[{
+            "tool_name": "drugbank_get_drug_references_by_drug_name_or_id",
+            "can_invoke": True,
+            "argument_mappings": [{"schema_arg": "query", "input_ref_id": "r_payload"}],
+            "argument_literals": [{"schema_arg": "limit", "literal_value_json": "25"}],
+            "missing_required_args": [],
+            "selection_reason": "payload ref fills query",
+        }]
+    )
+    client = _fake_openai_client(parse=_parsed_response(parsed))
+    provider = _provider_with_client(client)
+    out = provider.generate_json("plan", schema={"task": "step14_patent_tool_selection"})
+    assert client._calls["parse"] and not client._calls["create"]
+    assert client._calls["parse"][0]["response_format"] is _Step14PatentToolSelectionResponse
+    plan = out["tool_plans"][0]
+    assert plan["argument_mappings"] == [{"schema_arg": "query", "input_ref_id": "r_payload"}]
+    # literal_value_json decoded to a real literal_value.
+    assert plan["argument_literals"] == [{"schema_arg": "limit", "literal_value": 25}]
+    assert "selected_tool_plans" not in out  # single-stage shape, not Turn A
+
+
+def test_step14_strict_parser_schema_uses_literal_value_json_only():
+    from openai.lib._pydantic import to_strict_json_schema
+
+    schema_json = json.dumps(to_strict_json_schema(_Step14PatentToolSelectionResponse))
+    assert "literal_value_json" in schema_json
+    # The strict parser shape must NOT expose a bare `literal_value` field.
+    assert '"literal_value"' not in schema_json
 
 
 def test_openai_step9_stage1_uses_structured_parser_and_returns_dict():
