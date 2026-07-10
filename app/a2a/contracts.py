@@ -195,7 +195,7 @@ class OrchestratorRoutingDecisionRef(BaseModel):
     model_config = _FORBID
 
     planned_status: str
-    dispatch_mode: Literal["python_a2a", "http_a2a"] = "python_a2a"
+    dispatch_mode: Literal["python_a2a"]
     deterministic_gate_status: Optional[str] = None
     routing_phase: Optional[str] = None
     expected_outputs: list[str] = Field(default_factory=list)
@@ -260,8 +260,8 @@ class A2ATaskMetadata(BaseModel):
 
     model_config = _FORBID
 
-    adc_payload_type: Literal["worker_execution_request"] = "worker_execution_request"
-    adc_payload_version: str = "v1"
+    adc_payload_type: Literal["worker_execution_request"]
+    adc_payload_version: Literal["v1"]
     run_id: str
     task_id: str
     routing_plan_id: str
@@ -280,8 +280,8 @@ class WorkerExecutionRequest(BaseModel):
 
     model_config = _FORBID
 
-    payload_type: Literal["worker_execution_request"] = "worker_execution_request"
-    payload_version: str = "v1"
+    payload_type: Literal["worker_execution_request"]
+    payload_version: Literal["v1"]
     run_id: str
     session_id: Optional[str] = None
     task_id: str
@@ -293,7 +293,7 @@ class WorkerExecutionRequest(BaseModel):
     worker_request: WorkerRequestSpec
     orchestrator_routing_decision: OrchestratorRoutingDecisionRef
     input_projection: InputProjection
-    privacy_constraints: PrivacyConstraints = Field(default_factory=PrivacyConstraints)
+    privacy_constraints: PrivacyConstraints
     retry_context: Optional[RetryContext] = None
 
 
@@ -333,8 +333,8 @@ class WorkerExecutionResult(BaseModel):
 
     model_config = _FORBID
 
-    payload_type: Literal["worker_execution_result"] = "worker_execution_result"
-    payload_version: str = "v1"
+    payload_type: Literal["worker_execution_result"]
+    payload_version: Literal["v1"]
     run_id: str
     task_id: str
     routing_plan_id: Optional[str] = None

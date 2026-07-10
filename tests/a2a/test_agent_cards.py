@@ -103,14 +103,22 @@ def test_card_has_adc_agent_contract(builder, url, agent_id):
     assert parsed.agent_id == agent_id
 
 
-# ── 3. Step 5 input/output contract == production read/write paths ───────────
+# ── 3. Step 5 request-based input/output contract ────────────────────────────
 def test_step5_artifact_contract_matches_production():
     contract = _contract(build_step5_agent_card(STEP5_URL))
+    # run_step_plan is Step4/Orchestrator control, NOT a required domain input.
     assert _required_paths(contract, CAP_STEP5_CANDIDATE_CONTEXT) == {
         "raw_request_record": "inputs/raw_request_record.json",
         "structured_query": "inputs/structured_query.json",
-        "run_step_plan": "inputs/run_step_plan.json",
     }
+    required = _required_paths(contract, CAP_STEP5_CANDIDATE_CONTEXT)
+    assert "run_step_plan" not in required
+
+    # input_readiness_status is optional; the core does not depend on it.
+    assert _optional_paths(contract, CAP_STEP5_CANDIDATE_CONTEXT) == {
+        "input_readiness_status": "inputs/input_readiness_status.json",
+    }
+
     assert _output_pairs(contract, CAP_STEP5_CANDIDATE_CONTEXT) == [
         ("candidate_context_table", "candidate_context_table.json"),
     ]
@@ -118,6 +126,31 @@ def test_step5_artifact_contract_matches_production():
     cap = _only_cap(contract, CAP_STEP5_CANDIDATE_CONTEXT)
     assert cap["execution_mode"] == "single_step"
     assert cap["internal_execution_order"] == []
+
+
+def test_step5_required_artifact_fields_match_core_reads():
+    contract = _contract(build_step5_agent_card(STEP5_URL))
+    cap = _only_cap(contract, CAP_STEP5_CANDIDATE_CONTEXT)
+    raf = cap["required_artifact_fields"]
+    assert set(raf) == {"raw_request_record", "structured_query"}
+    assert raf["raw_request_record"]["required_field_keys"] == [
+        "raw_user_query",
+        "user_provided_context",
+        "uploaded_files",
+    ]
+    assert raf["structured_query"]["required_field_keys"] == [
+        "mentioned_entities",
+        "referenced_inputs",
+        "normalized_entities",
+        "entity_decompositions",
+    ]
+    assert cap["supported_lane_flags"] == [
+        "target_discovery_lane",
+        "antibody_discovery_lane",
+        "antibody_lane",
+        "compound_lane",
+        "structure_lane",
+    ]
 
 
 # ── 4. Step 6 input/output contract == production read/write paths ───────────
@@ -304,6 +337,17 @@ def test_contract_bad_dispatch_mode_is_rejected():
         parse_adc_agent_contract(card)
 
 
+@pytest.mark.parametrize(
+    "dispatch_modes",
+    [["http_a2a"], ["python_a2a", "http_a2a"], ["python_a2a", "python_a2a"]],
+)
+def test_contract_dispatch_mode_must_be_exactly_python_a2a(dispatch_modes):
+    card = build_step5_agent_card(STEP5_URL)
+    card.capabilities["adc_agent_contract"]["dispatch_modes"] = dispatch_modes
+    with pytest.raises(AgentContractError):
+        parse_adc_agent_contract(card)
+
+
 def test_routable_worker_without_url_is_rejected():
     card = build_step5_agent_card(STEP5_URL)
     card.url = ""
@@ -322,6 +366,21 @@ def test_output_artifact_missing_storage_path_is_rejected():
 def test_skills_capability_misalignment_is_rejected():
     card = build_step6_agent_card(STEP6_URL)
     card.skills = []
+    with pytest.raises(AgentContractError):
+        parse_adc_agent_contract(card)
+
+
+def test_duplicate_skill_id_is_rejected():
+    card = build_step5_agent_card(STEP5_URL)
+    card.skills.append(card.skills[0])
+    with pytest.raises(AgentContractError):
+        parse_adc_agent_contract(card)
+
+
+def test_duplicate_capability_id_is_rejected():
+    card = build_step5_agent_card(STEP5_URL)
+    capabilities = card.capabilities["adc_agent_contract"]["capabilities"]
+    capabilities.append(dict(capabilities[0]))
     with pytest.raises(AgentContractError):
         parse_adc_agent_contract(card)
 

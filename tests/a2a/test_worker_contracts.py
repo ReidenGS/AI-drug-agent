@@ -14,6 +14,7 @@ from app.a2a.contracts import (
     InputArtifactRef,
     InputProjection,
     OrchestratorRoutingDecisionRef,
+    PrivacyConstraints,
     RuntimeRef,
     ToolCallSummary,
     WorkerArtifactRef,
@@ -26,6 +27,8 @@ from app.a2a.contracts import (
 
 def _valid_request_kwargs() -> dict:
     return dict(
+        payload_type="worker_execution_request",
+        payload_version="v1",
         run_id="run_123",
         task_id="task_step6_001",
         routing_plan_id="wrp_001",
@@ -57,6 +60,7 @@ def _valid_request_kwargs() -> dict:
                 )
             },
         ),
+        privacy_constraints=PrivacyConstraints(),
     )
 
 
@@ -76,6 +80,16 @@ def test_valid_request_round_trips():
         "candidate:cand_her2_001:material:mat_pdb_1"
     ]
     assert ref["$ref"] == "candidate:cand_her2_001:material:mat_pdb_1"
+
+
+def test_request_rejects_http_a2a_dispatch_alias():
+    kwargs = _valid_request_kwargs()
+    kwargs["orchestrator_routing_decision"] = {
+        **kwargs["orchestrator_routing_decision"].model_dump(),
+        "dispatch_mode": "http_a2a",
+    }
+    with pytest.raises(ValidationError):
+        WorkerExecutionRequest(**kwargs)
 
 
 # ── 9. raw-looking forbidden fields are rejected on request AND result ───────
@@ -101,6 +115,8 @@ def test_request_rejects_raw_forbidden_fields(field):
 @pytest.mark.parametrize("field", _FORBIDDEN_FIELDS)
 def test_result_rejects_raw_forbidden_fields(field):
     base = dict(
+        payload_type="worker_execution_result",
+        payload_version="v1",
         run_id="run_123",
         task_id="task_step6_001",
         agent_id="step_06_developability_agent",
@@ -146,6 +162,8 @@ def test_runtime_ref_rejects_inline_raw_value():
 # ── A2ATaskMetadata carries only compact identifiers ────────────────────────
 def test_task_metadata_is_compact_identifiers_only():
     meta = A2ATaskMetadata(
+        adc_payload_type="worker_execution_request",
+        adc_payload_version="v1",
         run_id="run_123",
         task_id="task_step6_001",
         routing_plan_id="wrp_001",
@@ -157,6 +175,8 @@ def test_task_metadata_is_compact_identifiers_only():
     assert meta.adc_payload_type == "worker_execution_request"
     with pytest.raises(ValidationError):
         A2ATaskMetadata(
+            adc_payload_type="worker_execution_request",
+            adc_payload_version="v1",
             run_id="run_123",
             task_id="t",
             routing_plan_id="p",
@@ -199,6 +219,8 @@ def test_runtime_ref_safe_summary_rejects_deep_nested_a3m():
 
 def _result_kwargs(**overrides) -> dict:
     base = dict(
+        payload_type="worker_execution_result",
+        payload_version="v1",
         run_id="run_123",
         task_id="task_step6_001",
         agent_id="step_06_developability_agent",

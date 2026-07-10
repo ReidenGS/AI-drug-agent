@@ -54,7 +54,7 @@ AGENT_ID_STEP5 = "step_05_candidate_context_agent"
 AGENT_ID_STEP6 = "step_06_developability_agent"
 AGENT_ID_STRUCTURE = "structure_and_design_agent"
 
-_VALID_DISPATCH_MODES = {"python_a2a", "http_a2a"}
+_REQUIRED_DISPATCH_MODES = ["python_a2a"]
 _CONTRACT_KEY = "adc_agent_contract"
 
 
@@ -192,12 +192,18 @@ def _build_agent_card(*, contract: AdcAgentContract, url: str) -> AgentCard:
 
 
 def build_step5_agent_card(url: str) -> AgentCard:
-    """Step 5 CandidateContextAgent card.
+    """Step 5 CandidateContextAgent card (request-based worker contract).
 
-    Verified against ``app/agents/candidate_context_agent.py``:
-    reads ``inputs/structured_query.json`` + ``inputs/raw_request_record.json``,
-    requires ``run_step_plan`` in the registry, writes
-    ``candidate_context_table.json``.
+    Verified against ``app/agents/candidate_context_agent.py``: the request-based
+    core (``run_from_artifacts``) reads ``inputs/raw_request_record.json`` and
+    ``inputs/structured_query.json`` and writes ``candidate_context_table.json``.
+
+    ``run_step_plan`` is deliberately NOT a required input: it is Step 4 /
+    Orchestrator execution control, and the request-based worker's external
+    control contract is ``orchestrator_routing_decision``. (Only the legacy
+    ``run(run_id)`` path still gates on the registry ``run_step_plan_id``.)
+    ``input_readiness_status`` is an OPTIONAL input; the Step 5 core does not
+    depend on it.
     """
     contract = AdcAgentContract(
         agent_id=AGENT_ID_STEP5,
@@ -225,11 +231,43 @@ def build_step5_agent_card(url: str) -> AgentCard:
                     "structure_analysis",
                     "compound_screening",
                 ],
+                supported_lane_flags=[
+                    "target_discovery_lane",
+                    "antibody_discovery_lane",
+                    "antibody_lane",
+                    "compound_lane",
+                    "structure_lane",
+                ],
                 required_input_artifacts=[
                     _RAW_REQUEST_RECORD,
                     _STRUCTURED_QUERY,
-                    _RUN_STEP_PLAN,
                 ],
+                optional_input_artifacts=[
+                    ContractArtifactRef(
+                        artifact_name="input_readiness_status",
+                        storage_path="inputs/input_readiness_status.json",
+                    ),
+                ],
+                # Schema-key presence the Step 5 core actually reads (verified
+                # against candidate_context_agent._build_candidate_context). These
+                # denote key presence, not non-emptiness.
+                required_artifact_fields={
+                    "raw_request_record": ArtifactFieldRequirement(
+                        required_field_keys=[
+                            "raw_user_query",
+                            "user_provided_context",
+                            "uploaded_files",
+                        ],
+                    ),
+                    "structured_query": ArtifactFieldRequirement(
+                        required_field_keys=[
+                            "mentioned_entities",
+                            "referenced_inputs",
+                            "normalized_entities",
+                            "entity_decompositions",
+                        ],
+                    ),
+                },
                 required_control_context=["orchestrator_routing_decision"],
                 output_artifacts=[_CANDIDATE_CONTEXT_TABLE],
                 uses_llm=True,
@@ -531,11 +569,13 @@ def parse_adc_agent_contract(card: AgentCard) -> AdcAgentContract:
     # agent_id / agent_role presence is already enforced by the schema (min_length
     # / Literal). Below are the cross-field checks the schema cannot express.
 
-    # dispatch_modes must include a real A2A transport mode.
-    if not (_VALID_DISPATCH_MODES & set(contract.dispatch_modes)):
+    # This version has exactly one production dispatch mode. Do not accept an
+    # alias, secondary local mode, or duplicate entry that could later be used
+    # as a silent direct-call fallback.
+    if contract.dispatch_modes != _REQUIRED_DISPATCH_MODES:
         raise AgentContractError(
-            "dispatch_modes must include one of "
-            f"{sorted(_VALID_DISPATCH_MODES)}; got {contract.dispatch_modes}"
+            f"dispatch_modes must be exactly {_REQUIRED_DISPATCH_MODES}; "
+            f"got {contract.dispatch_modes}"
         )
 
     # Every required/output artifact ref must carry artifact_name + storage_path.
@@ -552,8 +592,17 @@ def parse_adc_agent_contract(card: AgentCard) -> AdcAgentContract:
         _validate_required_artifact_fields(cap)
 
     # Skills published on the card must line up 1:1 with contract capabilities.
-    skill_ids = {getattr(s, "id", None) for s in (getattr(card, "skills", None) or [])}
-    capability_ids = {cap.capability_id for cap in contract.capabilities}
+    skill_id_list = [getattr(s, "id", None) for s in (getattr(card, "skills", None) or [])]
+    capability_id_list = [cap.capability_id for cap in contract.capabilities]
+    if len(skill_id_list) != len(set(skill_id_list)):
+        raise AgentContractError(f"AgentCard.skills contains duplicate ids: {skill_id_list}")
+    if len(capability_id_list) != len(set(capability_id_list)):
+        raise AgentContractError(
+            "adc_agent_contract contains duplicate capability ids: "
+            f"{capability_id_list}"
+        )
+    skill_ids = set(skill_id_list)
+    capability_ids = set(capability_id_list)
     if skill_ids != capability_ids:
         raise AgentContractError(
             "AgentCard.skills do not align with adc_agent_contract capabilities: "

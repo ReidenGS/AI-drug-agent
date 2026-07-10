@@ -637,12 +637,60 @@ class CandidateContextAgent:
         raw = self.storage.read_json(
             self.storage.run_key(run_id, "inputs/raw_request_record.json")
         )
+        return self._build_candidate_context(
+            run_id,
+            raw=raw,
+            sq=sq,
+            sq_artifact_id=reg.active_artifacts.structured_query_id or "",
+        )
 
+    def run_from_artifacts(
+        self,
+        run_id: str,
+        *,
+        raw_request_record: dict,
+        structured_query: dict,
+        structured_query_artifact_id: str | None = None,
+    ) -> CandidateContextTable:
+        """Request-based worker entry — NO run_step_plan / Step 4 gate.
+
+        The A2A worker adapter has already validated the input artifact refs and
+        read the ``raw_request_record`` + ``structured_query`` bodies from
+        worker-owned storage. This entry runs the EXACT same shared
+        candidate-context core as the legacy :meth:`run` path (identical
+        candidate construction, LLM tool selection, MCP routing, artifact write,
+        registry + workflow-state update); it only skips the legacy registry gate
+        that requires a Step 4 ``run_step_plan``. It never reads or checks
+        ``run_step_plan_id``.
+        """
+        sq_artifact_id = structured_query_artifact_id
+        if sq_artifact_id is None:
+            sq_artifact_id = (
+                self.registry.get(run_id).active_artifacts.structured_query_id or ""
+            )
+        return self._build_candidate_context(
+            run_id,
+            raw=raw_request_record,
+            sq=structured_query,
+            sq_artifact_id=sq_artifact_id,
+        )
+
+    def _build_candidate_context(
+        self,
+        run_id: str,
+        *,
+        raw: dict,
+        sq: dict,
+        sq_artifact_id: str,
+    ) -> CandidateContextTable:
+        """Shared candidate-context core used by both :meth:`run` (legacy) and
+        :meth:`run_from_artifacts` (request-based). Identical business logic —
+        candidate construction, enrichment tool selection, MCP routing, artifact
+        persistence, registry + workflow-state update."""
         entities = sq.get("mentioned_entities") or {}
         ctx = raw.get("user_provided_context") or {}
         refs = [r for r in (sq.get("referenced_inputs") or []) if isinstance(r, dict)]
         uploaded = raw.get("uploaded_files") or []
-        sq_artifact_id = reg.active_artifacts.structured_query_id or ""
         raw_user_query = raw.get("raw_user_query") or ""
         target_text = (
             entities.get("target_or_antigen_text")
