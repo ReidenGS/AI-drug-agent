@@ -154,6 +154,41 @@ class _RecordingStep5Worker(Step5A2AWorker):
         return _CountingAgent()
 
 
+class _IdentityTamperingStep5Worker(Step5A2AWorker):
+    """TEST STUB: run the real agent, then corrupt one persisted identity.
+
+    It changes only the persisted test artifact after genuine agent execution;
+    the registry pointer remains untouched and production has no such branch.
+    """
+
+    def __init__(self, *args, identity_field: str, **kwargs):
+        self._identity_field = identity_field
+        super().__init__(*args, **kwargs)
+
+    def _default_agent_factory(self):
+        outer = self
+        real = CandidateContextAgent(
+            storage=outer._storage,
+            registry=outer._registry,
+            workflow_state=outer._workflow_state,
+            mcp_client=outer._mcp_client,
+            llm=outer._llm,
+        )
+
+        class _TamperingAgent:
+            def run_from_artifacts(self, run_id, **kwargs):
+                table = real.run_from_artifacts(run_id, **kwargs)
+                key = real.storage.run_key(run_id, "candidate_context_table.json")
+                persisted = real.storage.read_json(key)
+                persisted[outer._identity_field] = (
+                    f"tampered_{outer._identity_field}_test_only"
+                )
+                real.storage.write_json(key, persisted)
+                return table
+
+        return _TamperingAgent()
+
+
 class _ServerHandle:
     def __init__(self, base_url, worker, server, thread):
         self.base_url = base_url
@@ -617,6 +652,48 @@ async def test_valid_task_writes_artifact_and_matches_ref(worker_server, local_s
     tcs = result["tool_call_summary"]
     for key in ("attempted", "success", "failed", "dependency_unavailable", "skipped"):
         assert key in tcs
+
+
+@pytest.mark.parametrize("identity_field", ["artifact_id", "run_id"])
+async def test_persisted_step5_identity_mismatch_is_compact_tool_failure_over_http(
+    local_storage,
+    registry_service,
+    workflow_state_service,
+    identity_field,
+):
+    run_id = _setup_run(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+    )
+    worker = _IdentityTamperingStep5Worker(
+        url="http://step5-worker:8005",
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+        llm=MockLLMProvider(),
+        identity_field=identity_field,
+    )
+    with _serve(worker) as base_url:
+        request = _request(
+            run_id,
+            refs=_base_refs(registry_service, run_id),
+        )
+        result_task = await _send(base_url, _task(request))
+    result = _result(result_task)
+
+    assert result_task.status.state == TaskState.FAILED
+    assert result["result_status"] == "tool_failed"
+    assert result["execution_status"] == "failed"
+    assert result["error_code"] == (
+        "candidate_context_artifact_identity_mismatch"
+    )
+    assert result["output_artifact_refs"] == {}
+    assert identity_field in result["error_summary"]
+    compact_blob = json.dumps(result).lower()
+    assert "tampered_" not in compact_blob
+    assert "candidate_records" not in compact_blob
 
 
 # ── 22. compact result carries no raw material / secrets ─────────────────────

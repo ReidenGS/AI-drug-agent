@@ -153,19 +153,40 @@ def test_step5_required_artifact_fields_match_core_reads():
     ]
 
 
-# ── 4. Step 6 input/output contract == production read/write paths ───────────
+# ── 4. Step 6 request-based input/output contract ────────────────────────────
 def test_step6_artifact_contract_matches_production():
     contract = _contract(build_step6_agent_card(STEP6_URL))
     assert _required_paths(contract, CAP_STEP6_DEVELOPABILITY) == {
         "candidate_context_table": "candidate_context_table.json",
-        "run_step_plan": "inputs/run_step_plan.json",
     }
+    assert _optional_paths(contract, CAP_STEP6_DEVELOPABILITY) == {}
     assert _output_pairs(contract, CAP_STEP6_DEVELOPABILITY) == [
         ("structured_liability_summary", "structured_liability_summary.json"),
     ]
     cap = _only_cap(contract, CAP_STEP6_DEVELOPABILITY)
     assert cap["execution_mode"] == "single_step"
     assert cap["internal_execution_order"] == []
+    assert cap["required_control_context"] == ["orchestrator_routing_decision"]
+    assert cap["required_artifact_fields"] == {
+        "candidate_context_table": {
+            "required_field_keys": ["candidate_records"],
+            "entity_type": "candidate",
+            "default_selection_mode": "all_in_artifact",
+        }
+    }
+    assert cap["supported_lane_flags"] == [
+        "antibody_lane",
+        "compound_lane",
+        "structure_lane",
+        "payload_linker_compound_liability",
+        "antibody_protein_sequence_liability",
+        "antigen_protein_feature_context",
+        "structure_interface_quality",
+        "compound_bioactivity_prior_context",
+    ]
+    assert "run_step_plan" not in _required_paths(
+        contract, CAP_STEP6_DEVELOPABILITY
+    )
 
 
 # ── Structure worker: single capability ──────────────────────────────────────
@@ -548,7 +569,6 @@ def test_compact_catalog_step5_step6_single_step_no_regression():
     assert step6["capabilities"][0]["execution_mode"] == "single_step"
     assert step6["capabilities"][0]["required_input_artifact_names"] == [
         "candidate_context_table",
-        "run_step_plan",
     ]
     assert step6["capabilities"][0]["output_artifact_names"] == [
         "structured_liability_summary",

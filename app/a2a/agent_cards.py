@@ -147,10 +147,6 @@ _STRUCTURED_QUERY = ContractArtifactRef(
     artifact_name="structured_query",
     storage_path="inputs/structured_query.json",
 )
-_RUN_STEP_PLAN = ContractArtifactRef(
-    artifact_name="run_step_plan",
-    storage_path="inputs/run_step_plan.json",
-)
 _CANDIDATE_CONTEXT_TABLE = ContractArtifactRef(
     artifact_name="candidate_context_table",
     storage_path="candidate_context_table.json",
@@ -289,11 +285,12 @@ def build_step5_agent_card(url: str) -> AgentCard:
 
 
 def build_step6_agent_card(url: str) -> AgentCard:
-    """Step 6 DevelopabilityAgent card.
+    """Step 6 DevelopabilityAgent request-based worker card.
 
-    Verified against ``app/agents/developability_agent.py``: reads
-    ``candidate_context_table.json``, requires ``run_step_plan``, writes
-    ``structured_liability_summary.json``.
+    The request-based core reads ``candidate_context_table.json`` and writes
+    ``structured_liability_summary.json``. ``run_step_plan`` is deliberately
+    absent: Step 4 owns the dispatch gate and supplies the validated
+    ``orchestrator_routing_decision`` control context.
     """
     contract = AdcAgentContract(
         agent_id=AGENT_ID_STEP6,
@@ -321,6 +318,9 @@ def build_step6_agent_card(url: str) -> AgentCard:
                     "optimization",
                 ],
                 supported_lane_flags=[
+                    "antibody_lane",
+                    "compound_lane",
+                    "structure_lane",
                     "payload_linker_compound_liability",
                     "antibody_protein_sequence_liability",
                     "antigen_protein_feature_context",
@@ -329,8 +329,18 @@ def build_step6_agent_card(url: str) -> AgentCard:
                 ],
                 required_input_artifacts=[
                     _CANDIDATE_CONTEXT_TABLE,
-                    _RUN_STEP_PLAN,
                 ],
+                # The current production core reads the normalized top-level
+                # candidate_records list. Conditional lane inputs remain typed
+                # fields inside each record and must not become unconditional
+                # AgentCard requirements.
+                required_artifact_fields={
+                    "candidate_context_table": ArtifactFieldRequirement(
+                        entity_type="candidate",
+                        default_selection_mode="all_in_artifact",
+                        required_field_keys=["candidate_records"],
+                    ),
+                },
                 required_control_context=["orchestrator_routing_decision"],
                 output_artifacts=[
                     ContractArtifactRef(

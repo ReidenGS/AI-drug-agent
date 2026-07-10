@@ -183,6 +183,11 @@ class Step5A2AWorker:
                 message="Step 5 core returned but candidate_context_table was not persisted",
             )
 
+        self._validate_output_artifact_identity(
+            run_id=run_id,
+            registry_artifact_id=artifact_id,
+        )
+
         return self._build_result(request, table, artifact_id)
 
     def _validate_and_read_ref(
@@ -328,6 +333,48 @@ class Step5A2AWorker:
         except Exception:  # noqa: BLE001 — best-effort for the compact output ref
             return None
         return getattr(reg.active_artifacts, "candidate_context_table_id", None)
+
+    def _validate_output_artifact_identity(
+        self,
+        *,
+        run_id: str,
+        registry_artifact_id: str,
+    ) -> None:
+        storage_key = self._storage.run_key(
+            run_id,
+            _CANDIDATE_CONTEXT_STORAGE_KEY,
+        )
+        try:
+            persisted = self._storage.read_json(storage_key)
+        except Exception as exc:  # noqa: BLE001 - compact, sanitized failure
+            raise WorkerRequestRejected(
+                result_status="tool_failed",
+                error_code="candidate_context_artifact_identity_mismatch",
+                message="persisted artifact identity body could not be read",
+            ) from exc
+        if not isinstance(persisted, dict):
+            raise WorkerRequestRejected(
+                result_status="tool_failed",
+                error_code="candidate_context_artifact_identity_mismatch",
+                message="persisted artifact identity body is not an object",
+            )
+        if persisted.get("artifact_id") != registry_artifact_id:
+            raise WorkerRequestRejected(
+                result_status="tool_failed",
+                error_code="candidate_context_artifact_identity_mismatch",
+                message=(
+                    "persisted artifact_id identity does not match the "
+                    "registry active artifact ID"
+                ),
+            )
+        if persisted.get("run_id") != run_id:
+            raise WorkerRequestRejected(
+                result_status="tool_failed",
+                error_code="candidate_context_artifact_identity_mismatch",
+                message=(
+                    "persisted run_id identity does not match the request run_id"
+                ),
+            )
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
