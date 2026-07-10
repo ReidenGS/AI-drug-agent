@@ -36,11 +36,18 @@ from python_a2a import AgentCard, AgentSkill
 _FORBID = ConfigDict(extra="forbid")
 
 # Capability id constants (stable routing identifiers used by Turn B/C/D).
+# NOTE: The structure worker exposes ONE Orchestrator-facing capability
+# (``structure_design_workflow``). Step 7/8/9 are the worker's INTERNAL serial
+# steps, not independently dispatchable A2A capabilities — they are only ever
+# referenced as ``supported_step_ids`` / ``internal_execution_order`` below.
 CAP_STEP5_CANDIDATE_CONTEXT = "step_05_candidate_context"
 CAP_STEP6_DEVELOPABILITY = "step_06_developability"
-CAP_STEP7_STRUCTURE_INPUT = "step_07_structure_input"
-CAP_STEP8_STRUCTURE_EVALUATION = "step_08_structure_evaluation"
-CAP_STEP9_STRUCTURE_DESIGN = "step_09_structure_design"
+CAP_STRUCTURE_DESIGN_WORKFLOW = "structure_design_workflow"
+
+# Structure worker internal step ids (NOT A2A capabilities).
+STEP_07_STRUCTURE_INPUT = "step_07_structure_input"
+STEP_08_STRUCTURE_EVALUATION = "step_08_structure_evaluation"
+STEP_09_STRUCTURE_DESIGN = "step_09_structure_design"
 
 # Agent id constants (match the design docs' stable snake ids).
 AGENT_ID_STEP5 = "step_05_candidate_context_agent"
@@ -67,17 +74,44 @@ class ContractArtifactRef(BaseModel):
     storage_path: str = Field(min_length=1)
 
 
+class ArtifactFieldRequirement(BaseModel):
+    """Orchestrator-verifiable field contract for one input artifact.
+
+    ``required_field_keys`` are normalized schema key names that must exist in
+    the artifact (their *presence*, not non-emptiness). This is NOT a JSONPath,
+    NOT a raw value, and NOT a copy of the artifact body. Conditional domain
+    inputs (PDB / sequence / variant / UniProt id / masked prompt) are decided
+    by the worker's internal projection / LLM selection / runtime resolver, and
+    must never become unconditional required fields of the whole A2A task.
+    """
+
+    model_config = _FORBID
+
+    required_field_keys: list[str] = Field(min_length=1)
+    entity_type: Optional[str] = None
+    default_selection_mode: Optional[str] = None
+
+
+ExecutionMode = Literal["single_step", "sequential_workflow"]
+
+
 class AgentCapabilityContract(BaseModel):
     model_config = _FORBID
 
     capability_id: str = Field(min_length=1)
     skill_name: str = Field(min_length=1)
     capability_summary: str = Field(min_length=1)
+    # ``single_step``: one Orchestrator-facing step (Step 5 / Step 6).
+    # ``sequential_workflow``: one capability that runs an ordered set of
+    # INTERNAL steps inside the worker (structure Step 7 -> 8 -> 9).
+    execution_mode: ExecutionMode = "single_step"
+    internal_execution_order: list[str] = Field(default_factory=list)
     supported_step_ids: list[str] = Field(default_factory=list)
     supported_intents: list[str] = Field(default_factory=list)
     supported_lane_flags: list[str] = Field(default_factory=list)
     required_input_artifacts: list[ContractArtifactRef] = Field(default_factory=list)
     optional_input_artifacts: list[ContractArtifactRef] = Field(default_factory=list)
+    required_artifact_fields: dict[str, ArtifactFieldRequirement] = Field(default_factory=dict)
     required_control_context: list[str] = Field(default_factory=list)
     output_artifacts: list[ContractArtifactRef] = Field(min_length=1)
     uses_llm: bool
@@ -287,16 +321,24 @@ def build_step6_agent_card(url: str) -> AgentCard:
 
 
 def build_structure_agent_card(url: str) -> AgentCard:
-    """Structure and Design worker card (Step 7 / 8 / 9 capabilities).
+    """Structure and Design worker card — ONE ``structure_design_workflow`` capability.
 
-    Verified against ``app/agents/structure_and_design_agent.py``:
-    - Step 7 reads raw_request_record + structured_query + candidate_context_table
-      (requires run_step_plan) and writes ``prepared_structure_input_package.json``.
-    - Step 8 reads ``prepared_structure_input_package.json`` (requires
-      run_step_plan) and writes ``structure_prediction_and_interface_results.json``.
-    - Step 9 reads ``candidate_context_table.json`` (requires run_step_plan),
-      optionally reads the Step 7/8 packages + request records, and writes
-      ``compound_screening_artifact.json``.
+    The Orchestrator sees a single capability and dispatches a single
+    ``python_a2a.Task``. Step 7 -> Step 8 -> Step 9 are the worker's INTERNAL
+    serial steps (declared via ``internal_execution_order``), not independently
+    dispatchable A2A capabilities.
+
+    External workflow entry inputs (verified against
+    ``app/agents/structure_and_design_agent.py`` run_step_7 read paths):
+    ``raw_request_record``, ``structured_query``, ``candidate_context_table``.
+    ``prepared_structure_input_package`` and
+    ``structure_prediction_and_interface_results`` are INTERNAL Step 7 / Step 8
+    outputs, so they are not required inputs. ``run_step_plan`` is Step 4 /
+    Orchestrator execution control; the worker's external control contract is
+    ``orchestrator_routing_decision``, not a required input artifact. (The local
+    ``run_step_7`` still reads ``run_step_plan`` from the registry — that is a
+    worker-adapter implementation-compatibility concern, not part of this
+    Orchestrator-facing card.)
     """
     contract = AdcAgentContract(
         agent_id=AGENT_ID_STRUCTURE,
@@ -305,78 +347,89 @@ def build_structure_agent_card(url: str) -> AgentCard:
         display_name="Structure and Design Agent",
         description=(
             "Prepares structure-relevant inputs, evaluates structure/interface "
-            "context, and runs controlled structure design or variant / compound "
-            "screening when inputs allow."
+            "context, and runs controlled protein design and variant evaluation "
+            "when inputs allow."
         ),
         capabilities=[
             AgentCapabilityContract(
-                capability_id=CAP_STEP7_STRUCTURE_INPUT,
-                skill_name="Structure input preparation",
+                capability_id=CAP_STRUCTURE_DESIGN_WORKFLOW,
+                skill_name="Structure design workflow",
                 capability_summary=(
-                    "Prepare the structure input package from request records, "
-                    "structured query, and candidate context."
+                    "Prepare structure inputs, evaluate structure/interface "
+                    "context, and run protein design and variant evaluation as "
+                    "one sequential worker workflow (Step 7 -> 8 -> 9)."
                 ),
-                supported_step_ids=["step_07_structure_input"],
-                supported_lane_flags=["structure_lane"],
-                required_input_artifacts=[
-                    _RAW_REQUEST_RECORD,
-                    _STRUCTURED_QUERY,
-                    _CANDIDATE_CONTEXT_TABLE,
-                    _RUN_STEP_PLAN,
+                execution_mode="sequential_workflow",
+                internal_execution_order=[
+                    STEP_07_STRUCTURE_INPUT,
+                    STEP_08_STRUCTURE_EVALUATION,
+                    STEP_09_STRUCTURE_DESIGN,
                 ],
-                required_control_context=["orchestrator_routing_decision"],
-                output_artifacts=[_PREPARED_STRUCTURE_INPUT],
-                uses_llm=True,
-                uses_mcp=True,
-            ),
-            AgentCapabilityContract(
-                capability_id=CAP_STEP8_STRUCTURE_EVALUATION,
-                skill_name="Structure prediction and interface evaluation",
-                capability_summary=(
-                    "Run structure/complex prediction and interface evaluation "
-                    "from the prepared structure input package."
-                ),
-                supported_step_ids=["step_08_structure_evaluation"],
-                supported_lane_flags=["structure_lane"],
-                required_input_artifacts=[
-                    _PREPARED_STRUCTURE_INPUT,
-                    _RUN_STEP_PLAN,
+                supported_step_ids=[
+                    STEP_07_STRUCTURE_INPUT,
+                    STEP_08_STRUCTURE_EVALUATION,
+                    STEP_09_STRUCTURE_DESIGN,
                 ],
-                required_control_context=["orchestrator_routing_decision"],
-                output_artifacts=[_STRUCTURE_PREDICTION],
-                uses_llm=True,
-                uses_mcp=True,
-            ),
-            AgentCapabilityContract(
-                capability_id=CAP_STEP9_STRUCTURE_DESIGN,
-                skill_name="Structure variant and compound screening",
-                capability_summary=(
-                    "Run structure variant evaluation and compound screening "
-                    "using candidate context and, when available, prepared "
-                    "structure inputs and prediction results."
-                ),
-                supported_step_ids=["step_09_structure_design"],
+                supported_intents=[
+                    "new_adc_design",
+                    "existing_adc_evaluation",
+                    "structure_analysis",
+                    "optimization",
+                ],
                 supported_lane_flags=[
                     "structure_lane",
                     "protein_design_lane",
                     "variant_evaluation_lane",
                 ],
                 required_input_artifacts=[
-                    _CANDIDATE_CONTEXT_TABLE,
-                    _RUN_STEP_PLAN,
-                ],
-                optional_input_artifacts=[
-                    _PREPARED_STRUCTURE_INPUT,
-                    _STRUCTURE_PREDICTION,
                     _RAW_REQUEST_RECORD,
                     _STRUCTURED_QUERY,
+                    _CANDIDATE_CONTEXT_TABLE,
                 ],
+                optional_input_artifacts=[
+                    ContractArtifactRef(
+                        artifact_name="structured_liability_summary",
+                        storage_path="structured_liability_summary.json",
+                    ),
+                ],
+                # Orchestrator-verifiable schema-key presence, using the CURRENT
+                # real Pydantic field names (not the design doc's idealized ones).
+                required_artifact_fields={
+                    "raw_request_record": ArtifactFieldRequirement(
+                        required_field_keys=[
+                            "raw_user_query",
+                            "user_provided_context",
+                            "uploaded_files",
+                        ],
+                    ),
+                    "structured_query": ArtifactFieldRequirement(
+                        required_field_keys=[
+                            "task_intent",
+                            "referenced_inputs",
+                            "requested_outputs",
+                            "user_constraints",
+                            "normalized_entities",
+                            "canonical_query",
+                        ],
+                    ),
+                    "candidate_context_table": ArtifactFieldRequirement(
+                        entity_type="candidate",
+                        default_selection_mode="all_in_artifact",
+                        required_field_keys=[
+                            "candidate_records",
+                            "downstream_query_hints",
+                        ],
+                    ),
+                },
                 required_control_context=["orchestrator_routing_decision"],
+                # Ordered Step 7 / Step 8 / Step 9 workflow outputs.
                 output_artifacts=[
+                    _PREPARED_STRUCTURE_INPUT,
+                    _STRUCTURE_PREDICTION,
                     ContractArtifactRef(
                         artifact_name="structure_variant_and_compound_screening",
                         storage_path="compound_screening_artifact.json",
-                    )
+                    ),
                 ],
                 uses_llm=True,
                 uses_mcp=True,
@@ -400,6 +453,57 @@ def build_structure_agent_card(url: str) -> AgentCard:
 # ─────────────────────────────────────────────────────────────────────────────
 # Validation
 # ─────────────────────────────────────────────────────────────────────────────
+def _validate_execution_mode(cap: AgentCapabilityContract) -> None:
+    """Deterministic execution-mode / internal-order checks (never silent)."""
+    order = cap.internal_execution_order
+    if len(order) != len(set(order)):
+        raise AgentContractError(
+            f"capability '{cap.capability_id}' has duplicate steps in "
+            f"internal_execution_order: {order}"
+        )
+    unknown = [s for s in order if s not in cap.supported_step_ids]
+    if unknown:
+        raise AgentContractError(
+            f"capability '{cap.capability_id}' internal_execution_order references "
+            f"steps not in supported_step_ids: {unknown}"
+        )
+    if cap.execution_mode == "sequential_workflow":
+        if not order:
+            raise AgentContractError(
+                f"capability '{cap.capability_id}' is a sequential_workflow but has "
+                "an empty internal_execution_order"
+            )
+    else:  # single_step
+        if len(order) > 1:
+            raise AgentContractError(
+                f"single_step capability '{cap.capability_id}' must not declare "
+                f"multiple internal execution steps: {order}"
+            )
+
+
+def _validate_required_artifact_fields(cap: AgentCapabilityContract) -> None:
+    """Field-contract checks: keys must reference declared required inputs; the
+    required_field_keys must be deduped and free of empty strings."""
+    required_names = {ref.artifact_name for ref in cap.required_input_artifacts}
+    for artifact_name, requirement in cap.required_artifact_fields.items():
+        if artifact_name not in required_names:
+            raise AgentContractError(
+                f"capability '{cap.capability_id}' declares required_artifact_fields "
+                f"for '{artifact_name}', which is not a required_input_artifact"
+            )
+        keys = requirement.required_field_keys
+        if any((not isinstance(k, str) or not k.strip()) for k in keys):
+            raise AgentContractError(
+                f"capability '{cap.capability_id}' required_artifact_fields "
+                f"['{artifact_name}'] contains an empty field key"
+            )
+        if len(keys) != len(set(keys)):
+            raise AgentContractError(
+                f"capability '{cap.capability_id}' required_artifact_fields "
+                f"['{artifact_name}'] has duplicate field keys: {keys}"
+            )
+
+
 def parse_adc_agent_contract(card: AgentCard) -> AdcAgentContract:
     """Extract and validate the adc_agent_contract embedded in ``card``.
 
@@ -444,6 +548,8 @@ def parse_adc_agent_contract(card: AgentCard) -> AdcAgentContract:
                     f"capability '{cap.capability_id}' has an artifact ref missing "
                     "artifact_name or storage_path"
                 )
+        _validate_execution_mode(cap)
+        _validate_required_artifact_fields(cap)
 
     # Skills published on the card must line up 1:1 with contract capabilities.
     skill_ids = {getattr(s, "id", None) for s in (getattr(card, "skills", None) or [])}
@@ -495,6 +601,8 @@ def build_compact_card_for_agent(card: AgentCard) -> dict[str, Any]:
             {
                 "capability_id": cap.capability_id,
                 "capability_summary": cap.capability_summary,
+                "execution_mode": cap.execution_mode,
+                "internal_execution_order": list(cap.internal_execution_order),
                 "supported_step_ids": list(cap.supported_step_ids),
                 "supported_intents": list(cap.supported_intents),
                 "supported_lane_flags": list(cap.supported_lane_flags),
@@ -507,6 +615,11 @@ def build_compact_card_for_agent(card: AgentCard) -> dict[str, Any]:
                 "output_artifact_names": [
                     ref.artifact_name for ref in cap.output_artifacts
                 ],
+                # Field NAMES only (schema keys), never values/bodies.
+                "required_artifact_field_names": {
+                    artifact_name: list(requirement.required_field_keys)
+                    for artifact_name, requirement in cap.required_artifact_fields.items()
+                },
                 "uses_llm": cap.uses_llm,
                 "uses_mcp": cap.uses_mcp,
             }
@@ -523,8 +636,10 @@ def build_compact_card_catalog(cards: list[AgentCard]) -> list[dict[str, Any]]:
 __all__ = [
     "AgentContractError",
     "ContractArtifactRef",
+    "ArtifactFieldRequirement",
     "AgentCapabilityContract",
     "AdcAgentContract",
+    "ExecutionMode",
     "build_step5_agent_card",
     "build_step6_agent_card",
     "build_structure_agent_card",
@@ -534,9 +649,10 @@ __all__ = [
     "build_compact_card_catalog",
     "CAP_STEP5_CANDIDATE_CONTEXT",
     "CAP_STEP6_DEVELOPABILITY",
-    "CAP_STEP7_STRUCTURE_INPUT",
-    "CAP_STEP8_STRUCTURE_EVALUATION",
-    "CAP_STEP9_STRUCTURE_DESIGN",
+    "CAP_STRUCTURE_DESIGN_WORKFLOW",
+    "STEP_07_STRUCTURE_INPUT",
+    "STEP_08_STRUCTURE_EVALUATION",
+    "STEP_09_STRUCTURE_DESIGN",
     "AGENT_ID_STEP5",
     "AGENT_ID_STEP6",
     "AGENT_ID_STRUCTURE",
