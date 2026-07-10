@@ -617,6 +617,43 @@ async def test_candidate_context_body_missing_required_field_does_not_run_agent(
     assert worker_server.worker.agent_run_count == 0
 
 
+@pytest.mark.parametrize("identity_field", ["artifact_id", "run_id"])
+async def test_persisted_candidate_context_identity_mismatch_rejected_over_http(
+    worker_server,
+    local_storage,
+    registry_service,
+    workflow_state_service,
+    identity_field,
+):
+    run_id = _seed_candidate_context(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+    )
+    key = local_storage.run_key(run_id, "candidate_context_table.json")
+    persisted = local_storage.read_json(key)
+    persisted[identity_field] = f"tampered_test_only_{identity_field}"
+    local_storage.write_json(key, persisted)
+
+    request = _request(
+        run_id,
+        refs={"candidate_context_table": _artifact_ref(registry_service, run_id)},
+    )
+    result_task = await _send(worker_server.base_url, _task(request))
+    result = _result(result_task)
+
+    assert result_task.status.state == TaskState.FAILED
+    assert result["result_status"] == "validation_failed"
+    assert result["execution_status"] == "failed"
+    assert result["error_code"] == "input_artifact_identity_mismatch"
+    assert worker_server.worker.agent_run_count == 0
+    assert "candidate_context_table" in result["error_summary"]
+    assert identity_field in result["error_summary"]
+    compact_blob = json.dumps(result).lower()
+    assert "tampered_test_only" not in compact_blob
+    assert "candidate_records" not in compact_blob
+
+
 async def test_candidate_context_storage_artifact_missing_does_not_run_agent(
     worker_server,
     local_storage,

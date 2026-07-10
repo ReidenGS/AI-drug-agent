@@ -549,6 +549,48 @@ async def test_artifact_body_missing_required_field_rejected(worker_server, loca
     assert worker_server.worker.agent_run_count == 0
 
 
+@pytest.mark.parametrize(
+    "artifact_name,storage_path,identity_field",
+    [
+        ("raw_request_record", "inputs/raw_request_record.json", "artifact_id"),
+        ("raw_request_record", "inputs/raw_request_record.json", "run_id"),
+        ("structured_query", "inputs/structured_query.json", "artifact_id"),
+        ("structured_query", "inputs/structured_query.json", "run_id"),
+    ],
+)
+async def test_persisted_input_identity_mismatch_rejected_over_real_http(
+    worker_server,
+    local_storage,
+    registry_service,
+    workflow_state_service,
+    artifact_name,
+    storage_path,
+    identity_field,
+):
+    run_id = _setup_run(local_storage, registry_service, workflow_state_service)
+    key = local_storage.run_key(run_id, storage_path)
+    persisted = local_storage.read_json(key)
+    persisted[identity_field] = f"tampered_test_only_{identity_field}"
+    local_storage.write_json(key, persisted)
+
+    result_task = await _send(
+        worker_server.base_url,
+        _task(_request(run_id, refs=_base_refs(registry_service, run_id))),
+    )
+    result = _result(result_task)
+
+    assert result_task.status.state == TaskState.FAILED
+    assert result["result_status"] == "validation_failed"
+    assert result["execution_status"] == "failed"
+    assert result["error_code"] == "input_artifact_identity_mismatch"
+    assert worker_server.worker.agent_run_count == 0
+    assert artifact_name in result["error_summary"]
+    assert identity_field in result["error_summary"]
+    compact_blob = json.dumps(result).lower()
+    assert "tampered_test_only" not in compact_blob
+    assert "raw_user_query" not in compact_blob
+
+
 # ── 15. malformed JSON payload ───────────────────────────────────────────────
 async def test_malformed_json_payload_rejected(worker_server):
     msg = Message(content=TextContent(text="this is not json {["), role=MessageRole.USER)

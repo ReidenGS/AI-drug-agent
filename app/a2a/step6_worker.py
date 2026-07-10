@@ -287,11 +287,27 @@ class Step6A2AWorker:
                 error_code="artifact_not_found",
                 message="candidate_context_table not found in worker storage",
             )
-        body = self._storage.read_json(storage_key)
+        try:
+            body = self._storage.read_json(storage_key)
+        except Exception as exc:  # noqa: BLE001 - sanitized input failure
+            raise WorkerRequestRejected(
+                result_status="validation_failed",
+                error_code="input_artifact_identity_mismatch",
+                message=(
+                    f"input artifact '{self._input_spec.name}' identity body "
+                    "could not be read"
+                ),
+            ) from exc
+        self._validate_input_artifact_identity(
+            body=body,
+            ref=ref,
+            registry_artifact_id=registry_id,
+            run_id=run_id,
+        )
         missing_body_fields = [
             field
             for field in spec.required_field_keys
-            if not isinstance(body, dict) or field not in body
+            if field not in body
         ]
         if missing_body_fields:
             raise WorkerRequestRejected(
@@ -303,6 +319,44 @@ class Step6A2AWorker:
                 ),
             )
         return body
+
+    def _validate_input_artifact_identity(
+        self,
+        *,
+        body: Any,
+        ref: Any,
+        registry_artifact_id: str,
+        run_id: str,
+    ) -> None:
+        if not isinstance(body, dict):
+            raise WorkerRequestRejected(
+                result_status="validation_failed",
+                error_code="input_artifact_identity_mismatch",
+                message=(
+                    f"input artifact '{self._input_spec.name}' identity body "
+                    "is not an object"
+                ),
+            )
+        if (
+            body.get("artifact_id") != registry_artifact_id
+            or body.get("artifact_id") != ref.artifact_id
+        ):
+            raise WorkerRequestRejected(
+                result_status="validation_failed",
+                error_code="input_artifact_identity_mismatch",
+                message=(
+                    f"input artifact '{self._input_spec.name}' artifact_id "
+                    "identity mismatch"
+                ),
+            )
+        if body.get("run_id") != run_id:
+            raise WorkerRequestRejected(
+                result_status="validation_failed",
+                error_code="input_artifact_identity_mismatch",
+                message=(
+                    f"input artifact '{self._input_spec.name}' run_id identity mismatch"
+                ),
+            )
 
     def _validate_output_artifact_identity(
         self,

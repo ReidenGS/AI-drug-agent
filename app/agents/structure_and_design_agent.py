@@ -227,6 +227,105 @@ class StructureAndDesignAgent:
             self.storage.run_key(run_id, "candidate_context_table.json")
         )
 
+        return self._run_step_7_from_artifacts(
+            run_id,
+            raw_request_record=raw,
+            structured_query=sq,
+            candidate_context_table=cct,
+        )
+
+    def run_workflow_from_artifacts(
+        self,
+        run_id: str,
+        *,
+        raw_request_record: dict,
+        structured_query: dict,
+        candidate_context_table: dict,
+    ) -> tuple[
+        PreparedStructureInputPackage,
+        StructurePredictionAndInterfaceResults,
+        CompoundScreeningArtifact,
+    ]:
+        """Run the internal Step 7 -> Step 8 -> Step 9 workflow from refs.
+
+        The Orchestrator owns routing and the run-step-plan gate. This
+        request-based entry consumes already validated artifact bodies, writes
+        each internal artifact through the existing production implementation,
+        and advances only after the preceding method has returned.
+        """
+        step7 = self._run_step_7_from_artifacts(
+            run_id,
+            raw_request_record=raw_request_record,
+            structured_query=structured_query,
+            candidate_context_table=candidate_context_table,
+        )
+        self._require_internal_artifact(
+            run_id,
+            registry_field="prepared_structure_input_package_id",
+            storage_path="prepared_structure_input_package.json",
+            step_label="Step 7",
+        )
+        step8 = self.run_step_8(run_id)
+        self._require_internal_artifact(
+            run_id,
+            registry_field="structure_prediction_and_interface_results_id",
+            storage_path="structure_prediction_and_interface_results.json",
+            step_label="Step 8",
+        )
+        step9 = self.run_step_9(run_id)
+        return step7, step8, step9
+
+    def _require_internal_artifact(
+        self,
+        run_id: str,
+        *,
+        registry_field: str,
+        storage_path: str,
+        step_label: str,
+    ) -> None:
+        registry = self.registry.get(run_id)
+        artifact_id = getattr(registry.active_artifacts, registry_field, None)
+        artifact_exists = self.storage.exists(
+            self.storage.run_key(run_id, storage_path)
+        )
+        if not artifact_id or not artifact_exists:
+            raise WorkflowStateError(
+                f"{step_label} did not persist its required internal artifact"
+            )
+        try:
+            body = self.storage.read_json(
+                self.storage.run_key(run_id, storage_path)
+            )
+        except Exception as exc:  # noqa: BLE001 - sanitized workflow boundary
+            raise WorkflowStateError(
+                f"{step_label} internal artifact identity could not be read"
+            ) from exc
+        if not isinstance(body, dict):
+            raise WorkflowStateError(
+                f"{step_label} internal artifact identity body is not an object"
+            )
+        if body.get("artifact_id") != artifact_id:
+            raise WorkflowStateError(
+                f"{step_label} internal artifact artifact_id identity mismatch"
+            )
+        if body.get("run_id") != run_id:
+            raise WorkflowStateError(
+                f"{step_label} internal artifact run_id identity mismatch"
+            )
+
+    def _run_step_7_from_artifacts(
+        self,
+        run_id: str,
+        *,
+        raw_request_record: dict,
+        structured_query: dict,
+        candidate_context_table: dict,
+    ) -> PreparedStructureInputPackage:
+        """Shared Step 7 business core used by legacy and request workflows."""
+        raw = raw_request_record
+        sq = structured_query
+        cct = candidate_context_table
+
         # Group resources once.
         uploaded = raw.get("uploaded_files") or []
         structure_files = [
