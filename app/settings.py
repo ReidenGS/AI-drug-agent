@@ -67,6 +67,20 @@ class Settings(BaseSettings):
 
     api_key: str = "dev-key"
 
+    # \u2500\u2500 Multi-Agent A2A worker endpoints (Turn D) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    # Docker-internal service URLs the Orchestrator uses to DISCOVER each worker
+    # over real HTTP A2A. Discovery is never triggered at import/create_app time;
+    # it only runs when WorkerDiscoveryService.discover_for_run(run_id) is called.
+    step5_worker_url: str = "http://step5-worker:8005"
+    step6_worker_url: str = "http://step6-worker:8006"
+    structure_worker_url: str = "http://structure-worker:8009"
+
+    # Production network timeouts (seconds) for AgentCard discovery + health
+    # probes. These are explicit deployment settings (not hidden test caps) and
+    # must be > 0.
+    a2a_discovery_timeout_seconds: float = 5.0
+    a2a_health_timeout_seconds: float = 5.0
+
     tool_inventory_xlsx: str = "../\u9879\u76ee\u6587\u4ef6/ToolUniversity_inventory_v0.2.xlsx"
 
     # Step 1 multipart upload limits (per-request, server-side; never trust the
@@ -122,6 +136,18 @@ class Settings(BaseSettings):
         if not allowlist:
             return True
         return tool_name in allowlist
+
+    @field_validator(
+        "a2a_discovery_timeout_seconds",
+        "a2a_health_timeout_seconds",
+    )
+    @classmethod
+    def _positive_a2a_timeout(cls, v: float) -> float:
+        """A2A discovery / health timeouts are real production network budgets
+        and must be strictly positive."""
+        if v is None or float(v) <= 0:
+            raise ValueError("A2A discovery/health timeout seconds must be > 0")
+        return float(v)
 
     @field_validator("llm_provider", mode="before")
     @classmethod

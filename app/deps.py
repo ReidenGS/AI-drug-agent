@@ -52,6 +52,30 @@ def get_mcp_client() -> MCPClient:
 
 
 @lru_cache(maxsize=1)
+def get_worker_discovery_service():
+    """Orchestrator worker discovery service (Turn D).
+
+    Constructing it performs NO network I/O and does NOT trigger discovery — only
+    ``discover_for_run(run_id)`` reaches the workers. It is intentionally NOT
+    wired into app startup / create_app, so importing the app or running tests
+    never auto-discovers or touches the network.
+    """
+    from .a2a.orchestrator_discovery import (
+        WorkerDiscoveryService,
+        default_expected_workers,
+    )
+
+    settings = get_settings()
+    return WorkerDiscoveryService(
+        expected_workers=default_expected_workers(settings),
+        storage=get_storage(),
+        registry=get_registry_service(),
+        discovery_timeout_seconds=settings.a2a_discovery_timeout_seconds,
+        health_timeout_seconds=settings.a2a_health_timeout_seconds,
+    )
+
+
+@lru_cache(maxsize=1)
 def get_llm_provider() -> LLMProvider:
     """Return the configured LLM provider.
 
