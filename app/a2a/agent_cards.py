@@ -157,6 +157,12 @@ _CANDIDATE_CONTEXT_TABLE = ContractArtifactRef(
     readiness_status_field="context_build_status",
     ready_status_values=["ok", "partial"],
 )
+_STRUCTURED_LIABILITY_SUMMARY = ContractArtifactRef(
+    artifact_name="structured_liability_summary",
+    storage_path="structured_liability_summary.json",
+    readiness_status_field="prefilter_status",
+    ready_status_values=["completed", "completed_with_missing_lanes", "partial"],
+)
 _PREPARED_STRUCTURE_INPUT = ContractArtifactRef(
     artifact_name="prepared_structure_input_package",
     storage_path="prepared_structure_input_package.json",
@@ -348,12 +354,7 @@ def build_step6_agent_card(url: str) -> AgentCard:
                     ),
                 },
                 required_control_context=["orchestrator_routing_decision"],
-                output_artifacts=[
-                    ContractArtifactRef(
-                        artifact_name="structured_liability_summary",
-                        storage_path="structured_liability_summary.json",
-                    )
-                ],
+                output_artifacts=[_STRUCTURED_LIABILITY_SUMMARY],
                 uses_llm=True,
                 uses_mcp=True,
             )
@@ -440,18 +441,7 @@ def build_structure_agent_card(url: str) -> AgentCard:
                     _STRUCTURED_QUERY,
                     _CANDIDATE_CONTEXT_TABLE,
                 ],
-                optional_input_artifacts=[
-                    ContractArtifactRef(
-                        artifact_name="structured_liability_summary",
-                        storage_path="structured_liability_summary.json",
-                        readiness_status_field="prefilter_status",
-                        ready_status_values=[
-                            "completed",
-                            "completed_with_missing_lanes",
-                            "partial",
-                        ],
-                    ),
-                ],
+                optional_input_artifacts=[_STRUCTURED_LIABILITY_SUMMARY],
                 # Orchestrator-verifiable schema-key presence, using the CURRENT
                 # real Pydantic field names (not the design doc's idealized ones).
                 required_artifact_fields={

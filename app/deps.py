@@ -76,6 +76,19 @@ def get_worker_discovery_service():
 
 
 @lru_cache(maxsize=1)
+def get_orchestrator_routing_service():
+    """Construct the Turn F1 routing planner; performs no I/O until called."""
+    from .a2a.orchestrator_routing_service import OrchestratorRoutingService
+
+    return OrchestratorRoutingService(
+        discovery=get_worker_discovery_service(),
+        storage=get_storage(),
+        registry=get_registry_service(),
+        llm=get_llm_provider(),
+    )
+
+
+@lru_cache(maxsize=1)
 def get_llm_provider() -> LLMProvider:
     """Return the configured LLM provider.
 

@@ -128,6 +128,28 @@ def test_task_round_trips_request_metadata_and_all_identity_fields(
     ]
 
 
+def test_task_can_be_rebuilt_with_explicit_persisted_task_identity(
+    local_storage, registry_service
+):
+    run_id, validated = _ready(local_storage, registry_service)
+    first = build_orchestrator_worker_task(
+        run_id=run_id,
+        routing_plan_id="wrp_restore",
+        validated=validated,
+        task_id="task_persisted_identity",
+    )
+    rebuilt = build_orchestrator_worker_task(
+        run_id=run_id,
+        routing_plan_id="wrp_restore",
+        validated=validated,
+        task_id="task_persisted_identity",
+    )
+
+    assert first.task.id == rebuilt.task.id == "task_persisted_identity"
+    assert first.task.metadata == rebuilt.task.metadata
+    assert _request_from_task(first.task) == _request_from_task(rebuilt.task)
+
+
 def test_task_contains_only_compact_refs_and_url_stays_in_memory(
     local_storage, registry_service
 ):

@@ -40,6 +40,7 @@ def build_orchestrator_worker_task(
     validated: RuntimeValidatedDecision
     | ValidatedRoutingDecision
     | RejectedRoutingDecision,
+    task_id: str | None = None,
 ) -> PreparedA2ATask:
     """Build one Task for a ready decision; never sends or executes it."""
     if not isinstance(validated, RuntimeValidatedDecision):
@@ -59,7 +60,9 @@ def build_orchestrator_worker_task(
     ):
         raise ValueError("task_builder_dispatch_target_identity_mismatch")
 
-    task_id = new_task_id()
+    if task_id is not None and not task_id:
+        raise ValueError("task_builder_task_id_invalid")
+    task_id = task_id or new_task_id()
     expected_outputs = [
         artifact.artifact_name for artifact in validated.capability.output_artifacts
     ]

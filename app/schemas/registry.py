@@ -22,6 +22,14 @@ class ActiveArtifacts(BaseModel):
     # Turn F1 — compact deterministic routing plan; does not replace Step 4's
     # existing run_step_plan or the Turn D discovery snapshot.
     worker_routing_plan_id: Optional[str] = None
+    # Independent persisted control identity for the active routing plan.
+    # ``worker_routing_plan_id`` remains the artifact id; this field lets a
+    # fresh process fail closed if the body's routing_plan_id is tampered.
+    worker_routing_plan_control_id: Optional[str] = None
+    # Planning-time fingerprints of selected producer output IDs. Values are
+    # one-way hashes (or the fixed ``absent`` marker), never raw artifact IDs.
+    # Completion must point at a different, newly active artifact.
+    worker_routing_plan_output_baselines: dict[str, str] = Field(default_factory=dict)
     candidate_context_table_id: Optional[str] = None
     structured_liability_summary_id: Optional[str] = None
     prepared_structure_input_package_id: Optional[str] = None

@@ -8,7 +8,7 @@ or call a worker, LLM, or MCP tool.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 from app.schemas.registry import ActiveArtifacts
 from app.schemas.worker_routing_plan import (
@@ -80,10 +80,13 @@ class RoutingValidationResult:
 
 
 @dataclass(frozen=True)
-class _ArtifactCheck:
+class ArtifactInspection:
+    """Single AgentCard-declared artifact readiness/identity inspection."""
+
     state: str
     ref: InputArtifactRef | None = None
     code: str | None = None
+    present_field_names: tuple[str, ...] = ()
 
 
 def validate_orchestrator_routing(
@@ -93,17 +96,31 @@ def validate_orchestrator_routing(
     discovery: DiscoveryAuthority,
     storage: Storage,
     registry: ArtifactRegistryService,
+    routing_decision_ids: Sequence[str] | None = None,
+    completed_routing_decision_ids: set[str] | frozenset[str] = frozenset(),
 ) -> RoutingValidationResult:
     """Validate targets, privacy, artifacts and dependencies without dispatch."""
+    if routing_decision_ids is not None and len(routing_decision_ids) != len(
+        proposal.decisions
+    ):
+        raise ValueError("routing_decision_id_count_mismatch")
+    if routing_decision_ids is not None and (
+        any(not isinstance(item, str) or not item for item in routing_decision_ids)
+        or len(set(routing_decision_ids)) != len(routing_decision_ids)
+    ):
+        raise ValueError("routing_decision_ids_invalid")
+    stable_decision_ids = list(routing_decision_ids or ()) or [
+        new_routing_decision_id() for _ in proposal.decisions
+    ]
     result = RoutingValidationResult(run_id=run_id, loop_decision=proposal.loop_decision)
     loop_valid = _validate_loop_consistency(proposal, result)
     if not loop_valid:
         if proposal.loop_decision != "dispatch_next_workers":
             result.rejected_decisions = [
-                _rejected(
-                    new_routing_decision_id(), proposed, "invalid_loop_decision"
+                _rejected(decision_id, proposed, "invalid_loop_decision")
+                for decision_id, proposed in zip(
+                    stable_decision_ids, proposal.decisions, strict=True
                 )
-                for proposed in proposal.decisions
             ]
         return result
     if proposal.loop_decision != "dispatch_next_workers":
@@ -117,8 +134,9 @@ def validate_orchestrator_routing(
         pair_counts[pair] = pair_counts.get(pair, 0) + 1
 
     candidates: list[RuntimeValidatedDecision] = []
-    for proposed in proposal.decisions:
-        routing_decision_id = new_routing_decision_id()
+    for routing_decision_id, proposed in zip(
+        stable_decision_ids, proposal.decisions, strict=True
+    ):
         if _decision_has_unsafe_text(proposed):
             unsafe_identity = contains_unsafe_routing_text(proposed.agent_id) or (
                 contains_unsafe_routing_text(proposed.capability_id)
@@ -216,6 +234,7 @@ def validate_orchestrator_routing(
         storage=storage,
         registry=registry,
         result=result,
+        completed_routing_decision_ids=completed_routing_decision_ids,
     )
     return result
 
@@ -332,11 +351,14 @@ def _validate_artifacts_and_build_dag(
     storage: Storage,
     registry: ArtifactRegistryService,
     result: RoutingValidationResult,
+    completed_routing_decision_ids: set[str] | frozenset[str],
 ) -> None:
     if not decisions:
         return
     producer_index: dict[str, list[RuntimeValidatedDecision]] = {}
     for item in decisions:
+        if item.decision.routing_decision_id in completed_routing_decision_ids:
+            continue
         for output in item.capability.output_artifacts:
             producer_index.setdefault(output.artifact_name, []).append(item)
 
@@ -351,6 +373,10 @@ def _validate_artifacts_and_build_dag(
         return
     dependency_sources: dict[str, list[str]] = {}
     for item in decisions:
+        if item.decision.routing_decision_id in completed_routing_decision_ids:
+            item.input_artifact_refs = {}
+            item.task_build_allowed = False
+            continue
         refs: dict[str, InputArtifactRef] = {}
         missing_required: list[str] = []
         corrupt_required: list[str] = []
@@ -366,7 +392,7 @@ def _validate_artifacts_and_build_dag(
             requirement = item.capability.required_artifact_fields.get(
                 artifact.artifact_name
             )
-            check = _validate_artifact(
+            check = inspect_declared_artifact(
                 run_id=run_id,
                 artifact=artifact,
                 requirement=requirement,
@@ -393,7 +419,7 @@ def _validate_artifacts_and_build_dag(
                 continue
             if producer_index.get(artifact.artifact_name):
                 continue
-            check = _validate_artifact(
+            check = inspect_declared_artifact(
                 run_id=run_id,
                 artifact=artifact,
                 requirement=item.capability.required_artifact_fields.get(
@@ -506,42 +532,43 @@ def _validate_artifacts_and_build_dag(
                 changed = True
 
 
-def _validate_artifact(
+def inspect_declared_artifact(
     *,
     run_id: str,
     artifact: ContractArtifactRef,
     requirement: Any,
     active: ActiveArtifacts,
     storage: Storage,
-) -> _ArtifactCheck:
+) -> ArtifactInspection:
+    """Inspect one persisted artifact using its validated AgentCard contract."""
     registry_field = f"{artifact.artifact_name}_id"
     if registry_field not in ActiveArtifacts.model_fields:
-        return _ArtifactCheck("corrupt", code="unknown_artifact_registry_field")
+        return ArtifactInspection("corrupt", code="unknown_artifact_registry_field")
     artifact_id = getattr(active, registry_field)
     if not artifact_id:
-        return _ArtifactCheck("missing")
+        return ArtifactInspection("missing")
     storage_key = storage.run_key(run_id, artifact.storage_path)
     if not storage.exists(storage_key):
-        return _ArtifactCheck("corrupt", code="artifact_storage_missing")
+        return ArtifactInspection("corrupt", code="artifact_storage_missing")
     try:
         body = storage.read_json(storage_key)
     except Exception:  # noqa: BLE001 - compact code only, never raw exception
-        return _ArtifactCheck("corrupt", code="artifact_json_unreadable")
+        return ArtifactInspection("corrupt", code="artifact_json_unreadable")
     if not isinstance(body, dict):
-        return _ArtifactCheck("corrupt", code="artifact_body_not_object")
+        return ArtifactInspection("corrupt", code="artifact_body_not_object")
     if body.get("artifact_id") != artifact_id:
-        return _ArtifactCheck("corrupt", code="artifact_id_mismatch")
+        return ArtifactInspection("corrupt", code="artifact_id_mismatch")
     if body.get("run_id") != run_id:
-        return _ArtifactCheck("corrupt", code="artifact_run_id_mismatch")
+        return ArtifactInspection("corrupt", code="artifact_run_id_mismatch")
     field_keys = list(requirement.required_field_keys) if requirement else []
     if any(field_name not in body for field_name in field_keys):
-        return _ArtifactCheck("corrupt", code="artifact_required_fields_missing")
+        return ArtifactInspection("corrupt", code="artifact_required_fields_missing")
     if artifact.readiness_status_field is not None:
         readiness = body.get(artifact.readiness_status_field)
         if not isinstance(readiness, str) or readiness not in artifact.ready_status_values:
-            return _ArtifactCheck("not_ready", code="artifact_not_ready")
+            return ArtifactInspection("not_ready", code="artifact_not_ready")
     schema_version = body.get("schema_version")
-    return _ArtifactCheck(
+    return ArtifactInspection(
         "valid",
         ref=InputArtifactRef(
             artifact_id=artifact_id,
@@ -555,6 +582,9 @@ def _validate_artifact(
             ),
             field_keys=field_keys,
             can_read_from_db=True,
+        ),
+        present_field_names=tuple(
+            field_name for field_name in field_keys if field_name in body
         ),
     )
 
