@@ -21,6 +21,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+deployment = [
+    "tooluniverse==1.2.2",
+    "esm @ https://github.com/evolutionaryscale/esm/archive/ba4d7124864eed323a93bf3cfefcd958f573b75a.tar.gz",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

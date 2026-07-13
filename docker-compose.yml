@@ -1,0 +1,153 @@
+# Multi-Agent A2A v1 — single-server Docker Compose skeleton (Turn E).
+#
+# Four business services on one internal network. The three workers are only
+# reachable INSIDE the network (expose, no host ports). The orchestrator is the
+# only service with a host port, configured via ORCHESTRATOR_HOST_PORT.
+#
+# Turn E scope: bring the HTTP services + internal DNS up. It does NOT wire
+# discovery into startup, does NOT dispatch A2A tasks, and adds NO database /
+# vector store / Mem0 service. Mem0 + PostgreSQL/pgvector are future turns
+# (see DEPLOYMENT_A2A.md).
+#
+# Run with an isolated project name so it never touches Dify/RAGFlow:
+#   docker compose -p synagentics-a2a-v1 up -d --build
+
+x-adc-image: &adc-image
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+# Shared runtime env for all four business services: same object storage, same
+# shared local-storage root, same inventory path. LLM/tool-live modes have no
+# silent deployment default: the operator must choose both explicitly.
+x-adc-common-env: &adc-common-env
+  STORAGE_MODE: "local"
+  LOCAL_STORAGE_ROOT: "/data/localstore"
+  TOOL_INVENTORY_XLSX: "/opt/adc/inventory/ToolUniversity_inventory_v0.2.xlsx"
+  LLM_PROVIDER: ${LLM_PROVIDER:?LLM_PROVIDER must be set explicitly}
+  MCP_LIVE_TOOLS: ${MCP_LIVE_TOOLS:?MCP_LIVE_TOOLS must be set explicitly}
+
+# Read-only bind of the OFFICIAL ToolUniverse inventory (never copied into the
+# image, never modified). Same source + same container path for all services.
+x-adc-inventory-mount: &adc-inventory-mount
+  type: bind
+  source: ../项目文件/ToolUniversity_inventory_v0.2.xlsx
+  target: /opt/adc/inventory/ToolUniversity_inventory_v0.2.xlsx
+  read_only: true
+
+services:
+  # ── Orchestrator / backend (only service with a host port) ─────────────────
+  orchestrator:
+    <<: *adc-image
+    image: synagentics-adc-a2a:latest
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: *adc-common-env
+      # Docker-internal worker URLs the Orchestrator's WorkerDiscoveryService uses
+      # (Turn D defaults already point at these service names).
+      STEP5_WORKER_URL: "http://step5-worker:8005"
+      STEP6_WORKER_URL: "http://step6-worker:8006"
+      STRUCTURE_WORKER_URL: "http://structure-worker:8009"
+    volumes:
+      - adc_local_store:/data/localstore
+      - *adc-inventory-mount
+    # The ONLY host port mapping in this stack. Override the host side via
+    # ORCHESTRATOR_HOST_PORT (verify it is free on the target host before deploy).
+    ports:
+      - "${ORCHESTRATOR_HOST_PORT:-18080}:8000"
+    networks:
+      - adc_a2a_net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    # NOTE: no depends_on the workers — the backend must start even when a worker
+    # is unavailable. Worker readiness is decided at run time by Turn D discovery,
+    # never by compose depends_on.
+
+  # ── Step 5 worker (internal only) ──────────────────────────────────────────
+  step5-worker:
+    <<: *adc-image
+    image: synagentics-adc-a2a:latest
+    command: ["python", "-m", "app.a2a.step5_worker_main"]
+    environment:
+      <<: *adc-common-env
+      STEP5_WORKER_URL: "http://step5-worker:8005"
+      WORKER_BIND_HOST: "0.0.0.0"
+      WORKER_BIND_PORT: "8005"
+    volumes:
+      - adc_local_store:/data/localstore
+      - *adc-inventory-mount
+    expose:
+      - "8005"
+    networks:
+      - adc_a2a_net
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.a2a.container_healthcheck", "--url", "http://127.0.0.1:8005/health", "--agent-id", "step_05_candidate_context_agent", "--capability", "step_05_candidate_context", "--timeout", "3"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  # ── Step 6 worker (internal only) ──────────────────────────────────────────
+  step6-worker:
+    <<: *adc-image
+    image: synagentics-adc-a2a:latest
+    command: ["python", "-m", "app.a2a.step6_worker_main"]
+    environment:
+      <<: *adc-common-env
+      STEP6_WORKER_URL: "http://step6-worker:8006"
+      WORKER_BIND_HOST: "0.0.0.0"
+      WORKER_BIND_PORT: "8006"
+    volumes:
+      - adc_local_store:/data/localstore
+      - *adc-inventory-mount
+    expose:
+      - "8006"
+    networks:
+      - adc_a2a_net
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.a2a.container_healthcheck", "--url", "http://127.0.0.1:8006/health", "--agent-id", "step_06_developability_agent", "--capability", "step_06_developability", "--timeout", "3"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  # ── Structure worker (internal only) ───────────────────────────────────────
+  structure-worker:
+    <<: *adc-image
+    image: synagentics-adc-a2a:latest
+    command: ["python", "-m", "app.a2a.structure_worker_main"]
+    environment:
+      <<: *adc-common-env
+      STRUCTURE_WORKER_URL: "http://structure-worker:8009"
+      WORKER_BIND_HOST: "0.0.0.0"
+      WORKER_BIND_PORT: "8009"
+    volumes:
+      - adc_local_store:/data/localstore
+      - *adc-inventory-mount
+    expose:
+      - "8009"
+    networks:
+      - adc_a2a_net
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.a2a.container_healthcheck", "--url", "http://127.0.0.1:8009/health", "--agent-id", "structure_and_design_agent", "--capability", "structure_design_workflow", "--timeout", "3"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+# Single shared named volume so the orchestrator and all three workers see the
+# SAME run artifacts / registry / workflow-state under LOCAL_STORAGE_ROOT.
+volumes:
+  adc_local_store:
+
+networks:
+  adc_a2a_net:
+    driver: bridge
