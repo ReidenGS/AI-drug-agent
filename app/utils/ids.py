@@ -37,3 +37,15 @@ def new_registry_id() -> str:
 
 def new_file_id() -> str:
     return f"file_{secrets.token_hex(6)}"
+
+
+def new_routing_plan_id() -> str:
+    return f"wrp_{secrets.token_hex(8)}"
+
+
+def new_routing_decision_id() -> str:
+    return f"route_{secrets.token_hex(8)}"
+
+
+def new_task_id() -> str:
+    return f"task_{secrets.token_hex(8)}"

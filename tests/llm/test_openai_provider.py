@@ -13,9 +13,14 @@ from typing import Any
 
 import pytest
 
+from app.a2a.orchestrator_routing_prompt import (
+    ORCHESTRATOR_ROUTING_SYSTEM_PROMPT,
+    ORCHESTRATOR_ROUTING_USER_TASK,
+)
 from app.llm.openai_provider import (
     OpenAIProvider,
     OpenAIProviderError,
+    _OrchestratorRoutingResponse,
     _RESPONSE_MODEL_FOR_TASK,
     _ToolSelectionStage1Response,
     _Step6SchemaMappingStage1Response,
@@ -589,6 +594,7 @@ def test_parser_models_produce_real_strict_schema():
         "step9_tool_selection_stage_1",
         "step9_tool_schema_mapping_stage_2",
         "step14_patent_tool_selection",
+        "orchestrator_worker_routing",
     }
     assert "step6_schema_mapping_stage_2" not in _RESPONSE_MODEL_FOR_TASK
     for task, model in _RESPONSE_MODEL_FOR_TASK.items():
@@ -663,6 +669,228 @@ def test_openai_step6_stage1_uses_structured_parser_and_validated():
     assert client._calls["parse"] and not client._calls["create"]
     assert client._calls["parse"][0]["response_format"] is _Step6SchemaMappingStage1Response
     assert out["selections"][0]["tool_name"] == "DrugProps_pains_filter"
+
+
+def _orchestrator_response(**overrides: Any) -> dict[str, Any]:
+    decision = {
+        "agent_id": "step_06_developability_agent",
+        "capability_id": "step_06_developability",
+        "objective": "Assess developability.",
+        "selection_reason": "The user requested developability assessment.",
+        "priority": "normal",
+    }
+    decision.update(overrides)
+    return {
+        "loop_decision": "dispatch_next_workers",
+        "decisions": [decision],
+        "decision_summary": "Dispatch the developability worker.",
+    }
+
+
+def _orchestrator_prompt_schema() -> dict[str, Any]:
+    return {
+        "task": "orchestrator_worker_routing",
+        "compact_card_catalog": [
+            {
+                "agent_id": "step_06_developability_agent",
+                "capabilities": [
+                    {"capability_id": "step_06_developability"}
+                ],
+            }
+        ],
+        "compact_user_intent": "Assess developability",
+        "structured_intent": {},
+        "input_readiness_summary": {"input_readiness_status": "ready"},
+        "available_artifact_summary": [],
+        "current_routing_context": {},
+    }
+
+
+def test_openai_orchestrator_uses_official_parser_and_returns_external_dict():
+    parsed = _OrchestratorRoutingResponse.model_validate(_orchestrator_response())
+    client = _fake_openai_client(parse=_parsed_response(parsed))
+    provider = _provider_with_client(client)
+
+    out = provider.generate_json(
+        "route", schema={"task": "orchestrator_worker_routing"}
+    )
+
+    assert len(client._calls["parse"]) == 1
+    assert client._calls["create"] == []
+    assert client._calls["parse"][0]["response_format"] is _OrchestratorRoutingResponse
+    assert isinstance(out, dict)
+    assert out == _orchestrator_response()
+
+
+def test_openai_orchestrator_system_role_is_not_duplicated_in_user_message():
+    parsed = _OrchestratorRoutingResponse.model_validate(_orchestrator_response())
+    client = _fake_openai_client(parse=_parsed_response(parsed))
+    provider = _provider_with_client(client)
+
+    provider.generate_json(
+        ORCHESTRATOR_ROUTING_USER_TASK,
+        schema=_orchestrator_prompt_schema(),
+        system=ORCHESTRATOR_ROUTING_SYSTEM_PROMPT,
+    )
+
+    messages = client._calls["parse"][0]["messages"]
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert messages[0]["content"] == ORCHESTRATOR_ROUTING_SYSTEM_PROMPT
+    user = messages[1]["content"]
+    assert ORCHESTRATOR_ROUTING_SYSTEM_PROMPT not in user
+    assert ORCHESTRATOR_ROUTING_USER_TASK in user
+    assert user.count('"input_situation"') == 2
+    assert "Compact AgentCard catalog JSON:" in user
+    assert "step_06_developability_agent" in user
+    assert sum(
+        message["content"].count(ORCHESTRATOR_ROUTING_SYSTEM_PROMPT)
+        for message in messages
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("agent_id", ""),
+        ("capability_id", ""),
+        ("objective", ""),
+        ("selection_reason", ""),
+        ("priority", "urgent"),
+    ],
+)
+def test_openai_orchestrator_parser_model_validates_decision_fields(field, value):
+    with pytest.raises(ValueError):
+        _OrchestratorRoutingResponse.model_validate(
+            _orchestrator_response(**{field: value})
+        )
+
+
+def test_openai_orchestrator_parser_model_rejects_empty_summary():
+    with pytest.raises(ValueError):
+        _OrchestratorRoutingResponse.model_validate(
+            {**_orchestrator_response(), "decision_summary": ""}
+        )
+
+
+@pytest.mark.parametrize("field", ["objective", "selection_reason"])
+def test_openai_orchestrator_empty_decision_field_retries(field):
+    bad = _orchestrator_response(**{field: ""})
+    good = _OrchestratorRoutingResponse.model_validate(_orchestrator_response())
+    sequence = iter([_parsed_response(bad), _parsed_response(good)])
+    client = _fake_openai_client(parse=lambda **kw: next(sequence))
+    provider = _provider_with_client(client, max_retries=1)
+
+    out = provider.generate_json(
+        "route", schema={"task": "orchestrator_worker_routing"}
+    )
+
+    assert len(client._calls["parse"]) == 2
+    assert out["decisions"][0][field]
+
+
+def test_openai_orchestrator_empty_summary_retries():
+    bad = {**_orchestrator_response(), "decision_summary": ""}
+    good = _OrchestratorRoutingResponse.model_validate(_orchestrator_response())
+    sequence = iter([_parsed_response(bad), _parsed_response(good)])
+    client = _fake_openai_client(parse=lambda **kw: next(sequence))
+    provider = _provider_with_client(client, max_retries=1)
+
+    out = provider.generate_json(
+        "route", schema={"task": "orchestrator_worker_routing"}
+    )
+
+    assert len(client._calls["parse"]) == 2
+    assert out["decision_summary"]
+
+
+def test_openai_orchestrator_parser_unavailable_uses_json_object_fallback():
+    client = _fake_openai_client(
+        has_parse=False,
+        create=_chat_response(json.dumps(_orchestrator_response())),
+    )
+    provider = _provider_with_client(client)
+
+    out = provider.generate_json(
+        "route", schema={"task": "orchestrator_worker_routing"}
+    )
+
+    assert client._calls["parse"] == []
+    assert len(client._calls["create"]) == 1
+    assert out == _orchestrator_response()
+
+
+def test_openai_orchestrator_schema_incompatibility_uses_fallback():
+    def _incompatible(**kw: Any) -> Any:
+        raise TypeError("response_format invalid schema")
+
+    client = _fake_openai_client(
+        parse=_incompatible,
+        create=_chat_response(json.dumps(_orchestrator_response())),
+    )
+    provider = _provider_with_client(client)
+
+    out = provider.generate_json(
+        "route", schema={"task": "orchestrator_worker_routing"}
+    )
+
+    assert len(client._calls["parse"]) == 1
+    assert len(client._calls["create"]) == 1
+    assert out == _orchestrator_response()
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError("network down"), RuntimeError("auth failed"), RuntimeError("rate limit")]
+)
+def test_openai_orchestrator_runtime_errors_do_not_silent_fallback(error):
+    def _fail(**kw: Any) -> Any:
+        raise error
+
+    client = _fake_openai_client(
+        parse=_fail,
+        create=_chat_response(json.dumps(_orchestrator_response())),
+    )
+    provider = _provider_with_client(client)
+
+    with pytest.raises(RuntimeError, match=str(error)):
+        provider.generate_json(
+            "route", schema={"task": "orchestrator_worker_routing"}
+        )
+    assert client._calls["create"] == []
+
+
+def test_openai_orchestrator_usage_event_is_compact_and_private():
+    usage = SimpleNamespace(prompt_tokens=90, completion_tokens=20, total_tokens=110)
+    parsed = _OrchestratorRoutingResponse.model_validate(_orchestrator_response())
+    client = _fake_openai_client(parse=_parsed_response(parsed, usage=usage))
+    provider = _provider_with_client(client)
+
+    provider.generate_json(
+        "FULL_PROMPT_SECRET",
+        schema={"task": "orchestrator_worker_routing", "private": "RAW_SCHEMA_SECRET"},
+        system="SYSTEM_SECRET",
+    )
+
+    assert provider.usage_events == [
+        {
+            "provider": "openai",
+            "model": provider.model,
+            "task": "orchestrator_worker_routing",
+            "attempt": 0,
+            "prompt_tokens": 90,
+            "completion_tokens": 20,
+            "total_tokens": 110,
+            "cached_prompt_tokens": None,
+        }
+    ]
+    blob = json.dumps(provider.usage_events)
+    for forbidden in (
+        "FULL_PROMPT_SECRET",
+        "SYSTEM_SECRET",
+        "RAW_SCHEMA_SECRET",
+        "sk-fake-parser",
+        "response_format",
+    ):
+        assert forbidden not in blob
 
 
 def test_openai_step14_uses_structured_parser_and_normalizes_literals():

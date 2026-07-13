@@ -100,6 +100,29 @@ class _Step6SchemaMappingStage1Response(BaseModel):
     selections: list[_Step6Stage1Selection] = Field(default_factory=list)
 
 
+class _OrchestratorRouteDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    agent_id: str = Field(min_length=1)
+    capability_id: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    selection_reason: str = Field(min_length=1)
+    priority: Literal["low", "normal", "high"]
+
+
+class _OrchestratorRoutingResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    loop_decision: Literal[
+        "dispatch_next_workers",
+        "wait_for_dependencies",
+        "route_to_final_response",
+        "request_user_input",
+        "repair_or_retry",
+        "stop_cannot_satisfy",
+    ]
+    decisions: list[_OrchestratorRouteDecision] = Field(default_factory=list)
+    decision_summary: str = Field(min_length=1)
+
+
 class _Step9Stage1Selection(BaseModel):
     model_config = ConfigDict(extra="forbid")
     tool_name: str
@@ -356,6 +379,7 @@ class _Step14PatentToolSelectionResponse(BaseModel):
 _RESPONSE_MODEL_FOR_TASK: dict[str, type[BaseModel]] = {
     "tool_selection_stage_1": _ToolSelectionStage1Response,
     "step6_schema_mapping_stage_1": _Step6SchemaMappingStage1Response,
+    "orchestrator_worker_routing": _OrchestratorRoutingResponse,
     "step14_patent_tool_selection": _Step14PatentToolSelectionResponse,
     # step6_schema_mapping_stage_2 is TEMPORARILY DISABLED from the official
     # parser path. The current Step 6 Stage 2 prompt still asks for the legacy

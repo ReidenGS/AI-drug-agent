@@ -19,6 +19,9 @@ class ActiveArtifacts(BaseModel):
     # run (Orchestrator worker discovery + deterministic validation). Additive
     # only; does not affect run_step_plan or any existing artifact.
     worker_discovery_snapshot_id: Optional[str] = None
+    # Turn F1 — compact deterministic routing plan; does not replace Step 4's
+    # existing run_step_plan or the Turn D discovery snapshot.
+    worker_routing_plan_id: Optional[str] = None
     candidate_context_table_id: Optional[str] = None
     structured_liability_summary_id: Optional[str] = None
     prepared_structure_input_package_id: Optional[str] = None

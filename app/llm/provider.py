@@ -451,6 +451,80 @@ def _detect_referenced_inputs(text: str) -> list[dict]:
     return refs
 
 
+def _mock_orchestrator_worker_routing(schema: dict) -> dict:
+    """Test/offline-only deterministic routing over the supplied catalog.
+
+    This helper is not a live LLM result and is not a production-provider
+    failure fallback. It only emits agent/capability pairs present in the
+    caller-provided compact AgentCard catalog.
+    """
+    intent = str(schema.get("compact_user_intent") or "").lower()
+    available: dict[str, tuple[str, dict]] = {}
+    for agent in schema.get("compact_card_catalog", []):
+        if not isinstance(agent, dict) or not isinstance(agent.get("agent_id"), str):
+            continue
+        for capability in agent.get("capabilities", []):
+            if isinstance(capability, dict) and isinstance(
+                capability.get("capability_id"), str
+            ):
+                available[capability["capability_id"]] = (
+                    agent["agent_id"], capability
+                )
+
+    requested: list[tuple[str, str, str, str]] = []
+    if "developability" in intent:
+        requested.extend(
+            [
+                (
+                    "step_05_candidate_context",
+                    "Build normalized candidate context for downstream assessment.",
+                    "Candidate context supports the requested developability assessment.",
+                    "high",
+                ),
+                (
+                    "step_06_developability",
+                    "Assess developability and liability risks for normalized candidates.",
+                    "The user requests developability assessment.",
+                    "normal",
+                ),
+            ]
+        )
+    if any(token in intent for token in ("structure", "protein design")):
+        requested.append(
+            (
+                "structure_design_workflow",
+                "Run the sequential structure and design workflow.",
+                "The user requests structure or protein-design analysis.",
+                "high",
+            )
+        )
+    decisions = []
+    for capability_id, objective, reason, priority in requested:
+        match = available.get(capability_id)
+        if match is None:
+            continue
+        decisions.append(
+            {
+                "agent_id": match[0],
+                "capability_id": capability_id,
+                "objective": objective,
+                "selection_reason": reason,
+                "priority": priority,
+            }
+        )
+    return {
+        "loop_decision": (
+            "dispatch_next_workers" if decisions else "route_to_final_response"
+        ),
+        "decisions": decisions,
+        "decision_summary": (
+            "Selected matching capabilities from the supplied catalog."
+            if decisions
+            else "No supplied capability matches the compact user intent."
+        ),
+    }
+
+
 class MockLLMProvider:
     """Rule-based provider used for tests / no-API-key dev.
 
@@ -472,6 +546,8 @@ class MockLLMProvider:
         # Dispatch on `task` first so the selector can reuse the same
         # provider without colliding with the Supervisor parsing path.
         task = (schema or {}).get("task")
+        if task == "orchestrator_worker_routing":
+            return _mock_orchestrator_worker_routing(schema)
         if task == "tool_selection_stage_1":
             return _mock_stage1_selection(schema)
         if task == "tool_selection_stage_2":
