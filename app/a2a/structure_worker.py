@@ -45,6 +45,8 @@ class _ArtifactSpec:
     required_field_keys: tuple[str, ...] = ()
     expected_entity_type: Optional[str] = None
     expected_selection_mode: Optional[str] = None
+    readiness_status_field: Optional[str] = None
+    ready_status_values: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -157,6 +159,8 @@ class StructureA2AWorker:
                 expected_selection_mode=(
                     fields.default_selection_mode if fields else None
                 ),
+                readiness_status_field=ref.readiness_status_field,
+                ready_status_values=tuple(ref.ready_status_values),
             )
 
         return (
@@ -196,6 +200,7 @@ class StructureA2AWorker:
                     spec=spec,
                     ref=refs[spec.name],
                     registry=registry,
+                    optional=True,
                 )
 
         agent = self._structure_agent_factory()
@@ -216,7 +221,8 @@ class StructureA2AWorker:
         spec: _ArtifactSpec,
         ref: Any,
         registry: Any,
-    ) -> dict[str, Any]:
+        optional: bool = False,
+    ) -> dict[str, Any] | None:
         if ref.run_id != run_id:
             raise WorkerRequestRejected(
                 result_status="validation_failed",
@@ -318,7 +324,24 @@ class StructureA2AWorker:
                     f"{sorted(missing_body_fields)}"
                 ),
             )
+        if not self._input_artifact_is_ready(spec=spec, body=body):
+            if optional:
+                return None
+            raise WorkerRequestRejected(
+                result_status="validation_failed",
+                error_code="input_artifact_not_ready",
+                message=f"input artifact '{spec.name}': input_artifact_not_ready",
+            )
         return body
+
+    @staticmethod
+    def _input_artifact_is_ready(
+        *, spec: _ArtifactSpec, body: dict[str, Any]
+    ) -> bool:
+        if spec.readiness_status_field is None:
+            return True
+        status = body.get(spec.readiness_status_field)
+        return isinstance(status, str) and status in spec.ready_status_values
 
     @staticmethod
     def _validate_input_artifact_identity(

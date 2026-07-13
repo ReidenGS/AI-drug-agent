@@ -164,6 +164,9 @@ def test_step6_artifact_contract_matches_production():
         ("structured_liability_summary", "structured_liability_summary.json"),
     ]
     cap = _only_cap(contract, CAP_STEP6_DEVELOPABILITY)
+    candidate_ref = cap["required_input_artifacts"][0]
+    assert candidate_ref["readiness_status_field"] == "context_build_status"
+    assert candidate_ref["ready_status_values"] == ["ok", "partial"]
     assert cap["execution_mode"] == "single_step"
     assert cap["internal_execution_order"] == []
     assert cap["required_control_context"] == ["orchestrator_routing_decision"]
@@ -322,6 +325,20 @@ def test_structure_required_artifact_fields_use_real_schema_keys():
         "downstream_query_hints",
     ]
 
+    optional = cap["optional_input_artifacts"]
+    assert optional == [
+        {
+            "artifact_name": "structured_liability_summary",
+            "storage_path": "structured_liability_summary.json",
+            "readiness_status_field": "prefilter_status",
+            "ready_status_values": [
+                "completed",
+                "completed_with_missing_lanes",
+                "partial",
+            ],
+        }
+    ]
+
 
 # ── 6. AgentCard url can be a Docker internal service name ───────────────────
 def test_card_url_accepts_docker_internal_service_name():
@@ -382,6 +399,88 @@ def test_output_artifact_missing_storage_path_is_rejected():
     outputs[0]["storage_path"] = ""
     with pytest.raises(AgentContractError):
         parse_adc_agent_contract(card)
+
+
+@pytest.mark.parametrize("duplicate_kind", ["artifact_name", "storage_path"])
+def test_duplicate_output_artifact_identity_or_path_is_rejected(duplicate_kind):
+    card = build_step5_agent_card(STEP5_URL)
+    outputs = card.capabilities["adc_agent_contract"]["capabilities"][0][
+        "output_artifacts"
+    ]
+    duplicate = {
+        "artifact_name": "second_output",
+        "storage_path": "second_output.json",
+        "readiness_status_field": None,
+        "ready_status_values": [],
+    }
+    duplicate[duplicate_kind] = outputs[0][duplicate_kind]
+    outputs.append(duplicate)
+    with pytest.raises(AgentContractError, match="duplicate output"):
+        parse_adc_agent_contract(card)
+
+
+@pytest.mark.parametrize(
+    ("status_field", "ready_values"),
+    [
+        ("context_build_status", []),
+        (None, ["ok"]),
+        (" ", ["ok"]),
+        ("context_build_status", ["ok", "ok"]),
+        ("context_build_status", ["ok", ""]),
+    ],
+)
+def test_artifact_readiness_contract_fails_closed(status_field, ready_values):
+    card = build_step6_agent_card(STEP6_URL)
+    candidate_ref = card.capabilities["adc_agent_contract"]["capabilities"][0][
+        "required_input_artifacts"
+    ][0]
+    candidate_ref["readiness_status_field"] = status_field
+    candidate_ref["ready_status_values"] = ready_values
+    with pytest.raises(AgentContractError, match="readiness|ready_status"):
+        parse_adc_agent_contract(card)
+
+
+@pytest.mark.parametrize(
+    "storage_path",
+    [
+        "/absolute/artifact.json",
+        "../artifact.json",
+        "inputs/../artifact.json",
+        "inputs/./artifact.json",
+        "inputs//artifact.json",
+        "inputs/artifact.json/",
+        "C:\\private\\artifact.json",
+        "file://private/artifact.json",
+        "s3://bucket/artifact.json",
+        "http://worker/artifact.json",
+        "inputs/artifact\x00.json",
+    ],
+)
+def test_artifact_storage_path_must_be_canonical_relative_posix(storage_path):
+    card = build_step5_agent_card(STEP5_URL)
+    card.capabilities["adc_agent_contract"]["capabilities"][0][
+        "required_input_artifacts"
+    ][0]["storage_path"] = storage_path
+    with pytest.raises(AgentContractError, match="canonical relative POSIX"):
+        parse_adc_agent_contract(card)
+
+
+@pytest.mark.parametrize(
+    "storage_path",
+    [
+        "inputs/raw_request_record.json",
+        "candidate_context_table.json",
+        "nested/path/artifact.json",
+    ],
+)
+def test_canonical_relative_posix_storage_paths_are_accepted(storage_path):
+    card = build_step5_agent_card(STEP5_URL)
+    card.capabilities["adc_agent_contract"]["capabilities"][0][
+        "required_input_artifacts"
+    ][0]["storage_path"] = storage_path
+    assert parse_adc_agent_contract(card).capabilities[0].required_input_artifacts[
+        0
+    ].storage_path == storage_path
 
 
 def test_skills_capability_misalignment_is_rejected():

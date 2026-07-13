@@ -439,6 +439,9 @@ def test_agent_card_endpoint(worker_server):
     assert capability["required_artifact_fields"][
         "candidate_context_table"
     ]["required_field_keys"] == ["candidate_records"]
+    candidate_ref = capability["required_input_artifacts"][0]
+    assert candidate_ref["readiness_status_field"] == "context_build_status"
+    assert candidate_ref["ready_status_values"] == ["ok", "partial"]
     validate_adc_agent_contract(worker_server.worker.agent_card)
 
 
@@ -473,6 +476,83 @@ async def test_valid_request_uses_real_http_and_runs_without_run_step_plan(
         for name in worker_server.worker.execute_threads
     )
     assert registry_service.get(run_id).active_artifacts.run_step_plan_id is None
+
+
+async def test_partial_candidate_readiness_executes_over_real_http(
+    worker_server,
+    local_storage,
+    registry_service,
+    workflow_state_service,
+):
+    run_id = _seed_candidate_context(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+    )
+    key = local_storage.run_key(run_id, "candidate_context_table.json")
+    body = local_storage.read_json(key)
+    body["context_build_status"] = "partial"
+    local_storage.write_json(key, body)
+
+    result_task, result = await _run_valid(worker_server, registry_service, run_id)
+
+    assert result_task.status.state == TaskState.COMPLETED
+    assert result["result_status"] in {"success", "partial"}
+    assert worker_server.worker.agent_run_count == 1
+    assert "structured_liability_summary" in result["output_artifact_refs"]
+
+
+@pytest.mark.parametrize(
+    ("status_case", "status_value"),
+    [
+        ("failed", "failed"),
+        ("missing", None),
+        ("non_string", {"private_status": "test-only-sentinel"}),
+    ],
+)
+async def test_candidate_not_ready_fails_closed_over_real_http(
+    worker_server,
+    local_storage,
+    registry_service,
+    workflow_state_service,
+    status_case,
+    status_value,
+):
+    run_id = _seed_candidate_context(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+    )
+    key = local_storage.run_key(run_id, "candidate_context_table.json")
+    body = local_storage.read_json(key)
+    if status_case == "missing":
+        body.pop("context_build_status")
+    else:
+        body["context_build_status"] = status_value
+    local_storage.write_json(key, body)
+
+    result_task, result = await _run_valid(worker_server, registry_service, run_id)
+
+    assert result_task.status.state == TaskState.FAILED
+    assert result["result_status"] == "validation_failed"
+    assert result["execution_status"] == "failed"
+    assert result["error_code"] == "input_artifact_not_ready"
+    assert result["output_artifact_refs"] == {}
+    assert worker_server.worker.agent_run_count == 0
+    assert worker_server.worker.execute_threads
+    assert registry_service.get(
+        run_id
+    ).active_artifacts.structured_liability_summary_id is None
+    assert not local_storage.exists(
+        local_storage.run_key(run_id, "structured_liability_summary.json")
+    )
+    assert result["error_summary"] == (
+        "input artifact 'candidate_context_table': input_artifact_not_ready"
+    )
+    compact = json.dumps(result)
+    assert "candidate_records" not in compact
+    assert "candidate_context_table.json" not in compact
+    assert "test-only-sentinel" not in compact
 
 
 @pytest.mark.parametrize(

@@ -49,6 +49,8 @@ class _ArtifactSpec:
     registry_field: str
     expected_entity_type: Optional[str]
     expected_selection_mode: Optional[str]
+    readiness_status_field: Optional[str]
+    ready_status_values: tuple[str, ...]
 
 
 class Step6A2AWorker:
@@ -143,6 +145,8 @@ class Step6A2AWorker:
                     if field_requirement
                     else None
                 ),
+                readiness_status_field=input_ref.readiness_status_field,
+                ready_status_values=tuple(input_ref.ready_status_values),
             ),
             _ArtifactSpec(
                 name=output_ref.artifact_name,
@@ -152,6 +156,8 @@ class Step6A2AWorker:
                 registry_field="structured_liability_summary_id",
                 expected_entity_type=None,
                 expected_selection_mode=None,
+                readiness_status_field=output_ref.readiness_status_field,
+                ready_status_values=tuple(output_ref.ready_status_values),
             ),
         )
 
@@ -318,7 +324,22 @@ class Step6A2AWorker:
                     f"{sorted(missing_body_fields)}"
                 ),
             )
+        self._validate_input_artifact_readiness(spec=spec, body=body)
         return body
+
+    @staticmethod
+    def _validate_input_artifact_readiness(
+        *, spec: _ArtifactSpec, body: dict[str, Any]
+    ) -> None:
+        if spec.readiness_status_field is None:
+            return
+        status = body.get(spec.readiness_status_field)
+        if not isinstance(status, str) or status not in spec.ready_status_values:
+            raise WorkerRequestRejected(
+                result_status="validation_failed",
+                error_code="input_artifact_not_ready",
+                message=f"input artifact '{spec.name}': input_artifact_not_ready",
+            )
 
     def _validate_input_artifact_identity(
         self,

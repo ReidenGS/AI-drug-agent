@@ -27,7 +27,9 @@ HARD CONSTRAINTS:
 
 from __future__ import annotations
 
+import posixpath
 from typing import Any, Literal, Optional
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from python_a2a import AgentCard, AgentSkill
@@ -72,6 +74,8 @@ class ContractArtifactRef(BaseModel):
 
     artifact_name: str = Field(min_length=1)
     storage_path: str = Field(min_length=1)
+    readiness_status_field: Optional[str] = None
+    ready_status_values: list[str] = Field(default_factory=list)
 
 
 class ArtifactFieldRequirement(BaseModel):
@@ -150,6 +154,8 @@ _STRUCTURED_QUERY = ContractArtifactRef(
 _CANDIDATE_CONTEXT_TABLE = ContractArtifactRef(
     artifact_name="candidate_context_table",
     storage_path="candidate_context_table.json",
+    readiness_status_field="context_build_status",
+    ready_status_values=["ok", "partial"],
 )
 _PREPARED_STRUCTURE_INPUT = ContractArtifactRef(
     artifact_name="prepared_structure_input_package",
@@ -438,6 +444,12 @@ def build_structure_agent_card(url: str) -> AgentCard:
                     ContractArtifactRef(
                         artifact_name="structured_liability_summary",
                         storage_path="structured_liability_summary.json",
+                        readiness_status_field="prefilter_status",
+                        ready_status_values=[
+                            "completed",
+                            "completed_with_missing_lanes",
+                            "partial",
+                        ],
                     ),
                 ],
                 # Orchestrator-verifiable schema-key presence, using the CURRENT
@@ -552,6 +564,70 @@ def _validate_required_artifact_fields(cap: AgentCapabilityContract) -> None:
             )
 
 
+def _validate_artifact_storage_paths(contract: AdcAgentContract) -> None:
+    """Require canonical relative POSIX paths for every artifact contract."""
+    for capability in contract.capabilities:
+        refs = [
+            *capability.required_input_artifacts,
+            *capability.optional_input_artifacts,
+            *capability.output_artifacts,
+        ]
+        for ref in refs:
+            path = ref.storage_path
+            parts = path.split("/")
+            invalid = (
+                "\x00" in path
+                or "\\" in path
+                or path.startswith("/")
+                or bool(urlsplit(path).scheme)
+                or any(part in {"", ".", ".."} for part in parts)
+                or posixpath.normpath(path) != path
+            )
+            if invalid:
+                raise AgentContractError(
+                    "artifact storage_path must be a canonical relative POSIX path"
+                )
+
+
+def _validate_artifact_contracts(capability: AgentCapabilityContract) -> None:
+    """Validate generic readiness metadata and output ownership uniqueness."""
+    refs = [
+        *capability.required_input_artifacts,
+        *capability.optional_input_artifacts,
+        *capability.output_artifacts,
+    ]
+    for ref in refs:
+        has_field = ref.readiness_status_field is not None
+        has_values = bool(ref.ready_status_values)
+        if has_field != has_values:
+            raise AgentContractError(
+                "artifact readiness_status_field and ready_status_values must be "
+                "configured together"
+            )
+        if has_field and not ref.readiness_status_field.strip():
+            raise AgentContractError("artifact readiness_status_field must be non-empty")
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in ref.ready_status_values
+        ):
+            raise AgentContractError(
+                "artifact ready_status_values must be non-empty strings"
+            )
+        if len(ref.ready_status_values) != len(set(ref.ready_status_values)):
+            raise AgentContractError("artifact ready_status_values must be unique")
+
+    output_names = [ref.artifact_name for ref in capability.output_artifacts]
+    output_paths = [ref.storage_path for ref in capability.output_artifacts]
+    if len(output_names) != len(set(output_names)):
+        raise AgentContractError(
+            f"capability '{capability.capability_id}' has duplicate output artifact names"
+        )
+    if len(output_paths) != len(set(output_paths)):
+        raise AgentContractError(
+            f"capability '{capability.capability_id}' has duplicate output storage paths"
+        )
+
+
 def parse_adc_agent_contract(card: AgentCard) -> AdcAgentContract:
     """Extract and validate the adc_agent_contract embedded in ``card``.
 
@@ -575,6 +651,8 @@ def parse_adc_agent_contract(card: AgentCard) -> AdcAgentContract:
         raise AgentContractError(
             f"adc_agent_contract failed schema validation: {exc}"
         ) from exc
+
+    _validate_artifact_storage_paths(contract)
 
     # agent_id / agent_role presence is already enforced by the schema (min_length
     # / Literal). Below are the cross-field checks the schema cannot express.
@@ -600,6 +678,7 @@ def parse_adc_agent_contract(card: AgentCard) -> AdcAgentContract:
                 )
         _validate_execution_mode(cap)
         _validate_required_artifact_fields(cap)
+        _validate_artifact_contracts(cap)
 
     # Skills published on the card must line up 1:1 with contract capabilities.
     skill_id_list = [getattr(s, "id", None) for s in (getattr(card, "skills", None) or [])]

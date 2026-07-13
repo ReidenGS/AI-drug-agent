@@ -677,6 +677,21 @@ def test_agent_card_exposes_one_workflow_capability(worker_server):
     assert [skill["id"] for skill in card["skills"]] == [
         CAP_STRUCTURE_DESIGN_WORKFLOW
     ]
+    capability = contract["capabilities"][0]
+    candidate_ref = next(
+        ref
+        for ref in capability["required_input_artifacts"]
+        if ref["artifact_name"] == "candidate_context_table"
+    )
+    assert candidate_ref["readiness_status_field"] == "context_build_status"
+    assert candidate_ref["ready_status_values"] == ["ok", "partial"]
+    liability_ref = capability["optional_input_artifacts"][0]
+    assert liability_ref["readiness_status_field"] == "prefilter_status"
+    assert liability_ref["ready_status_values"] == [
+        "completed",
+        "completed_with_missing_lanes",
+        "partial",
+    ]
     validate_adc_agent_contract(worker_server.worker.agent_card)
 
 
@@ -706,6 +721,79 @@ async def test_real_http_runs_one_task_in_strict_order_without_run_step_plan(
         name.startswith("structure-worker-http")
         for name in worker_server.worker.execute_threads
     )
+
+
+async def test_partial_candidate_readiness_executes_all_steps_over_real_http(
+    worker_server,
+    local_storage,
+    registry_service,
+    workflow_state_service,
+):
+    run_id = _seed_run(local_storage, registry_service, workflow_state_service)
+    key = local_storage.run_key(run_id, "candidate_context_table.json")
+    body = local_storage.read_json(key)
+    body["context_build_status"] = "partial"
+    local_storage.write_json(key, body)
+
+    result_task, result = await _run_valid(worker_server, registry_service, run_id)
+
+    assert result_task.status.state == TaskState.COMPLETED
+    assert result["result_status"] in {"success", "partial"}
+    assert worker_server.worker.agent_run_count == 1
+    assert worker_server.worker.internal_events == _ORDER
+    assert list(result["output_artifact_refs"]) == [
+        name for name, _path, _field in _OUTPUTS
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status_case", "status_value"),
+    [
+        ("failed", "failed"),
+        ("missing", None),
+        ("non_string", {"private_status": "test-only-sentinel"}),
+    ],
+)
+async def test_candidate_not_ready_stops_before_step7_over_real_http(
+    worker_server,
+    local_storage,
+    registry_service,
+    workflow_state_service,
+    status_case,
+    status_value,
+):
+    run_id = _seed_run(local_storage, registry_service, workflow_state_service)
+    key = local_storage.run_key(run_id, "candidate_context_table.json")
+    body = local_storage.read_json(key)
+    if status_case == "missing":
+        body.pop("context_build_status")
+    else:
+        body["context_build_status"] = status_value
+    local_storage.write_json(key, body)
+
+    result_task, result = await _run_valid(worker_server, registry_service, run_id)
+
+    assert result_task.status.state == TaskState.FAILED
+    assert result["result_status"] == "validation_failed"
+    assert result["execution_status"] == "failed"
+    assert result["error_code"] == "input_artifact_not_ready"
+    assert result["output_artifact_refs"] == {}
+    assert worker_server.worker.agent_run_count == 0
+    assert worker_server.worker.internal_events == []
+    assert worker_server.worker.execute_threads
+    active = registry_service.get(run_id).active_artifacts
+    assert all(getattr(active, registry_field) is None for _, _, registry_field in _OUTPUTS)
+    assert all(
+        not local_storage.exists(local_storage.run_key(run_id, path))
+        for _, path, _ in _OUTPUTS
+    )
+    assert result["error_summary"] == (
+        "input artifact 'candidate_context_table': input_artifact_not_ready"
+    )
+    compact = json.dumps(result)
+    assert "candidate_records" not in compact
+    assert "candidate_context_table.json" not in compact
+    assert "test-only-sentinel" not in compact
 
 
 @pytest.mark.parametrize("missing_name", list(_FIELD_KEYS))
@@ -856,6 +944,55 @@ async def test_optional_liability_ref_is_not_required(
         _task(_request(run_id, refs=refs)),
     )
     assert result_task.status.state == TaskState.COMPLETED
+
+
+async def test_not_ready_optional_liability_ref_is_ignored_over_real_http(
+    worker_server,
+    local_storage,
+    registry_service,
+    workflow_state_service,
+):
+    run_id = _seed_run(local_storage, registry_service, workflow_state_service)
+    artifact_id = new_artifact_id("structured_liability_summary")
+    local_storage.write_json(
+        local_storage.run_key(run_id, "structured_liability_summary.json"),
+        {
+            "artifact_id": artifact_id,
+            "run_id": run_id,
+            "prefilter_status": "failed",
+            "candidate_liability_results": [
+                {"private_test_body": "must-not-enter-compact-result"}
+            ],
+        },
+    )
+    registry_service.update_active(
+        run_id,
+        structured_liability_summary_id=artifact_id,
+    )
+    refs = _refs(registry_service, run_id)
+    refs["structured_liability_summary"] = InputArtifactRef(
+        artifact_id=artifact_id,
+        run_id=run_id,
+        artifact_type="structured_liability_summary",
+        can_read_from_db=True,
+    )
+
+    result_task = await _send(
+        worker_server.base_url,
+        _task(_request(run_id, refs=refs)),
+    )
+    result = _result(result_task)
+
+    assert result_task.status.state == TaskState.COMPLETED
+    assert result["result_status"] in {"success", "partial"}
+    assert worker_server.worker.agent_run_count == 1
+    assert worker_server.worker.internal_events == _ORDER
+    assert list(result["output_artifact_refs"]) == [
+        name for name, _path, _field in _OUTPUTS
+    ]
+    compact = json.dumps(result)
+    assert "must-not-enter-compact-result" not in compact
+    assert "candidate_liability_results" not in compact
 
 
 def test_legacy_step7_still_requires_run_step_plan(
