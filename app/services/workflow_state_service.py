@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Literal
 
 from ..utils.time import now_iso
-from .storage_service import Storage
+from .storage_service import AtomicJsonStorage, Storage
 
 _STATE_KEY = "state/workflow_state.json"
 
@@ -35,12 +35,21 @@ class WorkflowStateService:
         return self.storage.read_json(self.storage.run_key(run_id, _STATE_KEY))
 
     def mark(self, run_id: str, step_key: str, status: StepStatus) -> dict:
-        state = self.get(run_id)
-        state["steps"][step_key] = status
-        state["updated_at"] = now_iso()
-        if status == "running":
-            state["current_step"] = step_key
-        self._save(run_id, state)
+        key = self.storage.run_key(run_id, _STATE_KEY)
+
+        def mutate(state: dict) -> dict:
+            state["steps"][step_key] = status
+            state["updated_at"] = now_iso()
+            if status == "running":
+                state["current_step"] = step_key
+            return state
+
+        if isinstance(self.storage, AtomicJsonStorage):
+            return self.storage.atomic_update_json(key, mutate)
+        # S3Storage has no conditional-write/CAS contract yet; retain the
+        # existing single-writer semantics rather than claiming local locking.
+        state = mutate(self.storage.read_json(key))
+        self.storage.write_json(key, state)
         return state
 
     def _save(self, run_id: str, state: dict) -> None:

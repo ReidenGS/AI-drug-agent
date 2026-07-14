@@ -288,6 +288,21 @@ class OrchestratorRoutingService:
                 discovery_performed=discovery_performed,
             )
 
+    def validate_execution_state_authority(
+        self, run_id: str, state: OrchestratorExecutionState
+    ) -> None:
+        """Validate checkpoint state against persisted plan/registry authority."""
+        with self._get_run_lock(run_id):
+            artifact_id = self._active_plan_artifact_id(run_id)
+            if not artifact_id:
+                raise OrchestratorRoutingServiceError(
+                    "worker_routing_plan_missing"
+                )
+            plan = self._load_plan(run_id, artifact_id)
+            self._validated_execution_lineage(
+                run_id=run_id, plan=plan, execution_state=state
+            )
+
     def _revalidate_loaded_plan(
         self,
         *,
@@ -495,11 +510,23 @@ class OrchestratorRoutingService:
             if not decision.task_id:
                 raise OrchestratorRoutingServiceError("completion_decision_has_no_task")
             runtime_decision = runtime_decisions.get(decision_id)
-            expected_task_id = (
-                runtime_decision.task_ids[-1]
-                if runtime_decision is not None
-                else decision.task_id
-            )
+            expected_task_id = decision.task_id
+            if runtime_decision is not None:
+                # A pending retry may already be the last lineage entry while
+                # the supplied durable proof correctly attests its immediately
+                # preceding terminal attempt.  Completion authority is the
+                # newest terminal task, never a not-started retry placeholder.
+                expected_task_id = next(
+                    (
+                        task_id
+                        for task_id in reversed(runtime_decision.task_ids)
+                        if execution_state.worker_tasks[
+                            task_id
+                        ].execution_status
+                        in {"completed", "failed"}
+                    ),
+                    runtime_decision.task_ids[-1],
+                )
             runtime_task = (
                 execution_state.worker_tasks[expected_task_id]
                 if execution_state is not None and expected_task_id is not None
@@ -685,6 +712,122 @@ class OrchestratorRoutingService:
             validated.decision = validated.decision.model_copy(
                 update={"task_id": task_id}
             )
+            return build_retry_orchestrator_worker_task(
+                run_id=run_id,
+                routing_plan_id=plan.routing_plan_id,
+                validated=validated,
+                task_id=task_id,
+                retry_attempt=task.retry_attempt,
+                max_retry_attempts=task.max_retry_attempts,
+                retry_of_task_id=task.retry_of_task_id,
+                retry_reason=previous.terminal_error_code,
+            )
+
+    def rebuild_task_from_execution_state(
+        self,
+        *,
+        run_id: str,
+        execution_state: OrchestratorExecutionState,
+        task_id: str,
+    ) -> PreparedA2ATask:
+        """Rebuild an initial or retry Task from persisted/frozen authority."""
+        task = execution_state.worker_tasks.get(task_id)
+        if task is None:
+            raise OrchestratorRoutingServiceError("execution_task_unknown")
+        with self._get_run_lock(run_id):
+            artifact_id = self._active_plan_artifact_id(run_id)
+            if not artifact_id:
+                raise OrchestratorRoutingServiceError(
+                    "worker_routing_plan_missing"
+                )
+            plan = self._load_plan(run_id, artifact_id)
+            runtime = self._validated_execution_lineage(
+                run_id=run_id, plan=plan, execution_state=execution_state
+            )
+            runtime_decision = runtime.get(task.routing_decision_id)
+            persisted = next(
+                (
+                    item
+                    for item in plan.validated_decisions
+                    if item.routing_decision_id == task.routing_decision_id
+                ),
+                None,
+            )
+            if (
+                persisted is None
+                or runtime_decision is None
+                or not runtime_decision.task_ids
+                or task_id not in runtime_decision.task_ids
+                or (
+                    task.retry_attempt == 0
+                    and persisted.task_id != task_id
+                )
+            ):
+                raise OrchestratorRoutingServiceError(
+                    "execution_task_identity_mismatch"
+                )
+            proposal = OrchestratorRoutingProposal(
+                loop_decision="dispatch_next_workers",
+                decisions=[
+                    OrchestratorRouteDecision(
+                        agent_id=persisted.agent_id,
+                        capability_id=persisted.capability_id,
+                        objective=persisted.objective,
+                        selection_reason=persisted.selection_reason,
+                        priority=persisted.priority,
+                    )
+                ],
+                decision_summary="Rebuild one persisted execution task.",
+            )
+            validation = validate_orchestrator_routing(
+                run_id=run_id,
+                proposal=proposal,
+                discovery=self._discovery,
+                storage=self._storage,
+                registry=self._registry,
+                routing_decision_ids=[persisted.routing_decision_id],
+            )
+            if len(validation.decisions) != 1:
+                raise OrchestratorRoutingServiceError(
+                    "execution_task_revalidation_failed"
+                )
+            validated = validation.decisions[0]
+            if (
+                validated.decision.validation_status != "ready"
+                or not validated.task_build_allowed
+                or validated.decision.required_artifact_names
+                != persisted.required_artifact_names
+                or validated.decision.expected_output_artifact_names
+                != persisted.expected_output_artifact_names
+            ):
+                raise OrchestratorRoutingServiceError(
+                    "execution_task_revalidation_failed"
+                )
+            validated.decision = validated.decision.model_copy(
+                update={"task_id": task_id}
+            )
+            if task.retry_attempt == 0:
+                return build_orchestrator_worker_task(
+                    run_id=run_id,
+                    routing_plan_id=plan.routing_plan_id,
+                    validated=validated,
+                    task_id=task_id,
+                )
+            if task.retry_of_task_id is None:
+                raise OrchestratorRoutingServiceError(
+                    "execution_task_identity_mismatch"
+                )
+            previous = execution_state.worker_tasks.get(task.retry_of_task_id)
+            if (
+                previous is None
+                or previous.execution_status != "failed"
+                or previous.result_status != "tool_failed"
+                or previous.terminal_error_code is None
+                or previous.retry_attempt + 1 != task.retry_attempt
+            ):
+                raise OrchestratorRoutingServiceError(
+                    "execution_task_identity_mismatch"
+                )
             return build_retry_orchestrator_worker_task(
                 run_id=run_id,
                 routing_plan_id=plan.routing_plan_id,

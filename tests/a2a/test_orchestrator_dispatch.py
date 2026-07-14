@@ -447,6 +447,8 @@ def _serve_task_handler(card_builder, handler) -> _Handle:
             hits["card"] += 1
         elif request.path in {"/tasks/send", "/a2a/tasks/send"}:
             hits["task"] += 1
+        elif request.path in {"/tasks/get", "/a2a/tasks/get"}:
+            hits["get_task"] += 1
 
     server = make_server("127.0.0.1", port, app, threaded=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

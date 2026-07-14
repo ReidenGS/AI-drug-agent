@@ -101,11 +101,16 @@ def project_orchestrator_context(
         if isinstance(structured_query.get("task_intent"), dict)
         else {}
     )
-    intent = (
-        structured_query.get("canonical_query")
-        or task_intent.get("user_goal_summary")
-        or ""
-    )
+    canonical_query = structured_query.get("canonical_query") or ""
+    user_goal = task_intent.get("user_goal_summary") or ""
+    intent_parts = []
+    if user_goal:
+        intent_parts.append(f"User goal: {redact_routing_text(user_goal)}")
+    if canonical_query and canonical_query != user_goal:
+        intent_parts.append(
+            f"Canonical query: {redact_routing_text(canonical_query)}"
+        )
+    intent = " ".join(intent_parts) or redact_routing_text(canonical_query)
     missing_slots = []
     for slot in structured_query.get("missing_slots", []):
         if isinstance(slot, dict) and (name := _safe_id(slot.get("slot_name"))):

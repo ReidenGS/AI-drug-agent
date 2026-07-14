@@ -5,7 +5,7 @@ from __future__ import annotations
 from ..schemas.registry import RunArtifactRegistry, ActiveArtifacts
 from ..utils.ids import new_registry_id
 from ..utils.time import now_iso
-from .storage_service import Storage
+from .storage_service import AtomicJsonStorage, Storage
 
 _REGISTRY_KEY = "registry/current.json"
 _SNAPSHOT_KEY = "registry/snapshot_{version:04d}.json"
@@ -34,23 +34,36 @@ class ArtifactRegistryService:
         )
 
     def update_active(self, run_id: str, **updates: str) -> RunArtifactRegistry:
-        reg = self.get(run_id)
-        # snapshot first
-        self.storage.write_json(
-            self.storage.run_key(run_id, _SNAPSHOT_KEY.format(version=reg.version)),
-            reg.model_dump(),
-        )
-        active = reg.active_artifacts.model_dump()
-        active.update(updates)
-        reg = reg.model_copy(
-            update={
-                "active_artifacts": ActiveArtifacts(**active),
-                "version": reg.version + 1,
-                "updated_at": now_iso(),
-            }
-        )
-        self._save(run_id, reg)
-        return reg
+        key = self.storage.run_key(run_id, _REGISTRY_KEY)
+
+        def mutate(payload: dict) -> dict:
+            reg = RunArtifactRegistry.model_validate(payload)
+            self.storage.write_json(
+                self.storage.run_key(
+                    run_id, _SNAPSHOT_KEY.format(version=reg.version)
+                ),
+                reg.model_dump(),
+            )
+            active = reg.active_artifacts.model_dump()
+            active.update(updates)
+            return reg.model_copy(
+                update={
+                    "active_artifacts": ActiveArtifacts(**active),
+                    "version": reg.version + 1,
+                    "updated_at": now_iso(),
+                }
+            ).model_dump()
+
+        if isinstance(self.storage, AtomicJsonStorage):
+            return RunArtifactRegistry.model_validate(
+                self.storage.atomic_update_json(key, mutate)
+            )
+        # S3Storage is currently a skeleton without conditional-write/CAS.
+        # Preserve its existing behavior explicitly; it does not inherit the
+        # LocalStorage cross-process guarantee.
+        updated = mutate(self.storage.read_json(key))
+        self.storage.write_json(key, updated)
+        return RunArtifactRegistry.model_validate(updated)
 
     def _save(self, run_id: str, reg: RunArtifactRegistry) -> None:
         self.storage.write_json(self.storage.run_key(run_id, _REGISTRY_KEY), reg.model_dump())

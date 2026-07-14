@@ -88,8 +88,13 @@ def test_no_mem0_service(compose):
 def test_no_postgres_service(compose):
     assert "postgres" not in compose["services"]
     assert all("postgres" not in img for img in _service_images(compose))
-    for svc in compose["services"].values():
-        assert "DATABASE_URL" not in _env(svc)
+    assert "LANGGRAPH_CHECKPOINT_DATABASE_URL" in _env(
+        compose["services"]["orchestrator"]
+    )
+    for name in _WORKERS:
+        assert "LANGGRAPH_CHECKPOINT_DATABASE_URL" not in _env(
+            compose["services"][name]
+        )
 
 
 def test_no_pgvector_or_vector_db(compose):
@@ -365,10 +370,14 @@ def _compose_env(*, explicit_modes: bool) -> dict[str, str]:
     env["COMPOSE_DISABLE_ENV_FILE"] = "1"
     env.pop("LLM_PROVIDER", None)
     env.pop("MCP_LIVE_TOOLS", None)
+    env.pop("LANGGRAPH_CHECKPOINT_DATABASE_URL", None)
     if explicit_modes:
         env["LLM_PROVIDER"] = "mock"
         env["MCP_LIVE_TOOLS"] = "false"
         env["ORCHESTRATOR_HOST_PORT"] = "18080"
+        env["LANGGRAPH_CHECKPOINT_DATABASE_URL"] = (
+            "postgresql://checkpoint_user:test-only@checkpoint-db/adc_checkpoint"
+        )
     return env
 
 

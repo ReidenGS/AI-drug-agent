@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 from typing import Any, Literal
 
-from pydantic import field_validator
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -82,6 +83,12 @@ class Settings(BaseSettings):
     a2a_health_timeout_seconds: float = 5.0
     # Deterministic worker retry policy: attempt 0 plus attempts 1..3.
     orchestrator_max_worker_retries: int = 3
+    # Dedicated LangGraph checkpoint database. There is deliberately no local,
+    # SQLite, or in-memory production default; the runtime factory fails closed
+    # when this secret is absent.
+    langgraph_checkpoint_database_url: SecretStr | None = None
+    # Finite budget for connection acquisition plus official checkpoint setup.
+    langgraph_checkpoint_startup_timeout_seconds: float = 30.0
 
     tool_inventory_xlsx: str = "../\u9879\u76ee\u6587\u4ef6/ToolUniversity_inventory_v0.2.xlsx"
 
@@ -142,13 +149,13 @@ class Settings(BaseSettings):
     @field_validator(
         "a2a_discovery_timeout_seconds",
         "a2a_health_timeout_seconds",
+        "langgraph_checkpoint_startup_timeout_seconds",
     )
     @classmethod
     def _positive_a2a_timeout(cls, v: float) -> float:
-        """A2A discovery / health timeouts are real production network budgets
-        and must be strictly positive."""
-        if v is None or float(v) <= 0:
-            raise ValueError("A2A discovery/health timeout seconds must be > 0")
+        """Production network/startup budgets must be finite and positive."""
+        if v is None or not math.isfinite(float(v)) or float(v) <= 0:
+            raise ValueError("timeout seconds must be finite and > 0")
         return float(v)
 
     @field_validator("orchestrator_max_worker_retries")

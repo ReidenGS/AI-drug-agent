@@ -1,0 +1,49 @@
+# Production-parity LangGraph checkpoint integration profile. Test credentials
+# are isolated to this ephemeral stack and are not production defaults.
+services:
+  checkpoint-postgres:
+    image: postgres:16-alpine
+    profiles: ["checkpoint-test"]
+    environment:
+      POSTGRES_DB: adc_checkpoint_test
+      POSTGRES_USER: checkpoint_test
+      POSTGRES_PASSWORD: checkpoint_test_only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U checkpoint_test -d adc_checkpoint_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    networks: [checkpoint_test_net]
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  checkpoint-test-runner:
+    # Reuse the already-built production runtime so the integration profile
+    # only installs test/checkpoint packages, rather than resolving the full
+    # biomedical deployment stack on every smoke run.
+    build: .
+    image: synagentics-adc-a2a:checkpoint-test
+    profiles: ["checkpoint-test"]
+    working_dir: /workspace
+    depends_on:
+      checkpoint-postgres:
+        condition: service_healthy
+    environment:
+      LANGGRAPH_CHECKPOINT_DATABASE_URL: postgresql://checkpoint_test:checkpoint_test_only@checkpoint-postgres:5432/adc_checkpoint_test
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - .:/workspace:ro
+    command:
+      - sh
+      - -ec
+      - >-
+        pip install --quiet --timeout 120 pytest pytest-asyncio &&
+        PYTHONPATH=/workspace
+        python -m pytest
+        tests/integration/test_orchestrator_postgres_checkpoint.py
+        -p no:cacheprovider -q
+    networks: [checkpoint_test_net]
+
+networks:
+  checkpoint_test_net:
+    driver: bridge

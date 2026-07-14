@@ -272,15 +272,22 @@ def _latest_completion_proofs(
     """Select one current terminal attestation per decision for DAG validation."""
     latest: dict[str, WorkerExecutionResult] = {}
     for decision_id, decision in state.routing.decisions.items():
-        if not decision.task_ids:
-            continue
-        task_id = decision.task_ids[-1]
-        proof = cumulative.get(task_id)
-        task = state.worker_tasks[task_id]
-        if task.execution_status in {"completed", "failed"} and proof is None:
-            raise OrchestratorPostIngestionError("completion_proof_required")
-        if proof is not None:
+        # A durable checkpoint may already contain a not-yet-dispatched retry.
+        # Its immediately preceding terminal attempt is still the attestation
+        # that explains the registry advancement.  Select the newest terminal
+        # attempt, while requiring a proof for every terminal state encountered
+        # at that boundary; never infer completion from the pending retry.
+        for task_id in reversed(decision.task_ids):
+            task = state.worker_tasks[task_id]
+            if task.execution_status not in {"completed", "failed"}:
+                continue
+            proof = cumulative.get(task_id)
+            if proof is None:
+                raise OrchestratorPostIngestionError(
+                    "completion_proof_required"
+                )
             latest[decision_id] = proof
+            break
     return latest
 
 

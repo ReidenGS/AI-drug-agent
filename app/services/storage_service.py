@@ -6,6 +6,7 @@ Path template (per ADC_S3_Structure.md):
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 
@@ -28,3 +29,14 @@ class Storage(Protocol):
 
     def run_key(self, run_id: str, *parts: str) -> str:
         return "/".join([self.prefix, "runs", run_id, *parts])
+
+
+@runtime_checkable
+class AtomicJsonStorage(Protocol):
+    """Optional local-storage capability for cross-process JSON mutation."""
+
+    def atomic_update_json(
+        self,
+        key: str,
+        update: Callable[[dict], dict],
+    ) -> dict: ...

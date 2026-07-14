@@ -134,3 +134,26 @@ def test_projection_redacts_structure_alignment_and_private_markers():
             available_artifacts=[],
         )
         assert sentinel not in str(out)
+
+
+def test_projection_preserves_distinct_user_goal_and_canonical_query():
+    out = project_orchestrator_context(
+        structured_query={
+            "canonical_query": "Evaluate an existing HER2 ADC.",
+            "task_intent": {
+                "user_goal_summary": (
+                    "Assess developability and prepare structure-guided "
+                    "protein design."
+                ),
+                "primary_intent": "existing_adc_evaluation",
+            },
+            "missing_slots": [],
+        },
+        readiness={"input_readiness_status": "ready"},
+        available_artifacts=[],
+    )
+    intent = out["compact_user_intent"]
+    assert intent == (
+        "User goal: Assess developability and prepare structure-guided protein "
+        "design. Canonical query: Evaluate an existing HER2 ADC."
+    )

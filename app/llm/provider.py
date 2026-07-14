@@ -298,7 +298,9 @@ def _mock_step9_tool_selection_stage1(schema: dict) -> dict:
             {
                 "tool_name": entry.get("tool_name"),
                 "lane_type": entry.get("lane_type"),
-                "selection_reason": "mock selected hard-gate allowed Step 9 tool",
+                "selection_reason": (
+                    "mock selected Step 9 tool from the supplied active catalog"
+                ),
             }
             for entry in catalog
             if isinstance(entry, dict) and entry.get("tool_name") and entry.get("lane_type")

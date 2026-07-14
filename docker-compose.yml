@@ -48,6 +48,7 @@ services:
       STEP5_WORKER_URL: "http://step5-worker:8005"
       STEP6_WORKER_URL: "http://step6-worker:8006"
       STRUCTURE_WORKER_URL: "http://structure-worker:8009"
+      LANGGRAPH_CHECKPOINT_DATABASE_URL: ${LANGGRAPH_CHECKPOINT_DATABASE_URL:?LANGGRAPH_CHECKPOINT_DATABASE_URL must be set explicitly}
     volumes:
       - adc_local_store:/data/localstore
       - *adc-inventory-mount

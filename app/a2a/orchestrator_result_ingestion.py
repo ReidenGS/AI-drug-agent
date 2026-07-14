@@ -132,6 +132,54 @@ class _DuplicateJsonKey(ValueError):
     pass
 
 
+def validate_reconciled_worker_response(
+    *,
+    run_id: str,
+    state: OrchestratorExecutionState,
+    task_id: str,
+    response: Task,
+    discovery: Any,
+    registry: ArtifactRegistryService,
+    storage: Storage,
+) -> WorkerExecutionResult:
+    """Preflight a get_task terminal result before any checkpoint mutation."""
+    try:
+        checked = OrchestratorExecutionState.model_validate(state.model_dump())
+        active = registry.get(run_id).active_artifacts
+        result = _parse_worker_result(response)
+        _validate_result_identity(
+            run_id=run_id, state=checked, task_id=task_id, result=result
+        )
+        task = checked.worker_tasks[task_id]
+        decision = checked.routing.decisions[task.routing_decision_id]
+        productive = result.result_status in _PRODUCTIVE_STATUSES
+        validate_worker_output_artifacts(
+            run_id=run_id,
+            agent_id=task.agent_id,
+            capability_id=task.capability_id,
+            expected_output_artifact_names=set(
+                decision.expected_output_artifact_names
+            ),
+            output_artifact_refs=result.output_artifact_refs,
+            productive=productive,
+            discovery=discovery,
+            registry=registry,
+            storage=storage,
+            active=active,
+        )
+    except (
+        KeyError,
+        ValidationError,
+        CompletionArtifactValidationError,
+        OrchestratorResultIngestionError,
+    ) as exc:
+        code = str(exc)
+        if not _COMPACT_CODE.fullmatch(code):
+            code = "worker_reconciliation_result_invalid"
+        raise OrchestratorResultIngestionError(code) from None
+    return result
+
+
 async def ingest_orchestrator_worker_results(
     *,
     run_id: str,
@@ -495,4 +543,5 @@ __all__ = [
     "ResultIngestionPostCheckpointError",
     "ResultIngestionReceipt",
     "ingest_orchestrator_worker_results",
+    "validate_reconciled_worker_response",
 ]
