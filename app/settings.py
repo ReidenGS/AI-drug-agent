@@ -80,6 +80,8 @@ class Settings(BaseSettings):
     # must be > 0.
     a2a_discovery_timeout_seconds: float = 5.0
     a2a_health_timeout_seconds: float = 5.0
+    # Deterministic worker retry policy: attempt 0 plus attempts 1..3.
+    orchestrator_max_worker_retries: int = 3
 
     tool_inventory_xlsx: str = "../\u9879\u76ee\u6587\u4ef6/ToolUniversity_inventory_v0.2.xlsx"
 
@@ -148,6 +150,13 @@ class Settings(BaseSettings):
         if v is None or float(v) <= 0:
             raise ValueError("A2A discovery/health timeout seconds must be > 0")
         return float(v)
+
+    @field_validator("orchestrator_max_worker_retries")
+    @classmethod
+    def _worker_retry_limit(cls, v: int) -> int:
+        if int(v) != 3:
+            raise ValueError("ORCHESTRATOR_MAX_WORKER_RETRIES must equal 3")
+        return int(v)
 
     @field_validator("llm_provider", mode="before")
     @classmethod

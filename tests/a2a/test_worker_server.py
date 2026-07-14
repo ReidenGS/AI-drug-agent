@@ -41,6 +41,7 @@ from app.a2a.contracts import (
     InputProjection,
     OrchestratorRoutingDecisionRef,
     PrivacyConstraints,
+    RetryContext,
     ToolCallSummary,
     WorkerExecutionRequest,
     WorkerExecutionResult,
@@ -159,6 +160,11 @@ class _FakeWorkerCore:
             routing_decision_id=request.routing_decision_id,
             agent_id=request.agent_id,
             capability_id=request.capability_id,
+            retry_of_task_id=(
+                request.retry_context.retry_of_task_id
+                if request.retry_context is not None
+                else None
+            ),
             execution_status="completed",
             result_status="success",
             compact_summary={"ok": True},
@@ -267,6 +273,26 @@ async def test_matching_identity_result_passes_through():
     assert result["task_id"] == "task_1"
 
 
+async def test_retry_parent_identity_passes_through_real_http_adapter():
+    request = _request().model_copy(
+        update={
+            "retry_context": RetryContext(
+                retry_of_task_id="task_0",
+                retry_attempt=1,
+                max_retry_attempts=3,
+                retry_reason="synthetic_tool_failed",
+            )
+        }
+    )
+    handle = _serve(_FakeWorkerCore())
+    try:
+        result = _result(await _send(handle.base_url, _task(request)))
+    finally:
+        handle.close()
+    assert result["result_status"] == "success"
+    assert result["retry_of_task_id"] == "task_0"
+
+
 async def test_transport_task_id_mismatch_rejected_before_core_execution():
     core = _FakeWorkerCore()
     handle = _serve(core)
@@ -304,6 +330,7 @@ async def test_transport_task_id_mismatch_rejected_before_core_execution():
         {"routing_decision_id": "WRONG_DECISION"},
         {"agent_id": "WRONG_AGENT"},
         {"capability_id": "WRONG_CAP"},
+        {"retry_of_task_id": "WRONG_PARENT"},
     ],
 )
 async def test_core_result_identity_mismatch_rejected(override):

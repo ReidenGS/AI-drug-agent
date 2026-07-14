@@ -19,6 +19,7 @@ from .contracts import (
     InputProjection,
     OrchestratorRoutingDecisionRef,
     PrivacyConstraints,
+    RetryContext,
     WorkerExecutionRequest,
     WorkerRequestSpec,
 )
@@ -42,8 +43,9 @@ def build_canonical_worker_execution_request(
     routing_plan_id: str,
     decision: ValidatedRoutingDecision,
     input_artifact_refs: Mapping[str, InputArtifactRef],
+    retry_context: RetryContext | None = None,
 ) -> WorkerExecutionRequest:
-    """Build the complete first-dispatch ADC request contract.
+    """Build the complete canonical ADC request for initial or retry dispatch.
 
     Both Task construction and transport validation call this function so
     optional/default request surfaces cannot drift independently.
@@ -81,7 +83,7 @@ def build_canonical_worker_execution_request(
             runtime_refs={},
         ),
         privacy_constraints=PrivacyConstraints(),
-        retry_context=None,
+        retry_context=retry_context,
     )
 
 
@@ -131,15 +133,77 @@ def build_orchestrator_worker_task(
         decision=updated_decision,
         input_artifact_refs=validated.input_artifact_refs,
     )
+    return _assemble_prepared_task(
+        decision=updated_decision,
+        request=request,
+        dispatch_target=validated.dispatch_target,
+        input_artifact_refs=validated.input_artifact_refs,
+    )
+
+
+def build_retry_orchestrator_worker_task(
+    *,
+    run_id: str,
+    routing_plan_id: str,
+    validated: RuntimeValidatedDecision,
+    task_id: str,
+    retry_attempt: int,
+    max_retry_attempts: int,
+    retry_of_task_id: str,
+    retry_reason: str,
+) -> PreparedA2ATask:
+    """Build one retry from freshly reconstructed persisted/frozen authority."""
+    if not isinstance(validated, RuntimeValidatedDecision):
+        raise ValueError("retry_task_requires_runtime_validated_decision")
+    if (
+        validated.decision.validation_status != "ready"
+        or not validated.task_build_allowed
+        or validated.decision.task_id != task_id
+    ):
+        raise ValueError("retry_task_validation_state_invalid")
+    if not task_id or task_id == retry_of_task_id:
+        raise ValueError("retry_task_identity_invalid")
+    retry_context = RetryContext(
+        retry_of_task_id=retry_of_task_id,
+        retry_attempt=retry_attempt,
+        max_retry_attempts=max_retry_attempts,
+        retry_reason=retry_reason,
+    )
+    decision = validated.decision
+    request = build_canonical_worker_execution_request(
+        run_id=run_id,
+        routing_plan_id=routing_plan_id,
+        decision=decision,
+        input_artifact_refs=validated.input_artifact_refs,
+        retry_context=retry_context,
+    )
+    return _assemble_prepared_task(
+        decision=decision,
+        request=request,
+        dispatch_target=validated.dispatch_target,
+        input_artifact_refs=validated.input_artifact_refs,
+    )
+
+
+def _assemble_prepared_task(
+    *,
+    decision: ValidatedRoutingDecision,
+    request: WorkerExecutionRequest,
+    dispatch_target: DispatchTarget,
+    input_artifact_refs: Mapping[str, InputArtifactRef],
+) -> PreparedA2ATask:
+    task_id = decision.task_id
+    if not task_id:
+        raise ValueError("prepared_task_id_required")
     metadata = A2ATaskMetadata(
         adc_payload_type="worker_execution_request",
         adc_payload_version="v1",
-        run_id=run_id,
+        run_id=request.run_id,
         task_id=task_id,
-        routing_plan_id=routing_plan_id,
-        routing_decision_id=updated_decision.routing_decision_id,
-        agent_id=updated_decision.agent_id,
-        capability_id=updated_decision.capability_id,
+        routing_plan_id=request.routing_plan_id,
+        routing_decision_id=decision.routing_decision_id,
+        agent_id=decision.agent_id,
+        capability_id=decision.capability_id,
         created_by=request.created_by,
     )
     message = Message(
@@ -152,10 +216,10 @@ def build_orchestrator_worker_task(
         metadata=metadata.model_dump(),
     )
     return PreparedA2ATask(
-        decision=updated_decision,
+        decision=decision,
         task=task,
-        dispatch_target=validated.dispatch_target,
-        input_artifact_refs=dict(validated.input_artifact_refs),
+        dispatch_target=dispatch_target,
+        input_artifact_refs=dict(input_artifact_refs),
     )
 
 
@@ -163,4 +227,5 @@ __all__ = [
     "PreparedA2ATask",
     "build_canonical_worker_execution_request",
     "build_orchestrator_worker_task",
+    "build_retry_orchestrator_worker_task",
 ]

@@ -314,6 +314,7 @@ def _complete(
         dispatched,
         task_id,
         result_status=status,
+        error_code=None if productive else "synthetic_worker_failed",
         output_artifact_refs=(
             {name: artifact_id} if artifact_id is not None else {}
         ),
@@ -332,7 +333,7 @@ def _complete(
         capability_id=prepared.decision.capability_id,
         execution_status="completed" if productive else "failed",
         result_status=status,
-        error_code=None if productive else "synthetic_worker_failure",
+        error_code=None if productive else "synthetic_worker_failed",
         output_artifact_refs=refs,
     )
     ingestion = OrchestratorResultIngestionResult(

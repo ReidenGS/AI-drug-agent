@@ -251,6 +251,7 @@ def mark_task_result(
     task_id: str,
     *,
     result_status: str,
+    error_code: str | None = None,
     output_artifact_refs: Mapping[str, str],
     available_output_artifact_names: frozenset[str] = frozenset(),
 ) -> OrchestratorExecutionState:
@@ -260,6 +261,10 @@ def mark_task_result(
     if current is None:
         raise OrchestratorExecutionStateError("task_id_unknown")
     productive = result_status in {"success", "partial"}
+    if productive and error_code is not None:
+        raise OrchestratorExecutionStateError("productive_result_error_code_forbidden")
+    if not productive and error_code is None:
+        raise OrchestratorExecutionStateError("failed_result_error_code_required")
     execution_status = "completed" if productive else "failed"
     decision = checked.routing.decisions[current.routing_decision_id]
     expected = set(decision.expected_output_artifact_names)
@@ -277,6 +282,7 @@ def mark_task_result(
         if (
             current.execution_status == execution_status
             and current.result_status == result_status
+            and current.terminal_error_code == error_code
             and dict(current.output_artifact_refs) == dict(output_artifact_refs)
         ):
             return checked
@@ -292,6 +298,7 @@ def mark_task_result(
         {
             "execution_status": execution_status,
             "result_status": result_status,
+            "terminal_error_code": error_code,
             "output_artifact_refs": dict(output_artifact_refs),
         }
     )
@@ -747,12 +754,35 @@ def recompute_aggregate_state(
         wakeup = NextWakeupState(
             target="orchestrator_loop", reason="worker_result_received"
         )
+    elif (
+        checked.run_status == "running"
+        and checked.orchestrator.status == "evaluating_results"
+        and checked.next_wakeup is not None
+        and checked.next_wakeup.reason == "worker_result_reconciliation_required"
+    ):
+        # Transport uncertainty is an explicit stop-the-loop disposition.  It
+        # takes precedence over the generic dispatch-failed aggregate so a
+        # checkpoint/reconstruction cannot silently become retry-eligible.
+        run_status = "running"
+        orchestrator_status = "evaluating_results"
+        wakeup = checked.next_wakeup
     elif dispatch_failures:
         run_status = "running"
         orchestrator_status = "evaluating_results"
         wakeup = NextWakeupState(
             target="orchestrator_loop", reason="dispatch_failed"
         )
+    elif (
+        checked.run_status == "failed"
+        and checked.orchestrator.status == "routing_to_final"
+        and checked.next_wakeup is not None
+        and checked.next_wakeup.target == "final_response"
+        and checked.next_wakeup.reason
+        in {"worker_retry_exhausted", "worker_non_retryable_failure"}
+    ):
+        run_status = "failed"
+        orchestrator_status = "routing_to_final"
+        wakeup = checked.next_wakeup
     elif checked.run_status == "failed" or (
         decisions and all(item["status"] in {"blocked", "failed"} for item in decisions.values())
     ):

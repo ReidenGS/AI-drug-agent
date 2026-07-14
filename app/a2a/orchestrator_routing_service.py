@@ -19,6 +19,7 @@ from pydantic import ValidationError
 from app.llm.json_task_validation import validate_task_shape
 from app.llm.provider import LLMProvider
 from app.schemas.step_03_input_readiness import InputReadinessStatus
+from app.schemas.orchestrator_execution_state import OrchestratorExecutionState
 from app.schemas.worker_routing_plan import (
     LoopDecision,
     OrchestratorRouteDecision,
@@ -52,12 +53,14 @@ from .orchestrator_routing_prompt import (
 )
 from .orchestrator_routing_validation import (
     RoutingValidationResult,
+    RuntimeValidatedDecision,
     inspect_declared_artifact,
     validate_orchestrator_routing,
 )
 from .orchestrator_task_builder import (
     PreparedA2ATask,
     build_orchestrator_worker_task,
+    build_retry_orchestrator_worker_task,
 )
 
 _PLAN_STORAGE_KEY = "inputs/worker_routing_plan.json"
@@ -256,6 +259,7 @@ class OrchestratorRoutingService:
         *,
         completed_results: Sequence[WorkerExecutionResult],
         expected_routing_plan_id: str | None = None,
+        execution_state: OrchestratorExecutionState | None = None,
     ) -> OrchestratorRoutingServiceResult:
         """Revalidate using cumulative strict terminal worker proofs.
 
@@ -280,6 +284,7 @@ class OrchestratorRoutingService:
                 artifact_id=artifact_id,
                 previous=previous,
                 completed_results=completed_results,
+                execution_state=execution_state,
                 discovery_performed=discovery_performed,
             )
 
@@ -291,6 +296,7 @@ class OrchestratorRoutingService:
         previous: WorkerRoutingPlan,
         completed_results: Sequence[WorkerExecutionResult],
         discovery_performed: bool,
+        execution_state: OrchestratorExecutionState | None = None,
     ) -> OrchestratorRoutingServiceResult:
         if previous.loop_decision != "dispatch_next_workers":
             if completed_results:
@@ -308,6 +314,7 @@ class OrchestratorRoutingService:
             run_id=run_id,
             plan=previous,
             completed_results=completed_results,
+            execution_state=execution_state,
         )
         proposal = OrchestratorRoutingProposal(
             loop_decision=previous.loop_decision,
@@ -451,6 +458,7 @@ class OrchestratorRoutingService:
         run_id: str,
         plan: WorkerRoutingPlan,
         completed_results: Sequence[WorkerExecutionResult],
+        execution_state: OrchestratorExecutionState | None = None,
     ) -> tuple[frozenset[str], frozenset[str]]:
         decisions = {
             decision.routing_decision_id: decision
@@ -460,6 +468,11 @@ class OrchestratorRoutingService:
         completed_ids: set[str] = set()
         seen_decision_ids: set[str] = set()
         attested_outputs_by_decision: dict[str, set[str]] = {}
+        runtime_decisions = self._validated_execution_lineage(
+            run_id=run_id,
+            plan=plan,
+            execution_state=execution_state,
+        )
         for supplied in completed_results:
             if not isinstance(supplied, WorkerExecutionResult):
                 raise OrchestratorRoutingServiceError("completion_result_type_invalid")
@@ -481,12 +494,31 @@ class OrchestratorRoutingService:
             decision = decisions[decision_id]
             if not decision.task_id:
                 raise OrchestratorRoutingServiceError("completion_decision_has_no_task")
+            runtime_decision = runtime_decisions.get(decision_id)
+            expected_task_id = (
+                runtime_decision.task_ids[-1]
+                if runtime_decision is not None
+                else decision.task_id
+            )
+            runtime_task = (
+                execution_state.worker_tasks[expected_task_id]
+                if execution_state is not None and expected_task_id is not None
+                else None
+            )
             if (
                 result.run_id != run_id
                 or result.routing_plan_id != plan.routing_plan_id
-                or result.task_id != decision.task_id
+                or result.task_id != expected_task_id
                 or result.agent_id != decision.agent_id
                 or result.capability_id != decision.capability_id
+                or result.retry_of_task_id
+                != (runtime_task.retry_of_task_id if runtime_task is not None else None)
+            ):
+                raise OrchestratorRoutingServiceError("completion_identity_mismatch")
+            if runtime_task is not None and (
+                runtime_task.execution_status not in {"completed", "failed"}
+                or runtime_task.result_status != result.result_status
+                or runtime_task.terminal_error_code != result.error_code
             ):
                 raise OrchestratorRoutingServiceError("completion_identity_mismatch")
             productive = result.result_status in {"success", "partial"}
@@ -524,6 +556,145 @@ class OrchestratorRoutingService:
             attested_outputs_by_decision=attested_outputs_by_decision,
         )
         return frozenset(completed_ids), frozenset(seen_decision_ids)
+
+    def _validated_execution_lineage(
+        self,
+        *,
+        run_id: str,
+        plan: WorkerRoutingPlan,
+        execution_state: OrchestratorExecutionState | None,
+    ) -> dict[str, Any]:
+        if execution_state is None:
+            return {}
+        try:
+            state = OrchestratorExecutionState.model_validate(
+                execution_state.model_dump()
+            )
+        except (AttributeError, ValidationError):
+            raise OrchestratorRoutingServiceError(
+                "completion_execution_state_invalid"
+            ) from None
+        if state.run_id != run_id or state.routing.routing_plan_id != plan.routing_plan_id:
+            raise OrchestratorRoutingServiceError("completion_identity_mismatch")
+        plan_decisions = {
+            item.routing_decision_id: item for item in plan.validated_decisions
+        }
+        if set(state.routing.decisions) != set(plan_decisions):
+            raise OrchestratorRoutingServiceError("completion_identity_mismatch")
+        for decision_id, runtime in state.routing.decisions.items():
+            persisted = plan_decisions[decision_id]
+            if (
+                runtime.agent_id != persisted.agent_id
+                or runtime.capability_id != persisted.capability_id
+                or runtime.required_artifact_names != persisted.required_artifact_names
+                or runtime.expected_output_artifact_names
+                != persisted.expected_output_artifact_names
+            ):
+                raise OrchestratorRoutingServiceError("completion_identity_mismatch")
+            if persisted.task_id is None:
+                if runtime.task_ids:
+                    raise OrchestratorRoutingServiceError("completion_identity_mismatch")
+                continue
+            if not runtime.task_ids or runtime.task_ids[0] != persisted.task_id:
+                raise OrchestratorRoutingServiceError("completion_identity_mismatch")
+            for task_id in runtime.task_ids:
+                task = state.worker_tasks[task_id]
+                if (
+                    task.routing_plan_id != plan.routing_plan_id
+                    or task.routing_decision_id != decision_id
+                    or task.agent_id != persisted.agent_id
+                    or task.capability_id != persisted.capability_id
+                ):
+                    raise OrchestratorRoutingServiceError("completion_identity_mismatch")
+        return dict(state.routing.decisions)
+
+    def rebuild_retry_task(
+        self,
+        *,
+        run_id: str,
+        execution_state: OrchestratorExecutionState,
+        task_id: str,
+    ) -> PreparedA2ATask:
+        """Rebuild one pending retry solely from persisted and frozen authority."""
+        with self._get_run_lock(run_id):
+            artifact_id = self._active_plan_artifact_id(run_id)
+            if not artifact_id:
+                raise OrchestratorRoutingServiceError("worker_routing_plan_missing")
+            plan = self._load_plan(run_id, artifact_id)
+            runtime = self._validated_execution_lineage(
+                run_id=run_id, plan=plan, execution_state=execution_state
+            )
+            task = execution_state.worker_tasks.get(task_id)
+            if task is None:
+                raise OrchestratorRoutingServiceError("retry_task_unknown")
+            decision = runtime.get(task.routing_decision_id)
+            if (
+                decision is None
+                or not decision.task_ids
+                or decision.task_ids[-1] != task_id
+                or task.retry_attempt == 0
+                or task.dispatch_status != "not_dispatched"
+                or task.execution_status != "not_started"
+                or task.retry_of_task_id is None
+            ):
+                raise OrchestratorRoutingServiceError("retry_task_state_invalid")
+            previous = execution_state.worker_tasks[task.retry_of_task_id]
+            if (
+                previous.execution_status != "failed"
+                or previous.result_status != "tool_failed"
+                or previous.terminal_error_code is None
+                or previous.retry_attempt + 1 != task.retry_attempt
+            ):
+                raise OrchestratorRoutingServiceError("retry_task_lineage_invalid")
+            persisted = next(
+                item
+                for item in plan.validated_decisions
+                if item.routing_decision_id == task.routing_decision_id
+            )
+            proposed = OrchestratorRouteDecision(
+                agent_id=persisted.agent_id,
+                capability_id=persisted.capability_id,
+                objective=persisted.objective,
+                selection_reason=persisted.selection_reason,
+                priority=persisted.priority,
+            )
+            validation = validate_orchestrator_routing(
+                run_id=run_id,
+                proposal=OrchestratorRoutingProposal(
+                    loop_decision="dispatch_next_workers",
+                    decisions=[proposed],
+                    decision_summary="Rebuild one validated retry task.",
+                ),
+                discovery=self._discovery,
+                storage=self._storage,
+                registry=self._registry,
+                routing_decision_ids=[persisted.routing_decision_id],
+            )
+            if len(validation.decisions) != 1:
+                raise OrchestratorRoutingServiceError("retry_task_revalidation_failed")
+            validated: RuntimeValidatedDecision = validation.decisions[0]
+            if (
+                validated.decision.validation_status != "ready"
+                or not validated.task_build_allowed
+                or validated.decision.required_artifact_names
+                != persisted.required_artifact_names
+                or validated.decision.expected_output_artifact_names
+                != persisted.expected_output_artifact_names
+            ):
+                raise OrchestratorRoutingServiceError("retry_task_revalidation_failed")
+            validated.decision = validated.decision.model_copy(
+                update={"task_id": task_id}
+            )
+            return build_retry_orchestrator_worker_task(
+                run_id=run_id,
+                routing_plan_id=plan.routing_plan_id,
+                validated=validated,
+                task_id=task_id,
+                retry_attempt=task.retry_attempt,
+                max_retry_attempts=task.max_retry_attempts,
+                retry_of_task_id=task.retry_of_task_id,
+                retry_reason=previous.terminal_error_code,
+            )
 
     def _require_completion_proofs_for_advanced_outputs(
         self,

@@ -27,7 +27,12 @@ from app.schemas.orchestrator_execution_state import (
     TaskId,
 )
 
-from .contracts import A2ATaskMetadata, InputArtifactRef, WorkerExecutionRequest
+from .contracts import (
+    A2ATaskMetadata,
+    InputArtifactRef,
+    RetryContext,
+    WorkerExecutionRequest,
+)
 from .orchestrator_context_projection import contains_unsafe_routing_text
 from .orchestrator_discovery import DispatchTarget
 from .orchestrator_execution_state import (
@@ -130,6 +135,7 @@ async def dispatch_orchestrator_tasks(
     checkpoint_config: Any,
     timeout_seconds: float,
     client_factory: Callable[..., A2AClient] = A2AClient,
+    routing_service: Any | None = None,
 ) -> OrchestratorDispatchResult:
     """Validate, checkpoint, and concurrently dispatch the complete ready batch."""
     timeout = _validated_timeout(timeout_seconds)
@@ -138,6 +144,7 @@ async def dispatch_orchestrator_tasks(
         state=state,
         prepared_tasks=prepared_tasks,
         discovery=discovery,
+        routing_service=routing_service,
     )
     if not batch:
         return OrchestratorDispatchResult(
@@ -239,6 +246,7 @@ def _validate_batch(
     state: OrchestratorExecutionState,
     prepared_tasks: Sequence[PreparedA2ATask],
     discovery: Any,
+    routing_service: Any | None,
 ) -> tuple[OrchestratorExecutionState, tuple[_ValidatedDispatch, ...]]:
     try:
         checked = OrchestratorExecutionState.model_validate(state.model_dump())
@@ -278,6 +286,7 @@ def _validate_batch(
             task_id=task_id,
             task_state=task_state,
             decision=decision,
+            routing_service=routing_service,
         )
         try:
             canonical = discovery.resolve_dispatch_target(
@@ -306,8 +315,26 @@ def _validate_prepared_identity(
     task_id: str,
     task_state: Any,
     decision: Any,
+    routing_service: Any | None,
 ) -> None:
     prepared_decision = prepared.decision
+    if task_state.retry_attempt > 0:
+        if routing_service is None:
+            raise OrchestratorDispatchError("retry_authority_required")
+        try:
+            authoritative = routing_service.rebuild_retry_task(
+                run_id=run_id,
+                execution_state=state,
+                task_id=task_id,
+            )
+        except Exception:
+            raise OrchestratorDispatchError(
+                "prepared_retry_authority_invalid"
+            ) from None
+        if not _prepared_tasks_equal(prepared, authoritative):
+            raise OrchestratorDispatchError(
+                "prepared_task_payload_contract_mismatch"
+            )
     expected = (
         task_id,
         state.routing.routing_plan_id,
@@ -365,17 +392,72 @@ def _validate_prepared_identity(
         input_artifact_refs=prepared.input_artifact_refs,
     )
     try:
+        retry_context = None
+        if task_state.retry_attempt > 0:
+            previous = _checked_previous_task(state, task_state)
+            retry_context = RetryContext(
+                retry_of_task_id=previous.task_id,
+                retry_attempt=task_state.retry_attempt,
+                max_retry_attempts=task_state.max_retry_attempts,
+                retry_reason=previous.terminal_error_code,
+            )
         canonical_request = build_canonical_worker_execution_request(
             run_id=run_id,
             routing_plan_id=state.routing.routing_plan_id,
             decision=prepared_decision,
             input_artifact_refs=prepared.input_artifact_refs,
+            retry_context=retry_context,
         )
     except (TypeError, ValueError, ValidationError):
         raise OrchestratorDispatchError(
             "prepared_task_payload_contract_mismatch"
         ) from None
     _validate_request_contract(request, metadata, canonical_request)
+
+
+def _prepared_tasks_equal(left: PreparedA2ATask, right: PreparedA2ATask) -> bool:
+    try:
+        left_request = WorkerExecutionRequest.model_validate_json(
+            left.task.message["content"]["text"]
+        )
+        right_request = WorkerExecutionRequest.model_validate_json(
+            right.task.message["content"]["text"]
+        )
+    except (KeyError, TypeError, ValidationError):
+        return False
+    return (
+        left.decision.model_dump() == right.decision.model_dump()
+        and str(left.task.id) == str(right.task.id)
+        and left_request.model_dump() == right_request.model_dump()
+        and left.task.metadata == right.task.metadata
+        and left.dispatch_target == right.dispatch_target
+        and {
+            key: value.model_dump() for key, value in left.input_artifact_refs.items()
+        }
+        == {
+            key: value.model_dump() for key, value in right.input_artifact_refs.items()
+        }
+    )
+
+
+def _checked_previous_task(state: OrchestratorExecutionState, task_state: Any) -> Any:
+    if task_state.retry_attempt == 0:
+        if task_state.retry_of_task_id is not None:
+            raise OrchestratorDispatchError("prepared_task_retry_lineage_invalid")
+        return None
+    previous = state.worker_tasks.get(task_state.retry_of_task_id)
+    if (
+        previous is None
+        or previous.routing_decision_id != task_state.routing_decision_id
+        or previous.agent_id != task_state.agent_id
+        or previous.capability_id != task_state.capability_id
+        or previous.retry_attempt + 1 != task_state.retry_attempt
+        or previous.execution_status != "failed"
+        or previous.result_status != "tool_failed"
+        or previous.terminal_error_code is None
+    ):
+        raise OrchestratorDispatchError("prepared_task_retry_lineage_invalid")
+    return previous
 
 
 def _validate_request_contract(

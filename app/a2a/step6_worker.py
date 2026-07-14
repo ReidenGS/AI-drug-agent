@@ -526,6 +526,11 @@ class Step6A2AWorker:
             routing_decision_id=request.routing_decision_id,
             agent_id=request.agent_id,
             capability_id=request.capability_id,
+            retry_of_task_id=(
+                request.retry_context.retry_of_task_id
+                if request.retry_context is not None
+                else None
+            ),
             execution_status=execution_status,  # type: ignore[arg-type]
             result_status=result_status,  # type: ignore[arg-type]
             error_code=error_code,

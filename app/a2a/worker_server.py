@@ -285,6 +285,13 @@ class A2AWorkerAdapter(A2AServer):
             for field in _RESULT_IDENTITY_FIELDS
             if getattr(result, field) != getattr(request, field)
         ]
+        expected_retry_parent = (
+            request.retry_context.retry_of_task_id
+            if request.retry_context is not None
+            else None
+        )
+        if result.retry_of_task_id != expected_retry_parent:
+            identity_mismatches.append("retry_of_task_id")
         if identity_mismatches:
             return _failure_result_from_request(
                 request,
@@ -441,6 +448,11 @@ def _failure_result_from_request(
         routing_decision_id=request.routing_decision_id,
         agent_id=request.agent_id,
         capability_id=request.capability_id,
+        retry_of_task_id=(
+            request.retry_context.retry_of_task_id
+            if request.retry_context is not None
+            else None
+        ),
         execution_status="failed",
         result_status=result_status,  # type: ignore[arg-type]
         error_code=error_code,

@@ -104,11 +104,13 @@ async def revalidate_orchestrator_after_ingestion(
         previous=previous_completion_proofs,
         current=ingestion_result.completion_proofs,
     )
+    latest = _latest_completion_proofs(state, cumulative)
     try:
         routing = routing_service.revalidate_for_run(
             run_id,
-            completed_results=[cumulative[key] for key in sorted(cumulative)],
+            completed_results=[latest[key] for key in sorted(latest)],
             expected_routing_plan_id=state.routing.routing_plan_id,
+            execution_state=state,
         )
     except OrchestratorRoutingServiceError as exc:
         raise OrchestratorPostIngestionError(str(exc)) from None
@@ -226,6 +228,7 @@ def _validate_proof_against_state(
         or proof.capability_id != task.capability_id
         or productive != task_productive
         or proof.execution_status != task.execution_status
+        or proof.retry_of_task_id != task.retry_of_task_id
         or task.execution_status not in {"completed", "failed"}
         or task.result_status != proof.result_status
     ):
@@ -239,20 +242,46 @@ def _validate_proof_against_state(
     }
     if dict(task.output_artifact_refs) != compact_ids:
         raise OrchestratorPostIngestionError("completion_proof_output_mismatch")
+    is_latest_attempt = bool(decision.task_ids) and decision.task_ids[-1] == proof.task_id
     for name, artifact_id in compact_ids.items():
         ref = proof.output_artifact_refs[name]
-        artifact = state.artifacts.get(name)
         if (
             ref.run_id != state.run_id
             or ref.artifact_type != name
-            or artifact is None
-            or artifact.status != ("available" if productive else "invalid")
-            or artifact.artifact_id != artifact_id
-            or artifact.producer_task_id != proof.task_id
         ):
             raise OrchestratorPostIngestionError(
                 "completion_proof_output_mismatch"
             )
+        if is_latest_attempt:
+            artifact = state.artifacts.get(name)
+            if (
+                artifact is None
+                or artifact.status != ("available" if productive else "invalid")
+                or artifact.artifact_id != artifact_id
+                or artifact.producer_task_id != proof.task_id
+            ):
+                raise OrchestratorPostIngestionError(
+                    "completion_proof_output_mismatch"
+                )
+
+
+def _latest_completion_proofs(
+    state: OrchestratorExecutionState,
+    cumulative: Mapping[str, WorkerExecutionResult],
+) -> dict[str, WorkerExecutionResult]:
+    """Select one current terminal attestation per decision for DAG validation."""
+    latest: dict[str, WorkerExecutionResult] = {}
+    for decision_id, decision in state.routing.decisions.items():
+        if not decision.task_ids:
+            continue
+        task_id = decision.task_ids[-1]
+        proof = cumulative.get(task_id)
+        task = state.worker_tasks[task_id]
+        if task.execution_status in {"completed", "failed"} and proof is None:
+            raise OrchestratorPostIngestionError("completion_proof_required")
+        if proof is not None:
+            latest[decision_id] = proof
+    return latest
 
 
 __all__ = [

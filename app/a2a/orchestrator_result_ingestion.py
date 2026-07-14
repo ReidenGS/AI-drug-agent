@@ -241,6 +241,7 @@ async def ingest_orchestrator_worker_results(
                 merged,
                 task_id,
                 result_status=result.result_status,
+                error_code=result.error_code,
                 output_artifact_refs=output_ids,
                 available_output_artifact_names=available,
             )
@@ -417,6 +418,7 @@ def _apply_ingestion_failure(
             state,
             task_id,
             result_status="tool_failed",
+            error_code=error_code,
             output_artifact_refs={},
         )
     except OrchestratorExecutionStateError:

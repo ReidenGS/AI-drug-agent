@@ -263,10 +263,13 @@ def test_initial_ready_waiting_projection_is_compact_and_generic():
         "dispatch_status": "not_dispatched",
         "execution_status": "not_started",
         "result_status": None,
-        "agent_failure_reason": "none",
-        "retry_of_task_id": None,
-        "output_artifact_refs": {},
-    }
+            "agent_failure_reason": "none",
+            "retry_of_task_id": None,
+            "retry_attempt": 0,
+            "max_retry_attempts": 3,
+            "terminal_error_code": None,
+            "output_artifact_refs": {},
+        }
     assert dispatch_eligible_task_ids(state) == ("task_1111111111111111",)
     assert state.artifacts["candidate_context_table"].status == "planned"
     assert state.artifacts["structured_liability_summary"].status == "planned"

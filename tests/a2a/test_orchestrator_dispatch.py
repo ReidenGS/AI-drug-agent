@@ -1165,7 +1165,12 @@ async def test_full_request_contract_drift_is_rejected_with_zero_side_effects(
         elif drift == "session_id":
             update["session_id"] = injected
         elif drift == "retry_context":
-            update["retry_context"] = RetryContext(retry_reason=injected)
+            update["retry_context"] = RetryContext(
+                retry_of_task_id="task_aaaaaaaaaaaaaaaa",
+                retry_attempt=1,
+                max_retry_attempts=3,
+                retry_reason="safe_injected_value",
+            )
         else:
             update["orchestrator_routing_decision"] = (
                 request.orchestrator_routing_decision.model_copy(

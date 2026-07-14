@@ -246,10 +246,16 @@ class PrivacyConstraints(BaseModel):
 class RetryContext(BaseModel):
     model_config = _FORBID
 
-    retry_of_task_id: Optional[str] = None
-    retry_attempt: int = 0
-    max_retry_attempts: int = 0
-    retry_reason: Optional[str] = None
+    retry_of_task_id: str = Field(min_length=1)
+    retry_attempt: int = Field(ge=1)
+    max_retry_attempts: int = Field(ge=1)
+    retry_reason: str = Field(pattern=r"^[a-z][a-z0-9_]{0,127}$")
+
+    @model_validator(mode="after")
+    def validate_retry_bounds(self) -> RetryContext:
+        if self.retry_attempt > self.max_retry_attempts:
+            raise ValueError("retry_attempt_exceeds_maximum")
+        return self
 
 
 class A2ATaskMetadata(BaseModel):

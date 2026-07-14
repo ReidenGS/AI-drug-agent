@@ -87,6 +87,9 @@ NextWakeupReason = Literal[
     "needs_user_input",
     "routing_completed",
     "routing_failed",
+    "worker_retry_exhausted",
+    "worker_non_retryable_failure",
+    "worker_result_reconciliation_required",
 ]
 
 RunId = Annotated[
@@ -228,6 +231,12 @@ class WorkerTaskExecutionState(BaseModel):
     result_status: ResultStatus | None = None
     agent_failure_reason: AgentFailureReason = "none"
     retry_of_task_id: TaskId | None = None
+    retry_attempt: int = Field(default=0, ge=0, le=3)
+    max_retry_attempts: Literal[3] = 3
+    terminal_error_code: str | None = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_]{0,127}$",
+    )
     output_artifact_refs: dict[ContractIdentifier, ArtifactId] = Field(
         default_factory=dict
     )
@@ -244,6 +253,8 @@ class WorkerTaskExecutionState(BaseModel):
             raise ValueError("agent_failure_reason_without_dispatch_failure")
         if self.execution_status in {"not_started", "running"} and self.result_status is not None:
             raise ValueError("result_status_before_terminal_execution")
+        if self.execution_status in {"not_started", "running"} and self.terminal_error_code is not None:
+            raise ValueError("terminal_error_before_terminal_execution")
         if self.execution_status in {"completed", "failed", "canceled"}:
             if self.result_status is None:
                 raise ValueError("terminal_execution_result_status_required")
@@ -252,11 +263,19 @@ class WorkerTaskExecutionState(BaseModel):
             "partial",
         }:
             raise ValueError("completed_execution_result_status_invalid")
+        if self.execution_status == "completed" and self.terminal_error_code is not None:
+            raise ValueError("completed_execution_error_code_forbidden")
         if self.execution_status == "failed" and self.result_status in {
             "success",
             "partial",
         }:
             raise ValueError("failed_execution_result_status_invalid")
+        if self.execution_status == "failed" and self.terminal_error_code is None:
+            raise ValueError("failed_execution_error_code_required")
+        if self.retry_attempt == 0 and self.retry_of_task_id is not None:
+            raise ValueError("initial_task_retry_parent_forbidden")
+        if self.retry_attempt > 0 and self.retry_of_task_id is None:
+            raise ValueError("retry_task_parent_required")
         return self
 
 
@@ -329,9 +348,15 @@ class OrchestratorExecutionState(BaseModel):
             ):
                 raise ValueError("task_routing_decision_identity_mismatch")
         for decision in self.routing.decisions.values():
-            for task_id in decision.task_ids:
+            for index, task_id in enumerate(decision.task_ids):
                 if task_id not in self.worker_tasks:
                     raise ValueError("routing_decision_task_unknown")
+                task = self.worker_tasks[task_id]
+                if task.retry_attempt != index:
+                    raise ValueError("task_retry_attempt_gap")
+                expected_parent = decision.task_ids[index - 1] if index else None
+                if task.retry_of_task_id != expected_parent:
+                    raise ValueError("task_retry_lineage_invalid")
         for key, artifact in self.artifacts.items():
             if key != artifact.artifact_name:
                 raise ValueError("artifact_identity_mismatch")
