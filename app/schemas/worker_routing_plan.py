@@ -60,6 +60,7 @@ class ValidatedRoutingDecision(BaseModel):
     selection_reason: str
     priority: Priority
     validation_status: ValidationStatus
+    required_artifact_names: list[str] = Field(default_factory=list)
     dependency_artifact_names: list[str] = Field(default_factory=list)
     dependency_producers: list[str] = Field(default_factory=list)
     expected_output_artifact_names: list[str] = Field(default_factory=list)

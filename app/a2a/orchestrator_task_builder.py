@@ -14,6 +14,7 @@ from app.utils.ids import new_task_id
 
 from .contracts import (
     A2ATaskMetadata,
+    InputArtifactRef,
     InputProjection,
     OrchestratorRoutingDecisionRef,
     PrivacyConstraints,
@@ -31,6 +32,7 @@ class PreparedA2ATask:
     decision: ValidatedRoutingDecision
     task: Task
     dispatch_target: DispatchTarget
+    input_artifact_refs: dict[str, InputArtifactRef]
 
 
 def build_orchestrator_worker_task(
@@ -126,4 +128,5 @@ def build_orchestrator_worker_task(
         decision=updated_decision,
         task=task,
         dispatch_target=validated.dispatch_target,
+        input_artifact_refs=dict(validated.input_artifact_refs),
     )

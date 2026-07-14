@@ -215,6 +215,10 @@ def validate_orchestrator_routing(
                     selection_reason=proposed.selection_reason,
                     priority=proposed.priority,
                     validation_status="ready",
+                    required_artifact_names=[
+                        item.artifact_name
+                        for item in capability.required_input_artifacts
+                    ],
                     expected_output_artifact_names=[
                         item.artifact_name for item in capability.output_artifacts
                     ],
