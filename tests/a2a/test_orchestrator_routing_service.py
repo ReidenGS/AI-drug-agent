@@ -38,6 +38,7 @@ from app.a2a.agent_cards import (
     parse_adc_agent_contract,
 )
 from app.a2a.contracts import (
+    ToolCallSummary,
     WorkerArtifactRef,
     WorkerExecutionRequest,
     WorkerExecutionResult,
@@ -714,6 +715,98 @@ def test_completion_unexpected_output_ref_fails_without_plan_pollution(
 
 
 @pytest.mark.parametrize(
+    "mutation",
+    [
+        "productive_error_code",
+        "failure_missing_error_code",
+        "failure_non_snake_error_code",
+        "productive_failed_execution",
+        "failure_completed_execution",
+        "negative_tool_count",
+        "malformed_output_ref",
+    ],
+)
+def test_direct_revalidation_rejects_schema_bypassed_typed_proof_without_pollution(
+    local_storage, registry_service, mutation
+):
+    run_id = _seed_inputs(
+        local_storage, registry_service, run_id="run_invalid_typed_proof"
+    )
+    service, _llm, _discovery = _service(local_storage, registry_service)
+    initial = service.plan_for_run(run_id)
+    decision = _decision(initial.plan, CAP_STEP5_CANDIDATE_CONTEXT)
+    artifact_id = _persist_candidate(local_storage, registry_service, run_id)
+    valid = _completed_result(
+        run_id=run_id,
+        plan=initial.plan,
+        decision=decision,
+        artifact_id=artifact_id,
+    )
+    if mutation == "productive_error_code":
+        invalid = valid.model_copy(update={"error_code": "schema_bypass"})
+    elif mutation == "failure_missing_error_code":
+        invalid = valid.model_copy(
+            update={
+                "execution_status": "failed",
+                "result_status": "tool_failed",
+                "error_code": None,
+            }
+        )
+    elif mutation == "failure_non_snake_error_code":
+        invalid = valid.model_copy(
+            update={
+                "execution_status": "failed",
+                "result_status": "tool_failed",
+                "error_code": "Not-Snake-sk-live-SECRET",
+            }
+        )
+    elif mutation == "productive_failed_execution":
+        invalid = valid.model_copy(update={"execution_status": "failed"})
+    elif mutation == "failure_completed_execution":
+        invalid = valid.model_copy(
+            update={
+                "execution_status": "completed",
+                "result_status": "tool_failed",
+                "error_code": "schema_bypass",
+            }
+        )
+    elif mutation == "negative_tool_count":
+        invalid = valid.model_copy(
+            update={
+                "tool_call_summary": ToolCallSummary.model_construct(attempted=-1)
+            }
+        )
+    else:
+        ref = valid.output_artifact_refs["candidate_context_table"]
+        invalid = valid.model_copy(
+            update={
+                "output_artifact_refs": {
+                    "candidate_context_table": WorkerArtifactRef.model_construct(
+                        artifact_id=123,
+                        artifact_type=ref.artifact_type,
+                        storage_key=ref.storage_key,
+                        run_id=ref.run_id,
+                    )
+                }
+            }
+        )
+    before = _persisted_plan_bytes(local_storage, run_id)
+    authority_before = _routing_authority(registry_service, run_id)
+
+    with pytest.raises(
+        OrchestratorRoutingServiceError,
+        match="^completion_proof_schema_invalid$",
+    ) as caught:
+        service.revalidate_for_run(run_id, completed_results=[invalid])
+
+    for forbidden in ("schema_bypass", "sk-live", "Not-Snake", mutation):
+        assert forbidden not in str(caught.value)
+        assert forbidden not in repr(caught.value)
+    assert _persisted_plan_bytes(local_storage, run_id) == before
+    assert _routing_authority(registry_service, run_id) == authority_before
+
+
+@pytest.mark.parametrize(
     ("storage_key", "accepted"),
     [
         (None, True),
@@ -793,7 +886,7 @@ def test_unknown_or_mismatched_completion_result_fails_closed(
     ("execution_status", "result_status"),
     [("failed", "tool_failed"), ("completed", "blocked")],
 )
-def test_unsuccessful_completion_result_fails_closed(
+def test_schema_bypassed_completion_status_pair_fails_closed(
     local_storage, registry_service, execution_status, result_status
 ):
     run_id = _seed_inputs(local_storage, registry_service, run_id="run_bad_completion")
@@ -814,7 +907,7 @@ def test_unsuccessful_completion_result_fails_closed(
     )
 
     with pytest.raises(
-        OrchestratorRoutingServiceError, match="completion_status_invalid"
+        OrchestratorRoutingServiceError, match="completion_proof_schema_invalid"
     ):
         service.revalidate_for_run(run_id, completed_results=[completed])
 

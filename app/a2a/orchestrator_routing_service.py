@@ -255,13 +255,25 @@ class OrchestratorRoutingService:
         run_id: str,
         *,
         completed_results: Sequence[WorkerExecutionResult],
+        expected_routing_plan_id: str | None = None,
     ) -> OrchestratorRoutingServiceResult:
-        """Revalidate using compact, identity-verified worker completion results."""
+        """Revalidate using cumulative strict terminal worker proofs.
+
+        Productive proofs release dependencies; validated failure attestations
+        only explain worker-owned registry advancement.
+        """
         with self._get_run_lock(run_id):
             artifact_id = self._active_plan_artifact_id(run_id)
             if not artifact_id:
                 raise OrchestratorRoutingServiceError("worker_routing_plan_missing")
             previous = self._load_plan(run_id, artifact_id)
+            if (
+                expected_routing_plan_id is not None
+                and previous.routing_plan_id != expected_routing_plan_id
+            ):
+                raise OrchestratorRoutingServiceError(
+                    "worker_routing_plan_identity_mismatch"
+                )
             discovery_performed = self._ensure_discovery(run_id)
             return self._revalidate_loaded_plan(
                 run_id=run_id,
@@ -292,7 +304,7 @@ class OrchestratorRoutingService:
                 discovery_performed=discovery_performed,
             )
 
-        completed_ids = self._validate_completed_results(
+        completed_ids, terminal_ids = self._validate_completed_results(
             run_id=run_id,
             plan=previous,
             completed_results=completed_results,
@@ -318,6 +330,7 @@ class OrchestratorRoutingService:
             validation=validation,
             previous_decisions=previous.validated_decisions,
             completed_routing_decision_ids=completed_ids,
+            terminal_routing_decision_ids=terminal_ids,
         )
         retained_rejected = [
             item
@@ -335,6 +348,7 @@ class OrchestratorRoutingService:
             unavailable_agent_ids=previous.unavailable_agent_ids,
             retained_rejected=retained_rejected,
             completed_routing_decision_ids=completed_ids,
+            terminal_routing_decision_ids=terminal_ids,
         )
         self._persist_existing_plan(run_id, artifact_id, plan)
         return OrchestratorRoutingServiceResult(
@@ -437,22 +451,33 @@ class OrchestratorRoutingService:
         run_id: str,
         plan: WorkerRoutingPlan,
         completed_results: Sequence[WorkerExecutionResult],
-    ) -> frozenset[str]:
+    ) -> tuple[frozenset[str], frozenset[str]]:
         decisions = {
             decision.routing_decision_id: decision
             for decision in plan.validated_decisions
         }
         active = self._registry.get(run_id).active_artifacts
         completed_ids: set[str] = set()
+        seen_decision_ids: set[str] = set()
+        attested_outputs_by_decision: dict[str, set[str]] = {}
         for supplied in completed_results:
             if not isinstance(supplied, WorkerExecutionResult):
                 raise OrchestratorRoutingServiceError("completion_result_type_invalid")
-            result = supplied
+            try:
+                result = WorkerExecutionResult.model_validate(
+                    supplied.model_dump(mode="python", warnings=False),
+                    strict=True,
+                )
+            except (AttributeError, ValidationError):
+                raise OrchestratorRoutingServiceError(
+                    "completion_proof_schema_invalid"
+                ) from None
             decision_id = result.routing_decision_id
             if not decision_id or decision_id not in decisions:
                 raise OrchestratorRoutingServiceError("completion_unknown_decision")
-            if decision_id in completed_ids:
+            if decision_id in seen_decision_ids:
                 raise OrchestratorRoutingServiceError("completion_duplicate_decision")
+            seen_decision_ids.add(decision_id)
             decision = decisions[decision_id]
             if not decision.task_id:
                 raise OrchestratorRoutingServiceError("completion_decision_has_no_task")
@@ -464,14 +489,10 @@ class OrchestratorRoutingService:
                 or result.capability_id != decision.capability_id
             ):
                 raise OrchestratorRoutingServiceError("completion_identity_mismatch")
-            if (
-                result.execution_status != "completed"
-                or result.result_status not in {"success", "partial"}
-            ):
-                raise OrchestratorRoutingServiceError("completion_status_invalid")
+            productive = result.result_status in {"success", "partial"}
             expected = set(decision.expected_output_artifact_names)
             actual = set(result.output_artifact_refs)
-            if expected - actual:
+            if productive and expected - actual:
                 raise OrchestratorRoutingServiceError(
                     "completion_output_artifacts_missing"
                 )
@@ -486,7 +507,7 @@ class OrchestratorRoutingService:
                     capability_id=decision.capability_id,
                     expected_output_artifact_names=expected,
                     output_artifact_refs=result.output_artifact_refs,
-                    productive=True,
+                    productive=productive,
                     discovery=self._discovery,
                     registry=self._registry,
                     storage=self._storage,
@@ -494,25 +515,26 @@ class OrchestratorRoutingService:
                 )
             except CompletionArtifactValidationError as exc:
                 raise OrchestratorRoutingServiceError(str(exc)) from None
-            completed_ids.add(decision_id)
+            attested_outputs_by_decision[decision_id] = actual
+            if productive:
+                completed_ids.add(decision_id)
         self._require_completion_proofs_for_advanced_outputs(
             plan=plan,
             active=active,
-            completed_ids=completed_ids,
+            attested_outputs_by_decision=attested_outputs_by_decision,
         )
-        return frozenset(completed_ids)
+        return frozenset(completed_ids), frozenset(seen_decision_ids)
 
     def _require_completion_proofs_for_advanced_outputs(
         self,
         *,
         plan: WorkerRoutingPlan,
         active: Any,
-        completed_ids: set[str],
+        attested_outputs_by_decision: dict[str, set[str]],
     ) -> None:
-        """Require cumulative execution proofs for every advanced producer output."""
+        """Require a validated terminal attestation for every advanced output."""
         baselines = active.worker_routing_plan_output_baselines
         for decision in plan.validated_decisions:
-            output_advanced = False
             for artifact_name in decision.expected_output_artifact_names:
                 baseline = baselines.get(artifact_name)
                 if baseline is None:
@@ -523,12 +545,13 @@ class OrchestratorRoutingService:
                     active, f"{artifact_name}_id", None
                 )
                 if artifact_id_fingerprint(current_artifact_id) != baseline:
-                    output_advanced = True
-            if (
-                output_advanced
-                and decision.routing_decision_id not in completed_ids
-            ):
-                raise OrchestratorRoutingServiceError("completion_proof_required")
+                    attested = attested_outputs_by_decision.get(
+                        decision.routing_decision_id, set()
+                    )
+                    if artifact_name not in attested:
+                        raise OrchestratorRoutingServiceError(
+                            "completion_proof_required"
+                        )
 
     def _prepare_tasks(
         self,
@@ -538,6 +561,7 @@ class OrchestratorRoutingService:
         validation: RoutingValidationResult,
         previous_decisions: Sequence[ValidatedRoutingDecision],
         completed_routing_decision_ids: frozenset[str],
+        terminal_routing_decision_ids: frozenset[str] = frozenset(),
     ) -> list[PreparedA2ATask]:
         previous_by_id = {
             item.routing_decision_id: item for item in previous_decisions
@@ -553,7 +577,7 @@ class OrchestratorRoutingService:
                 item.decision.validation_status != "ready"
                 or not item.task_build_allowed
                 or item.decision.routing_decision_id
-                in completed_routing_decision_ids
+                in terminal_routing_decision_ids
             ):
                 continue
             built = build_orchestrator_worker_task(
@@ -579,6 +603,7 @@ class OrchestratorRoutingService:
         unavailable_agent_ids: Sequence[str],
         retained_rejected: Sequence[RejectedRoutingDecision] = (),
         completed_routing_decision_ids: frozenset[str] = frozenset(),
+        terminal_routing_decision_ids: frozenset[str] = frozenset(),
     ) -> WorkerRoutingPlan:
         rejected = [*validation.rejected_decisions]
         known_rejected_ids = {item.routing_decision_id for item in rejected}
@@ -595,6 +620,7 @@ class OrchestratorRoutingService:
             validation=validation,
             prepared_task_count=prepared_task_count,
             completed_routing_decision_ids=completed_routing_decision_ids,
+            terminal_routing_decision_ids=terminal_routing_decision_ids,
         )
         warnings = self._compact_warnings(
             [*validation.warnings, *validation.plan_error_codes]
@@ -628,12 +654,13 @@ class OrchestratorRoutingService:
         validation: RoutingValidationResult,
         prepared_task_count: int,
         completed_routing_decision_ids: frozenset[str],
+        terminal_routing_decision_ids: frozenset[str] = frozenset(),
     ) -> str:
         active = [
             item
             for item in validation.decisions
             if item.decision.routing_decision_id
-            not in completed_routing_decision_ids
+            not in terminal_routing_decision_ids
         ]
         if validation.plan_error_codes:
             return "rejected"

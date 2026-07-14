@@ -394,10 +394,10 @@ async def test_two_real_http_synthetic_workers_dispatch_then_ingest_generically(
     [
         ("success", "completed", "completed", "available", 2),
         ("partial", "completed", "completed", "available", 2),
-        ("tool_failed", "failed", "failed", "invalid", 1),
-        ("validation_failed", "failed", "failed", "invalid", 1),
-        ("blocked", "failed", "blocked", "invalid", 1),
-        ("needs_user_input", "failed", "blocked", "invalid", 1),
+        ("tool_failed", "failed", "failed", "invalid", 2),
+        ("validation_failed", "failed", "failed", "invalid", 2),
+        ("blocked", "failed", "blocked", "invalid", 2),
+        ("needs_user_input", "failed", "blocked", "invalid", 2),
     ],
 )
 async def test_result_status_mapping_is_compact_and_deterministic(
@@ -861,7 +861,7 @@ async def test_output_contract_and_persisted_corruption_fail_closed_per_task(
 
 
 @pytest.mark.asyncio
-async def test_non_ready_failure_audit_artifact_is_retained_invalid_without_proof(
+async def test_non_ready_failure_audit_artifact_is_retained_with_terminal_proof(
     local_storage, registry_service
 ):
     _, dispatched, discovery = _dispatched_context(
@@ -894,7 +894,8 @@ async def test_non_ready_failure_audit_artifact_is_retained_invalid_without_proo
     assert result.state.worker_tasks[alpha_id].output_artifact_refs == {
         "scoring_handoff": ARTIFACT_IDS["scoring_handoff"]
     }
-    assert alpha_id not in result.completion_proofs
+    assert alpha_id in result.completion_proofs
+    assert result.completion_proofs[alpha_id].result_status == "tool_failed"
 
 
 @pytest.mark.asyncio

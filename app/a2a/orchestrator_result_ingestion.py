@@ -68,7 +68,12 @@ class ResultIngestionReceipt(BaseModel):
 
 
 class OrchestratorResultIngestionResult(BaseModel):
-    """Compact checkpoint result plus private current-process completion proofs."""
+    """Compact state plus private terminal worker completion proofs.
+
+    Proofs include productive successes and validated terminal failures.  A
+    failure proof may attest that a worker advanced an audit-artifact pointer,
+    but only productive proofs may satisfy a downstream DAG dependency.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -260,8 +265,7 @@ async def ingest_orchestrator_worker_results(
                 warning_count=len(result.warnings),
             )
         )
-        if productive:
-            proofs[task_id] = result
+        proofs[task_id] = result
 
     recovery = OrchestratorResultIngestionResult(
         state=merged,

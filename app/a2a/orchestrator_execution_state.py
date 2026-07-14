@@ -18,6 +18,7 @@ from app.schemas.orchestrator_execution_state import (
 )
 
 from .orchestrator_routing_service import OrchestratorRoutingServiceResult
+from .orchestrator_task_builder import PreparedA2ATask
 
 _DISPATCH_FAILURE_REASONS = {
     "dispatch_timeout",
@@ -356,6 +357,192 @@ def mark_task_result(
         ) from exc
 
 
+def reconcile_execution_state_after_revalidation(
+    state: OrchestratorExecutionState,
+    result: OrchestratorRoutingServiceResult,
+) -> tuple[OrchestratorExecutionState, tuple[PreparedA2ATask, ...]]:
+    """Merge one revalidated plan without replacing runtime task history.
+
+    The routing service remains the dependency-DAG authority.  This reducer only
+    reconciles its stable decision/task identities into compact runtime state.
+    Prepared A2A tasks are returned ephemerally and are never embedded in state.
+    """
+    checked = _validated_copy(state)
+    plan = result.plan
+    if plan.run_id != checked.run_id:
+        raise OrchestratorExecutionStateError("revalidation_run_identity_mismatch")
+    if plan.routing_plan_id != checked.routing.routing_plan_id:
+        raise OrchestratorExecutionStateError("revalidation_plan_identity_mismatch")
+
+    plan_decisions = {
+        decision.routing_decision_id: decision
+        for decision in plan.validated_decisions
+    }
+    if len(plan_decisions) != len(plan.validated_decisions) or set(plan_decisions) != set(
+        checked.routing.decisions
+    ):
+        raise OrchestratorExecutionStateError("revalidation_decision_set_mismatch")
+
+    prepared_by_decision: dict[str, PreparedA2ATask] = {}
+    for prepared in result.prepared_tasks:
+        decision_id = prepared.decision.routing_decision_id
+        if decision_id in prepared_by_decision:
+            raise OrchestratorExecutionStateError("prepared_task_identity_conflict")
+        prepared_by_decision[decision_id] = prepared
+
+    payload = checked.model_dump()
+    for decision_id, planned in plan_decisions.items():
+        current = checked.routing.decisions[decision_id]
+        if (
+            current.agent_id != planned.agent_id
+            or current.capability_id != planned.capability_id
+            or current.required_artifact_names != planned.required_artifact_names
+            or current.expected_output_artifact_names
+            != planned.expected_output_artifact_names
+        ):
+            raise OrchestratorExecutionStateError(
+                "revalidation_decision_identity_mismatch"
+            )
+
+        runtime_terminal = current.status in {
+            "completed",
+            "failed",
+            "dispatched",
+        } or any(
+            checked.worker_tasks[task_id].dispatch_status
+            in {"dispatching", "dispatched", "dispatch_failed"}
+            or checked.worker_tasks[task_id].execution_status
+            in {"running", "completed", "failed", "canceled"}
+            for task_id in current.task_ids
+        )
+        if not runtime_terminal:
+            payload["routing"]["decisions"][decision_id].update(
+                {
+                    "status": _routing_decision_status(planned.validation_status),
+                    "blocking_reason": _blocking_reason(
+                        planned.validation_status, planned.reason
+                    ),
+                }
+            )
+
+        prepared = prepared_by_decision.get(decision_id)
+        if prepared is None:
+            continue
+        task_id = prepared.decision.task_id
+        if (
+            task_id is None
+            or planned.task_id != task_id
+            or prepared.decision.agent_id != planned.agent_id
+            or prepared.decision.capability_id != planned.capability_id
+            or prepared.dispatch_target.agent_id != planned.agent_id
+            or prepared.dispatch_target.capability_id != planned.capability_id
+            or str(prepared.task.id) != task_id
+            or prepared.decision.validation_status != "ready"
+        ):
+            raise OrchestratorExecutionStateError("prepared_task_identity_mismatch")
+
+        existing_task = checked.worker_tasks.get(task_id)
+        if existing_task is not None:
+            if (
+                existing_task.routing_plan_id != plan.routing_plan_id
+                or existing_task.routing_decision_id != decision_id
+                or existing_task.agent_id != planned.agent_id
+                or existing_task.capability_id != planned.capability_id
+            ):
+                raise OrchestratorExecutionStateError(
+                    "prepared_task_identity_conflict"
+                )
+        else:
+            if current.task_ids:
+                raise OrchestratorExecutionStateError(
+                    "prepared_task_identity_conflict"
+                )
+            payload["worker_tasks"][task_id] = WorkerTaskExecutionState(
+                task_id=task_id,
+                routing_plan_id=plan.routing_plan_id,
+                routing_decision_id=decision_id,
+                agent_id=planned.agent_id,
+                capability_id=planned.capability_id,
+                dispatch_status="not_dispatched",
+                execution_status="not_started",
+                result_status=None,
+                agent_failure_reason="none",
+                output_artifact_refs={},
+            ).model_dump()
+            payload["routing"]["decisions"][decision_id]["task_ids"] = [task_id]
+
+        for artifact_name in planned.expected_output_artifact_names:
+            artifact = payload["artifacts"].get(artifact_name)
+            if artifact is None:
+                payload["artifacts"][artifact_name] = ArtifactExecutionState(
+                    artifact_name=artifact_name,
+                    status="planned",
+                    producer_task_id=task_id,
+                ).model_dump()
+            elif artifact["producer_task_id"] not in {None, task_id}:
+                raise OrchestratorExecutionStateError(
+                    "revalidation_artifact_producer_mismatch"
+                )
+            elif artifact["status"] not in {"available", "invalid"}:
+                artifact["producer_task_id"] = task_id
+                artifact["status"] = "planned"
+
+        for artifact_name, ref in prepared.input_artifact_refs.items():
+            if ref.run_id != plan.run_id or ref.artifact_type != artifact_name:
+                raise OrchestratorExecutionStateError(
+                    "input_artifact_ref_identity_mismatch"
+                )
+            artifact = payload["artifacts"].get(artifact_name)
+            if artifact is None:
+                payload["artifacts"][artifact_name] = ArtifactExecutionState(
+                    artifact_name=artifact_name,
+                    status="available",
+                    artifact_id=ref.artifact_id,
+                ).model_dump()
+            elif artifact["status"] != "available" or artifact["artifact_id"] != ref.artifact_id:
+                raise OrchestratorExecutionStateError(
+                    "input_artifact_ref_state_mismatch"
+                )
+
+    if set(prepared_by_decision) - set(plan_decisions):
+        raise OrchestratorExecutionStateError("prepared_task_decision_unknown")
+
+    if plan.routing_status == "completed":
+        payload["run_status"] = "completed"
+        payload["orchestrator"]["status"] = "completed"
+        payload["orchestrator"]["next_wakeup_reason"] = "routing_completed"
+        payload["next_wakeup"] = {
+            "target": "final_response",
+            "reason": "routing_completed",
+        }
+    else:
+        payload["run_status"] = "running"
+        payload["orchestrator"]["status"] = "validating"
+        payload["orchestrator"]["next_wakeup_reason"] = "dependencies_pending"
+        payload["next_wakeup"] = {
+            "target": "orchestrator_loop",
+            "reason": "dependencies_pending",
+        }
+    try:
+        reconciled = recompute_aggregate_state(
+            OrchestratorExecutionState.model_validate(payload)
+        )
+    except ValidationError as exc:
+        raise OrchestratorExecutionStateError(
+            "reconciled_execution_state_invalid"
+        ) from exc
+
+    eligible = set(dispatch_eligible_task_ids(reconciled))
+    prepared_for_dispatch = tuple(
+        prepared
+        for prepared in result.prepared_tasks
+        if str(prepared.task.id) in eligible
+    )
+    if {str(item.task.id) for item in prepared_for_dispatch} != eligible:
+        raise OrchestratorExecutionStateError("ready_task_preparation_mismatch")
+    return reconciled, prepared_for_dispatch
+
+
 def transition_task_lifecycle(
     state: OrchestratorExecutionState,
     task_id: str,
@@ -604,6 +791,7 @@ __all__ = [
     "mark_task_dispatching",
     "mark_task_running",
     "mark_task_result",
+    "reconcile_execution_state_after_revalidation",
     "recompute_aggregate_state",
     "transition_task_lifecycle",
 ]
