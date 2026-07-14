@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from python_a2a import Message, MessageRole, Task, TextContent
@@ -33,6 +34,55 @@ class PreparedA2ATask:
     task: Task
     dispatch_target: DispatchTarget
     input_artifact_refs: dict[str, InputArtifactRef]
+
+
+def build_canonical_worker_execution_request(
+    *,
+    run_id: str,
+    routing_plan_id: str,
+    decision: ValidatedRoutingDecision,
+    input_artifact_refs: Mapping[str, InputArtifactRef],
+) -> WorkerExecutionRequest:
+    """Build the complete first-dispatch ADC request contract.
+
+    Both Task construction and transport validation call this function so
+    optional/default request surfaces cannot drift independently.
+    """
+    if not decision.task_id:
+        raise ValueError("canonical_request_task_id_required")
+    return WorkerExecutionRequest(
+        payload_type="worker_execution_request",
+        payload_version="v1",
+        run_id=run_id,
+        session_id=None,
+        task_id=decision.task_id,
+        routing_plan_id=routing_plan_id,
+        routing_decision_id=decision.routing_decision_id,
+        agent_id=decision.agent_id,
+        capability_id=decision.capability_id,
+        created_by="step_04_orchestrator",
+        worker_request=WorkerRequestSpec(
+            objective=decision.objective,
+            reason=decision.selection_reason,
+            priority=decision.priority,
+        ),
+        orchestrator_routing_decision=OrchestratorRoutingDecisionRef(
+            planned_status="run",
+            dispatch_mode="python_a2a",
+            deterministic_gate_status="passed",
+            routing_phase=None,
+            expected_outputs=list(decision.expected_output_artifact_names),
+            reason=None,
+        ),
+        input_projection=InputProjection(
+            projection_version="v1",
+            compact_inputs={},
+            input_artifact_refs=dict(input_artifact_refs),
+            runtime_refs={},
+        ),
+        privacy_constraints=PrivacyConstraints(),
+        retry_context=None,
+    )
 
 
 def build_orchestrator_worker_task(
@@ -75,34 +125,11 @@ def build_orchestrator_worker_task(
             "task_id": task_id,
         }
     )
-    created_by = "step_04_orchestrator"
-    request = WorkerExecutionRequest(
-        payload_type="worker_execution_request",
-        payload_version="v1",
+    request = build_canonical_worker_execution_request(
         run_id=run_id,
-        task_id=task_id,
         routing_plan_id=routing_plan_id,
-        routing_decision_id=updated_decision.routing_decision_id,
-        agent_id=updated_decision.agent_id,
-        capability_id=updated_decision.capability_id,
-        created_by=created_by,
-        worker_request=WorkerRequestSpec(
-            objective=updated_decision.objective,
-            reason=updated_decision.selection_reason,
-            priority=updated_decision.priority,
-        ),
-        orchestrator_routing_decision=OrchestratorRoutingDecisionRef(
-            planned_status="run",
-            dispatch_mode="python_a2a",
-            deterministic_gate_status="passed",
-            expected_outputs=expected_outputs,
-        ),
-        input_projection=InputProjection(
-            compact_inputs={},
-            input_artifact_refs=validated.input_artifact_refs,
-            runtime_refs={},
-        ),
-        privacy_constraints=PrivacyConstraints(),
+        decision=updated_decision,
+        input_artifact_refs=validated.input_artifact_refs,
     )
     metadata = A2ATaskMetadata(
         adc_payload_type="worker_execution_request",
@@ -113,7 +140,7 @@ def build_orchestrator_worker_task(
         routing_decision_id=updated_decision.routing_decision_id,
         agent_id=updated_decision.agent_id,
         capability_id=updated_decision.capability_id,
-        created_by=created_by,
+        created_by=request.created_by,
     )
     message = Message(
         content=TextContent(text=request.model_dump_json()),
@@ -130,3 +157,10 @@ def build_orchestrator_worker_task(
         dispatch_target=validated.dispatch_target,
         input_artifact_refs=dict(validated.input_artifact_refs),
     )
+
+
+__all__ = [
+    "PreparedA2ATask",
+    "build_canonical_worker_execution_request",
+    "build_orchestrator_worker_task",
+]

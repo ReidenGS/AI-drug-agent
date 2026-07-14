@@ -20,6 +20,7 @@ from app.a2a.contracts import A2ATaskMetadata, WorkerExecutionRequest
 from app.a2a.orchestrator_discovery import DispatchTarget
 from app.a2a.orchestrator_routing_validation import validate_orchestrator_routing
 from app.a2a.orchestrator_task_builder import (
+    build_canonical_worker_execution_request,
     build_orchestrator_worker_task,
 )
 from app.schemas.worker_routing_plan import (
@@ -126,6 +127,18 @@ def test_task_round_trips_request_metadata_and_all_identity_fields(
     assert request.orchestrator_routing_decision.expected_outputs == [
         "structured_liability_summary"
     ]
+    assert request == build_canonical_worker_execution_request(
+        run_id=run_id,
+        routing_plan_id="wrp_builder",
+        decision=prepared.decision,
+        input_artifact_refs=prepared.input_artifact_refs,
+    )
+    assert request.session_id is None
+    assert request.retry_context is None
+    assert request.input_projection.compact_inputs == {}
+    assert request.input_projection.runtime_refs == {}
+    assert request.orchestrator_routing_decision.reason is None
+    assert request.orchestrator_routing_decision.routing_phase is None
 
 
 def test_task_can_be_rebuilt_with_explicit_persisted_task_identity(
