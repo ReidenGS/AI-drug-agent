@@ -300,7 +300,7 @@ def _persist_liability(local_storage, registry_service, run_id, *, status="compl
 
 
 def _completed_result(
-    *, run_id, plan, decision, artifact_id, storage_key="ignored/by/orchestrator.json"
+    *, run_id, plan, decision, artifact_id, storage_key="candidate_context_table.json"
 ):
     return WorkerExecutionResult(
         payload_type="worker_execution_result",
@@ -341,7 +341,7 @@ def _step6_completed_result(*, run_id, plan, decision, artifact_id):
             "structured_liability_summary": WorkerArtifactRef(
                 artifact_id=artifact_id,
                 artifact_type="structured_liability_summary",
-                storage_key="ignored/by/orchestrator.json",
+                storage_key="structured_liability_summary.json",
                 run_id=run_id,
                 schema_version="v1",
             )
@@ -711,6 +711,50 @@ def test_completion_unexpected_output_ref_fails_without_plan_pollution(
 
     assert _persisted_plan_bytes(local_storage, run_id) == before
     assert _routing_authority(registry_service, run_id) == authority_before
+
+
+@pytest.mark.parametrize(
+    ("storage_key", "accepted"),
+    [
+        (None, True),
+        ("candidate_context_table.json", True),
+        ("untrusted/output.json", False),
+    ],
+)
+def test_completion_storage_key_matches_shared_agent_card_contract(
+    local_storage, registry_service, storage_key, accepted
+):
+    run_id = _seed_inputs(
+        local_storage,
+        registry_service,
+        run_id=f"run_storage_key_{'none' if storage_key is None else accepted}",
+    )
+    service, _llm, _discovery = _service(local_storage, registry_service)
+    initial = service.plan_for_run(run_id)
+    step5 = _decision(initial.plan, CAP_STEP5_CANDIDATE_CONTEXT)
+    candidate_id = _persist_candidate(local_storage, registry_service, run_id)
+    completed = _completed_result(
+        run_id=run_id,
+        plan=initial.plan,
+        decision=step5,
+        artifact_id=candidate_id,
+        storage_key=storage_key,
+    )
+    if accepted:
+        result = service.revalidate_for_run(
+            run_id, completed_results=[completed]
+        )
+        assert _decision(
+            result.plan, CAP_STEP6_DEVELOPABILITY
+        ).validation_status == "ready"
+    else:
+        before = _persisted_plan_bytes(local_storage, run_id)
+        with pytest.raises(
+            OrchestratorRoutingServiceError,
+            match="^completion_output_artifact_storage_key_mismatch$",
+        ):
+            service.revalidate_for_run(run_id, completed_results=[completed])
+        assert _persisted_plan_bytes(local_storage, run_id) == before
 
 
 @pytest.mark.parametrize(

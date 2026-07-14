@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # The single ``extra="forbid"`` config reused by every contract model. Unknown
@@ -303,13 +303,13 @@ class WorkerExecutionRequest(BaseModel):
 class ToolCallSummary(BaseModel):
     """Compact roll-up of worker tool activity. No raw tool payloads."""
 
-    model_config = _FORBID
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
-    attempted: int = 0
-    success: int = 0
-    failed: int = 0
-    dependency_unavailable: int = 0
-    skipped: int = 0
+    attempted: int = Field(default=0, ge=0)
+    success: int = Field(default=0, ge=0)
+    failed: int = Field(default=0, ge=0)
+    dependency_unavailable: int = Field(default=0, ge=0)
+    skipped: int = Field(default=0, ge=0)
 
 
 ExecutionStatus = Literal["not_started", "running", "completed", "failed"]
@@ -343,7 +343,10 @@ class WorkerExecutionResult(BaseModel):
     capability_id: str
     execution_status: ExecutionStatus
     result_status: ResultStatus
-    error_code: Optional[str] = None
+    error_code: Optional[str] = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_]{0,127}$",
+    )
     retry_of_task_id: Optional[str] = None
     output_artifact_refs: dict[str, WorkerArtifactRef] = Field(default_factory=dict)
     compact_summary: dict[str, Any] = Field(default_factory=dict)
@@ -356,6 +359,21 @@ class WorkerExecutionResult(BaseModel):
     _validate_compact_summary = field_validator("compact_summary")(
         _compact_dict_privacy_validator("compact_summary")
     )
+
+    @model_validator(mode="after")
+    def validate_terminal_result_semantics(self) -> WorkerExecutionResult:
+        productive = self.result_status in {"success", "partial"}
+        if productive:
+            if self.execution_status != "completed":
+                raise ValueError("productive_result_execution_status_invalid")
+            if self.error_code is not None:
+                raise ValueError("productive_result_error_code_forbidden")
+        else:
+            if self.execution_status != "failed":
+                raise ValueError("failed_result_execution_status_invalid")
+            if self.error_code is None:
+                raise ValueError("failed_result_error_code_required")
+        return self
 
 
 # ─────────────────────────────────────────────────────────────────────────────

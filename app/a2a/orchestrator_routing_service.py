@@ -12,7 +12,6 @@ import re
 import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from hashlib import sha256
 from typing import Any, Iterable, Sequence
 
 from pydantic import ValidationError
@@ -33,8 +32,15 @@ from app.services.storage_service import Storage
 from app.utils.ids import new_artifact_id, new_routing_plan_id
 from app.utils.time import now_iso
 
-from .agent_cards import ArtifactFieldRequirement, ContractArtifactRef
 from .contracts import WorkerExecutionResult
+from .orchestrator_completion_validation import (
+    CanonicalArtifactSpec,
+    CompletionArtifactValidationError,
+    artifact_id_fingerprint,
+    artifact_requirement,
+    canonical_artifact_specs,
+    validate_worker_output_artifacts,
+)
 from .orchestrator_context_projection import (
     contains_unsafe_routing_text,
     project_orchestrator_context,
@@ -45,7 +51,6 @@ from .orchestrator_routing_prompt import (
     ORCHESTRATOR_ROUTING_USER_TASK,
 )
 from .orchestrator_routing_validation import (
-    ArtifactInspection,
     RoutingValidationResult,
     inspect_declared_artifact,
     validate_orchestrator_routing,
@@ -74,12 +79,6 @@ class OrchestratorRoutingServiceResult:
     reused_existing_plan: bool
     llm_called: bool
     discovery_performed: bool
-
-
-@dataclass(frozen=True)
-class _CanonicalArtifactSpec:
-    ref: ContractArtifactRef
-    required_field_keys: tuple[str, ...]
 
 
 class OrchestratorRoutingService:
@@ -418,61 +417,19 @@ class OrchestratorRoutingService:
 
     def _canonical_artifact_specs(
         self, run_id: str
-    ) -> dict[str, _CanonicalArtifactSpec]:
-        cache = self._discovery.get_full_card_cache(run_id)
-        refs: dict[str, ContractArtifactRef] = {}
-        required_fields: dict[str, set[str]] = defaultdict(set)
-        for worker in cache.workers.values():
-            if worker.contract is None:
-                continue
-            for capability in worker.contract.capabilities:
-                for ref in (
-                    *capability.required_input_artifacts,
-                    *capability.optional_input_artifacts,
-                    *capability.output_artifacts,
-                ):
-                    previous = refs.get(ref.artifact_name)
-                    if previous is not None and not self._same_artifact_contract(
-                        previous, ref
-                    ):
-                        raise OrchestratorRoutingServiceError(
-                            "artifact_contract_conflict"
-                        )
-                    refs[ref.artifact_name] = ref
-                for artifact_name, requirement in (
-                    capability.required_artifact_fields.items()
-                ):
-                    required_fields[artifact_name].update(
-                        requirement.required_field_keys
-                    )
-        return {
-            artifact_name: _CanonicalArtifactSpec(
-                ref=ref,
-                required_field_keys=tuple(sorted(required_fields[artifact_name])),
+    ) -> dict[str, CanonicalArtifactSpec]:
+        try:
+            return canonical_artifact_specs(
+                run_id=run_id, discovery=self._discovery
             )
-            for artifact_name, ref in refs.items()
-        }
-
-    @staticmethod
-    def _same_artifact_contract(
-        left: ContractArtifactRef, right: ContractArtifactRef
-    ) -> bool:
-        return (
-            left.artifact_name == right.artifact_name
-            and left.storage_path == right.storage_path
-            and left.readiness_status_field == right.readiness_status_field
-            and set(left.ready_status_values) == set(right.ready_status_values)
-        )
+        except CompletionArtifactValidationError as exc:
+            raise OrchestratorRoutingServiceError(str(exc)) from None
 
     @staticmethod
     def _artifact_requirement(
-        spec: _CanonicalArtifactSpec,
-    ) -> ArtifactFieldRequirement | None:
-        if not spec.required_field_keys:
-            return None
-        return ArtifactFieldRequirement(
-            required_field_keys=list(spec.required_field_keys)
-        )
+        spec: CanonicalArtifactSpec,
+    ) -> Any:
+        return artifact_requirement(spec)
 
     def _validate_completed_results(
         self,
@@ -485,8 +442,6 @@ class OrchestratorRoutingService:
             decision.routing_decision_id: decision
             for decision in plan.validated_decisions
         }
-        specs = self._canonical_artifact_specs(run_id)
-        cache = self._discovery.get_full_card_cache(run_id)
         active = self._registry.get(run_id).active_artifacts
         completed_ids: set[str] = set()
         for supplied in completed_results:
@@ -524,68 +479,21 @@ class OrchestratorRoutingService:
                 raise OrchestratorRoutingServiceError(
                     "completion_output_artifacts_unexpected"
                 )
-            worker = cache.workers.get(decision.agent_id)
-            capability = (
-                next(
-                    (
-                        item
-                        for item in worker.contract.capabilities
-                        if item.capability_id == decision.capability_id
-                    ),
-                    None,
-                )
-                if worker is not None and worker.contract is not None
-                else None
-            )
-            if capability is None or {
-                ref.artifact_name for ref in capability.output_artifacts
-            } != expected:
-                raise OrchestratorRoutingServiceError(
-                    "completion_capability_contract_mismatch"
-                )
-            for output in capability.output_artifacts:
-                output_ref = result.output_artifact_refs[output.artifact_name]
-                registry_field = f"{output.artifact_name}_id"
-                active_artifact_id = getattr(active, registry_field, None)
-                if (
-                    output_ref.artifact_type != output.artifact_name
-                    or output_ref.run_id != run_id
-                    or output_ref.artifact_id != active_artifact_id
-                ):
-                    raise OrchestratorRoutingServiceError(
-                        "completion_output_artifact_identity_mismatch"
-                    )
-                baseline = active.worker_routing_plan_output_baselines.get(
-                    output.artifact_name
-                )
-                if baseline is None:
-                    raise OrchestratorRoutingServiceError(
-                        "completion_output_baseline_missing"
-                    )
-                if self._artifact_id_fingerprint(output_ref.artifact_id) == baseline:
-                    raise OrchestratorRoutingServiceError(
-                        "completion_output_artifact_not_new"
-                    )
-                spec = specs.get(output.artifact_name)
-                if spec is None or not self._same_artifact_contract(spec.ref, output):
-                    raise OrchestratorRoutingServiceError(
-                        "completion_capability_contract_mismatch"
-                    )
-                inspection: ArtifactInspection = inspect_declared_artifact(
+            try:
+                validate_worker_output_artifacts(
                     run_id=run_id,
-                    artifact=spec.ref,
-                    requirement=self._artifact_requirement(spec),
-                    active=active,
+                    agent_id=decision.agent_id,
+                    capability_id=decision.capability_id,
+                    expected_output_artifact_names=expected,
+                    output_artifact_refs=result.output_artifact_refs,
+                    productive=True,
+                    discovery=self._discovery,
+                    registry=self._registry,
                     storage=self._storage,
+                    active=active,
                 )
-                if (
-                    inspection.state != "valid"
-                    or inspection.ref is None
-                    or inspection.ref.artifact_id != output_ref.artifact_id
-                ):
-                    raise OrchestratorRoutingServiceError(
-                        "completion_output_artifact_invalid"
-                    )
+            except CompletionArtifactValidationError as exc:
+                raise OrchestratorRoutingServiceError(str(exc)) from None
             completed_ids.add(decision_id)
         self._require_completion_proofs_for_advanced_outputs(
             plan=plan,
@@ -614,7 +522,7 @@ class OrchestratorRoutingService:
                 current_artifact_id = getattr(
                     active, f"{artifact_name}_id", None
                 )
-                if self._artifact_id_fingerprint(current_artifact_id) != baseline:
+                if artifact_id_fingerprint(current_artifact_id) != baseline:
                     output_advanced = True
             if (
                 output_advanced
@@ -817,7 +725,7 @@ class OrchestratorRoutingService:
             for artifact_name in decision.expected_output_artifact_names
         }
         output_baselines = {
-            artifact_name: self._artifact_id_fingerprint(
+            artifact_name: artifact_id_fingerprint(
                 getattr(active, f"{artifact_name}_id", None)
             )
             for artifact_name in sorted(output_names)
@@ -918,12 +826,6 @@ class OrchestratorRoutingService:
         )
         error_type = re.sub(r"[^a-z0-9_.-]", "_", type(exc).__name__.lower())
         return f"llm_error:{provider}:{error_type}"
-
-    @staticmethod
-    def _artifact_id_fingerprint(artifact_id: str | None) -> str:
-        if artifact_id is None:
-            return "absent"
-        return sha256(artifact_id.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _aligned_decision_ids(

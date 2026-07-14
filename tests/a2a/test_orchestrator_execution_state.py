@@ -17,12 +17,17 @@ from app.a2a.orchestrator_execution_state import (
     mark_task_dispatch_failed,
     mark_task_dispatched,
     mark_task_dispatching,
+    mark_task_result,
     mark_task_running,
+    recompute_aggregate_state,
     transition_task_lifecycle,
 )
 from app.a2a.orchestrator_routing_service import OrchestratorRoutingServiceResult
 from app.a2a.orchestrator_task_builder import PreparedA2ATask
-from app.schemas.orchestrator_execution_state import OrchestratorExecutionState
+from app.schemas.orchestrator_execution_state import (
+    NextWakeupState,
+    OrchestratorExecutionState,
+)
 from app.schemas.worker_routing_plan import (
     DependencyEdge,
     OrchestratorRouteDecision,
@@ -348,6 +353,102 @@ def test_dispatch_lifecycle_is_identity_stable_and_idempotent():
     assert running.worker_tasks["task_1111111111111111"].routing_decision_id == (
         "route_1111111111111111"
     )
+
+
+def _received_productive_result(state, task_id, artifact_name, artifact_id):
+    dispatched = mark_task_dispatched(mark_task_dispatching(state, task_id), task_id)
+    return mark_task_result(
+        dispatched,
+        task_id,
+        result_status="success",
+        output_artifact_refs={artifact_name: artifact_id},
+        available_output_artifact_names=frozenset({artifact_name}),
+    )
+
+
+def test_new_result_explicitly_enters_evaluating_but_completed_recompute_is_stable():
+    received = _received_productive_result(
+        execution_state_from_routing_result(routing_result_fixture()),
+        "task_1111111111111111",
+        "candidate_context_table",
+        "candidate_context_table_aaaaaaaaaaaa",
+    )
+    assert received.run_status == "running"
+    assert received.orchestrator.status == "evaluating_results"
+    assert received.next_wakeup.model_dump() == {
+        "target": "orchestrator_loop",
+        "reason": "worker_result_received",
+    }
+
+    completed = received.model_copy(
+        update={
+            "run_status": "completed",
+            "orchestrator": received.orchestrator.model_copy(
+                update={
+                    "status": "completed",
+                    "next_wakeup_reason": "routing_completed",
+                }
+            ),
+            "next_wakeup": NextWakeupState(
+                target="final_response", reason="routing_completed"
+            ),
+        }
+    )
+    completed = OrchestratorExecutionState.model_validate(completed.model_dump())
+    assert recompute_aggregate_state(completed) == completed
+
+    replayed = mark_task_result(
+        completed,
+        "task_1111111111111111",
+        result_status="success",
+        output_artifact_refs={
+            "candidate_context_table": "candidate_context_table_aaaaaaaaaaaa"
+        },
+        available_output_artifact_names=frozenset({"candidate_context_table"}),
+    )
+    assert replayed == completed
+
+
+def test_historical_terminal_tasks_do_not_mask_future_ready_or_waiting_state():
+    independent = execution_state_from_routing_result(
+        routing_result_fixture(independent_ready=True)
+    )
+    received = _received_productive_result(
+        independent,
+        "task_1111111111111111",
+        "candidate_context_table",
+        "candidate_context_table_aaaaaaaaaaaa",
+    )
+    future_ready = recompute_aggregate_state(received)
+    assert future_ready.orchestrator.status == "dispatching"
+    assert future_ready.next_wakeup.reason == "ready_tasks_available"
+    assert dispatch_eligible_task_ids(future_ready) == (
+        "task_2222222222222222",
+    )
+
+    waiting = _received_productive_result(
+        execution_state_from_routing_result(routing_result_fixture()),
+        "task_1111111111111111",
+        "candidate_context_table",
+        "candidate_context_table_bbbbbbbbbbbb",
+    )
+    advanced_waiting = waiting.model_copy(
+        update={
+            "orchestrator": waiting.orchestrator.model_copy(
+                update={
+                    "status": "validating",
+                    "next_wakeup_reason": "dependencies_pending",
+                }
+            ),
+            "next_wakeup": NextWakeupState(
+                target="orchestrator_loop", reason="dependencies_pending"
+            ),
+        }
+    )
+    future_waiting = recompute_aggregate_state(advanced_waiting)
+    assert future_waiting.run_status == "running"
+    assert future_waiting.orchestrator.status == "validating"
+    assert future_waiting.next_wakeup.reason == "dependencies_pending"
 
 
 def test_dispatch_failed_requires_compact_transport_reason():

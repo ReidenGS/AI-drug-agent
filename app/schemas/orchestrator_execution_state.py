@@ -244,6 +244,19 @@ class WorkerTaskExecutionState(BaseModel):
             raise ValueError("agent_failure_reason_without_dispatch_failure")
         if self.execution_status in {"not_started", "running"} and self.result_status is not None:
             raise ValueError("result_status_before_terminal_execution")
+        if self.execution_status in {"completed", "failed", "canceled"}:
+            if self.result_status is None:
+                raise ValueError("terminal_execution_result_status_required")
+        if self.execution_status == "completed" and self.result_status not in {
+            "success",
+            "partial",
+        }:
+            raise ValueError("completed_execution_result_status_invalid")
+        if self.execution_status == "failed" and self.result_status in {
+            "success",
+            "partial",
+        }:
+            raise ValueError("failed_execution_result_status_invalid")
         return self
 
 

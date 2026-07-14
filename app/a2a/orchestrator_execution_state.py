@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Mapping
+
 from pydantic import ValidationError
 
 from app.schemas.orchestrator_execution_state import (
@@ -243,6 +245,117 @@ def mark_task_running(
     )
 
 
+def mark_task_result(
+    state: OrchestratorExecutionState,
+    task_id: str,
+    *,
+    result_status: str,
+    output_artifact_refs: Mapping[str, str],
+    available_output_artifact_names: frozenset[str] = frozenset(),
+) -> OrchestratorExecutionState:
+    """Apply one validated terminal worker result to compact execution state."""
+    checked = _validated_copy(state)
+    current = checked.worker_tasks.get(task_id)
+    if current is None:
+        raise OrchestratorExecutionStateError("task_id_unknown")
+    productive = result_status in {"success", "partial"}
+    execution_status = "completed" if productive else "failed"
+    decision = checked.routing.decisions[current.routing_decision_id]
+    expected = set(decision.expected_output_artifact_names)
+    actual = set(output_artifact_refs)
+    if actual - expected:
+        raise OrchestratorExecutionStateError("task_result_output_unexpected")
+    if productive and actual != expected:
+        raise OrchestratorExecutionStateError("task_result_output_missing")
+    if productive and available_output_artifact_names != frozenset(actual):
+        raise OrchestratorExecutionStateError("task_result_output_not_available")
+    if not productive and available_output_artifact_names:
+        raise OrchestratorExecutionStateError("failed_task_output_available")
+
+    if current.execution_status in {"completed", "failed", "canceled"}:
+        if (
+            current.execution_status == execution_status
+            and current.result_status == result_status
+            and dict(current.output_artifact_refs) == dict(output_artifact_refs)
+        ):
+            return checked
+        raise OrchestratorExecutionStateError("task_terminal_result_conflict")
+    if current.dispatch_status != "dispatched" or current.execution_status not in {
+        "not_started",
+        "running",
+    }:
+        raise OrchestratorExecutionStateError("task_result_transition_invalid")
+
+    payload = checked.model_dump()
+    payload["worker_tasks"][task_id].update(
+        {
+            "execution_status": execution_status,
+            "result_status": result_status,
+            "output_artifact_refs": dict(output_artifact_refs),
+        }
+    )
+    decision_payload = payload["routing"]["decisions"][
+        current.routing_decision_id
+    ]
+    if productive:
+        decision_payload.update({"status": "completed", "blocking_reason": None})
+    elif result_status in {"blocked", "needs_user_input"}:
+        decision_payload.update(
+            {
+                "status": "blocked",
+                "blocking_reason": (
+                    "needs_user_input"
+                    if result_status == "needs_user_input"
+                    else "worker_failed"
+                ),
+            }
+        )
+    else:
+        decision_payload.update(
+            {"status": "failed", "blocking_reason": "worker_failed"}
+        )
+
+    for artifact_name in expected:
+        artifact = payload["artifacts"].get(artifact_name)
+        if artifact is None or artifact["producer_task_id"] != task_id:
+            raise OrchestratorExecutionStateError(
+                "task_result_artifact_identity_mismatch"
+            )
+        artifact.update(
+            {
+                "status": (
+                    "available"
+                    if artifact_name in available_output_artifact_names
+                    else "invalid"
+                ),
+                "artifact_id": output_artifact_refs.get(artifact_name),
+            }
+        )
+    try:
+        transitioned = OrchestratorExecutionState.model_validate(payload)
+    except ValidationError as exc:
+        raise OrchestratorExecutionStateError("task_result_state_invalid") from exc
+    aggregated = recompute_aggregate_state(transitioned)
+    result_received = aggregated.model_dump()
+    result_received["run_status"] = "running"
+    result_received["orchestrator"].update(
+        {
+            "status": "evaluating_results",
+            "next_wakeup_reason": "worker_result_received",
+        }
+    )
+    result_received["next_wakeup"] = {
+        "target": "orchestrator_loop",
+        "reason": "worker_result_received",
+    }
+    try:
+        return OrchestratorExecutionState.model_validate(result_received)
+    except ValidationError as exc:
+        raise OrchestratorExecutionStateError(
+            "task_result_received_state_invalid"
+        ) from exc
+
+
 def transition_task_lifecycle(
     state: OrchestratorExecutionState,
     task_id: str,
@@ -404,7 +517,6 @@ def recompute_aggregate_state(
         for task in tasks.values()
         if task["dispatch_status"] == "dispatch_failed"
     ]
-
     if eligible:
         run_status = "running"
         orchestrator_status = "dispatching"
@@ -423,12 +535,6 @@ def recompute_aggregate_state(
         wakeup = NextWakeupState(
             target="orchestrator_loop", reason="worker_result_received"
         )
-    elif dispatch_failures:
-        run_status = "running"
-        orchestrator_status = "evaluating_results"
-        wakeup = NextWakeupState(
-            target="orchestrator_loop", reason="dispatch_failed"
-        )
     elif checked.run_status == "completed":
         run_status = "completed"
         orchestrator_status = "completed"
@@ -439,6 +545,27 @@ def recompute_aggregate_state(
         run_status = "waiting_for_input"
         orchestrator_status = "planning"
         wakeup = NextWakeupState(target="user_input", reason="needs_user_input")
+    elif (
+        checked.run_status == "running"
+        and checked.orchestrator.status == "evaluating_results"
+        and checked.next_wakeup is not None
+        and checked.next_wakeup.target == "orchestrator_loop"
+        and checked.next_wakeup.reason == "worker_result_received"
+    ):
+        # This is an explicit result-received transition, not a state inferred
+        # from historical terminal tasks. A later Orchestrator loop may advance
+        # the top-level status without old tasks pulling it back here.
+        run_status = "running"
+        orchestrator_status = "evaluating_results"
+        wakeup = NextWakeupState(
+            target="orchestrator_loop", reason="worker_result_received"
+        )
+    elif dispatch_failures:
+        run_status = "running"
+        orchestrator_status = "evaluating_results"
+        wakeup = NextWakeupState(
+            target="orchestrator_loop", reason="dispatch_failed"
+        )
     elif checked.run_status == "failed" or (
         decisions and all(item["status"] in {"blocked", "failed"} for item in decisions.values())
     ):
@@ -476,6 +603,7 @@ __all__ = [
     "mark_task_dispatched",
     "mark_task_dispatching",
     "mark_task_running",
+    "mark_task_result",
     "recompute_aggregate_state",
     "transition_task_lifecycle",
 ]

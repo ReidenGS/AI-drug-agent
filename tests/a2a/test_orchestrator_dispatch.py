@@ -67,6 +67,9 @@ from app.a2a.orchestrator_execution_state import (
     execution_state_from_routing_result,
 )
 from app.a2a.orchestrator_routing_service import OrchestratorRoutingServiceResult
+from app.a2a.orchestrator_result_ingestion import (
+    ingest_orchestrator_worker_results,
+)
 from app.a2a.orchestrator_task_builder import (
     PreparedA2ATask,
     build_canonical_worker_execution_request,
@@ -1590,7 +1593,27 @@ async def test_real_routing_to_dispatch_to_step5_worker_and_compact_artifact_rec
         assert result.state.worker_tasks[task_id].dispatch_status == "dispatched"
         assert result.state.worker_tasks[task_id].execution_status == "not_started"
         assert "candidate_records" not in result.state.model_dump_json()
-        assert len(graph.inputs) == 2
+        ingested = await ingest_orchestrator_worker_results(
+            run_id=run_id,
+            dispatch_result=result,
+            discovery=discovery,
+            registry=registry_service,
+            storage=local_storage,
+            execution_graph=graph,
+            checkpoint_config=config,
+        )
+        assert ingested.state.worker_tasks[task_id].execution_status == "completed"
+        assert ingested.state.worker_tasks[task_id].result_status == "success"
+        assert ingested.state.artifacts["candidate_context_table"].status == (
+            "available"
+        )
+        assert set(ingested.completion_proofs) == {task_id}
+        assert ingested.receipts[0].tool_call_summary.model_dump() == expected
+        assert ingested.receipts[0].skipped_or_failed_tool_count == len(
+            compact["skipped_or_failed_tools"]
+        )
+        assert "candidate_records" not in ingested.state.model_dump_json()
+        assert len(graph.inputs) == 3
         assert list(saver.list(None))
     finally:
         server.shutdown()

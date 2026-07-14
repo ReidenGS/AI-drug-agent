@@ -380,7 +380,9 @@ async def test_core_result_model_construct_missing_identity_is_compact_failure()
 
 
 async def test_core_success_result_with_failed_execution_status_is_rejected():
-    bad = _valid_core_result(execution_status="failed")
+    # Deliberately bypass the now-strict shared result schema to prove the
+    # adapter still revalidates a malicious/buggy core object before emission.
+    bad = _valid_core_result().model_copy(update={"execution_status": "failed"})
     handle = _serve(_FakeWorkerCore(raw_return=bad))
     try:
         result = _result(await _send(handle.base_url, _task(_request())))

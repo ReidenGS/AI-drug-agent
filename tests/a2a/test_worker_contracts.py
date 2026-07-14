@@ -260,6 +260,90 @@ def test_safe_compact_summaries_still_pass():
     WorkerExecutionResult(**_result_kwargs(compact_summary=dict(safe)))
 
 
+@pytest.mark.parametrize("result_status", ["success", "partial"])
+def test_productive_result_requires_completed_and_no_error_code(result_status):
+    result = WorkerExecutionResult(
+        **_result_kwargs(result_status=result_status, error_code=None)
+    )
+    assert result.execution_status == "completed"
+    with pytest.raises(ValidationError):
+        WorkerExecutionResult(
+            **_result_kwargs(
+                result_status=result_status,
+                execution_status="failed",
+                error_code=None,
+            )
+        )
+    with pytest.raises(ValidationError):
+        WorkerExecutionResult(
+            **_result_kwargs(
+                result_status=result_status,
+                error_code="unexpected_success_error",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "result_status",
+    ["validation_failed", "tool_failed", "blocked", "needs_user_input"],
+)
+def test_terminal_failure_requires_failed_and_compact_error_code(result_status):
+    result = WorkerExecutionResult(
+        **_result_kwargs(
+            result_status=result_status,
+            execution_status="failed",
+            error_code="synthetic_worker_failure",
+        )
+    )
+    assert result.error_code == "synthetic_worker_failure"
+    with pytest.raises(ValidationError):
+        WorkerExecutionResult(
+            **_result_kwargs(
+                result_status=result_status,
+                execution_status="failed",
+                error_code=None,
+            )
+        )
+    with pytest.raises(ValidationError):
+        WorkerExecutionResult(
+            **_result_kwargs(
+                result_status=result_status,
+                execution_status="completed",
+                error_code="synthetic_worker_failure",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    ["UPPER_CASE", "contains-dash", "contains space", "_leading_underscore"],
+)
+def test_worker_result_rejects_non_snake_case_error_code(error_code):
+    with pytest.raises(ValidationError):
+        WorkerExecutionResult(
+            **_result_kwargs(
+                result_status="tool_failed",
+                execution_status="failed",
+                error_code=error_code,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["attempted", "success", "failed", "dependency_unavailable", "skipped"],
+)
+def test_tool_call_summary_rejects_negative_counts(field):
+    with pytest.raises(ValidationError):
+        ToolCallSummary(**{field: -1})
+
+
+def test_tool_call_summary_is_frozen():
+    summary = ToolCallSummary(attempted=1, success=1)
+    with pytest.raises(ValidationError):
+        summary.success = 2
+
+
 def test_worker_status_summary_defaults_and_forbid():
     summ = WorkerStatusSummary(agent_id="step_06_developability_agent")
     assert summ.availability == "available"
