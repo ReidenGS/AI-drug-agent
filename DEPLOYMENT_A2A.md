@@ -1,23 +1,50 @@
-# Multi-Agent A2A v1 — Docker Compose deployment (Turn E)
+# Multi-Agent A2A v1 — production Orchestrator deployment (Turn G)
 
-Single-server Docker Compose skeleton for the four business services. This turn
-only brings the HTTP services + internal DNS up. It does **not** wire discovery
-into startup, does **not** dispatch A2A tasks, and adds **no** database / vector
-store / Mem0 service.
+Single-server Docker Compose topology for the FastAPI Orchestrator and three
+HTTP A2A workers. Step 4 performs run-scoped discovery, validated routing,
+durable Postgres checkpointing, HTTP dispatch, ingestion, retry and resume. The
+stack itself still creates no database, vector store, or Mem0 service.
+
+## Production Step 4 lifecycle and API
+
+FastAPI lifespan owns one `OrchestratorPostgresCheckpointRuntime` per backend
+process. `LANGGRAPH_CHECKPOINT_DATABASE_URL` must name an externally managed
+Postgres database. Startup/migration failure aborts startup; there is no
+InMemory or direct-call fallback. Shutdown closes the runtime.
+Mutating execute/resume calls also take a run-scoped Postgres advisory lock;
+a competing backend fails compactly instead of planning or dispatching the same
+run twice. Status is read-only and may inspect the latest durable checkpoint.
+
+The production endpoints are:
+
+- `POST /runs/{run_id}/steps/4/execute`: plan a fresh run, or resume when a
+  checkpoint already exists.
+- `POST /runs/{run_id}/steps/4/resume`: explicitly resume/reconcile an existing
+  checkpoint.
+- `GET /runs/{run_id}/steps/4/status`: read the durable compact state without
+  worker discovery or dispatch.
+
+Responses contain compact identities, statuses/counts, next wakeup and safe
+artifact refs only. They never contain endpoints, Task/request/result bodies,
+completion proofs, storage paths, artifact bodies, prompts, or credentials.
+Worker execution remains exclusively `A2AClient -> HTTP A2AServer -> worker
+core`; the legacy serial graph is not this API's execution path.
 
 ## Services
 
 | Service            | Command                                  | Internal port | Host port                          |
 | ------------------ | ---------------------------------------- | ------------- | ---------------------------------- |
-| `orchestrator`     | `uvicorn app.main:app --port 8000`       | 8000          | `${ORCHESTRATOR_HOST_PORT:-18080}` |
-| `step5-worker`     | `python -m app.a2a.step5_worker_main`    | 8005 (expose) | none (internal only)               |
-| `step6-worker`     | `python -m app.a2a.step6_worker_main`    | 8006 (expose) | none (internal only)               |
-| `structure-worker` | `python -m app.a2a.structure_worker_main`| 8009 (expose) | none (internal only)               |
+| `orchestrator`                       | `uvicorn app.main:app --port 8000`        | 8000          | `${ORCHESTRATOR_HOST_PORT:-18080}` |
+| `step5-context-agent`                | `python -m app.a2a.step5_worker_main`     | 8005 (expose) | none (internal only)               |
+| `step6-developability-agent`         | `python -m app.a2a.step6_worker_main`     | 8006 (expose) | none (internal only)               |
+| `step7-9-structure-design-agent`     | `python -m app.a2a.structure_worker_main` | 8009 (expose) | none (internal only)               |
 
-- Service names are fixed (`orchestrator`, `step5-worker`, `step6-worker`,
-  `structure-worker`) because Turn D discovery defaults resolve these Docker DNS
-  names: `http://step5-worker:8005`, `http://step6-worker:8006`,
-  `http://structure-worker:8009`.
+- Each service key is also its explicit `container_name` and Docker DNS name:
+  `orchestrator`, `step5-context-agent`, `step6-developability-agent`, and
+  `step7-9-structure-design-agent`. Turn D discovery defaults therefore resolve
+  `http://step5-context-agent:8005`,
+  `http://step6-developability-agent:8006`, and
+  `http://step7-9-structure-design-agent:8009`.
 - Network logical key: `adc_a2a_net` (bridge). Compose creates a project-scoped
   resource such as `synagentics-a2a-v1_adc_a2a_net`; no global `name` override
   bypasses project isolation. Workers are reachable only inside it.
@@ -93,21 +120,92 @@ finite retry policy is retained rather than masking dependency failures.
 
 ## Explicit LLM and MCP live-mode selection
 
-Compose has no silent mock/offline default. Every deployment command must set:
+Compose has no silent mock/offline or worker-timeout default. Every deployment
+command must set:
 
 - `LLM_PROVIDER` — explicitly choose `gemini`, `openai`, `qwen`, or a deliberate
   `mock` test/development mode.
 - `MCP_LIVE_TOOLS` — explicitly choose `true` or `false`.
+- `ORCHESTRATOR_WORKER_TIMEOUT_SECONDS` — a finite positive transport budget
+  selected from the deployed worker SLA.
+- `LANGGRAPH_CHECKPOINT_DATABASE_URL` — the external Postgres checkpoint DSN.
 
 Do not put credentials in Compose or this document. Supply provider credentials
 through the deployment environment/secret mechanism. A discovery-only smoke may
 temporarily use `LLM_PROVIDER=mock MCP_LIVE_TOOLS=false`; that smoke must not send
 an A2A task or execute worker business logic, LLM, MCP, or biomedical tools.
 
+### Real OpenAI GPT-5.5 deployment
+
+Real OpenAI deployments add the provider-specific secret overlay rather than
+putting `OPENAI_API_KEY` in a service environment or copying `.env` into the
+image. Configure these values explicitly in the host deployment environment:
+
+- `LLM_PROVIDER=openai`
+- `OPENAI_MODEL=gpt-5.5`
+- `OPENAI_API_KEY` (host secret consumed by Docker Compose)
+- `LANGGRAPH_CHECKPOINT_DATABASE_URL`
+- `ORCHESTRATOR_WORKER_TIMEOUT_SECONDS`
+- `MCP_LIVE_TOOLS`
+
+Then run both Compose files:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.openai.yml \
+  -p synagentics-a2a-v1 \
+  up -d --build
+```
+
+The overlay declares `openai_api_key` from the host `OPENAI_API_KEY` and mounts
+that same secret into all four services. Containers receive only
+`OPENAI_API_KEY_FILE=/run/secrets/openai_api_key`; the key value is not a
+container environment variable. Application resolution keeps a non-empty
+direct `OPENAI_API_KEY` first for existing host workflows, otherwise reads and
+strips `OPENAI_API_KEY_FILE`, and fails closed if neither yields a key.
+
+For the first real LLM smoke, use `MCP_LIVE_TOOLS=false`. That disables live MCP
+tool calls only: the Orchestrator, Step 5, Step 6, and Step 7–9 worker LLM
+providers are still real GPT-5.5 through `OpenAIProvider`, not
+`MockLLMProvider`. This is not evidence of live MCP or ToolUniverse execution.
+
+### Live NVIDIA NIM and ESM Forge credentials
+
+Live Structure/Design MCP tools require a third, least-privilege overlay. Set
+`MCP_LIVE_TOOLS=true` and the host environment variable names
+`NVIDIA_API_KEY` and `ESM_API_KEY`, then combine all three Compose files:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.openai.yml \
+  -f docker-compose.live-tools.yml \
+  -p synagentics-a2a-v1 \
+  up -d --build
+```
+
+`docker-compose.live-tools.yml` converts those two host values into Docker
+secrets mounted only in `step7-9-structure-design-agent`. Its container
+environment contains only `NVIDIA_API_KEY_FILE=/run/secrets/nvidia_api_key` and
+`ESM_API_KEY_FILE=/run/secrets/esm_api_key`, never either key value. The
+Orchestrator, Step 5, and Step 6 receive neither secret. The base Compose file
+and the OpenAI-only overlay remain independently usable without these live-tool
+credentials.
+
+At runtime an already-set process credential wins; otherwise Settings resolves
+the corresponding direct value and then the secret file. An explicitly
+configured unreadable or empty file fails closed. If neither source is
+configured, the resolver returns empty so the tool retains its existing
+missing-credential/dependency-unavailable result; it does not manufacture an
+offline or mocked success.
+
 ## Shared artifact / registry / workflow state
 
-There is no database. `ArtifactRegistryService` and `WorkflowStateService` both
-use the shared `Storage`. All four services therefore see the same run artifacts:
+The external Postgres database stores compact LangGraph checkpoints only; it is
+not an artifact database. `ArtifactRegistryService` and `WorkflowStateService`
+both use the shared `Storage`. All four services therefore see the same run
+artifacts:
 
 - `STORAGE_MODE=local`: the logical volume `adc_local_store` is mounted at
   `/data/localstore` in all four services, with
@@ -139,10 +237,16 @@ compose `depends_on`.
 ```bash
 # Isolated project name so this stack never touches Dify/RAGFlow.
 LLM_PROVIDER=<explicit-provider> MCP_LIVE_TOOLS=<true-or-false> \
+  ORCHESTRATOR_WORKER_TIMEOUT_SECONDS=<finite-sla-seconds> \
+  LANGGRAPH_CHECKPOINT_DATABASE_URL=<external-postgres-dsn> \
   docker compose -p synagentics-a2a-v1 up -d --build
 LLM_PROVIDER=<explicit-provider> MCP_LIVE_TOOLS=<true-or-false> \
+  ORCHESTRATOR_WORKER_TIMEOUT_SECONDS=<finite-sla-seconds> \
+  LANGGRAPH_CHECKPOINT_DATABASE_URL=<external-postgres-dsn> \
   docker compose -p synagentics-a2a-v1 ps
 LLM_PROVIDER=<explicit-provider> MCP_LIVE_TOOLS=<true-or-false> \
+  ORCHESTRATOR_WORKER_TIMEOUT_SECONDS=<finite-sla-seconds> \
+  LANGGRAPH_CHECKPOINT_DATABASE_URL=<external-postgres-dsn> \
   docker compose -p synagentics-a2a-v1 logs --no-color
 ```
 
@@ -150,10 +254,11 @@ Do not run `down -v` as part of an audit unless the owner explicitly authorizes
 resource deletion. Older fixed global resources from an earlier smoke may still
 exist and should only be reported, not removed automatically.
 
-## Mem0 and PostgreSQL/pgvector — NOT in Turn E
+## Mem0 and application PostgreSQL/pgvector — not added
 
-Mem0 and PostgreSQL/pgvector are **not deployed or integrated in Turn E.**
-The future memory service will be added in a separate implementation turn.
+Mem0 and an application PostgreSQL/pgvector service are not deployed here. The
+external LangGraph Postgres checkpointer is integrated, but it stores compact
+runtime checkpoints only. A future memory service remains a separate turn.
 Mem0 will not be the artifact store or routing authority.
 
 Future memory-service boundary (for reference only — nothing below is created,
@@ -163,15 +268,18 @@ assumed, or depended on by this compose stack):
 - future internal URL example: `http://mem0:8010`
 - future deployment must use PostgreSQL/pgvector
 - the future database design must be reviewed separately
-- the current compose stack provides and assumes **no** database
+- the current compose stack creates **no** database service
+- the Orchestrator requires its explicitly configured external checkpoint DB
 - the current orchestrator and workers do **not** depend on Mem0
 - artifact / workflow state continues to use the shared `LocalStorage` or
   `S3Storage`, unchanged
 
-## Turn E boundaries
+## Turn G boundaries
 
-- No Step 4 LLM routing, no A2A task dispatch, no `send_task_async`.
-- Discovery is not wired into startup/lifespan and `discover_for_run` is not
-  auto-called.
+- Step 4 discovery is run-scoped, not an application-startup network probe.
+- Eligible business tasks use HTTP A2A dispatch; no worker domain method is
+  called directly.
+- No natural-language Final Response Agent is added; terminal API outcomes are
+  compact state only.
 - No change to MCP scope, ToolUniverse inventory, registry, or tool names.
-- No new database, vector store, or Mem0 service.
+- No Mem0, vector store, or Compose-managed database service.

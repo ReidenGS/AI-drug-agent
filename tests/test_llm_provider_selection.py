@@ -155,12 +155,75 @@ def test_openai_case_variants_all_select_openai(monkeypatch, raw_value):
 def test_explicit_openai_requires_key(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "openai")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    with pytest.raises(ValueError) as excinfo:
+    monkeypatch.delenv("OPENAI_API_KEY_FILE", raising=False)
+    with pytest.raises(ValueError, match="^openai_api_key_required$") as excinfo:
         deps.get_llm_provider()
     msg = str(excinfo.value)
-    assert "OPENAI_API_KEY" in msg
     # No key material leakage in the error.
     assert "sk-" not in msg
+
+
+def test_openai_secret_file_constructs_provider_without_request(
+    monkeypatch, tmp_path
+):
+    key_file = tmp_path / "openai-secret"
+    key_file.write_text("  sk-test-file-sentinel  ")
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    monkeypatch.setenv("OPENAI_API_KEY_FILE", str(key_file))
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-5.5")
+
+    provider = deps.get_llm_provider()
+
+    assert isinstance(provider, OpenAIProvider)
+    assert provider.api_key == "sk-test-file-sentinel"
+    assert provider.model == "gpt-5.5"
+    assert provider._client is None
+
+
+def test_openai_direct_key_takes_precedence_over_secret_file(
+    monkeypatch, tmp_path
+):
+    key_file = tmp_path / "openai-secret"
+    key_file.write_text("sk-test-file-not-selected")
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "  sk-test-direct-selected  ")
+    monkeypatch.setenv("OPENAI_API_KEY_FILE", str(key_file))
+
+    provider = deps.get_llm_provider()
+
+    assert isinstance(provider, OpenAIProvider)
+    assert provider.api_key == "sk-test-direct-selected"
+    assert provider._client is None
+
+
+@pytest.mark.parametrize(
+    ("kind", "error_code"),
+    [
+        ("missing", "openai_api_key_file_unreadable"),
+        ("unreadable", "openai_api_key_file_unreadable"),
+        ("empty", "openai_api_key_file_empty"),
+    ],
+)
+def test_openai_secret_file_failures_are_compact(
+    monkeypatch, tmp_path, kind, error_code
+):
+    secret_path = tmp_path / "private-path-sentinel"
+    if kind == "unreadable":
+        secret_path.mkdir()
+    elif kind == "empty":
+        secret_path.write_text("  \n")
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    monkeypatch.setenv("OPENAI_API_KEY_FILE", str(secret_path))
+
+    with pytest.raises(ValueError, match=f"^{error_code}$") as caught:
+        deps.get_llm_provider()
+
+    for rendered in (str(caught.value), repr(caught.value), repr(caught.value.args)):
+        assert "private-path-sentinel" not in rendered
+        assert str(tmp_path) not in rendered
+        assert "sk-" not in rendered
 
 
 def test_openai_api_key_alone_does_not_select_openai(monkeypatch):

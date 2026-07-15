@@ -599,6 +599,10 @@ def test_step6_uploaded_structure_ref_cannot_satisfy_pdb_id_only_structure_tools
         captured["proteinsplus"] = dict(kw)
         return {"status": "mocked", "quality": "ok"}
 
+    def _pisa(**kw):
+        captured["pisa"] = dict(kw)
+        return {"status": "mocked", "interfaces": []}
+
     from app.agents import step_06_schema_mapping_selector as selector
     def _signature_schema_for(tool_name: str) -> dict:
         return {
@@ -617,7 +621,7 @@ def test_step6_uploaded_structure_ref_cannot_satisfy_pdb_id_only_structure_tools
         storage=local_storage, registry=registry_service,
         workflow_state=workflow_state_service,
         mcp_client=LocalMCPClient(bindings={
-            "PDBePISA_get_interfaces": lambda **_kw: {"status": "mocked", "interfaces": []},
+            "PDBePISA_get_interfaces": _pisa,
             "ProteinsPlus_profile_structure_quality": _proteinsplus,
         }),
         llm=_StructureLLM(),
@@ -631,7 +635,21 @@ def test_step6_uploaded_structure_ref_cannot_satisfy_pdb_id_only_structure_tools
     tool_status = {tc["tool_name"]: tc["run_status"] for tc in lane["tool_call_records"]}
     assert tool_status["PDBePISA_get_interfaces"] == "skipped"
     assert tool_status["ProteinsPlus_profile_structure_quality"] == "skipped"
+    assert lane["input_status"] == "insufficient"
+    assert lane["assessment_status"] == "not_assessed_missing_input"
+    assert lane["risk_label"] == "not_assessed"
+    assert "typed or invokable input" in lane["not_assessed_reason"]
+    assert lane["missing_or_unassessed_items"]
+    typed_gap = lane["missing_or_unassessed_items"][0]
+    assert typed_gap["item"] == "required typed tool input"
+    assert typed_gap["missing_field_names"]
+    for tool_call in lane["tool_call_records"]:
+        input_summary = tool_call["tool_input_summary"]
+        assert input_summary["missing_required_fields"]
+        assert "runtime_resolver_audit" in input_summary
     assert "proteinsplus" not in captured
+    assert "pisa" not in captured
+    assert persisted["prefilter_status"] == "completed_with_missing_lanes"
     summary = persisted["selection_audit"]
     assert "PDBePISA_get_interfaces" in summary["step_06_stage2_uninvokable_tools"]
     assert "ProteinsPlus_profile_structure_quality" in summary["step_06_stage2_uninvokable_tools"]
@@ -1492,7 +1510,8 @@ def test_step6_stage2_payload_isolation_via_direct_policy_call():
             return {"run_status": "success", "payload": {}}
 
     class _LLM:
-        name = "x"; model = "x"
+        name = "x"
+        model = "x"
         def __init__(self) -> None:
             self.calls: list[dict] = []
         def generate(self, *_a, **_kw):

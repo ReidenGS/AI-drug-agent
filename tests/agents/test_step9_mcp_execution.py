@@ -392,6 +392,80 @@ class _Step9EsmScoreLLM:
         return {}
 
 
+def test_alphamissense_live_output_ref_contains_compact_normalization_only_in_audit(
+    local_storage,
+    registry_service,
+    workflow_state_service,
+    install_fake_universe,
+    enable_live,
+):
+    from tests.agents.test_structure_and_design_agent import (
+        _Step9RuntimePlannerLLM,
+    )
+
+    raw_sentinel = "RAW_ALPHAMISSENSE_RESPONSE_PRIVATE"
+    run_id = _seed(local_storage, registry_service, workflow_state_service)
+    candidate_id = _target_candidate_id(local_storage, run_id)
+    _add_uniprot_variant(local_storage, run_id, candidate_id)
+    fake = install_fake_universe(
+        tools={
+            "AlphaMissense_get_variant_score": lambda _args: {
+                "data": {
+                    "raw_response": {
+                        "uid": "P04626",
+                        "aa": "V",
+                        "resi": 777,
+                        "benign_all": "1:I",
+                        "ambiguous_all": None,
+                        "pathogenic_all": "2:A,L",
+                        "mean": 0.9,
+                        "mean_all": 0.91,
+                        "audit_sentinel": raw_sentinel,
+                    }
+                }
+            }
+        }
+    )
+    enable_live("AlphaMissense_get_variant_score")
+
+    artifact = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+        llm=_Step9RuntimePlannerLLM(),
+    ).run_step_9(run_id)
+
+    assert len(fake.calls) == 1
+    assert artifact.compound_hits == []
+    assert artifact.step9_runtime_executed_tools == [
+        "AlphaMissense_get_variant_score"
+    ]
+    tc = artifact.tool_call_records[0]
+    assert tc.run_status == "success"
+    assert tc.tool_output_ref is not None
+    stored = local_storage.read_json(tc.tool_output_ref)
+    output = stored["output"]
+    assert output["normalization_status"] == "normalized"
+    assert output["normalized_result"]["variant"] == "V777L"
+    assert output["normalized_result"]["classification"] == "pathogenic"
+    assert output["normalized_result"]["pathogenicity_score"] is None
+    assert output["payload"]["data"]["raw_response"]["audit_sentinel"] == (
+        raw_sentinel
+    )
+
+    artifact_blob = json.dumps(artifact.model_dump())
+    input_summary_blob = json.dumps(tc.tool_input_summary)
+    persisted_artifact = local_storage.read_json(
+        local_storage.run_key(run_id, "compound_screening_artifact.json")
+    )
+    persisted_blob = json.dumps(persisted_artifact)
+    for forbidden in (raw_sentinel, "raw_response", "pathogenic_all"):
+        assert forbidden not in artifact_blob
+        assert forbidden not in input_summary_blob
+        assert forbidden not in persisted_blob
+
+
 def test_selected_mapped_resolved_proteinmpnn_executes_once_with_real_kwargs(
     local_storage, registry_service, workflow_state_service, install_fake_universe, enable_live
 ):

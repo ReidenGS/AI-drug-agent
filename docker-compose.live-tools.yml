@@ -1,0 +1,16 @@
+# Provider-specific secret overlay for live NVIDIA NIM and ESM Forge tools.
+# Least privilege: only the Step 7-9 Structure/Design worker receives them.
+services:
+  step7-9-structure-design-agent:
+    environment:
+      NVIDIA_API_KEY_FILE: /run/secrets/nvidia_api_key
+      ESM_API_KEY_FILE: /run/secrets/esm_api_key
+    secrets:
+      - nvidia_api_key
+      - esm_api_key
+
+secrets:
+  nvidia_api_key:
+    environment: NVIDIA_API_KEY
+  esm_api_key:
+    environment: ESM_API_KEY

@@ -145,6 +145,8 @@ def _serve(worker_type, app_factory, *, storage, registry, workflow, mcp):
             hits["health"] += 1
         elif request.path in {"/tasks/send", "/a2a/tasks/send"}:
             hits["task"] += 1
+        elif request.path in {"/tasks/get", "/a2a/tasks/get"}:
+            hits["get_task"] += 1
 
     httpd = make_server("127.0.0.1", port, app, threaded=True)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -449,6 +451,28 @@ async def test_real_three_worker_http_parallel_smoke_without_retry(local_storage
             "step9_stage2_uninvokable_tool_details", []
         ),
         "step9_executed_tools": audit.get("step9_runtime_executed_tools", []),
+        "step9_schema_sources": [
+            {
+                "tool_name": item.get("tool_name"),
+                "schema_source": item.get("schema_source"),
+            }
+            for item in audit.get("step9_tool_schema_requirements", [])
+        ],
+        "step9_mapping_execution_boundary": [
+            {
+                "tool_name": item.get("tool_name"),
+                "can_invoke": item.get("can_invoke"),
+                "argument_mapping_count": len(
+                    item.get("argument_mappings") or []
+                ),
+                "argument_literal_count": len(
+                    item.get("argument_literals") or []
+                ),
+                "executed": item.get("tool_name")
+                in set(audit.get("step9_runtime_executed_tools", [])),
+            }
+            for item in audit.get("step9_stage2_mapped_tools", [])
+        ],
         "test_only_mocked_local_bindings": sorted(
             {
                 "SAbDab_search_structures",

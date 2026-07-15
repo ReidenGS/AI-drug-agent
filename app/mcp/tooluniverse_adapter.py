@@ -282,6 +282,8 @@ def _bounded_live_call(timeout_seconds: float):
 
 def _hydrate_env_from_settings() -> None:
     """Bridge selected `Settings` fields into `os.environ` for ToolUniverse."""
+    from ..secret_resolver import resolve_optional_secret
+
     try:
         from ..settings import get_settings
 
@@ -294,13 +296,33 @@ def _hydrate_env_from_settings() -> None:
         ("gemini_api_key", "GEMINI_API_KEY"),
         ("gemini_model", "GEMINI_MODEL_ID"),
         ("gemini_model", "TOOLUNIVERSE_LLM_MODEL_DEFAULT"),
-        ("nvidia_api_key", "NVIDIA_API_KEY"),
-        ("esm_api_key", "ESM_API_KEY"),
     )
     for attr, env_name in bridges:
         if os.environ.get(env_name):
             continue  # operator-set env always wins
         value = getattr(settings, attr, "") or ""
+        if value:
+            os.environ[env_name] = value
+
+    # Operator-set process environment always wins. Otherwise resolve the
+    # Settings direct/file pair. Explicit unreadable/empty files intentionally
+    # propagate a compact error instead of degrading to an offline success.
+    for attr, file_attr, env_name, secret_name in (
+        (
+            "nvidia_api_key",
+            "nvidia_api_key_file",
+            "NVIDIA_API_KEY",
+            "nvidia_api_key",
+        ),
+        ("esm_api_key", "esm_api_key_file", "ESM_API_KEY", "esm_api_key"),
+    ):
+        if os.environ.get(env_name):
+            continue
+        value = resolve_optional_secret(
+            direct_value=getattr(settings, attr, ""),
+            file_path=getattr(settings, file_attr, None),
+            secret_name=secret_name,
+        )
         if value:
             os.environ[env_name] = value
 

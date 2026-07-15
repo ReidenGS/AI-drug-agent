@@ -27,14 +27,26 @@ import pytest
 import yaml
 
 from app.a2a.worker_server import effective_url_port
+from app.settings import Settings
 
 _EXEC_DIR = Path(__file__).resolve().parents[2]
 _COMPOSE = _EXEC_DIR / "docker-compose.yml"
+_OPENAI_COMPOSE = _EXEC_DIR / "docker-compose.openai.yml"
+_LIVE_TOOLS_COMPOSE = _EXEC_DIR / "docker-compose.live-tools.yml"
 _DOCKERFILE = _EXEC_DIR / "Dockerfile"
 _DOCKERIGNORE = _EXEC_DIR / ".dockerignore"
 
-_BUSINESS_SERVICES = {"orchestrator", "step5-worker", "step6-worker", "structure-worker"}
-_WORKERS = {"step5-worker", "step6-worker", "structure-worker"}
+_BUSINESS_SERVICES = {
+    "orchestrator",
+    "step5-context-agent",
+    "step6-developability-agent",
+    "step7-9-structure-design-agent",
+}
+_WORKERS = {
+    "step5-context-agent",
+    "step6-developability-agent",
+    "step7-9-structure-design-agent",
+}
 _INVENTORY_CONTAINER_PATH = "/opt/adc/inventory/ToolUniversity_inventory_v0.2.xlsx"
 _STORAGE_ROOT = "/data/localstore"
 
@@ -71,6 +83,10 @@ def _volume_pairs(service: dict) -> list[tuple[str, str]]:
 # ── 1. service names ─────────────────────────────────────────────────────────
 def test_exact_four_business_services(compose):
     assert set(compose["services"]) == _BUSINESS_SERVICES
+    assert {
+        name: service["container_name"]
+        for name, service in compose["services"].items()
+    } == {name: name for name in _BUSINESS_SERVICES}
 
 
 # ── 2-4. no mem0 / postgres / pgvector / vector db ───────────────────────────
@@ -112,9 +128,9 @@ def test_workers_use_expose_no_host_ports(compose):
         assert "ports" not in svc, f"{name} must not publish host ports"
         assert svc.get("expose"), f"{name} must declare internal expose"
     # exact expose ports
-    assert compose["services"]["step5-worker"]["expose"] == ["8005"]
-    assert compose["services"]["step6-worker"]["expose"] == ["8006"]
-    assert compose["services"]["structure-worker"]["expose"] == ["8009"]
+    assert compose["services"]["step5-context-agent"]["expose"] == ["8005"]
+    assert compose["services"]["step6-developability-agent"]["expose"] == ["8006"]
+    assert compose["services"]["step7-9-structure-design-agent"]["expose"] == ["8009"]
 
 
 def test_only_orchestrator_maps_a_host_port(compose):
@@ -129,9 +145,32 @@ def test_only_orchestrator_maps_a_host_port(compose):
 # ── 6. orchestrator points at Docker-internal worker URLs ────────────────────
 def test_orchestrator_internal_worker_urls(compose):
     env = _env(compose["services"]["orchestrator"])
-    assert env["STEP5_WORKER_URL"] == "http://step5-worker:8005"
-    assert env["STEP6_WORKER_URL"] == "http://step6-worker:8006"
-    assert env["STRUCTURE_WORKER_URL"] == "http://structure-worker:8009"
+    assert env["STEP5_WORKER_URL"] == "http://step5-context-agent:8005"
+    assert env["STEP6_WORKER_URL"] == "http://step6-developability-agent:8006"
+    assert env["STRUCTURE_WORKER_URL"] == (
+        "http://step7-9-structure-design-agent:8009"
+    )
+    assert "must be set explicitly" in env[
+        "LANGGRAPH_CHECKPOINT_DATABASE_URL"
+    ]
+    assert "must be set explicitly" in env[
+        "ORCHESTRATOR_WORKER_TIMEOUT_SECONDS"
+    ]
+
+
+def test_default_settings_use_production_container_dns_names(monkeypatch):
+    for name in (
+        "STEP5_WORKER_URL",
+        "STEP6_WORKER_URL",
+        "STRUCTURE_WORKER_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.step5_worker_url == "http://step5-context-agent:8005"
+    assert settings.step6_worker_url == "http://step6-developability-agent:8006"
+    assert settings.structure_worker_url == (
+        "http://step7-9-structure-design-agent:8009"
+    )
 
 
 # ── 7-8. shared artifact volume + identical LOCAL_STORAGE_ROOT ────────────────
@@ -197,6 +236,33 @@ def test_dockerfile_has_no_credentials_and_uses_supported_runtime():
     assert "vendor/wheels" not in text
     for other_a2a in ("a2a-sdk", "google-a2a", "pip install a2a"):
         assert other_a2a not in low
+
+
+def test_application_source_does_not_invalidate_dependency_layer():
+    text = _DOCKERFILE.read_text()
+    dependency_install = text.index("'.[deployment,admet]'")
+    dependency_guard = text.index("python /tmp/check_cpu_dependencies.py")
+    app_copy = text.index("COPY app ./app")
+    full_build_tools_copy = text.index("COPY build_tools ./build_tools")
+
+    assert text.count("COPY app ./app") == 1
+    assert text.count("COPY build_tools ./build_tools") == 1
+    assert "COPY . ." not in text
+    assert dependency_install < dependency_guard < app_copy
+    assert dependency_guard < full_build_tools_copy
+    assert text.rindex("python -m pip install") < app_copy
+    assert "COPY pyproject.toml ./" in text[:dependency_install]
+    assert "COPY app ./app" not in text[:dependency_install]
+    assert "COPY build_tools ./build_tools" not in text[:dependency_install]
+    assert "--mount=type=cache,id=synagentics-pip-cache" in text
+    assert "target=/root/.cache/pip,sharing=locked" in text
+    assert "PIP_NO_CACHE_DIR" not in text
+    assert "--no-cache-dir" not in text
+
+
+def test_openai_sdk_is_a_direct_pinned_project_dependency():
+    pyproject = (_EXEC_DIR / "pyproject.toml").read_text()
+    assert pyproject.count('"openai==2.45.0"') == 1
 
 
 def test_deployment_python_and_esm_source_are_documented_and_unique():
@@ -290,9 +356,9 @@ def test_worker_entrypoints_do_not_call_domain_agents_or_scan_ports():
 
 def test_compose_advertised_url_matches_worker_bind_port(compose):
     for name, url_key in (
-        ("step5-worker", "STEP5_WORKER_URL"),
-        ("step6-worker", "STEP6_WORKER_URL"),
-        ("structure-worker", "STRUCTURE_WORKER_URL"),
+        ("step5-context-agent", "STEP5_WORKER_URL"),
+        ("step6-developability-agent", "STEP6_WORKER_URL"),
+        ("step7-9-structure-design-agent", "STRUCTURE_WORKER_URL"),
     ):
         env = _env(compose["services"][name])
         advertised = env[url_key]
@@ -303,9 +369,17 @@ def test_compose_advertised_url_matches_worker_bind_port(compose):
 
 def test_worker_commands_use_module_entrypoints_not_inline_python(compose):
     expected = {
-        "step5-worker": ["python", "-m", "app.a2a.step5_worker_main"],
-        "step6-worker": ["python", "-m", "app.a2a.step6_worker_main"],
-        "structure-worker": ["python", "-m", "app.a2a.structure_worker_main"],
+        "step5-context-agent": ["python", "-m", "app.a2a.step5_worker_main"],
+        "step6-developability-agent": [
+            "python",
+            "-m",
+            "app.a2a.step6_worker_main",
+        ],
+        "step7-9-structure-design-agent": [
+            "python",
+            "-m",
+            "app.a2a.structure_worker_main",
+        ],
     }
     for name, cmd in expected.items():
         got = compose["services"][name]["command"]
@@ -334,17 +408,17 @@ def test_no_mock_success_or_validation_bypass_config(compose_text):
 
 def test_worker_healthchecks_use_exact_identity_module(compose):
     expected = {
-        "step5-worker": (
+        "step5-context-agent": (
             "http://127.0.0.1:8005/health",
             "step_05_candidate_context_agent",
             "step_05_candidate_context",
         ),
-        "step6-worker": (
+        "step6-developability-agent": (
             "http://127.0.0.1:8006/health",
             "step_06_developability_agent",
             "step_06_developability",
         ),
-        "structure-worker": (
+        "step7-9-structure-design-agent": (
             "http://127.0.0.1:8009/health",
             "structure_and_design_agent",
             "structure_design_workflow",
@@ -371,6 +445,9 @@ def _compose_env(*, explicit_modes: bool) -> dict[str, str]:
     env.pop("LLM_PROVIDER", None)
     env.pop("MCP_LIVE_TOOLS", None)
     env.pop("LANGGRAPH_CHECKPOINT_DATABASE_URL", None)
+    env.pop("ORCHESTRATOR_WORKER_TIMEOUT_SECONDS", None)
+    env.pop("OPENAI_API_KEY", None)
+    env.pop("OPENAI_MODEL", None)
     if explicit_modes:
         env["LLM_PROVIDER"] = "mock"
         env["MCP_LIVE_TOOLS"] = "false"
@@ -378,6 +455,23 @@ def _compose_env(*, explicit_modes: bool) -> dict[str, str]:
         env["LANGGRAPH_CHECKPOINT_DATABASE_URL"] = (
             "postgresql://checkpoint_user:test-only@checkpoint-db/adc_checkpoint"
         )
+        env["ORCHESTRATOR_WORKER_TIMEOUT_SECONDS"] = "60"
+    return env
+
+
+def _openai_compose_env() -> dict[str, str]:
+    env = _compose_env(explicit_modes=True)
+    env["LLM_PROVIDER"] = "openai"
+    env["OPENAI_MODEL"] = "gpt-5.5"
+    env["OPENAI_API_KEY"] = "sk-fake-compose-sentinel"
+    return env
+
+
+def _live_tools_compose_env() -> dict[str, str]:
+    env = _openai_compose_env()
+    env["MCP_LIVE_TOOLS"] = "true"
+    env["NVIDIA_API_KEY"] = "fake-nvidia-compose-sentinel"
+    env["ESM_API_KEY"] = "fake-esm-compose-sentinel"
     return env
 
 
@@ -404,6 +498,25 @@ def test_docker_compose_config_is_valid_with_explicit_modes():
     )
     assert result.returncode == 0, f"docker compose config failed:\n{result.stderr}"
     resolved = yaml.safe_load(result.stdout)
+    assert set(resolved["services"]) == _BUSINESS_SERVICES
+    assert {
+        name: service["container_name"]
+        for name, service in resolved["services"].items()
+    } == {name: name for name in _BUSINESS_SERVICES}
+    orchestrator_env = resolved["services"]["orchestrator"]["environment"]
+    assert orchestrator_env["STEP5_WORKER_URL"] == (
+        "http://step5-context-agent:8005"
+    )
+    assert orchestrator_env["STEP6_WORKER_URL"] == (
+        "http://step6-developability-agent:8006"
+    )
+    assert orchestrator_env["STRUCTURE_WORKER_URL"] == (
+        "http://step7-9-structure-design-agent:8009"
+    )
+    assert "ports" in resolved["services"]["orchestrator"]
+    for name in _WORKERS:
+        assert "ports" not in resolved["services"][name]
+        assert resolved["services"][name]["expose"]
     assert resolved["volumes"]["adc_local_store"]["name"] == (
         "synagentics-a2a-v1_adc_local_store"
     )
@@ -414,11 +527,182 @@ def test_docker_compose_config_is_valid_with_explicit_modes():
     assert "ragflow" not in result.stdout.lower()
 
 
-# ── 19-20. no A2A task dispatch / Mem0 / PostgreSQL integration introduced ────
-def test_no_dispatch_or_memory_or_db_integration_added():
-    # The executable Turn E files (code + compose + Dockerfile) must not add task
-    # dispatch, a Mem0 client, or a DB client. The DEPLOYMENT doc is prose and is
-    # allowed to *name* these as future/not-used, so it is checked separately.
+@pytest.mark.skipif(shutil.which("docker") is None, reason="docker CLI not available")
+def test_docker_compose_config_services_are_exact():
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-p",
+            "synagentics-a2a-v1",
+            "-f",
+            str(_COMPOSE),
+            "config",
+            "--services",
+        ],
+        cwd=str(_EXEC_DIR),
+        env=_compose_env(explicit_modes=True),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert len(lines) == 4
+    assert set(lines) == _BUSINESS_SERVICES
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="docker CLI not available")
+def test_openai_compose_override_uses_one_secret_file_for_all_services():
+    override = yaml.safe_load(_OPENAI_COMPOSE.read_text())
+    assert "env_file" not in _COMPOSE.read_text()
+    assert "env_file" not in _OPENAI_COMPOSE.read_text()
+    assert set(override["services"]) == _BUSINESS_SERVICES
+    assert override["secrets"] == {
+        "openai_api_key": {"environment": "OPENAI_API_KEY"}
+    }
+    for service in override["services"].values():
+        assert service["environment"] == {
+            "OPENAI_API_KEY_FILE": "/run/secrets/openai_api_key",
+            "OPENAI_MODEL": "${OPENAI_MODEL:?OPENAI_MODEL must be set explicitly}",
+        }
+        assert service["secrets"] == ["openai_api_key"]
+
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-p",
+            "synagentics-a2a-v1",
+            "-f",
+            str(_COMPOSE),
+            "-f",
+            str(_OPENAI_COMPOSE),
+            "config",
+        ],
+        cwd=str(_EXEC_DIR),
+        env=_openai_compose_env(),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "sk-fake-compose-sentinel" not in result.stdout
+    assert "sk-fake-compose-sentinel" not in result.stderr
+    resolved = yaml.safe_load(result.stdout)
+    assert set(resolved["services"]) == _BUSINESS_SERVICES
+    for name, service in resolved["services"].items():
+        assert service["container_name"] == name
+        assert service["environment"]["LLM_PROVIDER"] == "openai"
+        assert service["environment"]["OPENAI_API_KEY_FILE"] == (
+            "/run/secrets/openai_api_key"
+        )
+        assert service["environment"]["OPENAI_MODEL"] == "gpt-5.5"
+        assert "OPENAI_API_KEY" not in service["environment"]
+        assert service["secrets"] == [
+            {
+                "source": "openai_api_key",
+                "target": "/run/secrets/openai_api_key",
+            }
+        ]
+    assert "ports" in resolved["services"]["orchestrator"]
+    for name in _WORKERS:
+        assert "ports" not in resolved["services"][name]
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="docker CLI not available")
+def test_openai_compose_override_requires_explicit_model():
+    env = _openai_compose_env()
+    env.pop("OPENAI_MODEL")
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-p",
+            "synagentics-a2a-v1",
+            "-f",
+            str(_COMPOSE),
+            "-f",
+            str(_OPENAI_COMPOSE),
+            "config",
+        ],
+        cwd=str(_EXEC_DIR),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "OPENAI_MODEL must be set explicitly" in result.stderr
+    assert "sk-fake-compose-sentinel" not in result.stderr
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="docker CLI not available")
+def test_live_tools_overlay_is_structure_only_and_secret_file_based():
+    override = yaml.safe_load(_LIVE_TOOLS_COMPOSE.read_text())
+    assert "env_file" not in _LIVE_TOOLS_COMPOSE.read_text()
+    assert set(override["services"]) == {"step7-9-structure-design-agent"}
+    structure = override["services"]["step7-9-structure-design-agent"]
+    assert structure["environment"] == {
+        "NVIDIA_API_KEY_FILE": "/run/secrets/nvidia_api_key",
+        "ESM_API_KEY_FILE": "/run/secrets/esm_api_key",
+    }
+    assert set(structure["secrets"]) == {"nvidia_api_key", "esm_api_key"}
+    assert override["secrets"] == {
+        "nvidia_api_key": {"environment": "NVIDIA_API_KEY"},
+        "esm_api_key": {"environment": "ESM_API_KEY"},
+    }
+
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-p",
+            "synagentics-a2a-v1",
+            "-f",
+            str(_COMPOSE),
+            "-f",
+            str(_OPENAI_COMPOSE),
+            "-f",
+            str(_LIVE_TOOLS_COMPOSE),
+            "config",
+        ],
+        cwd=str(_EXEC_DIR),
+        env=_live_tools_compose_env(),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    for sentinel in (
+        "fake-nvidia-compose-sentinel",
+        "fake-esm-compose-sentinel",
+        "sk-fake-compose-sentinel",
+    ):
+        assert sentinel not in result.stdout
+        assert sentinel not in result.stderr
+
+    resolved = yaml.safe_load(result.stdout)
+    assert set(resolved["services"]) == _BUSINESS_SERVICES
+    for name, service in resolved["services"].items():
+        environment = service["environment"]
+        assert "NVIDIA_API_KEY" not in environment
+        assert "ESM_API_KEY" not in environment
+        secret_sources = {
+            item["source"] if isinstance(item, dict) else item
+            for item in service.get("secrets", [])
+        }
+        if name == "step7-9-structure-design-agent":
+            assert environment["NVIDIA_API_KEY_FILE"] == (
+                "/run/secrets/nvidia_api_key"
+            )
+            assert environment["ESM_API_KEY_FILE"] == "/run/secrets/esm_api_key"
+            assert {"nvidia_api_key", "esm_api_key"} <= secret_sources
+        else:
+            assert "NVIDIA_API_KEY_FILE" not in environment
+            assert "ESM_API_KEY_FILE" not in environment
+            assert "nvidia_api_key" not in secret_sources
+            assert "esm_api_key" not in secret_sources
+
+
+# ── 19-20. no Mem0 or Compose-managed database service introduced ──────
+def test_no_memory_or_compose_database_service_added():
     code_files = [
         _COMPOSE, _DOCKERFILE, _DOCKERIGNORE,
         _EXEC_DIR / "app" / "a2a" / "step5_worker_main.py",
@@ -427,9 +711,9 @@ def test_no_dispatch_or_memory_or_db_integration_added():
     ]
     for path in code_files:
         low = path.read_text().lower()
-        for banned in ("send_task_async", "workerexecutionrequest", "psycopg", "sqlalchemy", "mem0client"):
+        for banned in ("sqlalchemy", "mem0client"):
             assert banned not in low, f"{path.name} must not reference {banned}"
-    # DEPLOYMENT doc explicitly records the future-only Mem0/Postgres boundary.
     doc = (_EXEC_DIR / "DEPLOYMENT_A2A.md").read_text()
-    assert "not deployed or integrated in Turn E" in doc
+    assert "external LangGraph Postgres checkpointer is integrated" in doc
+    assert "creates **no** database service" in doc
     assert "http://mem0:8010" in doc

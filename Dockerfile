@@ -20,32 +20,42 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
     PIP_DEFAULT_TIMEOUT=300 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
 
-# Install the real project dependencies from pyproject.toml (python-a2a comes
-# from there — no other A2A framework is installed).
-COPY pyproject.toml README.md ./
-COPY app ./app
-COPY build_tools ./build_tools
+# Install dependencies from project metadata before copying the application
+# source. A minimal package placeholder lets setuptools resolve the real
+# project extras without making every app/ edit invalidate the expensive
+# Torch/ESM/ADMET layer. The real source is copied after dependency validation.
+COPY pyproject.toml ./
+COPY build_tools/check_cpu_dependencies.py /tmp/check_cpu_dependencies.py
 # The shared production worker image needs ToolUniverse + ESM and the existing
 # ADMET-AI runtime used by the registered Step 6 ADMETAI tools. Install Torch
 # first from PyTorch's official CPU index and constrain the only subsequent
 # extras resolution so a default-index CUDA build cannot replace it. The ESM
 # immutable source is declared exactly once, in the deployment extra.
-RUN python -m pip install --no-cache-dir \
+RUN --mount=type=cache,id=synagentics-pip-cache,target=/root/.cache/pip,sharing=locked \
+    mkdir -p app \
+    && : > app/__init__.py \
+    && python -m pip install \
         --index-url https://download.pytorch.org/whl/cpu \
         'torch==2.13.0+cpu' \
     && printf '%s\n' 'torch==2.13.0+cpu' > /tmp/cpu-constraints.txt \
-    && python -m pip install --no-cache-dir \
-        --constraint /tmp/cpu-constraints.txt \
+    && python -m pip install \
+         --constraint /tmp/cpu-constraints.txt \
         '.[deployment,admet]' \
     && python -m pip check \
-    && python build_tools/check_cpu_dependencies.py \
-    && rm -f /tmp/cpu-constraints.txt
+    && python /tmp/check_cpu_dependencies.py \
+    && rm -rf app \
+    && rm -f /tmp/check_cpu_dependencies.py /tmp/cpu-constraints.txt
+
+# Ordinary application-code changes begin invalidating the cache here. No
+# dependency resolver runs after these copies, so the expensive layer is reused.
+COPY app ./app
+COPY build_tools ./build_tools
 
 # Shared local-storage mount point + read-only inventory mount point. The
 # directories are created and owned by a non-root user; the actual contents come

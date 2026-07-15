@@ -424,6 +424,74 @@ def interpreted_findings_from_flags(
     return out
 
 
+def all_tool_records_skipped_for_missing_typed_input(
+    tool_records: Optional[list[Any]],
+) -> bool:
+    """Whether every planned call was skipped for concrete typed-input gaps.
+
+    Policy-only skips do not qualify: every record must carry either a
+    non-empty ``missing_required_fields`` list or a runtime resolver audit with
+    an unresolved/missing required reference.
+    """
+
+    records = list(tool_records or [])
+    if not records:
+        return False
+    for record in records:
+        if getattr(record, "run_status", None) not in {"skipped", "not_run"}:
+            return False
+        summary = getattr(record, "tool_input_summary", None)
+        if not isinstance(summary, dict):
+            return False
+        missing_required = summary.get("missing_required_fields")
+        resolver_audit = summary.get("runtime_resolver_audit")
+        has_missing_required = isinstance(missing_required, list) and bool(
+            missing_required
+        )
+        has_unresolved_ref = isinstance(resolver_audit, list) and any(
+            isinstance(entry, dict)
+            and entry.get("resolve_status") in {"missing", "unresolved"}
+            for entry in resolver_audit
+        )
+        if not (has_missing_required or has_unresolved_ref):
+            return False
+    return True
+
+
+def missing_typed_input_item_from_tool_records(
+    tool_records: Optional[list[Any]],
+) -> dict:
+    """Build one compact gap item from declared/resolver field names only."""
+
+    missing_field_names: set[str] = set()
+    for record in tool_records or []:
+        summary = getattr(record, "tool_input_summary", None)
+        if not isinstance(summary, dict):
+            continue
+        missing_required = summary.get("missing_required_fields")
+        if isinstance(missing_required, list):
+            missing_field_names.update(
+                str(name) for name in missing_required if isinstance(name, str) and name
+            )
+        resolver_audit = summary.get("runtime_resolver_audit")
+        if isinstance(resolver_audit, list):
+            missing_field_names.update(
+                str(entry.get("schema_arg"))
+                for entry in resolver_audit
+                if isinstance(entry, dict)
+                and entry.get("resolve_status") in {"missing", "unresolved"}
+                and isinstance(entry.get("schema_arg"), str)
+                and entry.get("schema_arg")
+            )
+    return {
+        "item": "required typed tool input",
+        "reason": "selected tool requirements could not be resolved from available typed inputs",
+        "blocking": False,
+        "suggested_next_input": "the typed identifier or runtime reference required by the selected tool",
+        "missing_field_names": sorted(missing_field_names),
+    }
+
+
 def derive_lane_assessment(
     *,
     lane_type: str,
@@ -480,6 +548,22 @@ def derive_lane_assessment(
             "not_assessed_reason": "tool dependency unavailable in this runtime",
             "interpreted_findings": [],
             "missing_or_unassessed_items": extra_unassessed,
+        }
+    if not any_failed and all_tool_records_skipped_for_missing_typed_input(
+        tool_records
+    ):
+        return {
+            "assessment_status": "not_assessed_missing_input",
+            "risk_label": "not_assessed",
+            "not_assessed_reason": (
+                "all planned tool invocations were skipped because required "
+                "typed or invokable input could not be resolved"
+            ),
+            "interpreted_findings": [],
+            "missing_or_unassessed_items": [
+                missing_typed_input_item_from_tool_records(tool_records),
+                *extra_unassessed,
+            ],
         }
     if not any_success:
         return {

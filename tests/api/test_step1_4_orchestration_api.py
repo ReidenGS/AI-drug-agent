@@ -25,12 +25,15 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 import app.deps as deps
 from app.main import app
+from app.services.workflow_setup_service import WorkflowSetupService
+from app.utils.errors import WorkflowStateError
 
 
 _PDB_BYTES = (
@@ -77,13 +80,44 @@ def _create_run(client: TestClient, ctx: dict, *, query="HER2 ADC") -> str:
 
 
 def _run_steps_2_3_4(client: TestClient, run_id: str) -> dict:
-    """Execute Step 2 → 3 → 4 in sequence, returning the final-step response."""
+    """Run Step 2/3 APIs plus the retained legacy plan builder directly.
+
+    Turn G replaces the production Step 4 endpoint with the durable A2A
+    Orchestrator. This suite retains old plan-builder regression coverage
+    without representing that builder as the production API path.
+    """
     r2 = client.post(f"/runs/{run_id}/steps/2/execute")
     assert r2.status_code == 200, r2.text
     r3 = client.post(f"/runs/{run_id}/steps/3/execute")
     assert r3.status_code == 200, r3.text
-    r4 = client.post(f"/runs/{run_id}/steps/4/execute")
+    r4 = _legacy_plan_response(run_id)
     return {"step_2": r2, "step_3": r3, "step_4": r4}
+
+
+def _legacy_plan_response(run_id: str) -> SimpleNamespace:
+    try:
+        body = WorkflowSetupService(
+            storage=deps.get_storage(),
+            registry=deps.get_registry_service(),
+            workflow_state=deps.get_workflow_state_service(),
+        ).plan(run_id).model_dump()
+        r4 = SimpleNamespace(
+            status_code=200,
+            text=json.dumps(body),
+            json=lambda: body,
+        )
+    except WorkflowStateError as exc:
+        body = {
+            "code": exc.code,
+            "message": exc.message,
+            "detail": exc.detail,
+        }
+        r4 = SimpleNamespace(
+            status_code=exc.status_code,
+            text=json.dumps(body),
+            json=lambda: body,
+        )
+    return r4
 
 
 def _registry_artifacts(run_id: str) -> dict:
@@ -175,9 +209,9 @@ def test_scenario_C_blocked_does_not_create_a_ready_plan(client: TestClient):
     assert r3.status_code == 200
     assert r3.json()["input_readiness_status"] == "blocked"
 
-    # Step 4 refuses to plan — surfaces 409 (WorkflowStateError) with the
+    # The retained legacy builder refuses to plan with the same 409 shape and
     # blocking reasons attached. The plan must NOT be written.
-    r4 = client.post(f"/runs/{run_id}/steps/4/execute")
+    r4 = _legacy_plan_response(run_id)
     assert r4.status_code == 409, r4.text
     body = r4.json()
     assert body["code"] == "workflow_state_error"

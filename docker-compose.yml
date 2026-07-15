@@ -1,13 +1,12 @@
-# Multi-Agent A2A v1 — single-server Docker Compose skeleton (Turn E).
+# Multi-Agent A2A v1 — production HTTP worker topology (Turn G).
 #
 # Four business services on one internal network. The three workers are only
 # reachable INSIDE the network (expose, no host ports). The orchestrator is the
 # only service with a host port, configured via ORCHESTRATOR_HOST_PORT.
 #
-# Turn E scope: bring the HTTP services + internal DNS up. It does NOT wire
-# discovery into startup, does NOT dispatch A2A tasks, and adds NO database /
-# vector store / Mem0 service. Mem0 + PostgreSQL/pgvector are future turns
-# (see DEPLOYMENT_A2A.md).
+# Step 4 now plans and dispatches only through HTTP A2A. Its LangGraph
+# checkpointer uses an explicitly configured external Postgres database; this
+# compose file still creates no database/vector/Mem0 service.
 #
 # Run with an isolated project name so it never touches Dify/RAGFlow:
 #   docker compose -p synagentics-a2a-v1 up -d --build
@@ -38,6 +37,7 @@ x-adc-inventory-mount: &adc-inventory-mount
 services:
   # ── Orchestrator / backend (only service with a host port) ─────────────────
   orchestrator:
+    container_name: orchestrator
     <<: *adc-image
     image: synagentics-adc-a2a:latest
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
@@ -45,10 +45,11 @@ services:
       <<: *adc-common-env
       # Docker-internal worker URLs the Orchestrator's WorkerDiscoveryService uses
       # (Turn D defaults already point at these service names).
-      STEP5_WORKER_URL: "http://step5-worker:8005"
-      STEP6_WORKER_URL: "http://step6-worker:8006"
-      STRUCTURE_WORKER_URL: "http://structure-worker:8009"
+      STEP5_WORKER_URL: "http://step5-context-agent:8005"
+      STEP6_WORKER_URL: "http://step6-developability-agent:8006"
+      STRUCTURE_WORKER_URL: "http://step7-9-structure-design-agent:8009"
       LANGGRAPH_CHECKPOINT_DATABASE_URL: ${LANGGRAPH_CHECKPOINT_DATABASE_URL:?LANGGRAPH_CHECKPOINT_DATABASE_URL must be set explicitly}
+      ORCHESTRATOR_WORKER_TIMEOUT_SECONDS: ${ORCHESTRATOR_WORKER_TIMEOUT_SECONDS:?ORCHESTRATOR_WORKER_TIMEOUT_SECONDS must be set explicitly}
     volumes:
       - adc_local_store:/data/localstore
       - *adc-inventory-mount
@@ -70,13 +71,14 @@ services:
     # never by compose depends_on.
 
   # ── Step 5 worker (internal only) ──────────────────────────────────────────
-  step5-worker:
+  step5-context-agent:
+    container_name: step5-context-agent
     <<: *adc-image
     image: synagentics-adc-a2a:latest
     command: ["python", "-m", "app.a2a.step5_worker_main"]
     environment:
       <<: *adc-common-env
-      STEP5_WORKER_URL: "http://step5-worker:8005"
+      STEP5_WORKER_URL: "http://step5-context-agent:8005"
       WORKER_BIND_HOST: "0.0.0.0"
       WORKER_BIND_PORT: "8005"
     volumes:
@@ -95,13 +97,14 @@ services:
     restart: unless-stopped
 
   # ── Step 6 worker (internal only) ──────────────────────────────────────────
-  step6-worker:
+  step6-developability-agent:
+    container_name: step6-developability-agent
     <<: *adc-image
     image: synagentics-adc-a2a:latest
     command: ["python", "-m", "app.a2a.step6_worker_main"]
     environment:
       <<: *adc-common-env
-      STEP6_WORKER_URL: "http://step6-worker:8006"
+      STEP6_WORKER_URL: "http://step6-developability-agent:8006"
       WORKER_BIND_HOST: "0.0.0.0"
       WORKER_BIND_PORT: "8006"
     volumes:
@@ -120,13 +123,14 @@ services:
     restart: unless-stopped
 
   # ── Structure worker (internal only) ───────────────────────────────────────
-  structure-worker:
+  step7-9-structure-design-agent:
+    container_name: step7-9-structure-design-agent
     <<: *adc-image
     image: synagentics-adc-a2a:latest
     command: ["python", "-m", "app.a2a.structure_worker_main"]
     environment:
       <<: *adc-common-env
-      STRUCTURE_WORKER_URL: "http://structure-worker:8009"
+      STRUCTURE_WORKER_URL: "http://step7-9-structure-design-agent:8009"
       WORKER_BIND_HOST: "0.0.0.0"
       WORKER_BIND_PORT: "8009"
     volumes:
