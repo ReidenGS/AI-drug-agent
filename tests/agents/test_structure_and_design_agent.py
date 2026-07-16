@@ -105,6 +105,13 @@ def test_step7_builds_input_package_from_multipart_uploads(
     on the antibody candidate."""
     run_id = _seed(
         local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[
+            {
+                "id_type": "uploaded_file",
+                "value": "file_fasta",
+                "source": "antibody_heavy_chain_sequence",
+            }
+        ],
         uploaded_files=[
             {
                 "file_id": "file_pdb",
@@ -131,7 +138,9 @@ def test_step7_builds_input_package_from_multipart_uploads(
         mcp_client=_mcp(),
     )
     pkg = agent.run_step_7(run_id)
-    assert pkg.structure_preparation_status in {"ok", "partial"}
+    assert pkg.structure_preparation_status == "partial"
+    assert pkg.preparation_warnings == []
+    assert pkg.unresolved_resource_refs
     cases = {r.input_case for r in pkg.prepared_structure_inputs}
     assert "uploaded_structure_file" in cases
 
@@ -476,18 +485,30 @@ def test_step7_extracts_partial_residue_range_and_does_not_invent_when_absent(
 
 
 @pytest.mark.parametrize(
-    "filename,expected_role,expected_structure_role",
+    "filename,source,expected_role,expected_structure_role",
     [
-        ("heavy.fasta", "antibody_heavy", "antibody_only"),
-        ("antigen.fasta", "antigen", "antigen_only"),
+        (
+            "heavy.fasta",
+            "antibody_heavy_chain_sequence",
+            "antibody_heavy",
+            "antibody_only",
+        ),
+        ("antigen.fasta", "target_sequence", "antigen", "antigen_only"),
     ],
 )
-def test_step7_filename_scoped_fasta_binds_only_compatible_candidate(
+def test_step7_step2_scoped_fasta_binds_only_compatible_candidate(
     local_storage, registry_service, workflow_state_service,
-    filename, expected_role, expected_structure_role,
+    filename, source, expected_role, expected_structure_role,
 ):
     run_id = _seed(
         local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[
+            {
+                "id_type": "uploaded_file",
+                "value": f"file_{expected_role}",
+                "source": source,
+            }
+        ],
         uploaded_files=[{
             "file_id": f"file_{expected_role}",
             "original_filename": filename,
@@ -510,6 +531,45 @@ def test_step7_filename_scoped_fasta_binds_only_compatible_candidate(
     assert refs[0][1].sequence is None
     assert refs[0][1].sequence_storage_ref.endswith(filename)
     assert refs[0][1].prediction_input_kind == "fasta_ref"
+
+
+@pytest.mark.parametrize("filename", ["heavy.fasta", "target_antigen.fasta"])
+def test_step7_does_not_infer_fasta_role_from_filename_without_step2_source(
+    local_storage,
+    registry_service,
+    workflow_state_service,
+    filename,
+):
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        uploaded_files=[
+            {
+                "file_id": "file_unassigned",
+                "original_filename": filename,
+                "storage_path": f"adc_pilot/runs/x/inputs/files/{filename}",
+                "content_type": "text/x-fasta",
+                "size_bytes": 64,
+            }
+        ],
+    )
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    ).run_step_7(run_id)
+    assert not any(
+        ref.sequence_id == "file_unassigned"
+        for item in pkg.prepared_structure_inputs
+        for ref in item.sequence_refs_for_prediction
+    )
+    assert any(
+        ref["source_ref"] == "file_unassigned"
+        and ref["resource_binding_status"] == "unassigned"
+        for ref in pkg.unresolved_resource_refs
+    )
 
 
 def test_step7_target_sequence_role_binds_uploaded_fasta_to_antigen_candidate(
@@ -1155,6 +1215,8 @@ def test_step7_scope_failure_records_scope_unavailable(
         mcp_client=_FailingScopeClient(),
     ).run_step_7(run_id)
 
+    assert pkg.structure_preparation_status == "ok"
+    assert pkg.preparation_warnings == []
     by_name = {tc.tool_name: tc for tc in pkg.structure_tool_call_records}
     for tool in structure_and_design_module._STEP7_SCOPED_TOOLS:
         assert tool in by_name
@@ -1299,7 +1361,11 @@ def test_step7_uniprot_and_inline_sequence_semantics(
     assert uniprot.prediction_input_kind == "uniprot_id"
     assert rec.prediction_required is True
     assert rec.missing_metadata_flags == []
-    assert pkg.structure_preparation_status == "ok"
+    assert pkg.structure_preparation_status == "partial"
+    assert any(
+        warning["run_status"] == "dependency_unavailable"
+        for warning in pkg.preparation_warnings
+    )
 
 
 def test_step7_file_backed_target_sequence_material_is_fasta_ref_not_inline_path(
@@ -2335,6 +2401,73 @@ def test_step7_status_is_partial_when_selected_msa_call_fails(
         assert ">query" not in json.dumps(w)
 
 
+def test_step7_selected_dependency_unavailable_is_partial_and_blocks_openfold(
+    local_storage, registry_service, workflow_state_service
+):
+    """Test-only unavailable binding; production Step 7/8 routing remains real."""
+
+    run_id = _seed_sequence_only_antigen_antibody(
+        local_storage, registry_service, workflow_state_service
+    )
+
+    def _dependency_unavailable(**_kwargs):
+        raise NotImplementedError
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp_with_bindings(
+            {"NvidiaNIM_msa_search": _dependency_unavailable}
+        ),
+    )
+    pkg = agent.run_step_7(run_id)
+    selected = [
+        tc
+        for tc in pkg.structure_tool_call_records
+        if tc.tool_name == "NvidiaNIM_msa_search"
+        and tc.tool_input_summary.get("routing_decision") == "selected"
+    ]
+    assert len(selected) == 3
+    assert {tc.run_status for tc in selected} == {"dependency_unavailable"}
+    assert pkg.structure_preparation_status == "partial"
+    assert pkg.preparation_warnings == [
+        {
+            "tool_name": "NvidiaNIM_msa_search",
+            "run_status": "dependency_unavailable",
+            "reason": "wrapper_not_wired",
+            "chain_role": role,
+        }
+        for role in ("antigen", "antibody_heavy", "antibody_light")
+    ]
+    refs = [
+        ref
+        for item in pkg.prepared_structure_inputs
+        for ref in item.sequence_refs_for_prediction
+        if ref.chain_role in {"antigen", "antibody_heavy", "antibody_light"}
+    ]
+    assert refs
+    assert {ref.msa_status for ref in refs} == {"dependency_unavailable"}
+
+    results = agent.run_step_8(run_id)
+    openfold = [
+        tc
+        for tc in results.tool_call_records
+        if tc.tool_name == "NvidiaNIM_openfold3"
+    ]
+    assert openfold
+    assert all(tc.run_status == "skipped" for tc in openfold)
+    assert all(
+        tc.tool_input_summary.get("routing_decision")
+        in {"contract_unresolved", "duplicate_complex_prediction_mapping"}
+        for tc in openfold
+    )
+    assert not any(
+        tc.tool_input_summary.get("routing_decision") == "selected"
+        for tc in openfold
+    )
+
+
 def test_step7_status_stays_ok_when_only_not_applicable_skips(
     local_storage, registry_service, workflow_state_service
 ):
@@ -2458,7 +2591,7 @@ def test_step7_8_real_msa_payload_injects_openfold3_msa_and_keeps_artifacts_comp
         assert s["msa_alignment_format"] == "a3m"
         assert isinstance(s["msa_alignment_length"], int) and s["msa_alignment_length"] > 0
         assert s["msa_alignment_sha256_prefix"]
-    assert pkg.structure_preparation_status in {"ok", "partial"}
+    assert pkg.structure_preparation_status == "ok"
     # Normalized artifact carries only compact metadata — no raw seq / a3m.
     blob = json.dumps(pkg.model_dump())
     for raw in (_MSA_ANTIGEN, _MSA_HEAVY, _MSA_LIGHT):

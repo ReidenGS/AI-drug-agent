@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from app.schemas.worker_routing_plan import LoopDecision
+from app.utils.ids import SessionId
 
 _FORBID = ConfigDict(extra="forbid")
 
@@ -316,6 +317,8 @@ class OrchestratorExecutionState(BaseModel):
     model_config = _FORBID
 
     run_id: RunId
+    # Optional only for historical checkpoints; new production states set it.
+    session_id: SessionId | None = None
     run_status: RunStatus
     orchestrator: OrchestratorState
     routing: RoutingExecutionState

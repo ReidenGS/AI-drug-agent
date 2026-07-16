@@ -207,13 +207,20 @@ def _proposal(*agent_ids):
 
 
 def _seed_inputs(storage, registry):
-    registry.init_registry(RUN_ID)
+    run_registry = registry.init_registry(RUN_ID)
     raw_id = _persist(
         storage,
         registry,
         "raw_request_record",
         "inputs/raw_request_record.json",
-        {"raw_user_query": "Run generic DAG.", "uploaded_files": []},
+        {
+            "session_id": "sess_0123456789abcdef",
+            "run_artifact_registry_id": run_registry.run_artifact_registry_id,
+            "created_at": "2026-07-14T00:00:00Z",
+            "entry_source": "api",
+            "raw_user_query": "Run generic DAG.",
+            "uploaded_files": [],
+        },
     )
     query_id = _persist(
         storage,
@@ -221,7 +228,16 @@ def _seed_inputs(storage, registry):
         "structured_query",
         "inputs/structured_query.json",
         {
-            "task_intent": {"primary_intent": "generic_analysis", "secondary_intents": []},
+            "parsed_at": "2026-07-14T00:00:00Z",
+            "source_raw_request_ref": {
+                "raw_request_record_id": raw_id
+            },
+            "task_intent": {
+                "task_type": "generic_analysis",
+                "modality": "unknown",
+                "primary_intent": "unclear_or_needs_clarification",
+                "secondary_intents": [],
+            },
             "canonical_query": "Run generic DAG.",
             "requested_outputs": ["generic_result"],
             "missing_slots": [],

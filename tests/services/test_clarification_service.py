@@ -8,11 +8,19 @@ privacy. No LangGraph memory/checkpointer is used; Step 3 calls no LLM.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from app.a2a.orchestrator_readiness import OrchestratorReadinessError
 from app.agents.supervisor_agent import SupervisorAgent
 from app.llm.provider import MockLLMProvider
-from app.services.clarification_service import ClarificationService
+from app.services.clarification_service import (
+    ClarificationConflictError,
+    ClarificationRequestError,
+    ClarificationReparseError,
+    ClarificationService,
+)
 from app.services.input_readiness_service import InputReadinessService
 from app.services.intake_service import IntakeService
 from app.services.structured_query_service import StructuredQueryService
@@ -20,6 +28,16 @@ from app.services.structured_query_service import StructuredQueryService
 
 def _supervisor() -> SupervisorAgent:
     return SupervisorAgent(llm=MockLLMProvider())
+
+
+class _CapturingSupervisor:
+    def __init__(self):
+        self.inner = _supervisor()
+        self.inputs: list[dict] = []
+
+    def parse_raw_to_structured_query(self, payload: dict):
+        self.inputs.append(json.loads(json.dumps(payload)))
+        return self.inner.parse_raw_to_structured_query(payload)
 
 
 def _turn_one(local_storage, registry_service, workflow_state_service, query: str):
@@ -42,6 +60,117 @@ def _target_request_id(readiness) -> str:
     return reqs[0].request_id
 
 
+def _revision_key(storage, run_id: str, revision_id: str) -> str:
+    return storage.run_key(run_id, "clarification", f"{revision_id}.json")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda body: body["clarification_answers"][0].update(
+            target_slot_name="payload"
+        ),
+        lambda body: body["clarification_answers"][0].update(
+            target_slot_category="payload"
+        ),
+        lambda body: body["clarification_answers"][0].update(
+            answer_text="tampered-safe-answer"
+        ),
+        lambda body: body.update(
+            submission_fingerprint="clarification_submission_" + "0" * 64
+        ),
+        lambda body: body.update(resolved_request_ids=[]),
+        lambda body: body.update(unresolved_request_ids=[]),
+        lambda body: body.update(
+            revision_status="completed",
+            output_structured_query_id=None,
+            output_input_readiness_status_id=None,
+            failure_code=None,
+        ),
+        lambda body: body.update(
+            revision_status="submitted",
+            output_structured_query_id="structured_query_000000000000",
+            output_input_readiness_status_id=None,
+            failure_code=None,
+        ),
+        lambda body: body.update(
+            revision_status="reparse_failed",
+            output_structured_query_id="structured_query_000000000000",
+            output_input_readiness_status_id=None,
+            failure_code="clarification_step2_failed",
+        ),
+        lambda body: body.update(
+            revision_status="reparse_failed",
+            output_structured_query_id=None,
+            output_input_readiness_status_id=None,
+            failure_code="clarification_step3_failed",
+        ),
+    ],
+    ids=[
+        "slot-name",
+        "slot-category",
+        "answer-with-stale-fingerprint",
+        "fingerprint",
+        "resolved-ids",
+        "unresolved-ids",
+        "phase-combination",
+        "submitted-with-output",
+        "step2-failure-with-output",
+        "step3-failure-without-output",
+    ],
+)
+def test_revision_authority_tampering_fails_before_llm_or_new_files(
+    local_storage,
+    registry_service,
+    workflow_state_service,
+    mutate,
+):
+    run_id, readiness = _turn_one(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        "I want to design a new antibody-drug conjugate.",
+    )
+    request_id = _target_request_id(readiness)
+    service = ClarificationService(
+        local_storage, registry_service, workflow_state_service
+    )
+    state = service.submit_clarification_answer(
+        run_id,
+        [{"request_id": request_id, "answer_text": "HER2", "answered_at": "t"}],
+    )
+    key = _revision_key(local_storage, run_id, state.revision_id)
+    body = local_storage.read_json(key)
+    mutate(body)
+    local_storage.write_json(key, body)
+    before = set(local_storage.list_prefix(local_storage.run_key(run_id)))
+    supervisor = _CapturingSupervisor()
+
+    with pytest.raises(
+        ClarificationConflictError,
+        match="^clarification_revision_authority_invalid$",
+    ):
+        ClarificationService(
+            local_storage, registry_service, workflow_state_service
+        ).submit_and_reparse(
+            run_id,
+            [
+                {
+                    "request_id": request_id,
+                    "answer_text": "HER2",
+                    "answered_at": "later",
+                }
+            ],
+            supervisor,
+        )
+
+    assert supervisor.inputs == []
+    assert set(local_storage.list_prefix(local_storage.run_key(run_id))) == before
+    active = registry_service.get(run_id).active_artifacts
+    assert active.worker_routing_plan_id is None
+    assert active.candidate_context_table_id is None
+
+
 # ── A. basic save ─────────────────────────────────────────────────────────────
 
 
@@ -52,7 +181,7 @@ def test_submit_clarification_answer_persists_state(
         local_storage, registry_service, workflow_state_service,
         "I want to design a new antibody-drug conjugate.",
     )
-    assert readiness.input_readiness_status == "blocked"
+    assert readiness.input_readiness_status == "needs_user_input"
     rid = _target_request_id(readiness)
 
     svc = ClarificationService(local_storage, registry_service, workflow_state_service)
@@ -63,6 +192,12 @@ def test_submit_clarification_answer_persists_state(
     assert state.clarification_answers[0].target_slot_name == "target_or_antigen"
     assert rid in state.resolved_request_ids
     assert rid not in state.unresolved_request_ids
+    assert state.revision_status == "submitted"
+    assert state.revision_id.startswith("clarification_state_")
+    assert state.submission_fingerprint.startswith("clarification_submission_")
+    assert "HER2" not in state.submission_fingerprint
+    assert state.output_structured_query_id is None
+    assert state.output_input_readiness_status_id is None
     # The other (warning) requests stay unresolved.
     assert state.unresolved_request_ids
     # State is persisted and pointed at by the registry (non-destructive).
@@ -84,7 +219,9 @@ def test_unknown_request_id_raises(
         "I want to design a new antibody-drug conjugate.",
     )
     svc = ClarificationService(local_storage, registry_service, workflow_state_service)
-    with pytest.raises(ValueError, match="unknown clarification request_id"):
+    with pytest.raises(
+        ClarificationRequestError, match="^clarification_request_invalid$"
+    ):
         svc.submit_clarification_answer(
             run_id, [{"request_id": "clr_does_not_exist", "answer_text": "HER2", "answered_at": "t"}]
         )
@@ -101,7 +238,9 @@ def test_duplicate_request_id_rejected(
     )
     rid = _target_request_id(readiness)
     svc = ClarificationService(local_storage, registry_service, workflow_state_service)
-    with pytest.raises(ValueError, match="duplicate clarification answer"):
+    with pytest.raises(
+        ClarificationRequestError, match="^clarification_request_invalid$"
+    ):
         svc.submit_clarification_answer(
             run_id,
             [
@@ -123,7 +262,9 @@ def test_run_without_clarification_requests_raises_clearly(
     # Full-ish context → no clarification requests (ready or warning-only).
     svc = ClarificationService(local_storage, registry_service, workflow_state_service)
     if not readiness.clarification_requests:
-        with pytest.raises(ValueError, match="no Step 3 clarification_requests"):
+        with pytest.raises(
+            ClarificationRequestError, match="^clarification_source_not_ready$"
+        ):
             svc.submit_clarification_answer(
                 run_id, [{"request_id": "clr_x", "answer_text": "y", "answered_at": "t"}]
             )
@@ -137,14 +278,16 @@ def test_empty_answers_raises(
         "I want to design a new antibody-drug conjugate.",
     )
     svc = ClarificationService(local_storage, registry_service, workflow_state_service)
-    with pytest.raises(ValueError, match="no clarification answers"):
+    with pytest.raises(
+        ClarificationRequestError, match="^clarification_request_invalid$"
+    ):
         svc.submit_clarification_answer(run_id, [])
 
 
 # ── C. next-turn context ───────────────────────────────────────────────────────
 
 
-def test_next_run_preserves_original_query_and_carries_context(
+def test_same_run_effective_input_preserves_query_and_carries_context(
     local_storage, registry_service, workflow_state_service
 ):
     run_id, readiness = _turn_one(
@@ -153,27 +296,34 @@ def test_next_run_preserves_original_query_and_carries_context(
     )
     rid = _target_request_id(readiness)
     svc = ClarificationService(local_storage, registry_service, workflow_state_service)
-    state = svc.submit_clarification_answer(
-        run_id, [{"request_id": rid, "answer_text": "HER2", "answered_at": "t"}]
+    original = local_storage.read_json(
+        local_storage.run_key(run_id, "inputs/raw_request_record.json")
     )
-    next_raw = local_storage.read_json(
-        local_storage.run_key(state.next_run_id, "inputs/raw_request_record.json")
+    supervisor = _CapturingSupervisor()
+    result = svc.submit_and_reparse(
+        run_id,
+        [{"request_id": rid, "answer_text": "HER2", "answered_at": "t"}],
+        supervisor,
     )
-    # Original query preserved (not replaced by "HER2").
-    assert next_raw["raw_user_query"].startswith(
+    effective = supervisor.inputs[0]
+    assert result.run_id == run_id
+    assert effective["raw_user_query"].startswith(
         "I want to design a new antibody-drug conjugate."
     )
-    assert next_raw["raw_user_query"] != "HER2"
-    ctx = next_raw["user_provided_context"]
+    assert effective["raw_user_query"] != "HER2"
+    ctx = effective["user_provided_context"]
     assert ctx["previous_task_intent"]["primary_intent"] == "new_adc_design"
     assert ctx["previous_missing_slots"]
     assert ctx["previous_clarification_requests"]
     answers = ctx["clarification_answers"]
     assert answers[0]["answer_text"] == "HER2"
     assert answers[0]["slot_name"] == "target_or_antigen"
+    assert local_storage.read_json(
+        local_storage.run_key(run_id, "inputs/raw_request_record.json")
+    ) == original
 
 
-def test_next_run_does_not_clobber_unrelated_context_fields(
+def test_same_run_effective_input_does_not_clobber_context_fields(
     local_storage, registry_service, workflow_state_service
 ):
     # Turn one WITH an unrelated context field set.
@@ -189,13 +339,15 @@ def test_next_run_does_not_clobber_unrelated_context_fields(
     ).check(rec.run_id)
     rid = _target_request_id(readiness)
     svc = ClarificationService(local_storage, registry_service, workflow_state_service)
-    state = svc.submit_clarification_answer(
-        rec.run_id, [{"request_id": rid, "answer_text": "HER2", "answered_at": "t"}]
+    supervisor = _CapturingSupervisor()
+    svc.submit_and_reparse(
+        rec.run_id,
+        [{"request_id": rid, "answer_text": "HER2", "answered_at": "t"}],
+        supervisor,
     )
-    next_raw = local_storage.read_json(
-        local_storage.run_key(state.next_run_id, "inputs/raw_request_record.json")
+    assert supervisor.inputs[0]["user_provided_context"]["constraints_text"] == (
+        "DAR<=4"
     )
-    assert next_raw["user_provided_context"]["constraints_text"] == "DAR<=4"
 
 
 # ── D. Step 2/3 loop behavior ──────────────────────────────────────────────────
@@ -208,7 +360,7 @@ def test_clarification_loop_resolves_target_blocking(
         local_storage, registry_service, workflow_state_service,
         "I want to design a new antibody-drug conjugate.",
     )
-    assert readiness.input_readiness_status == "blocked"
+    assert readiness.input_readiness_status == "needs_user_input"
     rid = _target_request_id(readiness)
     svc = ClarificationService(local_storage, registry_service, workflow_state_service)
     result = svc.submit_and_reparse(
@@ -231,7 +383,7 @@ def test_clarification_loop_resolves_target_blocking(
     )
 
 
-def test_step3_reparse_does_not_overwrite_original_run(
+def test_step2_step3_reparse_preserves_old_bodies_in_same_run_history(
     local_storage, registry_service, workflow_state_service
 ):
     run_id, readiness = _turn_one(
@@ -241,18 +393,378 @@ def test_step3_reparse_does_not_overwrite_original_run(
     orig_sq = local_storage.read_json(
         local_storage.run_key(run_id, "inputs/structured_query.json")
     )
+    orig_readiness = local_storage.read_json(
+        local_storage.run_key(run_id, "inputs/input_readiness_status.json")
+    )
     rid = _target_request_id(readiness)
     svc = ClarificationService(local_storage, registry_service, workflow_state_service)
     result = svc.submit_and_reparse(
         run_id, [{"request_id": rid, "answer_text": "HER2", "answered_at": "t"}], _supervisor()
     )
-    # The revision lives under a NEW run id.
-    assert result.next_run_id != run_id
-    # Original run's structured_query is unchanged (still target-less).
+    assert result.run_id == run_id
     after = local_storage.read_json(
         local_storage.run_key(run_id, "inputs/structured_query.json")
     )
-    assert after == orig_sq
+    assert after["artifact_id"] != orig_sq["artifact_id"]
+    assert local_storage.read_json(
+        local_storage.run_key(
+            run_id,
+            "inputs/history/structured_query",
+            f"{orig_sq['artifact_id']}.json",
+        )
+    ) == orig_sq
+    assert local_storage.read_json(
+        local_storage.run_key(
+            run_id,
+            "inputs/history/input_readiness_status",
+            f"{orig_readiness['artifact_id']}.json",
+        )
+    ) == orig_readiness
+
+
+def test_legacy_missing_history_is_materialized_before_revision_and_recovery(
+    local_storage, registry_service, workflow_state_service, monkeypatch
+):
+    run_id, readiness = _turn_one(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        "Analyze the structure of HER2 and report the binding interface.",
+    )
+    request = next(
+        item
+        for item in readiness.clarification_requests
+        if item.slot_name == "structure_or_sequence"
+    )
+    structured_body = local_storage.read_json(
+        local_storage.run_key(run_id, "inputs/structured_query.json")
+    )
+    readiness_body = local_storage.read_json(
+        local_storage.run_key(run_id, "inputs/input_readiness_status.json")
+    )
+    structured_history = local_storage.run_key(
+        run_id,
+        "inputs/history/structured_query",
+        f"{structured_body['artifact_id']}.json",
+    )
+    readiness_history = local_storage.run_key(
+        run_id,
+        "inputs/history/input_readiness_status",
+        f"{readiness_body['artifact_id']}.json",
+    )
+    assert local_storage.delete(structured_history)
+    assert local_storage.delete(readiness_history)
+
+    supervisor = _CapturingSupervisor()
+    original_check = InputReadinessService.check
+    checks = 0
+
+    def fail_once(service, checked_run_id):
+        nonlocal checks
+        checks += 1
+        if checks == 1:
+            raise RuntimeError("test-only-step3-failure")
+        return original_check(service, checked_run_id)
+
+    monkeypatch.setattr(InputReadinessService, "check", fail_once)
+    payload = [
+        {
+            "request_id": request.request_id,
+            "answer_text": "Use PDB 1N8Z.",
+            "answered_at": "t",
+        }
+    ]
+    service = ClarificationService(
+        local_storage, registry_service, workflow_state_service
+    )
+    with pytest.raises(
+        ClarificationReparseError, match="clarification_reparse_failed"
+    ):
+        service.submit_and_reparse(run_id, payload, supervisor)
+    revision_id = registry_service.get(
+        run_id
+    ).active_artifacts.clarification_state_id
+    failed = local_storage.read_json(
+        _revision_key(local_storage, run_id, revision_id)
+    )
+    assert failed["failure_code"] == "clarification_step3_failed"
+    assert local_storage.read_json(structured_history) == structured_body
+    assert local_storage.read_json(readiness_history) == readiness_body
+    assert len(supervisor.inputs) == 1
+
+    recovered = ClarificationService(
+        local_storage, registry_service, workflow_state_service
+    ).submit_and_reparse(run_id, payload, supervisor)
+
+    assert recovered.state.revision_id == revision_id
+    assert recovered.state.revision_status == "completed"
+    assert len(supervisor.inputs) == 1
+    assert checks == 2
+    assert len(
+        local_storage.list_prefix(
+            local_storage.run_key(run_id, "inputs/history/structured_query")
+        )
+    ) == 2
+    assert len(
+        local_storage.list_prefix(
+            local_storage.run_key(
+                run_id, "inputs/history/input_readiness_status"
+            )
+        )
+    ) == 2
+
+
+def test_existing_source_history_is_never_overwritten_when_content_differs(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id, readiness = _turn_one(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        "I want to design a new antibody-drug conjugate.",
+    )
+    structured_id = registry_service.get(
+        run_id
+    ).active_artifacts.structured_query_id
+    history_key = local_storage.run_key(
+        run_id,
+        "inputs/history/structured_query",
+        f"{structured_id}.json",
+    )
+    tampered = local_storage.read_json(history_key)
+    tampered["canonical_query"] = "different-history-content"
+    local_storage.write_json(history_key, tampered)
+    before = local_storage.read_bytes(history_key)
+    request_id = _target_request_id(readiness)
+
+    with pytest.raises(
+        ClarificationConflictError, match="^structured_query_history_invalid$"
+    ):
+        ClarificationService(
+            local_storage, registry_service, workflow_state_service
+        ).submit_clarification_answer(
+            run_id,
+            [
+                {
+                    "request_id": request_id,
+                    "answer_text": "HER2",
+                    "answered_at": "t",
+                }
+            ],
+        )
+
+    assert local_storage.read_bytes(history_key) == before
+    assert registry_service.get(
+        run_id
+    ).active_artifacts.clarification_state_id is None
+
+
+class _CapturingProvider:
+    name = "test-only-capturing-mock"
+    model = "test-only"
+
+    def __init__(self):
+        self.inner = MockLLMProvider()
+        self.calls: list[dict] = []
+
+    def generate_json(self, prompt, *, schema, system=None):
+        self.calls.append(
+            json.loads(
+                json.dumps(
+                    {"prompt": prompt, "schema": schema, "system": system}
+                )
+            )
+        )
+        return self.inner.generate_json(prompt, schema=schema, system=system)
+
+
+def test_long_sequence_clarification_enters_step2_and_becomes_target_sequence(
+    local_storage,
+    registry_service,
+    workflow_state_service,
+):
+    raw_value = "ACDEFGHIKLMNPQRSTVWY" * 30
+    run_id, readiness = _turn_one(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        "Analyze the structure of HER2 and report the binding interface.",
+    )
+    request = next(
+        item
+        for item in readiness.clarification_requests
+        if item.slot_name == "structure_or_sequence"
+    )
+    class _ExplicitTargetSequenceProvider(_CapturingProvider):
+        """Test-only role fixture; not evidence of live LLM recognition."""
+
+        def generate_json(self, prompt, *, schema, system=None):
+            result = super().generate_json(prompt, schema=schema, system=system)
+            result["referenced_inputs"] = [
+                {"id_type": "target_sequence", "value": raw_value, "source": "user"}
+            ]
+            result["missing_slots"] = [
+                slot
+                for slot in result.get("missing_slots") or []
+                if slot.get("slot_name") != "structure_or_sequence"
+            ]
+            result["response"] = None
+            return result
+
+    provider = _ExplicitTargetSequenceProvider()
+    supervisor = SupervisorAgent(llm=provider)
+    service = ClarificationService(
+        local_storage, registry_service, workflow_state_service
+    )
+    payload = [
+        {
+            "request_id": request.request_id,
+            "answer_text": raw_value,
+            "answered_at": "t",
+        }
+    ]
+    result = service.submit_and_reparse(run_id, payload, supervisor)
+
+    assert len(provider.calls) == 1
+    provider_text = json.dumps(provider.calls, sort_keys=True)
+    assert raw_value in provider_text
+    answer = result.state.clarification_answers[0]
+    assert answer.answer_text == raw_value
+    assert result.input_readiness_status is not None
+    assert result.input_readiness_status.input_readiness_status == "ready"
+    assert len(
+        local_storage.list_prefix(local_storage.run_key(run_id, "clarification"))
+    ) == 1
+    structured = local_storage.read_json(
+        local_storage.run_key(run_id, "inputs/structured_query.json")
+    )
+    assert {
+        "id_type": "target_sequence",
+        "value": raw_value,
+        "source": "user",
+    } in structured["referenced_inputs"]
+    assert not any(
+        "clarification_input" in key
+        for key in local_storage.list_prefix(local_storage.run_key(run_id))
+    )
+
+    files_before = set(local_storage.list_prefix(local_storage.run_key(run_id)))
+    replay = ClarificationService(
+        local_storage, registry_service, workflow_state_service
+    ).submit_and_reparse(run_id, payload, supervisor)
+    assert replay.state.revision_id == result.state.revision_id
+    assert len(provider.calls) == 1
+    assert set(local_storage.list_prefix(local_storage.run_key(run_id))) == files_before
+    all_keys = local_storage.list_prefix(local_storage.run_key(run_id))
+    assert not any("checkpoint" in key or "tool_call_records" in key for key in all_keys)
+    active = registry_service.get(run_id).active_artifacts
+    assert active.worker_routing_plan_id is None
+    assert active.candidate_context_table_id is None
+
+
+@pytest.mark.parametrize("short_answer", ["1N8Z", "HER2", "MMAE"])
+def test_short_clarification_answers_remain_visible_to_step2(
+    local_storage,
+    registry_service,
+    workflow_state_service,
+    short_answer,
+):
+    run_id, readiness = _turn_one(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        "Analyze the structure of an ADC candidate and report the interface.",
+    )
+    request = next(
+        item
+        for item in readiness.clarification_requests
+        if not item.resolved and item.severity in {"blocking", "warning"}
+    )
+    provider = _CapturingProvider()
+    ClarificationService(
+        local_storage, registry_service, workflow_state_service
+    ).submit_and_reparse(
+        run_id,
+        [
+            {
+                "request_id": request.request_id,
+                "answer_text": short_answer,
+                "answered_at": "t",
+            }
+        ],
+        SupervisorAgent(llm=provider),
+    )
+    assert short_answer in json.dumps(provider.calls)
+
+
+def test_clarification_revision_preserves_same_run_session_and_raw_identity(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id, readiness = _turn_one(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        "I want to design a new antibody-drug conjugate.",
+    )
+    original = local_storage.read_json(
+        local_storage.run_key(run_id, "inputs/raw_request_record.json")
+    )
+    result = ClarificationService(
+        local_storage, registry_service, workflow_state_service
+    ).submit_and_reparse(
+        run_id,
+        [
+            {
+                "request_id": _target_request_id(readiness),
+                "answer_text": "HER2",
+                "answered_at": "t",
+            }
+        ],
+        _supervisor(),
+    )
+    current = local_storage.read_json(
+        local_storage.run_key(run_id, "inputs/raw_request_record.json")
+    )
+    assert result.run_id == run_id
+    assert current == original
+    assert registry_service.get(run_id).active_artifacts.raw_request_record_id == (
+        original["artifact_id"]
+    )
+
+
+def test_clarification_rejects_tampered_raw_identity_before_revision_write(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id, readiness = _turn_one(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        "I want to design a new antibody-drug conjugate.",
+    )
+    key = local_storage.run_key(run_id, "inputs/raw_request_record.json")
+    body = local_storage.read_json(key)
+    body["run_id"] = "sk-live-tampered-run"
+    local_storage.write_json(key, body)
+
+    with pytest.raises(
+        OrchestratorReadinessError,
+        match="^raw_request_record_identity_mismatch$",
+    ) as caught:
+        ClarificationService(
+            local_storage, registry_service, workflow_state_service
+        ).submit_clarification_answer(
+            run_id,
+            [
+                {
+                    "request_id": _target_request_id(readiness),
+                    "answer_text": "HER2",
+                    "answered_at": "t",
+                }
+            ],
+        )
+
+    assert "sk-live" not in repr(caught.value)
+    assert len(local_storage.list_prefix(local_storage.run_key(run_id, "clarification"))) == 0
 
 
 # ── E. prompt ──────────────────────────────────────────────────────────────────
@@ -317,7 +829,7 @@ def test_sequence_answer_is_user_input_not_copied_to_normalized_artifacts(
 # ── canonical_query carry-over ───────────────────────────────────────────────
 
 
-def test_next_context_includes_previous_canonical_query(
+def test_effective_context_includes_previous_canonical_query(
     local_storage, registry_service, workflow_state_service
 ):
     run_id, readiness = _turn_one(
@@ -326,17 +838,20 @@ def test_next_context_includes_previous_canonical_query(
     )
     rid = _target_request_id(readiness)
     svc = ClarificationService(local_storage, registry_service, workflow_state_service)
-    state = svc.submit_clarification_answer(
-        run_id, [{"request_id": rid, "answer_text": "HER2", "answered_at": "t"}]
+    supervisor = _CapturingSupervisor()
+    svc.submit_and_reparse(
+        run_id,
+        [{"request_id": rid, "answer_text": "HER2", "answered_at": "t"}],
+        supervisor,
     )
-    next_raw = local_storage.read_json(
-        local_storage.run_key(state.next_run_id, "inputs/raw_request_record.json")
-    )
-    ctx = next_raw["user_provided_context"]
+    effective = supervisor.inputs[0]
+    ctx = effective["user_provided_context"]
     assert ctx.get("previous_canonical_query")
     assert "antibody-drug conjugate" in ctx["previous_canonical_query"].lower()
     # Original raw query preserved (auditable), not replaced by a marker.
-    assert "I want to design a new antibody-drug conjugate." in next_raw["raw_user_query"]
+    assert "I want to design a new antibody-drug conjugate." in effective[
+        "raw_user_query"
+    ]
 
 
 def test_second_turn_updates_canonical_query_and_clears_target_block(
@@ -359,3 +874,42 @@ def test_second_turn_updates_canonical_query_and_clears_target_block(
         for m in sq.missing_slots
     )
     assert res.input_readiness_status.input_readiness_status != "blocked"
+
+
+def test_fresh_service_replays_completed_revision_from_persisted_storage(
+    local_storage, registry_service, workflow_state_service
+):
+    run_id, readiness = _turn_one(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        "Analyze the structure of HER2 and report the binding interface.",
+    )
+    request = next(
+        item
+        for item in readiness.clarification_requests
+        if item.slot_name == "structure_or_sequence"
+    )
+    first_supervisor = _CapturingSupervisor()
+    payload = [
+        {
+            "request_id": request.request_id,
+            "answer_text": "Use PDB 1N8Z.",
+            "answered_at": "2026-07-15T00:00:00Z",
+        }
+    ]
+    first = ClarificationService(
+        local_storage, registry_service, workflow_state_service
+    ).submit_and_reparse(run_id, payload, first_supervisor)
+    files = set(local_storage.list_prefix(local_storage.prefix))
+
+    replay_supervisor = _CapturingSupervisor()
+    payload[0]["answered_at"] = "2099-01-01T00:00:00Z"
+    replay = ClarificationService(
+        local_storage, registry_service, workflow_state_service
+    ).submit_and_reparse(run_id, payload, replay_supervisor)
+
+    assert replay.state.revision_id == first.state.revision_id
+    assert replay.input_readiness_status == first.input_readiness_status
+    assert replay_supervisor.inputs == []
+    assert set(local_storage.list_prefix(local_storage.prefix)) == files

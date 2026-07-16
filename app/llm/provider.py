@@ -1379,6 +1379,7 @@ _ANTIBODY_SEQUENCE_SOURCES = {
     "antibody_light_chain_sequence",
     "antibody_sequence_reference",
 }
+_TARGET_SEQUENCE_SOURCES = {"target_sequence"}
 _STRUCTURE_FILE_EXTS = (".pdb", ".cif", ".mmcif", ".ent")
 _SEQUENCE_FILE_EXTS = (".fasta", ".fa", ".faa", ".seq")
 
@@ -1419,17 +1420,33 @@ def _missing_slot_signals(
     has_sequence_ref = False
     has_structure_upload = False
     has_sequence_upload = False
+    prompt_file_ids = {
+        str(r.get("value") or "")
+        for r in referenced
+        if isinstance(r, dict)
+        and r.get("id_type") == "uploaded_file"
+        and r.get("source") == "prompt_sequence"
+    }
     for r in referenced:
         if not isinstance(r, dict):
             continue
         idt = (r.get("id_type") or "")
         src = (r.get("source") or "").lower()
         filename = (r.get("filename") or "").lower()
-        if idt in _ANTIBODY_SEQUENCE_SOURCES or src in _ANTIBODY_SEQUENCE_SOURCES:
+        if (
+            idt in _ANTIBODY_SEQUENCE_SOURCES
+            or src in _ANTIBODY_SEQUENCE_SOURCES
+            or idt in _TARGET_SEQUENCE_SOURCES
+            or src in _TARGET_SEQUENCE_SOURCES
+        ):
             has_sequence_ref = True
-        if filename.endswith(_STRUCTURE_FILE_EXTS):
+        file_is_prompt_only = (
+            idt == "uploaded_file"
+            and str(r.get("value") or "") in prompt_file_ids
+        )
+        if filename.endswith(_STRUCTURE_FILE_EXTS) and not file_is_prompt_only:
             has_structure_upload = True
-        if filename.endswith(_SEQUENCE_FILE_EXTS):
+        if filename.endswith(_SEQUENCE_FILE_EXTS) and not file_is_prompt_only:
             has_sequence_upload = True
 
     target_satisfied = bool(target) or "uniprot_id" in ref_id_types or "target_or_antigen" in norm_types

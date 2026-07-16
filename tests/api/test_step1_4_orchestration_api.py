@@ -200,8 +200,8 @@ def test_scenario_B_step5_api_is_gated_with_409(client: TestClient):
 def test_scenario_C_blocked_does_not_create_a_ready_plan(client: TestClient):
     run_id = _create_run(
         client,
-        ctx={},  # no target → readiness=blocked
-        query="Help me get started — no specifics yet",
+        ctx={},  # empty request is terminally invalid, not clarifiable
+        query="",
     )
     r2 = client.post(f"/runs/{run_id}/steps/2/execute")
     assert r2.status_code == 200

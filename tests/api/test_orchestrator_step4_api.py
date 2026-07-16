@@ -18,14 +18,21 @@ from app.a2a.orchestrator_application_service import (
 )
 from app.a2a.orchestrator_discovery import DispatchTarget
 from app.a2a.orchestrator_routing_service import OrchestratorRoutingService
+from app.agents.supervisor_agent import SupervisorAgent
 from app.graph.orchestrator_execution_graph import (
     build_orchestrator_execution_graph,
+    execution_graph_config,
 )
 from app.graph.orchestrator_checkpoint_runtime import (
     OrchestratorCheckpointRuntimeError,
 )
 from app.main import create_app
+from app.llm.provider import MockLLMProvider
+from app.services.input_readiness_service import InputReadinessService
+from app.services.intake_service import IntakeService
+from app.services.structured_query_service import StructuredQueryService
 from app.settings import get_settings
+from app.utils.ids import new_file_id
 from tests.a2a.test_orchestrator_dispatch import _serve_task_handler
 from tests.a2a.test_orchestrator_post_ingestion import (
     RUN_ID,
@@ -36,6 +43,10 @@ from tests.a2a.test_orchestrator_post_ingestion import (
     _seed_inputs,
 )
 from tests.a2a.test_orchestrator_retry_loop import _card, _SyntheticWorker
+from tests.a2a.test_orchestrator_routing_service import (
+    _seed_inputs as _seed_routing_inputs,
+    _service as _routing_service_fixture,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -78,6 +89,21 @@ class _StartupFailureRuntime:
 
     async def shutdown(self):
         raise AssertionError("never started")
+
+
+class _CountingApplicationService:
+    """Expose the real readiness gate while counting forbidden execute calls."""
+
+    def __init__(self, delegate):
+        self.delegate = delegate
+        self.execute_count = 0
+
+    def ensure_input_readiness_ready(self, run_id):
+        return self.delegate.ensure_input_readiness_ready(run_id)
+
+    async def execute(self, run_id):
+        self.execute_count += 1
+        return await self.delegate.execute(run_id)
 
 
 def _configure_lifespan(monkeypatch):
@@ -137,6 +163,278 @@ def test_configured_postgres_startup_failure_aborts_lifespan_without_fallback(
             pass
     assert "private" not in repr(caught.value)
     assert "secret" not in str(caught.value)
+
+
+def test_not_ready_execute_is_409_before_orchestrator_side_effects(
+    monkeypatch, local_storage, registry_service
+):
+    _configure_lifespan(monkeypatch)
+    run_ids = {
+        "needs_user_input": "run_20260715_abcde001",
+        "blocked": "run_20260715_abcde002",
+    }
+    for readiness, run_id in run_ids.items():
+        _seed_routing_inputs(
+            local_storage,
+            registry_service,
+            run_id=run_id,
+            readiness=readiness,
+        )
+    routing_service, llm, discovery = _routing_service_fixture(
+        local_storage, registry_service
+    )
+    runtime = _MemoryRuntime()
+    production_service = OrchestratorApplicationService(
+        checkpoint_runtime=runtime,
+        routing_service=routing_service,
+        discovery=discovery,
+        registry=registry_service,
+        storage=local_storage,
+        worker_timeout_seconds=2,
+        max_worker_retries=3,
+    )
+    counting = _CountingApplicationService(production_service)
+    app = create_app(
+        checkpoint_runtime_factory=lambda _settings: runtime,
+        orchestrator_service_factory=lambda _runtime: counting,
+    )
+
+    with TestClient(app) as client:
+        responses = {
+            status: client.post(f"/runs/{run_id}/steps/4/execute")
+            for status, run_id in run_ids.items()
+        }
+
+    assert {response.status_code for response in responses.values()} == {409}
+    assert {
+        response.json()["error_code"] for response in responses.values()
+    } == {"input_readiness_not_ready"}
+    assert counting.execute_count == 0
+    assert llm.call_count == discovery.discover_count == 0
+    assert list(runtime.saver.list(None)) == []
+    for run_id in run_ids.values():
+        active = registry_service.get(run_id).active_artifacts
+        assert active.worker_discovery_snapshot_id is None
+        assert active.worker_routing_plan_id is None
+        assert active.worker_routing_plan_control_id is None
+        assert active.candidate_context_table_id is None
+        assert active.structured_liability_summary_id is None
+        assert active.prepared_structure_input_package_id is None
+        assert not local_storage.exists(
+            local_storage.run_key(run_id, "worker_routing_plan.json")
+        )
+
+
+@pytest.mark.parametrize(
+    ("id_type", "value"),
+    [
+        ("target_sequence", "ACDE?FG"),
+        ("uniprot_id", "not-a-uniprot-accession"),
+    ],
+)
+def test_invalid_typed_structure_input_is_blocked_before_step4_or_a2a(
+    monkeypatch,
+    local_storage,
+    registry_service,
+    workflow_state_service,
+    id_type,
+    value,
+):
+    _configure_lifespan(monkeypatch)
+
+    class _InvalidSequenceProvider:
+        """Test-only Step 2 fixture; readiness and Step 4 gate are real."""
+
+        name = "test-only-invalid-sequence"
+        model = "test-only"
+
+        def __init__(self):
+            self.inner = MockLLMProvider()
+            self.call_count = 0
+
+        def generate_json(self, prompt, *, schema, system=None):
+            self.call_count += 1
+            result = self.inner.generate_json(
+                prompt, schema=schema, system=system
+            )
+            result["referenced_inputs"] = [
+                {
+                    "id_type": id_type,
+                    "value": value,
+                    "source": "user",
+                }
+            ]
+            result["missing_slots"] = []
+            result["response"] = None
+            return result
+
+    step2_provider = _InvalidSequenceProvider()
+    raw = IntakeService(
+        local_storage, registry_service, workflow_state_service
+    ).submit(
+        raw_user_query="Analyze the HER2 structure with the supplied sequence.",
+        user_provided_context={},
+    )
+    StructuredQueryService(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        SupervisorAgent(llm=step2_provider),
+    ).parse(raw.run_id)
+    readiness = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(raw.run_id)
+    assert readiness.input_readiness_status == "needs_user_input"
+
+    routing_service, routing_llm, discovery = _routing_service_fixture(
+        local_storage, registry_service
+    )
+    runtime = _MemoryRuntime()
+    production_service = OrchestratorApplicationService(
+        checkpoint_runtime=runtime,
+        routing_service=routing_service,
+        discovery=discovery,
+        registry=registry_service,
+        storage=local_storage,
+        worker_timeout_seconds=2,
+        max_worker_retries=3,
+    )
+    counting = _CountingApplicationService(production_service)
+    app = create_app(
+        checkpoint_runtime_factory=lambda _settings: runtime,
+        orchestrator_service_factory=lambda _runtime: counting,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(f"/runs/{raw.run_id}/steps/4/execute")
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "input_readiness_not_ready"
+    assert step2_provider.call_count == 1
+    assert counting.execute_count == 0
+    assert routing_llm.call_count == 0
+    assert discovery.discover_count == 0
+    assert list(runtime.saver.list(None)) == []
+    active = registry_service.get(raw.run_id).active_artifacts
+    assert active.worker_discovery_snapshot_id is None
+    assert active.worker_routing_plan_id is None
+    assert active.worker_routing_plan_control_id is None
+    assert active.candidate_context_table_id is None
+    assert active.structured_liability_summary_id is None
+    assert active.prepared_structure_input_package_id is None
+    assert not local_storage.exists(
+        local_storage.run_key(raw.run_id, "worker_routing_plan.json")
+    )
+    assert not any(
+        "tool_call_records" in key
+        for key in local_storage.list_prefix(local_storage.run_key(raw.run_id))
+    )
+
+
+def test_unassigned_uploaded_fasta_blocks_before_step4_or_a2a(
+    monkeypatch,
+    local_storage,
+    registry_service,
+    workflow_state_service,
+):
+    _configure_lifespan(monkeypatch)
+    file_id = new_file_id()
+
+    class _GenericFastaProvider:
+        """Test-only Step 2 fixture; production normalization/gates are real."""
+
+        name = "test-only-generic-fasta"
+        model = "test-only"
+
+        def __init__(self):
+            self.inner = MockLLMProvider()
+            self.call_count = 0
+
+        def generate_json(self, prompt, *, schema, system=None):
+            self.call_count += 1
+            result = self.inner.generate_json(prompt, schema=schema, system=system)
+            result["referenced_inputs"] = [
+                {
+                    "id_type": "uploaded_file",
+                    "value": file_id,
+                    "source": "uploaded_file",
+                }
+            ]
+            result["missing_slots"] = []
+            result["response"] = None
+            return result
+
+    step2_provider = _GenericFastaProvider()
+    raw = IntakeService(
+        local_storage, registry_service, workflow_state_service
+    ).submit(
+        raw_user_query=(
+            "Analyze the target heavy light sequence keywords in this upload."
+        ),
+        uploaded_files=[
+            {
+                "file_id": file_id,
+                "original_filename": "target_heavy_light_sequence.fasta",
+                "storage_path": f"inputs/files/{file_id}.fasta",
+                "content_type": "text/x-fasta",
+            }
+        ],
+    )
+    sq = StructuredQueryService(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        SupervisorAgent(llm=step2_provider),
+    ).parse(raw.run_id)
+    readiness = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(raw.run_id)
+    assert [ref.get("source") for ref in sq.referenced_inputs] == [
+        "uploaded_file"
+    ]
+    assert [slot.slot_name for slot in sq.missing_slots] == ["sequence_role"]
+    assert readiness.input_readiness_status == "needs_user_input"
+    assert any(
+        request.slot_name == "sequence_role"
+        for request in readiness.clarification_requests
+    )
+
+    routing_service, routing_llm, discovery = _routing_service_fixture(
+        local_storage, registry_service
+    )
+    runtime = _MemoryRuntime()
+    production_service = OrchestratorApplicationService(
+        checkpoint_runtime=runtime,
+        routing_service=routing_service,
+        discovery=discovery,
+        registry=registry_service,
+        storage=local_storage,
+        worker_timeout_seconds=2,
+        max_worker_retries=3,
+    )
+    counting = _CountingApplicationService(production_service)
+    app = create_app(
+        checkpoint_runtime_factory=lambda _settings: runtime,
+        orchestrator_service_factory=lambda _runtime: counting,
+    )
+    with TestClient(app) as client:
+        response = client.post(f"/runs/{raw.run_id}/steps/4/execute")
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "input_readiness_not_ready"
+    assert step2_provider.call_count == 1
+    assert counting.execute_count == 0
+    assert routing_llm.call_count == 0
+    assert discovery.discover_count == 0
+    assert list(runtime.saver.list(None)) == []
+    active = registry_service.get(raw.run_id).active_artifacts
+    assert active.worker_discovery_snapshot_id is None
+    assert active.worker_routing_plan_id is None
+    assert active.worker_routing_plan_control_id is None
+    assert active.candidate_context_table_id is None
+    assert not local_storage.exists(
+        local_storage.run_key(raw.run_id, "worker_routing_plan.json")
+    )
 
 
 def test_fresh_concurrent_execute_status_and_resume_are_idempotent_over_http(
@@ -231,6 +529,9 @@ def test_fresh_concurrent_execute_status_and_resume_are_idempotent_over_http(
     assert llm.call_count == 1
     assert handle.hits["task"] == 1
     assert len(worker.requests) == 1
+    assert worker.requests[0].session_id == "sess_0123456789abcdef"
+    checkpoint = runtime.graph.get_state(execution_graph_config(RUN_ID))
+    assert checkpoint.values["session_id"] == "sess_0123456789abcdef"
     assert status.status_code == resumed.status_code == 200
     assert status.json()["outcome"] == resumed.json()["outcome"] == "completed"
     assert status.json()["task_counts"]["completed"] == 1

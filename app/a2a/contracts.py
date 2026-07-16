@@ -30,6 +30,8 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.utils.ids import SessionId
+
 
 # The single ``extra="forbid"`` config reused by every contract model. Unknown
 # fields (including raw-looking ones) are rejected at validation time.
@@ -289,7 +291,7 @@ class WorkerExecutionRequest(BaseModel):
     payload_type: Literal["worker_execution_request"]
     payload_version: Literal["v1"]
     run_id: str
-    session_id: Optional[str] = None
+    session_id: Optional[SessionId] = None
     task_id: str
     routing_plan_id: str
     routing_decision_id: str

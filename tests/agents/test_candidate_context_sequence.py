@@ -20,7 +20,12 @@ import pytest
 
 from app.agents.candidate_context_agent import CandidateContextAgent
 from app.agents.developability_agent import DevelopabilityAgent
+from app.agents.structure_and_design_agent import StructureAndDesignAgent
+from app.agents.supervisor_agent import SupervisorAgent
 from app.agents.step_06_available_fields import project_candidate_available_fields
+from app.agents.step_09_input_projection import project_step9_inputs
+from app.agents.step_09_runtime_execution import resolve_step9_field_value
+from app.llm.provider import MockLLMProvider
 from app.mcp.client import LocalMCPClient
 from app.schemas.step_02_structured_query import (
     SourceRawRequestRef,
@@ -29,6 +34,7 @@ from app.schemas.step_02_structured_query import (
 )
 from app.services.input_readiness_service import InputReadinessService
 from app.services.intake_service import IntakeService
+from app.services.structured_query_service import StructuredQueryService
 from app.services.tool_inventory_service import ToolInventoryService
 from app.services.workflow_setup_service import WorkflowSetupService
 from app.utils.ids import new_artifact_id
@@ -105,6 +111,20 @@ def _run_step5(local_storage, registry_service, workflow_state_service, run_id) 
     )
 
 
+def _run_step5_without_external_tools(
+    local_storage, registry_service, workflow_state_service, run_id
+) -> dict:
+    CandidateContextAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(),
+    ).run(run_id)
+    return local_storage.read_json(
+        local_storage.run_key(run_id, "candidate_context_table.json")
+    )
+
+
 def _antibody_record(cct: dict) -> dict:
     abs_ = [c for c in cct["candidate_records"] if c["candidate_type"] == "antibody"]
     assert abs_, "expected an antibody candidate record"
@@ -156,6 +176,153 @@ def test_light_ref_only_becomes_light_material(local_storage, registry_service, 
     mat_types = {m["material_type"] for m in ab["materials"] if m["value_format"] == "amino_acid_sequence"}
     assert mat_types == {"antibody_light_chain_sequence"}
     assert not any(m["material_type"] == "antibody_heavy_chain_sequence" for m in ab["materials"])
+
+
+@pytest.mark.parametrize("sequence", ["ACDE", "ACDEFGHIKLMNPQRSTVWY" * 40])
+def test_explicit_target_sequence_fixture_reaches_step7_and_step9_runtime(
+    local_storage, registry_service, workflow_state_service, sequence
+):
+    class _ExplicitTargetSequenceProvider:
+        """Test-only semantic fixture; production normalization stays real."""
+
+        name = "test-only-explicit-target-sequence"
+        model = "test-only"
+
+        def __init__(self):
+            self.inner = MockLLMProvider()
+            self.calls = []
+
+        def generate_json(self, prompt, *, schema, system=None):
+            self.calls.append(
+                json.loads(json.dumps({"prompt": prompt, "schema": schema}))
+            )
+            result = self.inner.generate_json(prompt, schema=schema, system=system)
+            result["task_intent"] = {
+                "task_type": "structure_preparation",
+                "task_type_confidence": 1.0,
+                "modality": "ADC",
+                "modality_confidence": 1.0,
+                "user_goal_summary": "Analyze an explicitly typed target sequence.",
+                "primary_intent": "structure_analysis",
+                "primary_intent_confidence": 1.0,
+                "secondary_intents": [],
+            }
+            result["referenced_inputs"] = [
+                {"id_type": "target_sequence", "value": sequence, "source": "user"}
+            ]
+            result["missing_slots"] = [
+                slot
+                for slot in result.get("missing_slots") or []
+                if slot.get("slot_name") != "structure_or_sequence"
+            ]
+            result["response"] = None
+            return result
+
+    provider = _ExplicitTargetSequenceProvider()
+    raw = IntakeService(
+        local_storage, registry_service, workflow_state_service
+    ).submit(
+        raw_user_query=f"Analyze target protein sequence: {sequence}",
+        user_provided_context={},
+    )
+    run_id = raw.run_id
+    structured = StructuredQueryService(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        SupervisorAgent(llm=provider),
+    ).parse(run_id)
+    assert sequence in json.dumps(provider.calls)
+    assert structured.referenced_inputs == [
+        {"id_type": "target_sequence", "value": sequence, "source": "user"}
+    ]
+    readiness = InputReadinessService(
+        local_storage, registry_service, workflow_state_service
+    ).check(run_id)
+    assert readiness.input_readiness_status == "ready", readiness.model_dump()
+    WorkflowSetupService(
+        local_storage, registry_service, workflow_state_service
+    ).plan(run_id)
+    cct = _run_step5_without_external_tools(
+        local_storage, registry_service, workflow_state_service, run_id
+    )
+    target = next(
+        item for item in cct["candidate_records"]
+        if item["candidate_type"] == "target_antigen"
+    )
+    material = next(
+        item for item in target["materials"]
+        if item["material_type"] == "target_sequence"
+    )
+    assert material["value"] == sequence
+    assert material["value_format"] == "amino_acid_sequence"
+    assert cct.get("tool_call_records") == []
+
+    step7 = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(),
+    ).run_step_7(run_id)
+    prepared = next(
+        item for item in step7.prepared_structure_inputs
+        if item.candidate_id == target["candidate_id"]
+    )
+    sequence_ref = next(
+        item for item in prepared.sequence_refs_for_prediction
+        if item.source_ref == material["material_id"]
+    )
+    assert sequence_ref.sequence_value_status == "inline"
+    assert sequence_ref.prediction_input_kind == "amino_acid_sequence"
+    assert prepared.input_case == "sequence_only_input"
+    assert prepared.missing_metadata_flags == []
+
+    projection = project_step9_inputs(
+        candidate_context_table=cct,
+        prepared_structure_input_package=step7.model_dump(mode="json"),
+        structure_prediction_and_interface_results=None,
+    )
+    field = next(
+        item for item in projection["input_fields"]
+        if item.field_ref == f"material:{material['material_id']}"
+    )
+    assert field.status == "available"
+    assert field.missing_reason is None
+    assert field.supports_tool_args == ["sequence"]
+    value, error = resolve_step9_field_value(
+        field.model_dump(mode="json"),
+        candidate_context_table=cct,
+        prepared_inputs=step7.model_dump(mode="json")["prepared_structure_inputs"],
+        step8_result={},
+        storage=local_storage,
+    )
+    assert error is None
+    assert value == sequence
+    tool_statuses = [
+        (record.tool_name, record.run_status, record.error_message)
+        for record in step7.structure_tool_call_records
+    ]
+    assert sum(status == "dependency_unavailable" for _, status, _ in tool_statuses) == 1
+    assert sum(status == "skipped" for _, status, _ in tool_statuses) == 6
+    assert not any(status in {"success", "failed"} for _, status, _ in tool_statuses)
+    assert sequence_ref.msa_status == "dependency_unavailable"
+    assert step7.structure_preparation_status == "partial"
+    assert step7.preparation_warnings == [
+        {
+            "tool_name": "NvidiaNIM_msa_search",
+            "run_status": "dependency_unavailable",
+            "reason": "wrapper_not_wired",
+            "chain_role": "antigen",
+        }
+    ]
+    unavailable = next(
+        record
+        for record in step7.structure_tool_call_records
+        if record.run_status == "dependency_unavailable"
+    )
+    assert unavailable.tool_name == "NvidiaNIM_msa_search"
+    assert unavailable.tool_input_summary["routing_decision"] == "selected"
+    assert unavailable.error_message == "wrapper_not_wired"
 
 
 def test_step5_does_not_record_antibody_sequence_missing(

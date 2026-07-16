@@ -1161,6 +1161,14 @@ async def test_all_non_success_tool_statuses_remain_auditable(
     statuses = {record["run_status"] for record in records}
 
     assert result_task.status.state == TaskState.COMPLETED
+    assert result["result_status"] == "partial"
+    assert result["execution_status"] == "completed"
+    assert result["compact_summary"]["step7_status"] == "partial"
+    assert result["compact_summary"]["step7_preparation_warning_count"] > 0
+    assert outputs["prepared_structure_input_package"][
+        "structure_preparation_status"
+    ] == "partial"
+    assert outputs["prepared_structure_input_package"]["preparation_warnings"]
     assert {"success", "failed", "dependency_unavailable", "skipped"} <= statuses
     assert result["tool_call_summary"] == _expected_tool_summary(records)
     assert result["tool_call_summary"]["failed"] >= 1

@@ -128,6 +128,7 @@ def test_checkpoint_values_have_only_compact_schema_keys_and_no_sensitive_body()
         "routing",
         "run_id",
         "run_status",
+        "session_id",
         "worker_tasks",
     ]
     serialized = json.dumps(values, sort_keys=True)
@@ -142,6 +143,34 @@ def test_checkpoint_values_have_only_compact_schema_keys_and_no_sensitive_body()
         "storage_path",
     ):
         assert forbidden not in serialized.lower()
+
+
+def test_same_session_keeps_distinct_run_checkpoint_namespaces():
+    first = execution_state_from_routing_result(routing_result_fixture())
+    second = first.model_copy(
+        update={"run_id": "run_20260715_abcdef13"}
+    )
+    saver = InMemorySaver()
+    graph = build_orchestrator_execution_graph(checkpointer=saver)
+    first_config = execution_graph_config(first.run_id)
+    second_config = execution_graph_config(second.run_id)
+
+    graph.invoke(first, config=first_config)
+    graph.invoke(second, config=second_config)
+    restored_first = OrchestratorExecutionState.model_validate(
+        graph.get_state(first_config).values
+    )
+    restored_second = OrchestratorExecutionState.model_validate(
+        graph.get_state(second_config).values
+    )
+
+    assert restored_first.session_id == restored_second.session_id == (
+        "sess_0123456789abcdef"
+    )
+    assert restored_first.run_id != restored_second.run_id
+    assert graph.get_state(first_config).config != graph.get_state(
+        second_config
+    ).config
 
 
 def test_execution_graph_has_no_dispatch_or_worker_call_path():

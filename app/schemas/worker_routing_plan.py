@@ -6,6 +6,8 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.utils.ids import SessionId
+
 _FORBID = ConfigDict(extra="forbid")
 
 LoopDecision = Literal[
@@ -88,6 +90,8 @@ class RejectedRoutingDecision(BaseModel):
 class WorkerRoutingPlan(BaseModel):
     model_config = _FORBID
     run_id: str
+    # Optional only for loading historical plans. New production plans set it.
+    session_id: SessionId | None = None
     step_id: Literal["step_04_orchestrator_routing"] = "step_04_orchestrator_routing"
     routing_plan_id: str
     planned_at: str

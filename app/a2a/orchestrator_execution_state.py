@@ -154,6 +154,7 @@ def execution_state_from_routing_result(
     try:
         projected = OrchestratorExecutionState(
             run_id=plan.run_id,
+            session_id=plan.session_id,
             run_status=run_status,
             orchestrator=OrchestratorState(
                 status="planning",

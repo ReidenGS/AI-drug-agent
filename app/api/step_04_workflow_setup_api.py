@@ -37,6 +37,12 @@ async def execute_step_04(
             status_code=503,
         )
     try:
+        gate = getattr(service, "ensure_input_readiness_ready", None)
+        if not callable(gate):
+            raise OrchestratorApplicationServiceError(
+                "input_readiness_gate_unavailable"
+            )
+        gate(run_id)
         return await service.execute(run_id)
     except OrchestratorApplicationServiceError as exc:
         return _service_error_response(run_id, exc)
@@ -114,7 +120,12 @@ def _service_error_response(
     run_id: str, exc: OrchestratorApplicationServiceError
 ) -> JSONResponse:
     code = str(exc)
-    status = 404 if code == "orchestrator_checkpoint_not_found" else 503
+    if code == "orchestrator_checkpoint_not_found":
+        status = 404
+    elif code == "input_readiness_not_ready":
+        status = 409
+    else:
+        status = 503
     return _error_response(run_id, code, status_code=status)
 
 

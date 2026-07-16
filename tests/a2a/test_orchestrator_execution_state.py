@@ -158,6 +158,7 @@ def routing_result_fixture(*, independent_ready: bool = False):
         )
     plan = WorkerRoutingPlan(
         run_id=run_id,
+        session_id="sess_0123456789abcdef",
         routing_plan_id="wrp_0123456789abcdef",
         planned_at="2026-07-13T00:00:00Z",
         loop_decision="dispatch_next_workers",

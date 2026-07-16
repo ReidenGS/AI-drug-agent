@@ -22,6 +22,7 @@ from app.a2a.orchestrator_routing_validation import validate_orchestrator_routin
 from app.a2a.orchestrator_task_builder import (
     build_canonical_worker_execution_request,
     build_orchestrator_worker_task,
+    build_retry_orchestrator_worker_task,
 )
 from app.schemas.worker_routing_plan import (
     OrchestratorRoutingProposal,
@@ -139,6 +140,42 @@ def test_task_round_trips_request_metadata_and_all_identity_fields(
     assert request.input_projection.runtime_refs == {}
     assert request.orchestrator_routing_decision.reason is None
     assert request.orchestrator_routing_decision.routing_phase is None
+
+
+def test_initial_and_retry_tasks_preserve_explicit_session(
+    local_storage, registry_service
+):
+    run_id, validated = _ready(local_storage, registry_service)
+    session_id = "sess_0123456789abcdef"
+    initial = build_orchestrator_worker_task(
+        run_id=run_id,
+        routing_plan_id="wrp_session",
+        validated=validated,
+        task_id="task_initial_session",
+        session_id=session_id,
+    )
+    retry_runtime = validated
+    retry_runtime.decision = initial.decision.model_copy(
+        update={"task_id": "task_retry_session"}
+    )
+    retry = build_retry_orchestrator_worker_task(
+        run_id=run_id,
+        routing_plan_id="wrp_session",
+        validated=retry_runtime,
+        task_id="task_retry_session",
+        retry_attempt=1,
+        max_retry_attempts=3,
+        retry_of_task_id="task_initial_session",
+        retry_reason="synthetic_tool_failed",
+        session_id=session_id,
+    )
+
+    initial_request = _request_from_task(initial.task)
+    retry_request = _request_from_task(retry.task)
+    assert initial_request.session_id == retry_request.session_id == session_id
+    assert initial_request.retry_context is None
+    assert retry_request.retry_context.retry_of_task_id == initial.task.id
+    assert retry_request.retry_context.retry_attempt == 1
 
 
 def test_task_can_be_rebuilt_with_explicit_persisted_task_identity(

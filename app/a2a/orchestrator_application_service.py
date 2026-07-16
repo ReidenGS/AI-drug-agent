@@ -26,6 +26,10 @@ from .orchestrator_execution_state import (
     execution_state_from_routing_result,
 )
 from .orchestrator_resume import resume_orchestrator_run
+from .orchestrator_readiness import (
+    OrchestratorReadinessError,
+    require_ready_input_readiness,
+)
 
 
 class OrchestratorApplicationServiceError(RuntimeError):
@@ -79,6 +83,7 @@ class OrchestratorApplicationService:
 
     async def execute(self, run_id: str) -> OrchestratorStep4Response:
         """Plan a fresh run, or resume when a durable checkpoint exists."""
+        self.ensure_input_readiness_ready(run_id)
         async with self._run_lock(run_id):
             try:
                 async with self._runtime.run_lock(run_id):
@@ -91,6 +96,18 @@ class OrchestratorApplicationService:
                     if str(exc) == "checkpoint_run_lock_unavailable"
                     else "orchestrator_run_lock_failed"
                 ) from None
+
+    def ensure_input_readiness_ready(self, run_id: str) -> None:
+        """Validate the Step 3 authority before any Step 4 side effect."""
+
+        try:
+            require_ready_input_readiness(
+                run_id=run_id,
+                registry=self._registry,
+                storage=self._storage,
+            )
+        except OrchestratorReadinessError as exc:
+            raise OrchestratorApplicationServiceError(str(exc)) from None
 
     async def _execute_locked(self, run_id: str) -> OrchestratorStep4Response:
         existing = await self._load_state(run_id, required=False)

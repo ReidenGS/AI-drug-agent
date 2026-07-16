@@ -11,7 +11,7 @@ from app.schemas.worker_routing_plan import (
     RejectedRoutingDecision,
     ValidatedRoutingDecision,
 )
-from app.utils.ids import new_task_id
+from app.utils.ids import SessionId, new_task_id
 
 from .contracts import (
     A2ATaskMetadata,
@@ -43,6 +43,7 @@ def build_canonical_worker_execution_request(
     routing_plan_id: str,
     decision: ValidatedRoutingDecision,
     input_artifact_refs: Mapping[str, InputArtifactRef],
+    session_id: SessionId | None = None,
     retry_context: RetryContext | None = None,
 ) -> WorkerExecutionRequest:
     """Build the complete canonical ADC request for initial or retry dispatch.
@@ -56,7 +57,7 @@ def build_canonical_worker_execution_request(
         payload_type="worker_execution_request",
         payload_version="v1",
         run_id=run_id,
-        session_id=None,
+        session_id=session_id,
         task_id=decision.task_id,
         routing_plan_id=routing_plan_id,
         routing_decision_id=decision.routing_decision_id,
@@ -95,6 +96,7 @@ def build_orchestrator_worker_task(
     | ValidatedRoutingDecision
     | RejectedRoutingDecision,
     task_id: str | None = None,
+    session_id: SessionId | None = None,
 ) -> PreparedA2ATask:
     """Build one Task for a ready decision; never sends or executes it."""
     if not isinstance(validated, RuntimeValidatedDecision):
@@ -132,6 +134,7 @@ def build_orchestrator_worker_task(
         routing_plan_id=routing_plan_id,
         decision=updated_decision,
         input_artifact_refs=validated.input_artifact_refs,
+        session_id=session_id,
     )
     return _assemble_prepared_task(
         decision=updated_decision,
@@ -151,6 +154,7 @@ def build_retry_orchestrator_worker_task(
     max_retry_attempts: int,
     retry_of_task_id: str,
     retry_reason: str,
+    session_id: SessionId | None = None,
 ) -> PreparedA2ATask:
     """Build one retry from freshly reconstructed persisted/frozen authority."""
     if not isinstance(validated, RuntimeValidatedDecision):
@@ -175,6 +179,7 @@ def build_retry_orchestrator_worker_task(
         routing_plan_id=routing_plan_id,
         decision=decision,
         input_artifact_refs=validated.input_artifact_refs,
+        session_id=session_id,
         retry_context=retry_context,
     )
     return _assemble_prepared_task(

@@ -118,6 +118,7 @@ def _request_for(prepared: PreparedA2ATask) -> WorkerExecutionRequest:
         payload_type="worker_execution_request",
         payload_version="v1",
         run_id="run_20260714_abcdef12",
+        session_id="sess_0123456789abcdef",
         task_id=decision.task_id,
         routing_plan_id="wrp_0123456789abcdef",
         routing_decision_id=decision.routing_decision_id,
@@ -1165,7 +1166,7 @@ async def test_full_request_contract_drift_is_rejected_with_zero_side_effects(
                 update={"no_api_keys": False}
             )
         elif drift == "session_id":
-            update["session_id"] = injected
+            update["session_id"] = "sess_fedcba9876543210"
         elif drift == "retry_context":
             update["retry_context"] = RetryContext(
                 retry_of_task_id="task_aaaaaaaaaaaaaaaa",

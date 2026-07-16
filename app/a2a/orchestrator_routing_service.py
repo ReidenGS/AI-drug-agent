@@ -18,7 +18,6 @@ from pydantic import ValidationError
 
 from app.llm.json_task_validation import validate_task_shape
 from app.llm.provider import LLMProvider
-from app.schemas.step_03_input_readiness import InputReadinessStatus
 from app.schemas.orchestrator_execution_state import OrchestratorExecutionState
 from app.schemas.worker_routing_plan import (
     LoopDecision,
@@ -51,6 +50,11 @@ from .orchestrator_routing_prompt import (
     ORCHESTRATOR_ROUTING_SYSTEM_PROMPT,
     ORCHESTRATOR_ROUTING_USER_TASK,
 )
+from .orchestrator_readiness import (
+    OrchestratorReadinessError,
+    ValidatedInputReadinessAuthority,
+    require_ready_input_authority,
+)
 from .orchestrator_routing_validation import (
     RoutingValidationResult,
     RuntimeValidatedDecision,
@@ -64,8 +68,6 @@ from .orchestrator_task_builder import (
 )
 
 _PLAN_STORAGE_KEY = "inputs/worker_routing_plan.json"
-_STRUCTURED_QUERY_STORAGE_KEY = "inputs/structured_query.json"
-_READINESS_STORAGE_KEY = "inputs/input_readiness_status.json"
 _COMPACT_CODE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _SAFE_FIELD_NAME = re.compile(r"^[A-Za-z0-9_.:-]+$")
 
@@ -108,10 +110,26 @@ class OrchestratorRoutingService:
     def plan_for_run(self, run_id: str) -> OrchestratorRoutingServiceResult:
         """Create one plan for ``run_id`` or reuse its valid active plan."""
         with self._get_run_lock(run_id):
+            try:
+                input_authority = require_ready_input_authority(
+                    run_id=run_id,
+                    registry=self._registry,
+                    storage=self._storage,
+                )
+            except OrchestratorReadinessError as exc:
+                raise OrchestratorRoutingServiceError(str(exc)) from None
             active_plan_id = self._active_plan_artifact_id(run_id)
             if active_plan_id:
                 plan = self._load_plan(run_id, active_plan_id)
+                self._confirm_readiness_authority(
+                    run_id=run_id,
+                    expected_authority=input_authority,
+                )
                 discovery_performed = self._ensure_discovery(run_id)
+                self._confirm_readiness_authority(
+                    run_id=run_id,
+                    expected_authority=input_authority,
+                )
                 return self._revalidate_loaded_plan(
                     run_id=run_id,
                     artifact_id=active_plan_id,
@@ -120,61 +138,28 @@ class OrchestratorRoutingService:
                     discovery_performed=discovery_performed,
                 )
 
+            session_id = input_authority.raw_request.session_id
+            if session_id is None:
+                raise OrchestratorRoutingServiceError("session_id_missing")
+            structured_query = input_authority.structured_query.model_dump(
+                mode="json"
+            )
+            self._confirm_readiness_authority(
+                run_id=run_id,
+                expected_authority=input_authority,
+            )
             snapshot = self._discovery.discover_for_run(run_id)
             self._discovered_runs.add(run_id)
             compact_catalog = self._discovery.get_compact_card_catalog(run_id)
-            structured_query = self._load_input_artifact(
-                run_id=run_id,
-                artifact_name="structured_query",
-                storage_path=_STRUCTURED_QUERY_STORAGE_KEY,
-            )
-            readiness_body = self._load_input_artifact(
-                run_id=run_id,
-                artifact_name="input_readiness_status",
-                storage_path=_READINESS_STORAGE_KEY,
-            )
-            try:
-                readiness_model = InputReadinessStatus.model_validate(readiness_body)
-            except ValidationError as exc:
-                raise OrchestratorRoutingServiceError(
-                    "input_readiness_status_schema_invalid"
-                ) from exc
             artifact_summary = self._available_artifact_summary(run_id)
-
-            if readiness_model.input_readiness_status != "ready":
-                needs_input = (
-                    readiness_model.input_readiness_status == "needs_user_input"
-                )
-                plan = self._empty_plan(
-                    run_id=run_id,
-                    routing_status="waiting" if needs_input else "blocked",
-                    loop_decision="request_user_input" if needs_input else None,
-                    llm_selection_source=(
-                        "not_run_step3_needs_user_input"
-                        if needs_input
-                        else "not_run_step3_blocked"
-                    ),
-                    warning=(
-                        "input_readiness_needs_user_input"
-                        if needs_input
-                        else "input_readiness_blocked"
-                    ),
-                    available_agent_ids=snapshot.available_agent_ids,
-                    unavailable_agent_ids=snapshot.unavailable_agent_ids,
-                )
-                artifact_id = self._persist_new_plan(run_id, plan)
-                return OrchestratorRoutingServiceResult(
-                    plan=plan,
-                    plan_artifact_id=artifact_id,
-                    prepared_tasks=(),
-                    reused_existing_plan=False,
-                    llm_called=False,
-                    discovery_performed=True,
-                )
+            self._confirm_readiness_authority(
+                run_id=run_id,
+                expected_authority=input_authority,
+            )
 
             projected = project_orchestrator_context(
                 structured_query=structured_query,
-                readiness=readiness_body,
+                readiness=input_authority.readiness.model_dump(mode="json"),
                 available_artifacts=artifact_summary,
                 current_routing_context={
                     "available_agent_ids": snapshot.available_agent_ids,
@@ -195,6 +180,10 @@ class OrchestratorRoutingService:
                     schema=llm_schema,
                     system=ORCHESTRATOR_ROUTING_SYSTEM_PROMPT,
                 )
+                self._confirm_readiness_authority(
+                    run_id=run_id,
+                    expected_authority=input_authority,
+                )
                 validated_shape = validate_task_shape(
                     raw_proposal,
                     "orchestrator_worker_routing",
@@ -204,15 +193,25 @@ class OrchestratorRoutingService:
                 )
                 proposal = OrchestratorRoutingProposal.model_validate(validated_shape)
             except (OrchestratorRoutingServiceError, ValidationError):
+                self._confirm_readiness_authority(
+                    run_id=run_id,
+                    expected_authority=input_authority,
+                )
                 return self._persist_llm_failure(
                     run_id,
+                    session_id,
                     snapshot.available_agent_ids,
                     snapshot.unavailable_agent_ids,
                     "llm_response_schema_invalid",
                 )
             except Exception as exc:  # noqa: BLE001 - never persist raw detail
+                self._confirm_readiness_authority(
+                    run_id=run_id,
+                    expected_authority=input_authority,
+                )
                 return self._persist_llm_failure(
                     run_id,
+                    session_id,
                     snapshot.available_agent_ids,
                     snapshot.unavailable_agent_ids,
                     self._llm_failure_code(exc),
@@ -228,6 +227,7 @@ class OrchestratorRoutingService:
             routing_plan_id = new_routing_plan_id()
             prepared = self._prepare_tasks(
                 run_id=run_id,
+                session_id=session_id,
                 routing_plan_id=routing_plan_id,
                 validation=validation,
                 previous_decisions=(),
@@ -235,6 +235,7 @@ class OrchestratorRoutingService:
             )
             plan = self._plan_from_validation(
                 run_id=run_id,
+                session_id=session_id,
                 routing_plan_id=routing_plan_id,
                 planned_at=now_iso(),
                 proposal=proposal,
@@ -242,6 +243,10 @@ class OrchestratorRoutingService:
                 prepared_task_count=len(prepared),
                 available_agent_ids=snapshot.available_agent_ids,
                 unavailable_agent_ids=snapshot.unavailable_agent_ids,
+            )
+            self._confirm_readiness_authority(
+                run_id=run_id,
+                expected_authority=input_authority,
             )
             artifact_id = self._persist_new_plan(run_id, plan)
             return OrchestratorRoutingServiceResult(
@@ -251,6 +256,31 @@ class OrchestratorRoutingService:
                 reused_existing_plan=False,
                 llm_called=True,
                 discovery_performed=True,
+            )
+
+    def _confirm_readiness_authority(
+        self,
+        *,
+        run_id: str,
+        expected_authority: ValidatedInputReadinessAuthority,
+    ) -> None:
+        """Recheck authority before discovery without changing prompt input."""
+
+        try:
+            current = require_ready_input_authority(
+                run_id=run_id,
+                registry=self._registry,
+                storage=self._storage,
+            )
+        except OrchestratorReadinessError as exc:
+            raise OrchestratorRoutingServiceError(str(exc)) from None
+        except Exception:
+            raise OrchestratorRoutingServiceError(
+                "input_readiness_status_unavailable"
+            ) from None
+        if current != expected_authority:
+            raise OrchestratorRoutingServiceError(
+                "input_readiness_status_authority_changed"
             )
 
     def revalidate_for_run(
@@ -348,6 +378,7 @@ class OrchestratorRoutingService:
         )
         prepared = self._prepare_tasks(
             run_id=run_id,
+            session_id=previous.session_id,
             routing_plan_id=previous.routing_plan_id,
             validation=validation,
             previous_decisions=previous.validated_decisions,
@@ -361,6 +392,7 @@ class OrchestratorRoutingService:
         ]
         plan = self._plan_from_validation(
             run_id=run_id,
+            session_id=previous.session_id,
             routing_plan_id=previous.routing_plan_id,
             planned_at=previous.planned_at,
             proposal=proposal,
@@ -398,32 +430,6 @@ class OrchestratorRoutingService:
             return self._registry.get(run_id).active_artifacts.worker_routing_plan_id
         except Exception as exc:  # noqa: BLE001
             raise OrchestratorRoutingServiceError("run_registry_unavailable") from exc
-
-    def _load_input_artifact(
-        self, *, run_id: str, artifact_name: str, storage_path: str
-    ) -> dict[str, Any]:
-        try:
-            active = self._registry.get(run_id).active_artifacts
-        except Exception as exc:  # noqa: BLE001
-            raise OrchestratorRoutingServiceError("run_registry_unavailable") from exc
-        registry_field = f"{artifact_name}_id"
-        artifact_id = getattr(active, registry_field, None)
-        if not artifact_id:
-            raise OrchestratorRoutingServiceError(f"{artifact_name}_missing")
-        key = self._storage.run_key(run_id, storage_path)
-        if not self._storage.exists(key):
-            raise OrchestratorRoutingServiceError(f"{artifact_name}_storage_missing")
-        try:
-            body = self._storage.read_json(key)
-        except Exception as exc:  # noqa: BLE001
-            raise OrchestratorRoutingServiceError(
-                f"{artifact_name}_identity_mismatch"
-            ) from exc
-        if not isinstance(body, dict):
-            raise OrchestratorRoutingServiceError(f"{artifact_name}_identity_mismatch")
-        if body.get("artifact_id") != artifact_id or body.get("run_id") != run_id:
-            raise OrchestratorRoutingServiceError(f"{artifact_name}_identity_mismatch")
-        return body
 
     def _available_artifact_summary(self, run_id: str) -> list[dict[str, Any]]:
         active = self._registry.get(run_id).active_artifacts
@@ -601,7 +607,11 @@ class OrchestratorRoutingService:
             raise OrchestratorRoutingServiceError(
                 "completion_execution_state_invalid"
             ) from None
-        if state.run_id != run_id or state.routing.routing_plan_id != plan.routing_plan_id:
+        if (
+            state.run_id != run_id
+            or state.session_id != plan.session_id
+            or state.routing.routing_plan_id != plan.routing_plan_id
+        ):
             raise OrchestratorRoutingServiceError("completion_identity_mismatch")
         plan_decisions = {
             item.routing_decision_id: item for item in plan.validated_decisions
@@ -714,6 +724,7 @@ class OrchestratorRoutingService:
             )
             return build_retry_orchestrator_worker_task(
                 run_id=run_id,
+                session_id=plan.session_id,
                 routing_plan_id=plan.routing_plan_id,
                 validated=validated,
                 task_id=task_id,
@@ -809,6 +820,7 @@ class OrchestratorRoutingService:
             if task.retry_attempt == 0:
                 return build_orchestrator_worker_task(
                     run_id=run_id,
+                    session_id=plan.session_id,
                     routing_plan_id=plan.routing_plan_id,
                     validated=validated,
                     task_id=task_id,
@@ -830,6 +842,7 @@ class OrchestratorRoutingService:
                 )
             return build_retry_orchestrator_worker_task(
                 run_id=run_id,
+                session_id=plan.session_id,
                 routing_plan_id=plan.routing_plan_id,
                 validated=validated,
                 task_id=task_id,
@@ -871,6 +884,7 @@ class OrchestratorRoutingService:
         self,
         *,
         run_id: str,
+        session_id: str | None,
         routing_plan_id: str,
         validation: RoutingValidationResult,
         previous_decisions: Sequence[ValidatedRoutingDecision],
@@ -896,6 +910,7 @@ class OrchestratorRoutingService:
                 continue
             built = build_orchestrator_worker_task(
                 run_id=run_id,
+                session_id=session_id,
                 routing_plan_id=routing_plan_id,
                 validated=item,
                 task_id=item.decision.task_id,
@@ -908,6 +923,7 @@ class OrchestratorRoutingService:
         self,
         *,
         run_id: str,
+        session_id: str,
         routing_plan_id: str,
         planned_at: str,
         proposal: OrchestratorRoutingProposal,
@@ -941,6 +957,7 @@ class OrchestratorRoutingService:
         )
         return WorkerRoutingPlan(
             run_id=run_id,
+            session_id=session_id,
             routing_plan_id=routing_plan_id,
             planned_at=planned_at,
             loop_decision=proposal.loop_decision,
@@ -1013,6 +1030,7 @@ class OrchestratorRoutingService:
         self,
         *,
         run_id: str,
+        session_id: str | None,
         routing_status: str,
         loop_decision: LoopDecision | None = None,
         llm_selection_source: str,
@@ -1022,6 +1040,7 @@ class OrchestratorRoutingService:
     ) -> WorkerRoutingPlan:
         return WorkerRoutingPlan(
             run_id=run_id,
+            session_id=session_id,
             routing_plan_id=new_routing_plan_id(),
             planned_at=now_iso(),
             loop_decision=loop_decision,
@@ -1035,12 +1054,14 @@ class OrchestratorRoutingService:
     def _persist_llm_failure(
         self,
         run_id: str,
+        session_id: str,
         available_agent_ids: Sequence[str],
         unavailable_agent_ids: Sequence[str],
         code: str,
     ) -> OrchestratorRoutingServiceResult:
         plan = self._empty_plan(
             run_id=run_id,
+            session_id=session_id,
             routing_status="llm_failed",
             llm_selection_source="llm_failed",
             warning=code,

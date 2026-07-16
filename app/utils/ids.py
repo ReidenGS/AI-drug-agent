@@ -4,6 +4,19 @@ from __future__ import annotations
 
 import secrets
 from datetime import datetime, timezone
+from typing import Annotated
+
+from pydantic import StringConstraints
+
+
+SessionId = Annotated[
+    str,
+    StringConstraints(
+        min_length=21,
+        max_length=21,
+        pattern=r"^sess_[0-9a-f]{16}$",
+    ),
+]
 
 
 def _today_compact() -> str:
@@ -21,6 +34,12 @@ def new_run_id() -> str:
     consumers only require the value to be `str` and start with ``run_``.
     """
     return f"run_{_today_compact()}_{secrets.token_hex(4)}"
+
+
+def new_session_id() -> str:
+    """Mint one opaque session identity without embedding user information."""
+
+    return f"sess_{secrets.token_hex(8)}"
 
 
 def new_tool_call_id() -> str:

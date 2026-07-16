@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from app.agents.candidate_context_agent import CandidateContextAgent
 from app.mcp.client import LocalMCPClient
 from app.services.input_readiness_service import InputReadinessService
@@ -285,6 +287,7 @@ def test_step5_uploaded_pdb_creates_structure_material(
 def test_step5_uploaded_fasta_creates_sequence_material(
     local_storage, registry_service, workflow_state_service
 ):
+    file_id = new_file_id()
     run_id = _bootstrap(
         local_storage, registry_service, workflow_state_service,
         payload="MMAE", linker="vc",
@@ -293,9 +296,16 @@ def test_step5_uploaded_fasta_creates_sequence_material(
             "candidate_text": "Trastuzumab",
             "payload_linker_text": "vc-MMAE",
         },
+        referenced_inputs=[
+            {
+                "id_type": "uploaded_file",
+                "value": file_id,
+                "source": "antibody_heavy_chain_sequence",
+            }
+        ],
         uploaded_files=[
             {
-                "file_id": new_file_id(),
+                "file_id": file_id,
                 "original_filename": "heavy_chain.fasta",
                 "storage_path": "/upload/heavy_chain.fasta",
                 "sha256": "sha256:def",
@@ -304,6 +314,124 @@ def test_step5_uploaded_fasta_creates_sequence_material(
     )
     table = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
     assert "antibody_heavy_chain_sequence" in _types(table)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_material_type"),
+    [
+        ("target_sequence", "target_sequence"),
+        ("antibody_heavy_chain_sequence", "antibody_heavy_chain_sequence"),
+        ("antibody_light_chain_sequence", "antibody_light_chain_sequence"),
+        ("prompt_sequence", "prompt_sequence"),
+    ],
+)
+def test_step5_uploaded_fasta_role_comes_only_from_step2_source(
+    local_storage,
+    registry_service,
+    workflow_state_service,
+    source,
+    expected_material_type,
+):
+    file_id = new_file_id()
+    storage_key = f"test_inputs/{file_id}.fasta"
+    local_storage.write_bytes(
+        storage_key,
+        (">test\nACD_EF" if source == "prompt_sequence" else ">test\nACDEFG").encode(),
+    )
+    run_id = _bootstrap(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        referenced_inputs=[
+            {"id_type": "uploaded_file", "value": file_id, "source": source}
+        ],
+        uploaded_files=[
+            {
+                "file_id": file_id,
+                "original_filename": "sequence.fasta",
+                "storage_path": storage_key,
+                "content_type": "text/x-fasta",
+                "sha256": "sha256:authority",
+            }
+        ],
+    )
+
+    table = _run_step5(
+        local_storage, registry_service, workflow_state_service, run_id
+    )
+    matching = [
+        material
+        for candidate in table.candidate_records
+        for material in candidate.materials
+        if material.material_type == expected_material_type
+    ]
+    assert len(matching) == 1
+    assert not any(
+        material.material_type
+        in {
+            "target_sequence",
+            "antibody_heavy_chain_sequence",
+            "antibody_light_chain_sequence",
+            "prompt_sequence",
+        }
+        and material.material_type != expected_material_type
+        for candidate in table.candidate_records
+        for material in candidate.materials
+    )
+
+
+def test_step5_does_not_infer_unassigned_fasta_role_from_filename_or_query(
+    local_storage,
+    registry_service,
+    workflow_state_service,
+):
+    file_id = new_file_id()
+    run_id = _bootstrap(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        referenced_inputs=[
+            {
+                "id_type": "uploaded_file",
+                "value": file_id,
+                "source": "uploaded_file",
+            }
+        ],
+        uploaded_files=[
+            {
+                "file_id": file_id,
+                "original_filename": "target_heavy_light_sequence.fasta",
+                "storage_path": "/upload/target_heavy_light_sequence.fasta",
+                "content_type": "text/x-fasta",
+            }
+        ],
+        raw_context={
+            "target_or_antigen_text": "HER2 target",
+            "candidate_text": "trastuzumab heavy light antibody",
+        },
+    )
+    table = _run_step5(
+        local_storage, registry_service, workflow_state_service, run_id
+    )
+
+    role_materials = [
+        material.material_type
+        for candidate in table.candidate_records
+        for material in candidate.materials
+        if material.material_type
+        in {
+            "target_sequence",
+            "antibody_heavy_chain_sequence",
+            "antibody_light_chain_sequence",
+            "prompt_sequence",
+        }
+    ]
+    assert role_materials == []
+    assert any(
+        "uploaded_fasta_sequence_file_unassigned" in gap
+        for candidate in table.candidate_records
+        for gap in candidate.data_gaps
+    )
 
 
 # ── 5. provided SMILES becomes a compound_smiles material ───────────────────
@@ -809,7 +937,6 @@ def test_step5_dedupes_target_uniprot_identifier_from_multipath_normalization(
     entities, AND P04626 also appears as an explicit referenced_input.
     The final target candidate must carry exactly ONE P04626 identifier
     with merged provenance from every contributing path."""
-    sq_path_id = "structured_query_multipath_sentinel"
     run_id = _bootstrap(
         local_storage, registry_service, workflow_state_service,
         target="HER2",
@@ -883,6 +1010,13 @@ def test_step5_dedupes_identical_target_sequence_material_per_candidate(
         # multipath case where intake / Step 2 contributed the same
         # reference under two different drift paths.
         uploaded_files=[fasta, dict(fasta)],
+        referenced_inputs=[
+            {
+                "id_type": "uploaded_file",
+                "value": fasta["file_id"],
+                "source": "target_sequence",
+            }
+        ],
     )
     table = _run_step5(
         local_storage, registry_service, workflow_state_service, run_id,
@@ -915,7 +1049,16 @@ def test_step5_keeps_distinct_target_sequence_materials_at_different_paths(
     }
     run_id = _bootstrap(
         local_storage, registry_service, workflow_state_service,
-        target="HER2", uploaded_files=[f1, f2],
+        target="HER2",
+        uploaded_files=[f1, f2],
+        referenced_inputs=[
+            {
+                "id_type": "uploaded_file",
+                "value": item["file_id"],
+                "source": "target_sequence",
+            }
+            for item in (f1, f2)
+        ],
     )
     table = _run_step5(
         local_storage, registry_service, workflow_state_service, run_id,

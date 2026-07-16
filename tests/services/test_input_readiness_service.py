@@ -32,14 +32,14 @@ def _bootstrap_step_2(local_storage, registry_service, workflow_state_service, r
     workflow_state_service.mark(run_id, "step_02", "completed")
 
 
-def test_readiness_marks_blocked_without_target(
+def test_readiness_requests_user_input_without_target(
     local_storage, registry_service, workflow_state_service
 ):
     intake = IntakeService(local_storage, registry_service, workflow_state_service)
     rec = intake.submit(raw_user_query="design something", user_provided_context={})
     _bootstrap_step_2(local_storage, registry_service, workflow_state_service, rec.run_id)
     out = InputReadinessService(local_storage, registry_service, workflow_state_service).check(rec.run_id)
-    assert out.input_readiness_status == "blocked"
+    assert out.input_readiness_status == "needs_user_input"
 
 
 def test_readiness_needs_user_input_when_payload_missing(

@@ -67,7 +67,7 @@ def test_step3_missing_target_is_blocking(
     rec = intake.submit(raw_user_query="x", user_provided_context={})
     _bootstrap_step_2(local_storage, registry_service, workflow_state_service, rec.run_id)
     out = InputReadinessService(local_storage, registry_service, workflow_state_service).check(rec.run_id)
-    assert out.input_readiness_status == "blocked"
+    assert out.input_readiness_status == "needs_user_input"
     blocking = [m for m in out.missing_input_checklist if m.severity == "blocking"]
     assert blocking and blocking[0].category == "target"
 
@@ -146,6 +146,7 @@ def test_step3_uploaded_fasta_file_inferred_as_sequence(
     local_storage, registry_service, workflow_state_service
 ):
     intake = IntakeService(local_storage, registry_service, workflow_state_service)
+    file_id = new_file_id()
     rec = intake.submit(
         raw_user_query="HER2 ADC",
         user_provided_context={
@@ -155,7 +156,7 @@ def test_step3_uploaded_fasta_file_inferred_as_sequence(
         },
         uploaded_files=[
             {
-                "file_id": new_file_id(),
+                "file_id": file_id,
                 "original_filename": "heavy_chain.fasta",
                 "storage_path": "/upload/heavy_chain.fasta",
                 "sha256": "sha256:def",
@@ -165,6 +166,13 @@ def test_step3_uploaded_fasta_file_inferred_as_sequence(
     _bootstrap_step_2(
         local_storage, registry_service, workflow_state_service, rec.run_id,
         target="HER2", candidate="Trastuzumab", payload="MMAE", linker="vc",
+        referenced_inputs=[
+            {
+                "id_type": "uploaded_file",
+                "value": file_id,
+                "source": "antibody_heavy_chain_sequence",
+            }
+        ],
     )
     out = InputReadinessService(local_storage, registry_service, workflow_state_service).check(rec.run_id)
     assert out.basic_adc_input_presence.structure_or_sequence_present

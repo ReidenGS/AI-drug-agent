@@ -115,6 +115,41 @@ def test_empty_raw_user_query_returns_422_and_writes_nothing(client: TestClient)
     assert _disk_is_empty(deps.get_storage())
 
 
+def test_invalid_session_returns_422_before_any_io(client: TestClient):
+    response = client.post(
+        "/runs/multipart",
+        data={
+            "raw_user_query": "HER2 structure",
+            "session_id": "sess_NOT_OPAQUE",
+        },
+        files=[("files", ("complex.pdb", _PDB_BYTES, "chemical/x-pdb"))],
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "session_id_invalid"
+    assert _disk_is_empty(deps.get_storage())
+
+
+def test_multipart_persists_explicit_session(client: TestClient):
+    session_id = "sess_0123456789abcdef"
+    response = client.post(
+        "/runs/multipart",
+        data={"raw_user_query": "HER2 structure", "session_id": session_id},
+        files=[("files", ("complex.pdb", _PDB_BYTES, "chemical/x-pdb"))],
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["session_id"] == session_id
+    assert body["raw_request_record"]["session_id"] == session_id
+    persisted = deps.get_storage().read_json(
+        deps.get_storage().run_key(
+            body["run_id"], "inputs/raw_request_record.json"
+        )
+    )
+    assert persisted["session_id"] == session_id
+
+
 # ── upload limits ────────────────────────────────────────────────────────────
 
 def test_too_many_files_returns_413_and_writes_nothing(client: TestClient):

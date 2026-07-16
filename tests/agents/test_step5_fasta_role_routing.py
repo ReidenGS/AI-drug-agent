@@ -25,6 +25,7 @@ def _bootstrap(
     antibody: str | None = "Trastuzumab",
     raw_user_query: str | None = None,
     uploaded_files: list[dict] | None = None,
+    referenced_inputs: list[dict] | None = None,
 ):
     rec = IntakeService(local_storage, registry_service, workflow_state_service).submit(
         raw_user_query=raw_user_query or "Run developability context extraction.",
@@ -45,7 +46,7 @@ def _bootstrap(
             target_or_antigen_text=target,
             antibody_candidate_text=antibody,
         ),
-        referenced_inputs=[],
+        referenced_inputs=referenced_inputs or [],
         raw_context={},
     )
     sq_id = new_artifact_id("structured_query")
@@ -99,6 +100,18 @@ def test_step5_uploaded_heavy_and_light_fasta_files_route_to_antibody_candidate(
         registry_service=registry_service,
         workflow_state_service=workflow_state_service,
         uploaded_files=[heavy_fasta, light_fasta],
+        referenced_inputs=[
+            {
+                "id_type": "uploaded_file",
+                "value": heavy_fasta["file_id"],
+                "source": "antibody_heavy_chain_sequence",
+            },
+            {
+                "id_type": "uploaded_file",
+                "value": light_fasta["file_id"],
+                "source": "antibody_light_chain_sequence",
+            },
+        ],
         raw_user_query="Assess antibody developability for Trastuzumab and HER2 target.",
     )
     table = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
@@ -154,11 +167,11 @@ def test_step5_antibody_named_fasta_with_unknown_chain_is_not_materialized(
         for m in _record_by_type(table, "target_antigen").materials
     )
     assert any(
-        "antibody_sequence_role_unresolved" in note
+        "sequence_file_unassigned_for_antibody_skipped" in note
         for note in antibody.context_notes
     )
     assert any(
-        "antibody_sequence_role_unresolved" in gap
+        "uploaded_fasta_sequence_file_unassigned" in gap
         for gap in antibody.data_gaps
     )
 
@@ -176,6 +189,13 @@ def test_step5_antigen_cues_route_fasta_to_target_sequence(
         registry_service=registry_service,
         workflow_state_service=workflow_state_service,
         uploaded_files=[antigen_fasta],
+        referenced_inputs=[
+            {
+                "id_type": "uploaded_file",
+                "value": antigen_fasta["file_id"],
+                "source": "target_sequence",
+            }
+        ],
         raw_user_query="Analyze target FASTA for HER2 antigen.",
     )
     table = _run_step5(local_storage, registry_service, workflow_state_service, run_id)
@@ -229,7 +249,7 @@ def test_step5_ambiguous_fasta_keeps_unassigned_notes_not_target_sequence(
     )
 
 
-def test_sequence_fasta_query_target_cue_routes_to_target_sequence(
+def test_sequence_fasta_query_target_cue_cannot_override_missing_step2_source(
     local_storage, registry_service, workflow_state_service
 ):
     ambiguous = {
@@ -250,7 +270,7 @@ def test_sequence_fasta_query_target_cue_routes_to_target_sequence(
     target = _record_by_type(table, "target_antigen")
     antibody = _record_by_type(table, "antibody")
 
-    assert any(
+    assert not any(
         m.material_type == "target_sequence" and m.value == ambiguous["storage_path"]
         for m in target.materials
     )
@@ -294,11 +314,11 @@ def test_sequence_fasta_query_antibody_cue_does_not_materialize_without_chain(
         for m in antibody.materials
     )
     assert any(
-        "antibody_sequence_role_unresolved" in note
+        "sequence_file_unassigned_for_antibody_skipped" in note
         for note in antibody.context_notes
     )
     assert any(
-        "antibody_sequence_role_unresolved" in gap
+        "uploaded_fasta_sequence_file_unassigned" in gap
         for gap in antibody.data_gaps
     )
 

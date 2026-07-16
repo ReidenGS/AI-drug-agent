@@ -403,6 +403,7 @@ def _validate_prepared_identity(
             )
         canonical_request = build_canonical_worker_execution_request(
             run_id=run_id,
+            session_id=state.session_id,
             routing_plan_id=state.routing.routing_plan_id,
             decision=prepared_decision,
             input_artifact_refs=prepared.input_artifact_refs,

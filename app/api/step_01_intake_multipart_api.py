@@ -40,12 +40,13 @@ from pathlib import PurePosixPath
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from pydantic import TypeAdapter, ValidationError
 
 from ..deps import get_registry_service, get_storage, get_workflow_state_service
 from ..services.intake_service import IntakeService
 from ..services.storage_service import Storage
 from ..settings import get_settings
-from ..utils.ids import new_file_id
+from ..utils.ids import SessionId, new_file_id, new_session_id
 
 router = APIRouter(prefix="/runs", tags=["runs"])
 logger = logging.getLogger(__name__)
@@ -89,6 +90,7 @@ async def create_run_multipart(
     entry_source: Annotated[str, Form()] = "ui",
     submitted_by: Annotated[Optional[str], Form()] = None,
     user_provided_context: Annotated[Optional[str], Form()] = None,
+    session_id: Annotated[Optional[str], Form()] = None,
 ) -> dict:
     settings = get_settings()
 
@@ -101,6 +103,15 @@ async def create_run_multipart(
             detail=f"entry_source must be one of {sorted(_ALLOWED_ENTRY_SOURCES)}",
         )
     ctx = _parse_user_context(user_provided_context)
+    if session_id is None or not session_id.strip():
+        checked_session_id = new_session_id()
+    else:
+        try:
+            checked_session_id = TypeAdapter(SessionId).validate_python(
+                session_id, strict=True
+            )
+        except ValidationError:
+            raise HTTPException(status_code=422, detail="session_id_invalid") from None
 
     # 2. File-count pre-validation (filenameless / empty parts are ignored).
     real_files = [f for f in (files or []) if f and f.filename]
@@ -160,6 +171,7 @@ async def create_run_multipart(
             submitted_by=submitted_by,
             user_provided_context=ctx,
             uploaded_files=uploaded_files_meta,
+            session_id=checked_session_id,
         )
     except HTTPException:
         _cleanup(storage, written_keys)
@@ -170,6 +182,7 @@ async def create_run_multipart(
 
     return {
         "run_id": record.run_id,
+        "session_id": record.session_id,
         "uploaded_file_count": len(uploaded_files_meta),
         "raw_request_record": record.model_dump(),
     }

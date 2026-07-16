@@ -190,7 +190,7 @@ def _seed_inputs(
     readiness="ready",
     sensitive=False,
 ):
-    registry_service.init_registry(run_id)
+    run_registry = registry_service.init_registry(run_id)
     sensitive_text = (
         "sk-private-secret\nHEADER PRIVATE_PDB\nACDEFGHIKLMNPQRSTVWYACDEFGHIK"
         if sensitive
@@ -203,6 +203,10 @@ def _seed_inputs(
         "raw_request_record",
         "inputs/raw_request_record.json",
         {
+            "session_id": "sess_0123456789abcdef",
+            "run_artifact_registry_id": run_registry.run_artifact_registry_id,
+            "created_at": "2026-07-13T00:00:00Z",
+            "entry_source": "api",
             "raw_user_query": f"Assess developability {sensitive_text}",
             "user_provided_context": {"private_payload": sensitive_text},
             "uploaded_files": [],
@@ -215,7 +219,13 @@ def _seed_inputs(
         "structured_query",
         "inputs/structured_query.json",
         {
+            "parsed_at": "2026-07-13T00:00:00Z",
+            "source_raw_request_ref": {
+                "raw_request_record_id": raw_request_id
+            },
             "task_intent": {
+                "task_type": "developability_assessment",
+                "modality": "ADC",
                 "primary_intent": "developability_assessment",
                 "secondary_intents": [],
             },
@@ -242,7 +252,11 @@ def _seed_inputs(
             },
             "input_readiness_status": readiness,
             "missing_input_checklist": [],
-            "blocking_reasons": [sensitive_text] if sensitive else [],
+            "blocking_reasons": (
+                [sensitive_text]
+                if sensitive and readiness != "ready"
+                else []
+            ),
         },
     )
     return run_id
@@ -387,9 +401,12 @@ def test_initial_plan_persists_identity_and_only_prepares_step5(
         "candidate_context_table"
     ]
     assert len(result.prepared_tasks) == result.plan.ready_task_count == 1
-    assert _task_request(result.prepared_tasks[0]).capability_id == (
-        CAP_STEP5_CANDIDATE_CONTEXT
+    initial_request = _task_request(result.prepared_tasks[0])
+    assert initial_request.capability_id == CAP_STEP5_CANDIDATE_CONTEXT
+    assert result.plan.session_id == initial_request.session_id == (
+        "sess_0123456789abcdef"
     )
+    assert "sess_0123456789abcdef" not in json.dumps(llm.schemas)
     assert llm.call_count == discovery.discover_count == 1
 
     active = registry_service.get(run_id).active_artifacts
@@ -399,6 +416,71 @@ def test_initial_plan_persists_identity_and_only_prepares_step5(
     assert persisted["run_id"] == run_id
     assert persisted["routing_plan_id"] == result.plan.routing_plan_id
     assert active.worker_routing_plan_control_id == result.plan.routing_plan_id
+
+
+def test_new_plan_requires_valid_session_before_discovery_or_persistence(
+    local_storage, registry_service
+):
+    run_id = _seed_inputs(
+        local_storage, registry_service, run_id="run_session_required"
+    )
+    raw_key = local_storage.run_key(run_id, "inputs/raw_request_record.json")
+    raw = local_storage.read_json(raw_key)
+    raw.pop("session_id")
+    local_storage.write_json(raw_key, raw)
+    service, llm, discovery = _service(local_storage, registry_service)
+
+    with pytest.raises(
+        OrchestratorRoutingServiceError,
+        match="^raw_request_record_identity_mismatch$",
+    ):
+        service.plan_for_run(run_id)
+
+    active = registry_service.get(run_id).active_artifacts
+    assert llm.call_count == discovery.discover_count == 0
+    assert active.worker_discovery_snapshot_id is None
+    assert active.worker_routing_plan_id is None
+    assert active.worker_routing_plan_control_id is None
+    assert not local_storage.exists(local_storage.run_key(run_id, _PLAN_KEY))
+
+
+def test_switching_readiness_authority_fails_before_discovery_llm_or_plan(
+    local_storage, registry_service, monkeypatch
+):
+    run_id = _seed_inputs(
+        local_storage, registry_service, run_id="run_switching_readiness"
+    )
+    readiness_key = local_storage.run_key(
+        run_id, "inputs/input_readiness_status.json"
+    )
+    original_read_json = local_storage.read_json
+    readiness_reads = 0
+
+    def _switching_read_json(key):
+        nonlocal readiness_reads
+        body = original_read_json(key)
+        if key == readiness_key:
+            readiness_reads += 1
+            if readiness_reads >= 2:
+                body["input_readiness_status"] = "needs_user_input"
+        return body
+
+    monkeypatch.setattr(local_storage, "read_json", _switching_read_json)
+    service, llm, discovery = _service(local_storage, registry_service)
+
+    with pytest.raises(
+        OrchestratorRoutingServiceError,
+        match="^input_readiness_not_ready$",
+    ):
+        service.plan_for_run(run_id)
+
+    active = registry_service.get(run_id).active_artifacts
+    assert readiness_reads == 2
+    assert llm.call_count == discovery.discover_count == 0
+    assert active.worker_discovery_snapshot_id is None
+    assert active.worker_routing_plan_id is None
+    assert active.worker_routing_plan_control_id is None
+    assert not local_storage.exists(local_storage.run_key(run_id, _PLAN_KEY))
 
 
 def test_old_candidate_does_not_release_selected_producer_dependency(
@@ -536,6 +618,9 @@ def test_completed_producer_revalidation_prepares_only_step6_with_stable_ids(
     assert len(updated.prepared_tasks) == updated.plan.ready_task_count == 1
     request = _task_request(updated.prepared_tasks[0])
     assert request.capability_id == CAP_STEP6_DEVELOPABILITY
+    assert request.session_id == updated.plan.session_id == (
+        "sess_0123456789abcdef"
+    )
     assert request.routing_plan_id == initial.plan.routing_plan_id
     ref = request.input_projection.input_artifact_refs["candidate_context_table"]
     assert ref.artifact_id == candidate_id
@@ -626,8 +711,10 @@ def test_fresh_service_requires_proof_then_restores_only_step6_identity(
     assert restored.plan.routing_plan_id == initial.plan.routing_plan_id
     assert len(restored.prepared_tasks) == restored.plan.ready_task_count == 1
     assert restored.prepared_tasks[0].task.id == step6_task_id
-    assert _task_request(restored.prepared_tasks[0]).capability_id == (
-        CAP_STEP6_DEVELOPABILITY
+    restored_request = _task_request(restored.prepared_tasks[0])
+    assert restored_request.capability_id == CAP_STEP6_DEVELOPABILITY
+    assert restored_request.session_id == restored.plan.session_id == (
+        "sess_0123456789abcdef"
     )
     assert fresh_llm.call_count == 0
     assert fresh_discovery.discover_count == 1
@@ -1090,19 +1177,19 @@ def test_step3_blocked_skips_llm_and_tasks(local_storage, registry_service):
     )
     service, llm, discovery = _service(local_storage, registry_service)
 
-    result = service.plan_for_run(run_id)
+    with pytest.raises(
+        OrchestratorRoutingServiceError,
+        match="^input_readiness_not_ready$",
+    ):
+        service.plan_for_run(run_id)
 
-    assert discovery.discover_count == 1
+    assert discovery.discover_count == 0
     assert llm.call_count == 0
-    assert result.plan.routing_status == "blocked"
-    assert result.plan.loop_decision is None
-    assert result.plan.warnings == ["input_readiness_blocked"]
-    assert result.prepared_tasks == ()
-    persisted = json.dumps(
-        local_storage.read_json(local_storage.run_key(run_id, _PLAN_KEY))
-    )
-    for forbidden in ("blocking_reasons", "sk-private", "PRIVATE_PDB"):
-        assert forbidden not in persisted
+    active = registry_service.get(run_id).active_artifacts
+    assert active.worker_discovery_snapshot_id is None
+    assert active.worker_routing_plan_id is None
+    assert active.worker_routing_plan_control_id is None
+    assert not local_storage.exists(local_storage.run_key(run_id, _PLAN_KEY))
 
 
 def test_step3_needs_user_input_waits_without_llm_or_tasks(
@@ -1116,18 +1203,19 @@ def test_step3_needs_user_input_waits_without_llm_or_tasks(
     )
     service, llm, discovery = _service(local_storage, registry_service)
 
-    result = service.plan_for_run(run_id)
+    with pytest.raises(
+        OrchestratorRoutingServiceError,
+        match="^input_readiness_not_ready$",
+    ):
+        service.plan_for_run(run_id)
 
-    assert discovery.discover_count == 1
+    assert discovery.discover_count == 0
     assert llm.call_count == 0
-    assert result.prepared_tasks == ()
-    assert result.plan.routing_status == "waiting"
-    assert result.plan.loop_decision == "request_user_input"
-    assert result.plan.warnings == ["input_readiness_needs_user_input"]
-    repeated = service.plan_for_run(run_id)
-    assert repeated.plan == result.plan
-    assert repeated.prepared_tasks == ()
-    assert llm.call_count == 0
+    active = registry_service.get(run_id).active_artifacts
+    assert active.worker_discovery_snapshot_id is None
+    assert active.worker_routing_plan_id is None
+    assert active.worker_routing_plan_control_id is None
+    assert not local_storage.exists(local_storage.run_key(run_id, _PLAN_KEY))
 
 
 @pytest.mark.parametrize("bad_status", [None, "unknown"])

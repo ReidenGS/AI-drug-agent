@@ -27,6 +27,17 @@ ErrorFactory = Callable[[str], BaseException]
 # shared by the Step 2 mock detector and the post-LLM normalizer: a usable
 # `prompt_sequence` must contain an explicit "_" run or literal "<mask>".
 _MASK_MARKER_RE = re.compile(r"_|<mask>", re.IGNORECASE)
+_STANDARD_AMINO_ACIDS = frozenset("ACDEFGHIKLMNPQRSTVWY")
+_UNIPROT_ACCESSION_RE = re.compile(
+    r"^(?:[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2})(?:-\d+)?$"
+)
+
+
+def is_valid_uniprot_accession(value: Any) -> bool:
+    """Validate an explicitly typed accession without inferring its role."""
+    return isinstance(value, str) and bool(
+        _UNIPROT_ACCESSION_RE.fullmatch(value.strip().upper())
+    )
 
 
 def looks_like_masked_prompt_sequence(value: Any) -> bool:
@@ -40,6 +51,40 @@ def looks_like_masked_prompt_sequence(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     return bool(_MASK_MARKER_RE.search(value))
+
+
+def normalize_inline_protein_sequence(value: Any) -> str | None:
+    """Return a consumable uppercase amino-acid sequence or ``None``.
+
+    The accepted value may be a plain sequence or a single-record FASTA
+    body.  PDB/mmCIF/A3M bodies, masked generation prompts, prose, IDs, and
+    non-standard residues fail closed.  This validates an LLM-emitted typed
+    field; it does not scan arbitrary user prose for biological content.
+    """
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw or looks_like_masked_prompt_sequence(raw):
+        return None
+    lowered = raw.lower()
+    if (
+        "\natom" in f"\n{lowered}"
+        or "\nhetatm" in f"\n{lowered}"
+        or lowered.startswith("data_")
+        or "_atom_site." in lowered
+    ):
+        return None
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if lines and lines[0].startswith(">"):
+        if any(line.startswith(">") for line in lines[1:]):
+            return None
+        lines = lines[1:]
+    if not lines:
+        return None
+    sequence = "".join(lines).replace(" ", "").upper()
+    if not set(sequence) <= _STANDARD_AMINO_ACIDS:
+        return None
+    return sequence
 
 
 # Shared, LLM-agnostic keyword heuristic for "the user is asking to

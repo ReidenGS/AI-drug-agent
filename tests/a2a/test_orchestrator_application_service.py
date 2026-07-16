@@ -24,6 +24,7 @@ from app.a2a.orchestrator_routing_service import OrchestratorRoutingService
 from app.graph.orchestrator_execution_graph import (
     build_orchestrator_execution_graph,
 )
+from app.utils.ids import new_artifact_id
 from tests.a2a.test_orchestrator_dispatch import _serve_task_handler
 from tests.a2a.test_orchestrator_post_ingestion import (
     RUN_ID,
@@ -110,7 +111,15 @@ class _BlockingRoutingService:
         return getattr(self._delegate, name)
 
 
-def _application(storage, registry, routing, discovery, *, runtime=None):
+def _application(
+    storage,
+    registry,
+    routing,
+    discovery,
+    *,
+    runtime=None,
+    client_factory=None,
+):
     return OrchestratorApplicationService(
         checkpoint_runtime=runtime or _Runtime(),
         routing_service=routing,
@@ -119,6 +128,7 @@ def _application(storage, registry, routing, discovery, *, runtime=None):
         storage=storage,
         worker_timeout_seconds=0.3,
         max_worker_retries=3,
+        client_factory=client_factory,
     )
 
 
@@ -151,7 +161,7 @@ def _generic_environment(storage, registry, *, failure_status, fail_count):
 
 
 @pytest.mark.asyncio
-async def test_step3_needs_user_input_checkpoints_without_llm_or_http(
+async def test_step3_needs_user_input_stops_before_checkpoint_llm_or_http(
     local_storage, registry_service
 ):
     _seed_step_inputs(
@@ -169,16 +179,161 @@ async def test_step3_needs_user_input_checkpoints_without_llm_or_http(
         llm=llm,
     )
 
-    result = await _application(
-        local_storage, registry_service, routing, discovery
-    ).execute(RUN_ID)
+    runtime = _Runtime()
+    with pytest.raises(
+        OrchestratorApplicationServiceError,
+        match="^input_readiness_not_ready$",
+    ):
+        await _application(
+            local_storage,
+            registry_service,
+            routing,
+            discovery,
+            runtime=runtime,
+        ).execute(RUN_ID)
 
-    assert result.outcome == "waiting_for_input"
-    assert result.run_status == "waiting_for_input"
-    assert result.action_code == "provide_required_input"
-    assert result.task_counts.total == 0
-    assert result.dispatch_attempt_count == 0
     assert llm.call_count == 0
+    assert discovery.discover_count == 0
+    assert list(runtime.saver.list(None)) == []
+    active = registry_service.get(RUN_ID).active_artifacts
+    assert active.worker_discovery_snapshot_id is None
+    assert active.worker_routing_plan_id is None
+
+
+@pytest.mark.parametrize(
+    ("slot_name", "category"),
+    [
+        ("prompt_sequence", "structure_or_sequence"),
+        ("structure_or_sequence", "structure_or_sequence"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_semantically_inconsistent_ready_stops_with_zero_side_effects(
+    local_storage, registry_service, slot_name, category
+):
+    _seed_step_inputs(local_storage, registry_service, run_id=RUN_ID)
+    key = local_storage.run_key(
+        RUN_ID, "inputs/input_readiness_status.json"
+    )
+    body = local_storage.read_json(key)
+    body.update(
+        {
+            "input_readiness_status": "ready",
+            "missing_input_checklist": [
+                {
+                    "field": f"structured_query.missing_slots.{slot_name}",
+                    "severity": "blocking",
+                    "message": "test-only recoverable gap",
+                    "category": category,
+                    "recoverable": True,
+                }
+            ],
+            "blocking_reasons": [],
+            "clarification_requests": [
+                {
+                    "request_id": f"clr_{slot_name}_test",
+                    "slot_name": slot_name,
+                    "slot_category": "structure",
+                    "severity": "blocking",
+                    "question": "Provide the missing input.",
+                    "resolved": False,
+                }
+            ],
+        }
+    )
+    local_storage.write_json(key, body)
+    discovery = _StepDiscovery()
+    llm = _DeterministicRoutingLLM()
+    routing = OrchestratorRoutingService(
+        discovery=discovery,
+        storage=local_storage,
+        registry=registry_service,
+        llm=llm,
+    )
+    runtime = _Runtime()
+    client_constructions = 0
+
+    def _never_client(*_args, **_kwargs):
+        nonlocal client_constructions
+        client_constructions += 1
+        raise AssertionError("semantic readiness must stop before A2A client")
+
+    with pytest.raises(
+        OrchestratorApplicationServiceError,
+        match="^input_readiness_status_semantic_invalid$",
+    ):
+        await _application(
+            local_storage,
+            registry_service,
+            routing,
+            discovery,
+            runtime=runtime,
+            client_factory=_never_client,
+        ).execute(RUN_ID)
+
+    active = registry_service.get(RUN_ID).active_artifacts
+    assert llm.call_count == discovery.discover_count == 0
+    assert client_constructions == 0
+    assert list(runtime.saver.list(None)) == []
+    assert active.worker_discovery_snapshot_id is None
+    assert active.worker_routing_plan_id is None
+    assert active.worker_routing_plan_control_id is None
+    assert active.candidate_context_table_id is None
+    assert active.structured_liability_summary_id is None
+
+
+@pytest.mark.asyncio
+async def test_stale_ready_source_chain_stops_before_all_step4_side_effects(
+    local_storage, registry_service
+):
+    _seed_step_inputs(local_storage, registry_service, run_id=RUN_ID)
+    structured_key = local_storage.run_key(
+        RUN_ID, "inputs/structured_query.json"
+    )
+    replacement = local_storage.read_json(structured_key)
+    replacement_id = new_artifact_id("structured_query")
+    replacement["artifact_id"] = replacement_id
+    local_storage.write_json(structured_key, replacement)
+    registry_service.update_active(
+        RUN_ID, structured_query_id=replacement_id
+    )
+    discovery = _StepDiscovery()
+    llm = _DeterministicRoutingLLM()
+    routing = OrchestratorRoutingService(
+        discovery=discovery,
+        storage=local_storage,
+        registry=registry_service,
+        llm=llm,
+    )
+    runtime = _Runtime()
+    client_constructions = 0
+
+    def _never_client(*_args, **_kwargs):
+        nonlocal client_constructions
+        client_constructions += 1
+        raise AssertionError("stale readiness must stop before A2A")
+
+    with pytest.raises(
+        OrchestratorApplicationServiceError,
+        match="^input_readiness_status_source_mismatch$",
+    ):
+        await _application(
+            local_storage,
+            registry_service,
+            routing,
+            discovery,
+            runtime=runtime,
+            client_factory=_never_client,
+        ).execute(RUN_ID)
+
+    active = registry_service.get(RUN_ID).active_artifacts
+    assert llm.call_count == discovery.discover_count == 0
+    assert client_constructions == 0
+    assert list(runtime.saver.list(None)) == []
+    assert active.worker_discovery_snapshot_id is None
+    assert active.worker_routing_plan_id is None
+    assert active.worker_routing_plan_control_id is None
+    assert active.candidate_context_table_id is None
 
 
 @pytest.mark.asyncio
