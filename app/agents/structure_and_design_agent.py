@@ -3784,13 +3784,22 @@ def _step8_crystal_validation_args(sin: dict) -> tuple[dict[str, Any], list[str]
     mw = sin.get("molecular_weight_estimate") or {}
     args: dict[str, Any] = {"operation": "validate"}
     missing: list[str] = []
-    a = _float_or_none(crystal.get("a")) if isinstance(crystal, dict) else None
+    cell_parameters = (
+        {
+            name: _float_or_none(crystal.get(name))
+            for name in ("a", "b", "c", "alpha", "beta", "gamma")
+        }
+        if isinstance(crystal, dict)
+        else {}
+    )
     z_value = _int_or_none(crystal.get("z_value")) if isinstance(crystal, dict) else None
     mw_value = _float_or_none(mw.get("value")) if isinstance(mw, dict) else None
-    if a is None:
-        missing.append("a")
-    else:
-        args["a"] = a
+    for name in ("a", "b", "c", "alpha", "beta", "gamma"):
+        value = cell_parameters.get(name)
+        if value is None:
+            missing.append(name)
+        else:
+            args[name] = value
     if z_value is None:
         missing.append("Z")
     else:

@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import json
 import threading
+from pathlib import Path
 
 import pytest
 import requests
@@ -140,6 +141,60 @@ def _auditable_local_mcp() -> LocalMCPClient:
             "PDBePISA_get_interfaces": _failed,
         }
     )
+
+
+class _ProteinMPNNOnlyLLM:
+    """Test-only deterministic Step 9 selection; no live LLM evidence."""
+
+    name = "test-only-proteinmpnn-selection"
+    model = "test-only-proteinmpnn-selection"
+
+    def __init__(self, candidate_id: str):
+        self._candidate_id = candidate_id
+        self._fallback = MockLLMProvider()
+        self.step9_prompts: list[str] = []
+
+    def generate(self, prompt, *, system=None, **kwargs):
+        return self._fallback.generate(prompt, system=system, **kwargs)
+
+    def generate_json(self, prompt, *, schema, system=None):
+        task = schema.get("task")
+        if task == "step9_tool_selection_stage_1":
+            self.step9_prompts.append(prompt)
+            return {
+                "selections": [
+                    {
+                        "tool_name": "NvidiaNIM_proteinmpnn",
+                        "lane_type": "protein_design",
+                        "selection_reason": "test-only validated structure route",
+                    }
+                ]
+            }
+        if task == "step9_tool_schema_mapping_stage_2":
+            self.step9_prompts.append(prompt)
+            return {
+                "tools": [
+                    {
+                        "tool_name": "NvidiaNIM_proteinmpnn",
+                        "lane_type": "protein_design",
+                        "can_invoke": True,
+                        "argument_mappings": [
+                            {
+                                "schema_arg": "input_pdb",
+                                "field_ref": (
+                                    "step8_validated_structure_ref:"
+                                    f"{self._candidate_id}"
+                                ),
+                            }
+                        ],
+                        "argument_literals": [],
+                        "missing_required_fields": [],
+                        "skip_reason": "",
+                        "argument_mapping_reason": "test-only schema mapping",
+                    }
+                ]
+            }
+        return self._fallback.generate_json(prompt, schema=schema, system=system)
 
 
 def _candidate(*, known_pdb: bool = False) -> dict:
@@ -721,6 +776,142 @@ async def test_real_http_runs_one_task_in_strict_order_without_run_step_plan(
         name.startswith("structure-worker-http")
         for name in worker_server.worker.execute_threads
     )
+
+
+@pytest.mark.asyncio
+async def test_real_http_upload_file_id_reaches_proteinmpnn_as_structure_text(
+    local_storage,
+    registry_service,
+    workflow_state_service,
+    caplog,
+):
+    """Production workflow and transport with test-only LLM/MCP isolation.
+
+    This proves A2AClient -> localhost HTTP -> A2AServer -> Step 7/8/9 and
+    file_id -> verified storage_ref -> transient raw structure text. It does
+    not prove live OpenAI, ToolUniverse, or NvidiaNIM success.
+    """
+    run_id = _seed_run(local_storage, registry_service, workflow_state_service)
+    candidate_id = "cand_structure_http"
+    file_id = "file_http_uploaded_structure"
+    pdb_text = (
+        Path(__file__).resolve().parents[3] / "data" / "pdb" / "S1.pdb"
+    ).read_text(encoding="utf-8")
+    storage_ref = local_storage.run_key(
+        run_id, "inputs/files/file_http_uploaded_structure.pdb"
+    )
+    local_storage.write_bytes(storage_ref, pdb_text.encode("utf-8"))
+
+    raw_key = local_storage.run_key(run_id, "inputs/raw_request_record.json")
+    raw = local_storage.read_json(raw_key)
+    raw["uploaded_files"] = [
+        {
+            "file_id": file_id,
+            "original_filename": "uploaded_structure.pdb",
+            "storage_path": storage_ref,
+            "content_type": "chemical/x-pdb",
+            "sha256": "sha256:test-only-http-structure",
+            "size_bytes": len(pdb_text.encode("utf-8")),
+            "related_candidate_id": candidate_id,
+            "related_candidate_ids": [candidate_id],
+            "role": "target",
+        }
+    ]
+    local_storage.write_json(raw_key, raw)
+
+    query_key = local_storage.run_key(run_id, "inputs/structured_query.json")
+    query = local_storage.read_json(query_key)
+    query.setdefault("referenced_inputs", []).append(
+        {"id_type": "uploaded_file", "value": file_id, "source": "uploaded_files"}
+    )
+    local_storage.write_json(query_key, query)
+
+    captured: list[dict] = []
+
+    def _proteinmpnn(**kwargs):
+        captured.append(dict(kwargs))
+        return {"status": "mocked", "designed_sequences": ["MKTAYIAK"]}
+
+    mcp = LocalMCPClient(
+        bindings={
+            "CrystalStructure_validate": lambda **_kwargs: {
+                "status": "mocked",
+                "validated": True,
+            },
+            "NvidiaNIM_proteinmpnn": _proteinmpnn,
+        }
+    )
+    llm = _ProteinMPNNOnlyLLM(candidate_id)
+    worker = _RecordingStructureWorker(
+        url="http://structure-worker:8009",
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=mcp,
+        llm=llm,
+    )
+    with _serve(worker) as handle:
+        result_task, result = await _run_valid(handle, registry_service, run_id)
+
+    assert result_task.status.state == TaskState.COMPLETED
+    assert result["result_status"] in {"success", "partial"}
+    assert worker.agent_run_count == 1
+    assert worker.internal_events == _ORDER
+    assert captured == [{"input_pdb": pdb_text}]
+
+    outputs = _persisted_outputs(local_storage, run_id)
+    step7 = outputs["prepared_structure_input_package"]
+    step8 = outputs["structure_prediction_and_interface_results"]
+    step9 = outputs["structure_variant_and_compound_screening"]
+    matching_refs = [
+        ref
+        for prepared in step7["prepared_structure_inputs"]
+        if prepared["candidate_id"] == candidate_id
+        for ref in prepared["structure_refs"]
+        if ref.get("file_id") == file_id
+    ]
+    assert len(matching_refs) == 1
+    assert matching_refs[0]["storage_ref"] == storage_ref
+    handoff = next(
+        item["downstream_handoff"]
+        for item in step8["candidate_structure_results"]
+        if item["candidate_id"] == candidate_id
+        and item["downstream_handoff"].get("validated_structure_ref")
+    )
+    assert handoff["validated_structure_ref"] == file_id
+    protein_records = [
+        record
+        for record in step9["tool_call_records"]
+        if record["tool_name"] == "NvidiaNIM_proteinmpnn"
+    ]
+    assert len(protein_records) == 1
+    assert protein_records[0]["run_status"] == "success"
+    assert "NvidiaNIM_proteinmpnn" in step9["step9_stage1_catalog_tool_names"]
+    assert len(step9["step9_stage1_selected_tools"]) == 1
+    assert len(step9["step9_stage2_mapped_tools"]) == 1
+    assert len(step9["step9_runtime_resolved_tools"]) == 1
+    assert step9["step9_runtime_executed_tools"] == [
+        "NvidiaNIM_proteinmpnn"
+    ]
+    persisted_blob = json.dumps(outputs)
+    assert pdb_text not in persisted_blob
+    assert storage_ref not in json.dumps(step9)
+    assert pdb_text not in "".join(llm.step9_prompts)
+    assert storage_ref not in "".join(llm.step9_prompts)
+    assert pdb_text not in caplog.text
+    assert storage_ref not in caplog.text
+    active = registry_service.get(run_id).active_artifacts
+    assert active.prepared_structure_input_package_id == step7["artifact_id"]
+    assert active.structure_prediction_and_interface_results_id == step8["artifact_id"]
+    assert active.structure_variant_and_compound_screening_id == step9["artifact_id"]
+    assert {
+        name: ref["artifact_id"]
+        for name, ref in result["output_artifact_refs"].items()
+    } == {
+        "prepared_structure_input_package": step7["artifact_id"],
+        "structure_prediction_and_interface_results": step8["artifact_id"],
+        "structure_variant_and_compound_screening": step9["artifact_id"],
+    }
 
 
 async def test_partial_candidate_readiness_executes_all_steps_over_real_http(

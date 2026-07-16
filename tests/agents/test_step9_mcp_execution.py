@@ -162,8 +162,10 @@ def _target_candidate_id(local_storage, run_id: str) -> str:
 
 def _write_validated_backbone(local_storage, run_id: str, candidate_id: str) -> str:
     """Write a real backbone file + Step 7/8 artifacts so
-    `step8_validated_structure_ref:<candidate_id>` resolves to it."""
+    `step8_validated_structure_ref:<candidate_id>` resolves through the
+    production Step 7 file_id -> storage_ref shape."""
     backbone_key = local_storage.run_key(run_id, "uploads", "validated_backbone.pdb")
+    file_id = "file_validated_backbone"
     local_storage.write_bytes(backbone_key, FAKE_PDB_TEXT.encode("utf-8"))
     local_storage.write_json(
         local_storage.run_key(run_id, "prepared_structure_input_package.json"),
@@ -173,7 +175,12 @@ def _write_validated_backbone(local_storage, run_id: str, candidate_id: str) -> 
                     "candidate_id": candidate_id,
                     "structure_input_id": f"si_{candidate_id}",
                     "structure_refs": [
-                        {"source_ref": "mat_backbone", "storage_ref": backbone_key, "structure_format": "pdb"}
+                        {
+                            "file_id": file_id,
+                            "source_ref": "different_source_ref",
+                            "storage_ref": backbone_key,
+                            "structure_format": "pdb",
+                        }
                     ],
                     "sequence_refs_for_prediction": [],
                 }
@@ -187,7 +194,7 @@ def _write_validated_backbone(local_storage, run_id: str, candidate_id: str) -> 
                 {
                     "candidate_id": candidate_id,
                     "downstream_handoff": {
-                        "validated_structure_ref": "mat_backbone",
+                        "validated_structure_ref": file_id,
                         "has_complex_structure": True,
                     },
                 }

@@ -330,6 +330,116 @@ def test_resolve_validated_structure_ref_through_step7_source_ref_chain(local_st
     assert error is None
 
 
+def test_resolve_validated_structure_ref_through_step7_file_id_chain(local_storage):
+    key = local_storage.run_key("run1", "uploads", "validated.pdb")
+    local_storage.write_bytes(key, RAW_PDB_BODY.encode("utf-8"))
+    step8_result = {
+        "candidate_structure_results": [
+            {
+                "candidate_id": "cand_a",
+                "downstream_handoff": {"validated_structure_ref": "file_954bd1cb7b35"},
+            }
+        ]
+    }
+    prepared_inputs = [
+        {
+            "candidate_id": "cand_a",
+            "structure_input_id": "si_1",
+            "structure_refs": [
+                {
+                    "file_id": "file_954bd1cb7b35",
+                    "source_ref": "different_source_ref",
+                    "storage_ref": key,
+                }
+            ],
+        }
+    ]
+    field = _field(
+        field_ref="step8_validated_structure_ref:cand_a",
+        field_type="structure",
+        value_kind="validated_structure_ref",
+        runtime_lookup={"candidate_id": "cand_a"},
+    )
+    value, error = resolve_step9_field_value(
+        field,
+        candidate_context_table={},
+        prepared_inputs=prepared_inputs,
+        step8_result=step8_result,
+        storage=local_storage,
+    )
+    assert value == key
+    assert error is None
+
+
+def test_resolve_validated_structure_ref_rejects_ambiguous_file_id(local_storage):
+    keys = [local_storage.run_key("run1", "uploads", name) for name in ("a.pdb", "b.pdb")]
+    for key in keys:
+        local_storage.write_bytes(key, RAW_PDB_BODY.encode("utf-8"))
+    step8_result = {
+        "candidate_structure_results": [
+            {
+                "candidate_id": "cand_a",
+                "downstream_handoff": {"validated_structure_ref": "file_duplicate"},
+            }
+        ]
+    }
+    prepared_inputs = [
+        {
+            "candidate_id": "cand_a",
+            "structure_refs": [
+                {"file_id": "file_duplicate", "storage_ref": key} for key in keys
+            ],
+        }
+    ]
+    value, error = resolve_step9_field_value(
+        _field(
+            field_ref="step8_validated_structure_ref:cand_a",
+            field_type="structure",
+            value_kind="validated_structure_ref",
+            runtime_lookup={"candidate_id": "cand_a"},
+        ),
+        candidate_context_table={},
+        prepared_inputs=prepared_inputs,
+        step8_result=step8_result,
+        storage=local_storage,
+    )
+    assert value is None
+    assert error == "structure_ref_ambiguous"
+
+
+def test_resolve_validated_structure_ref_rejects_missing_file_storage(local_storage):
+    step8_result = {
+        "candidate_structure_results": [
+            {
+                "candidate_id": "cand_a",
+                "downstream_handoff": {"validated_structure_ref": "file_missing"},
+            }
+        ]
+    }
+    prepared_inputs = [
+        {
+            "candidate_id": "cand_a",
+            "structure_refs": [
+                {"file_id": "file_missing", "storage_ref": "missing/structure.pdb"}
+            ],
+        }
+    ]
+    value, error = resolve_step9_field_value(
+        _field(
+            field_ref="step8_validated_structure_ref:cand_a",
+            field_type="structure",
+            value_kind="validated_structure_ref",
+            runtime_lookup={"candidate_id": "cand_a"},
+        ),
+        candidate_context_table={},
+        prepared_inputs=prepared_inputs,
+        step8_result=step8_result,
+        storage=local_storage,
+    )
+    assert value is None
+    assert error == "structure_ref_storage_ref_invalid"
+
+
 def test_resolve_validated_structure_ref_through_step5_material_id_chain(local_storage):
     key = local_storage.run_key("run1", "uploads", "validated.pdb")
     local_storage.write_bytes(key, b"fake validated pdb")
@@ -811,6 +921,65 @@ def test_proteinmpnn_input_pdb_reads_storage_text_via_validated_structure_ref(lo
     assert summary["resolved_from"] == "storage_ref_or_local_path"
     assert summary["value_length"] == len(RAW_PDB_BODY)
     assert summary["field_ref"] == "step8_validated_structure_ref:cand_a"
+
+
+def test_proteinmpnn_file_id_chain_rejects_non_structure_content(local_storage):
+    key = local_storage.run_key("run1", "uploads", "not_structure.txt")
+    local_storage.write_bytes(key, b"plain text without structure records")
+    step8_result = {
+        "candidate_structure_results": [
+            {
+                "candidate_id": "cand_a",
+                "downstream_handoff": {"validated_structure_ref": "file_not_structure"},
+            }
+        ]
+    }
+    prepared = {
+        "prepared_structure_inputs": [
+            {
+                "candidate_id": "cand_a",
+                "structure_input_id": "si_1",
+                "structure_refs": [
+                    {"file_id": "file_not_structure", "storage_ref": key}
+                ],
+            }
+        ]
+    }
+    requests = resolve_step9_execution_requests(
+        kwargs_contracts=[
+            _contract(
+                "NvidiaNIM_proteinmpnn",
+                "protein_design",
+                [
+                    {
+                        "runtime_arg": "input_pdb",
+                        "source": "field_ref",
+                        "schema_arg": "input_pdb",
+                        "field_ref": "step8_validated_structure_ref:cand_a",
+                    }
+                ],
+            )
+        ],
+        input_fields=[
+            _field(
+                field_ref="step8_validated_structure_ref:cand_a",
+                field_type="structure",
+                value_kind="validated_structure_ref",
+                supports_tool_args=["input_pdb"],
+                runtime_lookup={"candidate_id": "cand_a"},
+            )
+        ],
+        candidate_context_table={},
+        prepared_structure_input_package=prepared,
+        structure_prediction_and_interface_results=step8_result,
+        storage=local_storage,
+    )
+    assert requests[0]["can_execute"] is False
+    assert requests[0]["unresolved_reasons"] == [
+        "input_pdb:structure_text_not_found"
+    ]
+    assert "plain text" not in json.dumps(requests[0])
+    assert key not in json.dumps(requests[0])
 
 
 def test_rfdiffusion_input_pdb_reads_storage_text_via_step7_structure_ref(local_storage):
