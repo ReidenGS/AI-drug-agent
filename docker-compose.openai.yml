@@ -1,0 +1,34 @@
+# Provider-specific overlay for real OpenAI deployments. The host credential
+# becomes a Docker secret file and is never injected into container environment.
+services:
+  orchestrator:
+    environment:
+      OPENAI_API_KEY_FILE: /run/secrets/openai_api_key
+      OPENAI_MODEL: ${OPENAI_MODEL:?OPENAI_MODEL must be set explicitly}
+    secrets:
+      - openai_api_key
+
+  step5-context-agent:
+    environment:
+      OPENAI_API_KEY_FILE: /run/secrets/openai_api_key
+      OPENAI_MODEL: ${OPENAI_MODEL:?OPENAI_MODEL must be set explicitly}
+    secrets:
+      - openai_api_key
+
+  step6-developability-agent:
+    environment:
+      OPENAI_API_KEY_FILE: /run/secrets/openai_api_key
+      OPENAI_MODEL: ${OPENAI_MODEL:?OPENAI_MODEL must be set explicitly}
+    secrets:
+      - openai_api_key
+
+  step7-9-structure-design-agent:
+    environment:
+      OPENAI_API_KEY_FILE: /run/secrets/openai_api_key
+      OPENAI_MODEL: ${OPENAI_MODEL:?OPENAI_MODEL must be set explicitly}
+    secrets:
+      - openai_api_key
+
+secrets:
+  openai_api_key:
+    environment: OPENAI_API_KEY

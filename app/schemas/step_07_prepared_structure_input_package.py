@@ -53,7 +53,14 @@ class SequenceRef(BaseModel):
     msa_source_tool: Optional[str] = None
     msa_tool_call_id: Optional[str] = None
     msa_status: Optional[
-        Literal["available", "upstream_error", "a3m_not_found", "not_run", "skipped"]
+        Literal[
+            "available",
+            "upstream_error",
+            "dependency_unavailable",
+            "a3m_not_found",
+            "not_run",
+            "skipped",
+        ]
     ] = None
     msa_alignment_format: Optional[str] = None
     msa_alignment_length: Optional[int] = None

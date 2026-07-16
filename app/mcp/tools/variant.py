@@ -22,8 +22,203 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
 from typing import Any
+
+
+_STANDARD_AMINO_ACIDS = frozenset("ACDEFGHIKLMNPQRSTVWY")
+_PROTEIN_VARIANT_RE = re.compile(
+    r"^(?:p\.)?([ACDEFGHIKLMNPQRSTVWY])(\d+)([ACDEFGHIKLMNPQRSTVWY])$",
+    re.IGNORECASE,
+)
+
+
+def _parse_protein_variant(variant: str) -> tuple[str, int, str, str] | None:
+    match = _PROTEIN_VARIANT_RE.fullmatch(variant.strip())
+    if match is None:
+        return None
+    reference_aa = match.group(1).upper()
+    position = int(match.group(2))
+    variant_aa = match.group(3).upper()
+    return reference_aa, position, variant_aa, f"{reference_aa}{position}{variant_aa}"
+
+
+def _numeric(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _normalize_classification(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return {
+        "benign": "benign",
+        "likely_benign": "benign",
+        "ambiguous": "ambiguous",
+        "pathogenic": "pathogenic",
+        "likely_pathogenic": "pathogenic",
+    }.get(value.strip().lower())
+
+
+def _parse_classification_bin(
+    raw_response: dict[str, Any], classification: str,
+) -> tuple[set[str], str | None, bool]:
+    all_key = f"{classification}_all"
+    base_key = classification
+    raw_value = raw_response.get(all_key)
+    source_key = all_key
+    if raw_value in (None, ""):
+        raw_value = raw_response.get(base_key)
+        source_key = base_key
+    if raw_value in (None, ""):
+        return set(), None, False
+    if not isinstance(raw_value, str) or ":" not in raw_value:
+        return set(), None, True
+    amino_acid_text = raw_value.split(":", 1)[1].strip()
+    if not amino_acid_text:
+        return set(), f"raw_response.{source_key}", False
+    amino_acids = {item.strip().upper() for item in amino_acid_text.split(",")}
+    if any(len(item) != 1 or item not in _STANDARD_AMINO_ACIDS for item in amino_acids):
+        return set(), None, True
+    return amino_acids, f"raw_response.{source_key}", False
+
+
+def _alphamissense_identity_error(envelope: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **envelope,
+        "status": "upstream_error",
+        "normalization_status": "identity_mismatch",
+        "normalized_result": None,
+        "error_message": "alphamissense_response_identity_mismatch",
+    }
+
+
+def _normalize_alphamissense_envelope(
+    envelope: dict[str, Any], *, uniprot_id: str, variant: str,
+) -> dict[str, Any]:
+    if envelope.get("status") not in {"ok", "empty"}:
+        return {
+            **envelope,
+            "normalization_status": "upstream_error",
+            "normalized_result": None,
+        }
+
+    parsed_variant = _parse_protein_variant(variant)
+    if parsed_variant is None:
+        return {
+            **envelope,
+            "status": "upstream_error",
+            "normalization_status": "identity_mismatch",
+            "normalized_result": None,
+            "error_message": "alphamissense_response_identity_mismatch",
+        }
+    reference_aa, position, variant_aa, canonical_variant = parsed_variant
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict):
+        return _alphamissense_identity_error(envelope)
+
+    data = payload.get("data")
+    raw_response = data.get("raw_response") if isinstance(data, dict) else None
+    if isinstance(raw_response, dict):
+        if (
+            raw_response.get("uid") != uniprot_id
+            or str(raw_response.get("aa") or "").upper() != reference_aa
+            or raw_response.get("resi") != position
+        ):
+            return _alphamissense_identity_error(envelope)
+
+        bins: dict[str, tuple[set[str], str | None]] = {}
+        malformed = False
+        for classification in ("benign", "ambiguous", "pathogenic"):
+            members, source, one_malformed = _parse_classification_bin(
+                raw_response, classification
+            )
+            bins[classification] = (members, source)
+            malformed = malformed or one_malformed
+        matches = [
+            (classification, source)
+            for classification, (members, source) in bins.items()
+            if variant_aa in members
+        ]
+        classification = matches[0][0] if len(matches) == 1 and not malformed else None
+        classification_source = (
+            matches[0][1] if len(matches) == 1 and not malformed else None
+        )
+        normalized_result = {
+            "uniprot_id": uniprot_id,
+            "variant": canonical_variant,
+            "position": position,
+            "reference_aa": reference_aa,
+            "variant_aa": variant_aa,
+            "classification": classification,
+            "classification_source": classification_source,
+            "pathogenicity_score": None,
+            "pathogenicity_score_source": None,
+            "residue_mean_snv_score": _numeric(raw_response.get("mean")),
+            "residue_mean_all_substitutions_score": _numeric(
+                raw_response.get("mean_all")
+            ),
+        }
+        return {
+            **envelope,
+            "normalization_status": (
+                "normalized" if classification is not None
+                else "classification_unavailable"
+            ),
+            "normalized_result": normalized_result,
+        }
+
+    returned_uniprot = payload.get("uniprot_id") or payload.get("uid")
+    returned_variant = payload.get("variant")
+    returned_parsed = (
+        _parse_protein_variant(returned_variant)
+        if isinstance(returned_variant, str)
+        else None
+    )
+    if returned_uniprot != uniprot_id or returned_parsed != parsed_variant:
+        return _alphamissense_identity_error(envelope)
+
+    score_key = "pathogenicity_score" if "pathogenicity_score" in payload else "score"
+    score = _numeric(payload.get(score_key))
+    if score is None:
+        classification = None
+        classification_source = None
+    elif payload.get("classification") not in (None, ""):
+        classification = _normalize_classification(payload.get("classification"))
+        classification_source = (
+            "payload.classification" if classification is not None else None
+        )
+    else:
+        classification = (
+            "benign" if score < 0.34
+            else "pathogenic" if score > 0.564
+            else "ambiguous"
+        )
+        classification_source = f"payload.{score_key}_threshold"
+    return {
+        **envelope,
+        "normalization_status": (
+            "normalized" if score is not None and classification is not None
+            else "classification_unavailable"
+        ),
+        "normalized_result": {
+            "uniprot_id": uniprot_id,
+            "variant": canonical_variant,
+            "position": position,
+            "reference_aa": reference_aa,
+            "variant_aa": variant_aa,
+            "classification": classification,
+            "classification_source": classification_source,
+            "pathogenicity_score": score,
+            "pathogenicity_score_source": (
+                f"payload.{score_key}" if score is not None else None
+            ),
+            "residue_mean_snv_score": None,
+            "residue_mean_all_substitutions_score": None,
+        },
+    }
 
 
 def _call_variant_tu(tool_name: str, args: dict[str, Any], *, _live: bool = False) -> dict[str, Any]:
@@ -67,9 +262,14 @@ def AlphaMissense_get_variant_score(
         }
     from ..tooluniverse_adapter import call_tool
 
-    return call_tool(
+    envelope = call_tool(
         "AlphaMissense_get_variant_score",
         {"uniprot_id": uniprot_id, "variant": variant},
+    )
+    return _normalize_alphamissense_envelope(
+        envelope,
+        uniprot_id=uniprot_id,
+        variant=variant,
     )
 
 

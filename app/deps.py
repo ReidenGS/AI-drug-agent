@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
-from .settings import get_settings
+from .settings import Settings, get_settings
 from .services.storage_service import Storage
 from .services.storage_local import LocalStorage
 from .services.storage_s3 import S3Storage
@@ -52,6 +53,67 @@ def get_mcp_client() -> MCPClient:
 
 
 @lru_cache(maxsize=1)
+def get_worker_discovery_service():
+    """Orchestrator worker discovery service (Turn D).
+
+    Constructing it performs NO network I/O and does NOT trigger discovery — only
+    ``discover_for_run(run_id)`` reaches the workers. It is intentionally NOT
+    wired into app startup / create_app, so importing the app or running tests
+    never auto-discovers or touches the network.
+    """
+    from .a2a.orchestrator_discovery import (
+        WorkerDiscoveryService,
+        default_expected_workers,
+    )
+
+    settings = get_settings()
+    return WorkerDiscoveryService(
+        expected_workers=default_expected_workers(settings),
+        storage=get_storage(),
+        registry=get_registry_service(),
+        discovery_timeout_seconds=settings.a2a_discovery_timeout_seconds,
+        health_timeout_seconds=settings.a2a_health_timeout_seconds,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_orchestrator_routing_service():
+    """Construct the Turn F1 routing planner; performs no I/O until called."""
+    from .a2a.orchestrator_routing_service import OrchestratorRoutingService
+
+    return OrchestratorRoutingService(
+        discovery=get_worker_discovery_service(),
+        storage=get_storage(),
+        registry=get_registry_service(),
+        llm=get_llm_provider(),
+    )
+
+
+def build_orchestrator_application_service(checkpoint_runtime):
+    """Wire the production Turn G application service around one runtime."""
+    from .a2a.orchestrator_application_service import (
+        OrchestratorApplicationService,
+        OrchestratorApplicationServiceError,
+    )
+
+    settings = get_settings()
+    timeout = settings.orchestrator_worker_timeout_seconds
+    if timeout is None:
+        raise OrchestratorApplicationServiceError(
+            "orchestrator_worker_timeout_required"
+        )
+    return OrchestratorApplicationService(
+        checkpoint_runtime=checkpoint_runtime,
+        routing_service=get_orchestrator_routing_service(),
+        discovery=get_worker_discovery_service(),
+        registry=get_registry_service(),
+        storage=get_storage(),
+        worker_timeout_seconds=timeout,
+        max_worker_retries=settings.orchestrator_max_worker_retries,
+    )
+
+
+@lru_cache(maxsize=1)
 def get_llm_provider() -> LLMProvider:
     """Return the configured LLM provider.
 
@@ -69,12 +131,10 @@ def get_llm_provider() -> LLMProvider:
             )
         return GeminiProvider(api_key=settings.gemini_api_key, model=settings.gemini_model)
     if settings.llm_provider == "openai":
-        if not settings.openai_api_key:
-            raise ValueError(
-                "LLM_PROVIDER=openai but OPENAI_API_KEY is empty; "
-                "either set the key or use LLM_PROVIDER=mock."
-            )
-        return OpenAIProvider(api_key=settings.openai_api_key, model=settings.openai_model)
+        return OpenAIProvider(
+            api_key=_resolve_openai_api_key(settings),
+            model=settings.openai_model,
+        )
     if settings.llm_provider == "qwen":
         if not settings.qwen_api_key:
             raise ValueError(
@@ -88,3 +148,20 @@ def get_llm_provider() -> LLMProvider:
             timeout=settings.qwen_timeout,
         )
     return MockLLMProvider()
+
+
+def _resolve_openai_api_key(settings: Settings) -> str:
+    """Resolve an OpenAI credential without exposing its source or content."""
+    direct = (settings.openai_api_key or "").strip()
+    if direct:
+        return direct
+    key_file = (settings.openai_api_key_file or "").strip()
+    if not key_file:
+        raise ValueError("openai_api_key_required")
+    try:
+        resolved = Path(key_file).read_text(encoding="utf-8").strip()
+    except OSError:
+        raise ValueError("openai_api_key_file_unreadable") from None
+    if not resolved:
+        raise ValueError("openai_api_key_file_empty")
+    return resolved

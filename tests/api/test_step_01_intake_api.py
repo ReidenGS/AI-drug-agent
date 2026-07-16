@@ -54,3 +54,91 @@ def test_step_01_reexecute_known_run_returns_existing_artifact(client: TestClien
     assert resp.status_code == 200
     body = resp.json()
     assert body["run_id"] == real_run_id, "Step 1 re-execute must not allocate a new run_id"
+
+
+def test_create_and_get_run_return_generated_session(client: TestClient):
+    created = client.post("/runs", json={"raw_user_query": "Analyze HER2"})
+    assert created.status_code == 200
+    body = created.json()
+    session_id = body["session_id"]
+    assert session_id.startswith("sess_") and len(session_id) == 21
+    assert body["raw_request_record"]["session_id"] == session_id
+
+    fetched = client.get(f"/runs/{body['run_id']}")
+    assert fetched.status_code == 200
+    assert fetched.json()["session_id"] == session_id
+
+
+def test_create_run_reuses_valid_session_but_keeps_run_authority_isolated(
+    client: TestClient,
+):
+    session_id = "sess_0123456789abcdef"
+    first = client.post(
+        "/runs", json={"raw_user_query": "first", "session_id": session_id}
+    ).json()
+    second = client.post(
+        "/runs", json={"raw_user_query": "second", "session_id": session_id}
+    ).json()
+
+    assert first["session_id"] == second["session_id"] == session_id
+    assert first["run_id"] != second["run_id"]
+    assert (
+        first["raw_request_record"]["run_artifact_registry_id"]
+        != second["raw_request_record"]["run_artifact_registry_id"]
+    )
+
+
+def test_invalid_json_session_is_422_and_writes_no_artifact(client: TestClient):
+    before = list(deps.get_storage().list_prefix(deps.get_storage().prefix))
+    response = client.post(
+        "/runs",
+        json={"raw_user_query": "invalid session", "session_id": "session-secret"},
+    )
+    after = list(deps.get_storage().list_prefix(deps.get_storage().prefix))
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "session_id_invalid"
+    assert "session-secret" not in response.text
+    assert before == after == []
+
+
+def test_get_run_rejects_tampered_raw_identity_with_compact_error(
+    client: TestClient,
+):
+    created = client.post(
+        "/runs", json={"raw_user_query": "identity authority"}
+    ).json()
+    storage = deps.get_storage()
+    key = storage.run_key(
+        created["run_id"], "inputs/raw_request_record.json"
+    )
+    body = storage.read_json(key)
+    body["artifact_id"] = "sk-live-tampered-artifact"
+    storage.write_json(key, body)
+
+    response = client.get(f"/runs/{created['run_id']}")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "raw_request_record_identity_mismatch"
+    assert "sk-live" not in response.text
+
+
+def test_get_run_rejects_invalid_persisted_session_without_leaking_it(
+    client: TestClient,
+):
+    created = client.post(
+        "/runs", json={"raw_user_query": "session authority"}
+    ).json()
+    storage = deps.get_storage()
+    key = storage.run_key(
+        created["run_id"], "inputs/raw_request_record.json"
+    )
+    body = storage.read_json(key)
+    body["session_id"] = "sk-live-invalid-persisted-session"
+    storage.write_json(key, body)
+
+    response = client.get(f"/runs/{created['run_id']}")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "raw_request_record_schema_invalid"
+    assert "sk-live" not in response.text

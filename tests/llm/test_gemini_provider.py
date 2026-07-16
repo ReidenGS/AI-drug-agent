@@ -6,9 +6,14 @@ These tests monkeypatch the provider's model call and never hit the network.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
+from app.a2a.orchestrator_routing_prompt import (
+    ORCHESTRATOR_ROUTING_SYSTEM_PROMPT,
+    ORCHESTRATOR_ROUTING_USER_TASK,
+)
 from app.llm.gemini_provider import GeminiProvider, GeminiProviderError
 
 
@@ -21,6 +26,52 @@ def _provider_with_responses(responses: list[object]) -> GeminiProvider:
 
     provider._generate_content = _fake_generate_content  # type: ignore[method-assign]
     return provider
+
+
+def test_orchestrator_combined_prompt_contains_system_exactly_once():
+    calls: list[dict[str, Any]] = []
+
+    def _generate_content(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return SimpleNamespace(
+            parsed={
+                "loop_decision": "route_to_final_response",
+                "decisions": [],
+                "decision_summary": "No worker is needed.",
+            }
+        )
+
+    provider = GeminiProvider(api_key="fake-key", max_retries=0)
+    provider._client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=_generate_content)
+    )
+    provider.generate_json(
+        ORCHESTRATOR_ROUTING_USER_TASK,
+        schema={
+            "task": "orchestrator_worker_routing",
+            "compact_card_catalog": [
+                {
+                    "agent_id": "step_06_developability_agent",
+                    "capabilities": [
+                        {"capability_id": "step_06_developability"}
+                    ],
+                }
+            ],
+            "compact_user_intent": "Already satisfied",
+            "structured_intent": {},
+            "input_readiness_summary": {"input_readiness_status": "ready"},
+            "available_artifact_summary": [],
+            "current_routing_context": {},
+        },
+        system=ORCHESTRATOR_ROUTING_SYSTEM_PROMPT,
+    )
+
+    combined = calls[0]["contents"]
+    assert combined.count(ORCHESTRATOR_ROUTING_SYSTEM_PROMPT) == 1
+    assert ORCHESTRATOR_ROUTING_USER_TASK in combined
+    assert combined.count('"input_situation"') == 2
+    assert "Compact AgentCard catalog JSON:" in combined
+    assert "step_06_developability_agent" in combined
 
 
 def test_stage1_accepts_json_mode_text_response():

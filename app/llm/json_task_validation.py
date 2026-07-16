@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 ErrorFactory = Callable[[str], BaseException]
 
@@ -27,6 +27,17 @@ ErrorFactory = Callable[[str], BaseException]
 # shared by the Step 2 mock detector and the post-LLM normalizer: a usable
 # `prompt_sequence` must contain an explicit "_" run or literal "<mask>".
 _MASK_MARKER_RE = re.compile(r"_|<mask>", re.IGNORECASE)
+_STANDARD_AMINO_ACIDS = frozenset("ACDEFGHIKLMNPQRSTVWY")
+_UNIPROT_ACCESSION_RE = re.compile(
+    r"^(?:[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2})(?:-\d+)?$"
+)
+
+
+def is_valid_uniprot_accession(value: Any) -> bool:
+    """Validate an explicitly typed accession without inferring its role."""
+    return isinstance(value, str) and bool(
+        _UNIPROT_ACCESSION_RE.fullmatch(value.strip().upper())
+    )
 
 
 def looks_like_masked_prompt_sequence(value: Any) -> bool:
@@ -40,6 +51,40 @@ def looks_like_masked_prompt_sequence(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     return bool(_MASK_MARKER_RE.search(value))
+
+
+def normalize_inline_protein_sequence(value: Any) -> str | None:
+    """Return a consumable uppercase amino-acid sequence or ``None``.
+
+    The accepted value may be a plain sequence or a single-record FASTA
+    body.  PDB/mmCIF/A3M bodies, masked generation prompts, prose, IDs, and
+    non-standard residues fail closed.  This validates an LLM-emitted typed
+    field; it does not scan arbitrary user prose for biological content.
+    """
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw or looks_like_masked_prompt_sequence(raw):
+        return None
+    lowered = raw.lower()
+    if (
+        "\natom" in f"\n{lowered}"
+        or "\nhetatm" in f"\n{lowered}"
+        or lowered.startswith("data_")
+        or "_atom_site." in lowered
+    ):
+        return None
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if lines and lines[0].startswith(">"):
+        if any(line.startswith(">") for line in lines[1:]):
+            return None
+        lines = lines[1:]
+    if not lines:
+        return None
+    sequence = "".join(lines).replace(" ", "").upper()
+    if not set(sequence) <= _STANDARD_AMINO_ACIDS:
+        return None
+    return sequence
 
 
 # Shared, LLM-agnostic keyword heuristic for "the user is asking to
@@ -233,6 +278,44 @@ def build_json_prompt_sections(
     schema = schema or {}
     task = schema.get("task") or "structured_query"
     shape = shape_instruction(task)
+    if task == "orchestrator_worker_routing":
+        from app.a2a.orchestrator_routing_prompt import (
+            ORCHESTRATOR_ROUTING_FEW_SHOTS,
+        )
+
+        system_block = f"System instructions:\n{system}\n\n" if system else ""
+        json_only = (
+            "Return exactly one valid JSON object. Do not include markdown fences, "
+            "comments, prose, or tool calls."
+        )
+        catalog = _canonical_orchestrator_catalog(
+            schema.get("compact_card_catalog", [])
+        )
+        stable_prefix = (
+            f"{system_block}"
+            f"{json_only}\n"
+            f"Expected top-level shape:\n{shape}\n\n"
+            f"User/developer task:\n{prompt}\n\n"
+            "Few-shot examples JSON:\n"
+            f"{json.dumps(ORCHESTRATOR_ROUTING_FEW_SHOTS, ensure_ascii=False, separators=(',', ':'))}\n\n"
+            "Compact AgentCard catalog JSON:\n"
+            f"{json.dumps(catalog, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
+        )
+        dynamic_keys = (
+            "compact_user_intent",
+            "structured_intent",
+            "input_readiness_summary",
+            "available_artifact_summary",
+            "current_routing_context",
+        )
+        dynamic_schema = {key: schema.get(key) for key in dynamic_keys}
+        dynamic_suffix = (
+            "\n\nRun-specific routing context JSON:\n"
+            + json.dumps(
+                dynamic_schema, ensure_ascii=False, separators=(",", ":"), default=str
+            )
+        )
+        return stable_prefix, dynamic_suffix
     system_block = f"System instructions:\n{system}\n\n" if system else ""
     header = (
         f"{system_block}"
@@ -255,6 +338,44 @@ def build_json_prompt_sections(
     dynamic_payload = json.dumps(dynamic_schema, ensure_ascii=False, sort_keys=True, default=str)
     dynamic_suffix = f"\n\nCandidate/run-specific context JSON:\n{dynamic_payload}"
     return stable_prefix, dynamic_suffix
+
+
+def _canonical_orchestrator_catalog(value: Any) -> list[dict[str, Any]]:
+    """Keep only stable AgentCard contract fields and sort both levels."""
+    agent_keys = (
+        "agent_id", "agent_role", "display_name", "name", "description",
+        "status", "routable", "uses_llm", "uses_mcp", "dispatch_modes",
+    )
+    capability_keys = (
+        "capability_id", "capability_summary", "execution_mode",
+        "internal_execution_order", "supported_step_ids", "supported_intents",
+        "supported_lane_flags", "required_input_artifact_names",
+        "optional_input_artifact_names", "output_artifact_names",
+        "required_artifact_field_names", "uses_llm", "uses_mcp",
+    )
+    agents: list[dict[str, Any]] = []
+    for raw_agent in value if isinstance(value, list) else []:
+        if not isinstance(raw_agent, dict) or not raw_agent.get("agent_id"):
+            continue
+        agent = {key: raw_agent[key] for key in agent_keys if key in raw_agent}
+        capabilities = []
+        for raw_capability in raw_agent.get("capabilities", []):
+            if not isinstance(raw_capability, dict) or not raw_capability.get(
+                "capability_id"
+            ):
+                continue
+            capabilities.append(
+                {
+                    key: raw_capability[key]
+                    for key in capability_keys
+                    if key in raw_capability
+                }
+            )
+        agent["capabilities"] = sorted(
+            capabilities, key=lambda item: str(item["capability_id"])
+        )
+        agents.append(agent)
+    return sorted(agents, key=lambda item: str(item["agent_id"]))
 
 
 # Keys inside a Step 5 ``tool_selection_stage_1`` ``context`` block that are
@@ -497,6 +618,15 @@ def _split_prompt_schema(schema: dict, task: str) -> tuple[dict | None, dict]:
 
 
 def shape_instruction(task: str) -> str:
+    if task == "orchestrator_worker_routing":
+        return (
+            '{"loop_decision":"dispatch_next_workers|wait_for_dependencies|'
+            'route_to_final_response|request_user_input|repair_or_retry|'
+            'stop_cannot_satisfy","decisions":[{"agent_id":"string",'
+            '"capability_id":"string","objective":"string",'
+            '"selection_reason":"string","priority":"low|normal|high"}],'
+            '"decision_summary":"string"}'
+        )
     if task == "step14_patent_tool_selection":
         return (
             '{"tool_plans":[{"tool_name":"string","can_invoke":true,'
@@ -689,6 +819,17 @@ def _strip_markdown_fence(text: str) -> str:
 # ── Per-task validator ────────────────────────────────────────────────────
 
 def validate_task_shape(data: dict, task: str, *, error_factory: ErrorFactory) -> dict:
+    if task == "orchestrator_worker_routing":
+        from pydantic import ValidationError
+
+        from app.schemas.worker_routing_plan import OrchestratorRoutingProposal
+
+        try:
+            return OrchestratorRoutingProposal.model_validate(data).model_dump()
+        except ValidationError as exc:
+            raise error_factory(
+                "orchestrator_worker_routing response violates routing proposal schema"
+            ) from exc
     if task == "step14_patent_tool_selection":
         plans = data.get("tool_plans")
         if not isinstance(plans, list):

@@ -8,12 +8,14 @@ from __future__ import annotations
 
 from typing import Optional
 
+from pydantic import TypeAdapter, ValidationError
+
 from ..schemas.step_01_raw_request_record import (
     RawRequestRecord,
     UploadedFile,
     UserProvidedContext,
 )
-from ..utils.ids import new_run_id, new_artifact_id
+from ..utils.ids import SessionId, new_artifact_id, new_run_id, new_session_id
 from ..utils.time import now_iso
 from .artifact_registry_service import ArtifactRegistryService
 from .storage_service import Storage
@@ -53,6 +55,7 @@ class IntakeService:
         user_provided_context: Optional[dict] = None,
         uploaded_files: Optional[list[dict]] = None,
         run_id: Optional[str] = None,
+        session_id: Optional[SessionId] = None,
     ) -> RawRequestRecord:
         """Persist a raw_request_record for a run.
 
@@ -62,11 +65,21 @@ class IntakeService:
         passes the result back in. JSON callers never need this.
         """
         run_id = run_id or new_run_id()
+        candidate_session_id = (
+            new_session_id() if session_id is None else session_id
+        )
+        try:
+            session_id = TypeAdapter(SessionId).validate_python(
+                candidate_session_id, strict=True
+            )
+        except ValidationError:
+            raise ValueError("session_id_invalid") from None
         self.workflow_state.init_run(run_id)
         registry = self.registry.init_registry(run_id)
 
         record = RawRequestRecord(
             run_id=run_id,
+            session_id=session_id,
             run_artifact_registry_id=registry.run_artifact_registry_id,
             created_at=now_iso(),
             entry_source=entry_source,  # type: ignore[arg-type]

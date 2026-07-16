@@ -454,10 +454,11 @@ def _resolve_step8_complex_ref(
 # ── Step 8 downstream_handoff.{validated_structure_ref,
 #    structure_for_variant_generation_ref} ──────────────────────────────────
 #
-# These handoff values may be a material_id or a storage path, never a raw
+# These handoff values may be a Step 7 file_id/source_ref, a Step 5 material_id,
+# or a storage path, never a raw
 # structure body (the projection layer already filters raw bodies out at
 # `_project_step8_fields` time). Real resolution walks Step 7 structure_refs
-# first (matching `source_ref`), then Step 5 candidate materials (matching
+# first (matching `file_id` or `source_ref`), then Step 5 candidate materials (matching
 # `material_id`) — never passes the compact field_ref or a bare material_id
 # straight through to ToolUniverse.
 
@@ -502,7 +503,7 @@ def _resolve_structure_hint(
     storage: Storage,
 ) -> tuple[str | None, str | None]:
     """Resolve a structure "hint" — already a usable storage path, OR a
-    Step 7 `structure_refs[].source_ref`, OR a Step 5 `materials[].material_id`
+    Step 7 `structure_refs[].file_id`/`source_ref`, OR a Step 5 `materials[].material_id`
     — to a real, storage-verified path. Never returns a bare identifier/path
     string that hasn't been checked to actually resolve."""
 
@@ -511,16 +512,33 @@ def _resolve_structure_hint(
     if _path_exists(storage, hint):
         return hint, None
 
+    matching_step7_refs: list[dict[str, Any]] = []
     for sin in prepared_inputs:
         if str(sin.get("candidate_id") or "") != candidate_id:
             continue
         for sref in sin.get("structure_refs") or []:
             if not isinstance(sref, dict):
                 continue
-            if str(sref.get("source_ref") or "") == hint:
-                storage_ref = sref.get("storage_ref")
-                if isinstance(storage_ref, str) and _path_exists(storage, storage_ref):
-                    return storage_ref, None
+            if hint in {
+                str(sref.get("file_id") or ""),
+                str(sref.get("source_ref") or ""),
+            }:
+                matching_step7_refs.append(sref)
+
+    if matching_step7_refs:
+        declared_storage_refs = {
+            storage_ref
+            for sref in matching_step7_refs
+            if isinstance((storage_ref := sref.get("storage_ref")), str)
+            and storage_ref
+        }
+        if len(declared_storage_refs) > 1:
+            return None, "structure_ref_ambiguous"
+        if len(declared_storage_refs) == 1:
+            storage_ref = next(iter(declared_storage_refs))
+            if _path_exists(storage, storage_ref):
+                return storage_ref, None
+        return None, "structure_ref_storage_ref_invalid"
 
     for candidate in candidate_context_table.get("candidate_records") or []:
         if not isinstance(candidate, dict) or str(candidate.get("candidate_id") or "") != candidate_id:

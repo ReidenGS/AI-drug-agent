@@ -15,6 +15,10 @@ Covers the structured required-slot gap channel added on top of Step 2:
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from app.agents.supervisor_agent import (
     SUPERVISOR_SYSTEM_PROMPT,
     SupervisorAgent,
@@ -112,6 +116,218 @@ def test_prompt_describes_conditional_uploaded_fasta_role_slot():
     assert "conditional uploaded FASTA role" in sp
     assert "blocking sequence_role ONLY when an uploaded FASTA/sequence file exists" in sp
     assert "Do not emit it when no FASTA exists" in sp
+    assert "source` is its only downstream" in sp
+    assert "Never infer this role from" in sp
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "target_sequence",
+        "antibody_heavy_chain_sequence",
+        "antibody_light_chain_sequence",
+        "prompt_sequence",
+    ],
+)
+def test_normalizer_preserves_canonical_uploaded_fasta_source(source):
+    out = normalize_llm_payload_for_step2(
+        {
+            "referenced_inputs": [
+                {
+                    "id_type": "uploaded_file",
+                    "value": "file_sequence",
+                    "source": source,
+                }
+            ],
+            "missing_slots": [],
+        },
+        {
+            "raw_user_query": "Analyze the uploaded file.",
+            "user_provided_context": {},
+            "uploaded_files": [
+                {
+                    "file_id": "file_sequence",
+                    "original_filename": "generic.fasta",
+                }
+            ],
+        },
+    )
+    assert out["referenced_inputs"] == [
+        {
+            "id_type": "uploaded_file",
+            "value": "file_sequence",
+            "source": source,
+        }
+    ]
+    assert not any(
+        slot["slot_name"] == "sequence_role" for slot in out["missing_slots"]
+    )
+
+
+def test_normalizer_keeps_unassigned_fasta_generic_and_blocks_sequence_role():
+    out = normalize_llm_payload_for_step2(
+        {
+            "referenced_inputs": [
+                {
+                    "id_type": "uploaded_file",
+                    "value": "file_sequence",
+                    "source": "uploaded_file",
+                }
+            ],
+            "missing_slots": [],
+        },
+        {
+            "raw_user_query": "Use target heavy light keywords.",
+            "user_provided_context": {
+                "target_or_antigen_text": "target",
+                "candidate_text": "heavy light antibody",
+            },
+            "uploaded_files": [
+                {
+                    "file_id": "file_sequence",
+                    "original_filename": "target_heavy_light.fasta",
+                }
+            ],
+        },
+    )
+    assert out["referenced_inputs"] == [
+        {
+            "id_type": "uploaded_file",
+            "value": "file_sequence",
+            "source": "uploaded_file",
+        }
+    ]
+    slots = [
+        slot for slot in out["missing_slots"] if slot["slot_name"] == "sequence_role"
+    ]
+    assert len(slots) == 1
+    assert slots[0]["severity"] == "blocking"
+
+
+def test_assigned_fasta_does_not_delete_llm_sequence_role_semantics():
+    existing = {
+        "slot_name": "sequence_role",
+        "slot_category": "sequence",
+        "severity": "blocking",
+        "required_for": ["structure_analysis"],
+        "reason": "The antibody sequence chain role is unresolved.",
+        "suggested_question": "Is the antibody sequence heavy or light chain?",
+        "evidence": "structured_query.referenced_inputs[1]",
+    }
+    out = normalize_llm_payload_for_step2(
+        {
+            "referenced_inputs": [
+                {
+                    "id_type": "uploaded_file",
+                    "value": "file_target",
+                    "source": "target_sequence",
+                },
+                {
+                    "id_type": "antibody_sequence_reference",
+                    "value": "EVQLVESGGGLVQPGGSLRLSCAAS",
+                    "source": "user",
+                },
+            ],
+            "missing_slots": [existing],
+        },
+        {
+            "raw_user_query": "The uploaded FASTA is the target sequence.",
+            "user_provided_context": {},
+            "uploaded_files": [
+                {
+                    "file_id": "file_target",
+                    "original_filename": "target.fasta",
+                    "role": "target_sequence",
+                }
+            ],
+        },
+    )
+    assert out["referenced_inputs"][0]["source"] == "target_sequence"
+    assert out["referenced_inputs"][1]["id_type"] == (
+        "antibody_sequence_reference"
+    )
+    assert out["missing_slots"] == [existing]
+
+
+def test_unassigned_fasta_dedupes_sequence_role_and_preserves_first_evidence():
+    first = {
+        "slot_name": "sequence_role",
+        "slot_category": "sequence",
+        "severity": "warning",
+        "required_for": ["structure_analysis"],
+        "reason": "Existing semantic reason.",
+        "suggested_question": "Existing semantic question?",
+        "evidence": "existing_semantic_evidence",
+    }
+    duplicate = {**first, "reason": "duplicate must be removed"}
+    out = normalize_llm_payload_for_step2(
+        {
+            "referenced_inputs": [
+                {
+                    "id_type": "uploaded_file",
+                    "value": "file_unassigned",
+                    "source": "uploaded_file",
+                }
+            ],
+            "missing_slots": [first, duplicate],
+        },
+        {
+            "raw_user_query": "Use the upload.",
+            "user_provided_context": {},
+            "uploaded_files": [
+                {
+                    "file_id": "file_unassigned",
+                    "original_filename": "sequence.fasta",
+                }
+            ],
+        },
+    )
+    slots = [
+        slot
+        for slot in out["missing_slots"]
+        if slot["slot_name"] == "sequence_role"
+    ]
+    assert len(slots) == 1
+    assert slots[0] == {**first, "severity": "blocking"}
+
+
+@pytest.mark.parametrize(
+    ("metadata", "source"),
+    [
+        ({"role": "target_sequence"}, "target_sequence"),
+        ({"chain_role": "heavy"}, "antibody_heavy_chain_sequence"),
+        ({"chain_role": "light"}, "antibody_light_chain_sequence"),
+        ({"role": "prompt_sequence"}, "prompt_sequence"),
+    ],
+)
+def test_explicit_uploaded_file_metadata_normalizes_into_step2_source(
+    metadata,
+    source,
+):
+    out = normalize_llm_payload_for_step2(
+        {"referenced_inputs": [], "missing_slots": []},
+        {
+            "raw_user_query": "Analyze the uploaded file.",
+            "user_provided_context": {},
+            "uploaded_files": [
+                {
+                    "file_id": "file_sequence",
+                    "original_filename": "generic.fasta",
+                    **metadata,
+                }
+            ],
+        },
+    )
+    assert out["referenced_inputs"] == [
+        {
+            "id_type": "uploaded_file",
+            "value": "file_sequence",
+            "source": source,
+        }
+    ]
+    assert not any(
+        slot["slot_name"] == "sequence_role" for slot in out["missing_slots"]
+    )
 
 
 # ── normalizer drift handling ───────────────────────────────────────────────
@@ -330,6 +546,382 @@ def test_mock_missing_slots_survive_full_supervisor_parse():
     )
     blocking = [m for m in sq.missing_slots if m.severity == "blocking"]
     assert any(m.slot_name == "target_or_antigen" for m in blocking)
+
+
+@pytest.mark.parametrize(
+    "sequence",
+    ["ACDE", "ACDEFGHIKLMNPQRSTVWY" * 40],
+)
+def test_initial_inline_target_sequence_is_visible_and_canonical(sequence):
+    class _CapturingProvider:
+        """Test-only fixture: explicit Step2 role output, not live semantics."""
+
+        name = "test-only-capturing-mock"
+        model = "test-only"
+
+        def __init__(self):
+            self.inner = MockLLMProvider()
+            self.calls = []
+
+        def generate_json(self, prompt, *, schema, system=None):
+            self.calls.append({"prompt": prompt, "schema": schema, "system": system})
+            result = self.inner.generate_json(prompt, schema=schema, system=system)
+            result["referenced_inputs"] = [
+                {"id_type": "target_sequence", "value": sequence, "source": "user"}
+            ]
+            result["missing_slots"] = [
+                slot
+                for slot in result.get("missing_slots") or []
+                if slot.get("slot_name") != "structure_or_sequence"
+            ]
+            result["response"] = None
+            return result
+
+    provider = _CapturingProvider()
+    sq = SupervisorAgent(llm=provider).parse_raw_to_structured_query(
+        {
+            "run_id": "run_20260715_abcdef12",
+            "run_artifact_registry_id": "raw_request_record_20260715_abcdef12",
+            "artifact_id": "raw_request_record_20260715_abcdef12",
+            "created_at": "2026-07-15T00:00:00Z",
+            "raw_user_query": f"Analyze target sequence: {sequence}",
+            "user_provided_context": {},
+            "uploaded_files": [],
+        }
+    )
+    assert sequence in json.dumps(provider.calls)
+    assert any(
+        ref.get("id_type") == "target_sequence" and ref.get("value") == sequence
+        for ref in sq.referenced_inputs
+    )
+    assert not any(slot.slot_name == "structure_or_sequence" for slot in sq.missing_slots)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Analyze target sequence: ACDEFGHIKLMNPQ",
+        "Protein sequence: PLEASE",
+    ],
+)
+def test_mock_does_not_infer_target_sequence_from_raw_query(query):
+    out = _parse(query)
+    assert not any(
+        ref.get("id_type") == "target_sequence"
+        for ref in out["referenced_inputs"]
+    )
+
+
+@pytest.mark.parametrize(
+    "generic_id_type",
+    ["protein_sequence", "fasta_sequence", "amino_acid_sequence"],
+)
+def test_normalizer_does_not_promote_generic_sequence_aliases(generic_id_type):
+    out = normalize_llm_payload_for_step2(
+        {
+            "referenced_inputs": [
+                {
+                    "id_type": generic_id_type,
+                    "value": "MKTAYIAKQNNVG",
+                    "source": "user",
+                }
+            ],
+            "missing_slots": [
+                {
+                    "slot_name": "structure_or_sequence",
+                    "slot_category": "sequence",
+                    "severity": "blocking",
+                    "reason": "Step2 did not assign a consumable role.",
+                }
+            ],
+        }
+    )
+    assert out["referenced_inputs"][0]["id_type"] == generic_id_type
+    assert out["missing_slots"][0]["slot_name"] == "structure_or_sequence"
+
+
+@pytest.mark.parametrize(
+    "id_type",
+    [
+        "target_sequence",
+        "antibody_heavy_chain_sequence",
+        "antibody_light_chain_sequence",
+    ],
+)
+def test_invalid_canonical_typed_sequence_restores_exact_blocking_slot(id_type):
+    invalid = "ACDE?FG"
+    out = normalize_llm_payload_for_step2(
+        {
+            "referenced_inputs": [
+                {"id_type": id_type, "value": invalid, "source": "user"}
+            ],
+            "missing_slots": [],
+        }
+    )
+
+    assert out["referenced_inputs"] == []
+    assert invalid not in json.dumps(out["parse_warnings"])
+    assert out["parse_warnings"] == [
+        (
+            "dropped invalid target_sequence referenced_input"
+            if id_type == "target_sequence"
+            else "dropped invalid antibody chain sequence referenced_input"
+        )
+    ]
+    assert out["missing_slots"] == [
+        {
+            "slot_name": "structure_or_sequence",
+            "slot_category": "sequence",
+            "severity": "blocking",
+            "required_for": [],
+            "reason": "The supplied protein sequence could not be used.",
+            "suggested_question": "Please provide a valid protein sequence.",
+            "evidence": None,
+        }
+    ]
+
+
+def test_invalid_typed_sequence_does_not_duplicate_existing_structure_slot():
+    out = normalize_llm_payload_for_step2(
+        {
+            "referenced_inputs": [
+                {
+                    "id_type": "target_sequence",
+                    "value": "ACDE?FG",
+                    "source": "user",
+                }
+            ],
+            "missing_slots": [
+                {
+                    "slot_name": "structure_or_sequence",
+                    "slot_category": "structure",
+                    "severity": "warning",
+                    "required_for": ["structure_analysis"],
+                    "reason": "Existing reason.",
+                    "suggested_question": "Existing question?",
+                    "evidence": "existing-safe-evidence",
+                }
+            ],
+        }
+    )
+
+    slots = [
+        slot
+        for slot in out["missing_slots"]
+        if slot["slot_name"] == "structure_or_sequence"
+    ]
+    assert len(slots) == 1
+    assert slots[0] == {
+        "slot_name": "structure_or_sequence",
+        "slot_category": "structure",
+        "severity": "blocking",
+        "required_for": ["structure_analysis"],
+        "reason": "Existing reason.",
+        "suggested_question": "Existing question?",
+        "evidence": "existing-safe-evidence",
+    }
+
+
+def test_invalid_typed_sequence_is_redundant_when_valid_pdb_remains():
+    out = normalize_llm_payload_for_step2(
+        {
+            "referenced_inputs": [
+                {
+                    "id_type": "target_sequence",
+                    "value": "ACDE?FG",
+                    "source": "user",
+                },
+                {"id_type": "pdb_id", "value": "1N8Z", "source": "user"},
+            ],
+            "missing_slots": [],
+        }
+    )
+
+    assert out["referenced_inputs"] == [
+        {"id_type": "pdb_id", "value": "1N8Z", "source": "user"}
+    ]
+    assert not any(
+        slot["slot_name"] == "structure_or_sequence"
+        for slot in out["missing_slots"]
+    )
+
+
+@pytest.mark.parametrize(
+    "prompt_ref",
+    [
+        {
+            "id_type": "prompt_sequence",
+            "value": "ACDEFGHIK_LMNPQRST",
+            "source": "user",
+        },
+        {
+            "id_type": "uploaded_file",
+            "value": "file_prompt",
+            "source": "prompt_sequence",
+        },
+    ],
+)
+def test_prompt_sequence_does_not_clear_previous_structure_or_sequence_slot(
+    prompt_ref,
+):
+    out = normalize_llm_payload_for_step2(
+        {"referenced_inputs": [prompt_ref], "missing_slots": []},
+        {
+            "raw_user_query": "Analyze a protein structure.",
+            "user_provided_context": {
+                "previous_missing_slots": [
+                    {
+                        "slot_name": "structure_or_sequence",
+                        "slot_category": "sequence",
+                        "severity": "blocking",
+                    }
+                ]
+            },
+            "uploaded_files": [
+                {
+                    "file_id": "file_prompt",
+                    "original_filename": "generation_prompt.fasta",
+                }
+            ],
+        },
+    )
+    assert out["referenced_inputs"] == [prompt_ref]
+    assert any(
+        slot["slot_name"] == "structure_or_sequence"
+        and slot["severity"] == "blocking"
+        for slot in out["missing_slots"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("accession", "slot_remains"),
+    [("P04626", False), ("not-a-uniprot-accession", True)],
+)
+def test_only_valid_typed_uniprot_satisfies_previous_structure_or_sequence_slot(
+    accession,
+    slot_remains,
+):
+    out = normalize_llm_payload_for_step2(
+        {
+            "referenced_inputs": [
+                {"id_type": "uniprot_id", "value": accession, "source": "user"}
+            ],
+            "missing_slots": [],
+        },
+        {
+            "raw_user_query": "Analyze a protein structure.",
+            "user_provided_context": {
+                "previous_missing_slots": [
+                    {
+                        "slot_name": "structure_or_sequence",
+                        "slot_category": "sequence",
+                        "severity": "blocking",
+                    }
+                ]
+            },
+            "uploaded_files": [],
+        },
+    )
+    assert (
+        any(slot["slot_name"] == "structure_or_sequence" for slot in out["missing_slots"])
+        is slot_remains
+    )
+
+
+@pytest.mark.parametrize("accession", ["P04626", "P04626-2"])
+def test_normalizer_preserves_valid_uniprot_and_isoform(accession):
+    out = normalize_llm_payload_for_step2(
+        {
+            "referenced_inputs": [
+                {"id_type": "uniprot_id", "value": accession, "source": "user"}
+            ],
+            "missing_slots": [],
+        }
+    )
+    assert out["referenced_inputs"] == [
+        {"id_type": "uniprot_id", "value": accession, "source": "user"}
+    ]
+    assert not any(
+        slot["slot_name"] == "structure_or_sequence"
+        for slot in out["missing_slots"]
+    )
+
+
+def test_invalid_uniprot_is_dropped_and_restores_blocking_structure_slot():
+    invalid = "not-a-uniprot-accession"
+    out = normalize_llm_payload_for_step2(
+        {
+            "referenced_inputs": [
+                {"id_type": "uniprot_id", "value": invalid, "source": "user"}
+            ],
+            "missing_slots": [],
+        }
+    )
+    assert out["referenced_inputs"] == []
+    assert out["parse_warnings"] == [
+        "dropped invalid uniprot_id referenced_input"
+    ]
+    assert out["dropped_referenced_input_counts"] == {"uniprot_id": 1}
+    assert invalid not in json.dumps(out["parse_warnings"])
+    slots = [
+        slot
+        for slot in out["missing_slots"]
+        if slot["slot_name"] == "structure_or_sequence"
+    ]
+    assert len(slots) == 1
+    assert slots[0]["severity"] == "blocking"
+
+
+@pytest.mark.parametrize(
+    "valid_ref",
+    [
+        {"id_type": "pdb_id", "value": "1N8Z", "source": "user"},
+        {
+            "id_type": "target_sequence",
+            "value": "ACDEFGHIK",
+            "source": "user",
+        },
+    ],
+)
+def test_invalid_uniprot_does_not_block_another_valid_input(valid_ref):
+    out = normalize_llm_payload_for_step2(
+        {
+            "referenced_inputs": [
+                {
+                    "id_type": "uniprot_id",
+                    "value": "not-a-uniprot-accession",
+                    "source": "user",
+                },
+                valid_ref,
+            ],
+            "missing_slots": [],
+        }
+    )
+    assert out["referenced_inputs"] == [valid_ref]
+    assert not any(
+        slot["slot_name"] == "structure_or_sequence"
+        for slot in out["missing_slots"]
+    )
+
+
+def test_mock_prompt_file_does_not_satisfy_structure_analysis_input():
+    out = _parse(
+        "Analyze the structure of HER2; the attached file is the prompt_sequence.",
+        files=[
+            {
+                "file_id": "file_prompt",
+                "original_filename": "generation_prompt.fasta",
+                "content_type": "text/x-fasta",
+            }
+        ],
+    )
+    assert any(
+        ref.get("id_type") == "uploaded_file"
+        and ref.get("value") == "file_prompt"
+        and ref.get("source") == "prompt_sequence"
+        for ref in out["referenced_inputs"]
+    )
+    assert _slots_by_name(out)["structure_or_sequence"]["severity"] == "blocking"
 
 
 def test_mock_missing_slots_do_not_leak_sequences_or_keys():

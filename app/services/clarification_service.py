@@ -1,85 +1,91 @@
-"""Step 3 clarification multi-turn loop — minimal backend closed loop.
-
-The frontend shows the user the Step 3 `response`; the user supplies only the
-missing information. This service records that answer and builds the NEXT
-turn's Step 1 input by carrying the previous intent + the answers forward, so
-the Step 2 LLM can remember the original request and re-parse. Step 3 still
-NEVER calls an LLM, and there is NO LangGraph memory / checkpointer — state
-is persisted as ordinary artifacts via LocalStorage + ArtifactRegistryService.
-
-Design principles honored here:
-
-- The user's answer is NOT parsed into business fields by this service. It is
-  carried as ``user_provided_context.clarification_answers`` (plus compact
-  ``previous_*`` context) into a fresh revision run; the Step 2 LLM re-parses.
-- The original run's Step 2 / Step 3 artifacts are never overwritten — the
-  revision is a NEW run linked from the ``ClarificationState`` artifact.
-"""
+"""Same-run Step 3 clarification revisions with persisted replay authority."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Optional
+
+from pydantic import ValidationError
+
+from app.a2a.orchestrator_readiness import (
+    OrchestratorReadinessError,
+    ValidatedInputReadinessAuthority,
+    load_input_readiness_authority,
+)
 
 from ..schemas.step_01_raw_request_record import RawRequestRecord
 from ..schemas.step_02_structured_query import StructuredQuery
 from ..schemas.step_03_clarification import ClarificationAnswer, ClarificationState
 from ..schemas.step_03_input_readiness import InputReadinessStatus
-from ..utils.errors import WorkflowStateError
 from ..utils.ids import new_artifact_id
 from ..utils.time import now_iso
 from .artifact_registry_service import ArtifactRegistryService
-from .intake_service import IntakeService
+from .input_readiness_service import (
+    InputReadinessService,
+    input_readiness_history_key,
+)
+from .raw_request_authority import RawRequestAuthorityError, load_active_raw_request
 from .storage_service import Storage
+from .structured_query_service import (
+    StructuredQueryService,
+    structured_query_history_key,
+)
 from .workflow_state_service import WorkflowStateService
 
+_STATE_DIR = "clarification"
+_STATE_KEY = "clarification/{revision_id}.json"
+_STRUCTURED_CANONICAL_KEY = "inputs/structured_query.json"
+_READINESS_CANONICAL_KEY = "inputs/input_readiness_status.json"
 
-_RAW_KEY = "inputs/raw_request_record.json"
-_SQ_KEY = "inputs/structured_query.json"
-_READINESS_KEY = "inputs/input_readiness_status.json"
-_STATE_KEY_TMPL = ("clarification", "{artifact_id}.json")
 
-
-@dataclass
+@dataclass(frozen=True)
 class ClarificationRoundResult:
-    """Outcome of a full submit + re-parse round."""
+    """Compact in-process result of one same-run clarification revision."""
 
     state: ClarificationState
-    next_run_id: str
+    run_id: str
     structured_query: Optional[StructuredQuery] = None
     input_readiness_status: Optional[InputReadinessStatus] = None
 
 
+class ClarificationRequestError(ValueError):
+    """Fixed compact user clarification input failure (HTTP 422)."""
+
+
+class ClarificationConflictError(RuntimeError):
+    """Fixed compact same-run authority conflict (HTTP 409)."""
+
+
+class ClarificationReparseError(RuntimeError):
+    """Fixed compact Step 2/3 internal failure (HTTP 503)."""
+
+
 def _compact_missing_slots(slots: list[dict]) -> list[dict]:
-    out: list[dict] = []
-    for s in slots or []:
-        if not isinstance(s, dict):
-            continue
-        out.append(
-            {
-                "slot_name": s.get("slot_name"),
-                "slot_category": s.get("slot_category"),
-                "severity": s.get("severity"),
-            }
-        )
-    return out
+    return [
+        {
+            "slot_name": item.get("slot_name"),
+            "slot_category": item.get("slot_category"),
+            "severity": item.get("severity"),
+        }
+        for item in slots or []
+        if isinstance(item, dict)
+    ]
 
 
 def _compact_requests(requests: list[dict]) -> list[dict]:
-    out: list[dict] = []
-    for r in requests or []:
-        if not isinstance(r, dict):
-            continue
-        out.append(
-            {
-                "request_id": r.get("request_id"),
-                "slot_name": r.get("slot_name"),
-                "slot_category": r.get("slot_category"),
-                "severity": r.get("severity"),
-                "question": r.get("question"),
-            }
-        )
-    return out
+    return [
+        {
+            "request_id": item.get("request_id"),
+            "slot_name": item.get("slot_name"),
+            "slot_category": item.get("slot_category"),
+            "severity": item.get("severity"),
+            "question": item.get("question"),
+        }
+        for item in requests or []
+        if isinstance(item, dict)
+    ]
 
 
 class ClarificationService:
@@ -92,108 +98,82 @@ class ClarificationService:
         self.storage = storage
         self.registry = registry
         self.workflow_state = workflow_state
-        self.intake = IntakeService(storage, registry, workflow_state)
-
-    # ── public API ──────────────────────────────────────────────────────────
 
     def submit_clarification_answer(
         self,
         run_id: str,
         answers: list[ClarificationAnswer] | list[dict],
     ) -> ClarificationState:
-        """Record clarification answers and create the next revision run.
+        """Create or replay one persisted same-run clarification revision."""
 
-        Validates each answer's ``request_id`` against the source Step 3
-        ``clarification_requests``; rejects unknown ids and duplicate answers
-        for the same request (deterministic — raises ``ValueError``). Writes a
-        ``ClarificationState`` artifact and a fresh revision ``RawRequestRecord``
-        (new run id) carrying the previous intent + answers. Does NOT call an
-        LLM and does NOT overwrite the original run's Step 2 / Step 3 outputs.
-        """
-        reg = self.registry.get(run_id)
-        raw_id = reg.active_artifacts.raw_request_record_id
-        sq_id = reg.active_artifacts.structured_query_id
-        readiness_id = reg.active_artifacts.input_readiness_status_id
-        if not raw_id or not sq_id or not readiness_id:
-            raise WorkflowStateError(
-                "clarification requires Step 1 + Step 2 + Step 3 artifacts in registry"
+        self._ensure_not_routed(run_id)
+        existing = self._matching_revision(run_id, answers)
+        if existing is not None:
+            self._materialize_revision_source_history(existing)
+            if existing.revision_status == "completed":
+                self._validate_completed_authority(existing)
+            else:
+                self._validate_recovery_authority(existing)
+            return existing
+        authority = self._load_source_authority(run_id)
+        requests = self._eligible_requests(authority)
+        revisions = self._load_revisions(run_id)
+        if any(
+            revision.source_input_readiness_status_id
+            == authority.readiness_artifact_id
+            for revision in revisions
+        ):
+            raise ClarificationConflictError(
+                "clarification_submission_conflict"
             )
 
-        raw = self.storage.read_json(self.storage.run_key(run_id, _RAW_KEY))
-        sq = self.storage.read_json(self.storage.run_key(run_id, _SQ_KEY))
-        readiness = self.storage.read_json(self.storage.run_key(run_id, _READINESS_KEY))
-
-        requests = readiness.get("clarification_requests") or []
-        if not requests:
-            raise ValueError(
-                "run has no Step 3 clarification_requests to answer "
-                "(nothing to clarify or pre-clarification artifact)"
+        source_ids = self._active_source_ids(run_id)
+        if source_ids != (
+            authority.raw_request_artifact_id,
+            authority.structured_query_artifact_id,
+            authority.readiness_artifact_id,
+        ):
+            raise OrchestratorReadinessError(
+                "input_readiness_status_source_mismatch"
             )
-        requests_by_id = {
-            r.get("request_id"): r for r in requests if isinstance(r, dict)
-        }
-
-        normalized = self._normalize_answers(answers, requests_by_id)
-
-        resolved_ids = [a.request_id for a in normalized]
-        unresolved_ids = [
-            rid for rid in requests_by_id if rid not in set(resolved_ids)
-        ]
-
-        next_run_id, next_raw = self._build_next_run(
-            run_id=run_id,
-            raw=raw,
-            sq=sq,
-            requests=requests,
-            answers=normalized,
-        )
-
+        self._materialize_active_source_history(authority)
+        normalized = self._normalize_answers(run_id, answers, requests)
+        revision_id = new_artifact_id("clarification_state")
+        timestamp = now_iso()
+        resolved = [answer.request_id for answer in normalized]
         state = ClarificationState(
             run_id=run_id,
-            source_input_readiness_status_id=readiness_id,
-            source_structured_query_id=sq_id,
-            source_raw_request_record_id=raw_id,
+            revision_id=revision_id,
+            revision_number=len(revisions) + 1,
+            source_input_readiness_status_id=authority.readiness_artifact_id,
+            source_structured_query_id=authority.structured_query_artifact_id,
+            source_raw_request_record_id=authority.raw_request_artifact_id,
             clarification_answers=normalized,
-            resolved_request_ids=resolved_ids,
-            unresolved_request_ids=unresolved_ids,
-            next_run_id=next_run_id,
-            next_raw_request_record_id=next_raw.run_artifact_registry_id,
-            created_at=now_iso(),
-        )
-
-        artifact_id = new_artifact_id("clarification_state")
-        self.storage.write_json(
-            self.storage.run_key(
-                run_id, _STATE_KEY_TMPL[0], _STATE_KEY_TMPL[1].format(artifact_id=artifact_id)
+            resolved_request_ids=resolved,
+            unresolved_request_ids=[
+                request_id
+                for request_id in requests
+                if request_id not in set(resolved)
+            ],
+            submission_fingerprint=self._submission_fingerprint(
+                source_raw_request_record_id=authority.raw_request_artifact_id,
+                source_structured_query_id=authority.structured_query_artifact_id,
+                source_input_readiness_status_id=authority.readiness_artifact_id,
+                answers=normalized,
             ),
-            {"artifact_id": artifact_id, **state.model_dump()},
+            revision_status="submitted",
+            created_at=timestamp,
+            updated_at=timestamp,
         )
-        # Non-destructive: original Step 2/3 artifacts are untouched; we only
-        # add a pointer to the latest clarification state.
-        self.registry.update_active(run_id, clarification_state_id=artifact_id)
+        self._write_state(state)
+        self.registry.update_active(
+            run_id, clarification_state_id=revision_id
+        )
+        if self._active_source_ids(run_id) != source_ids:
+            raise ClarificationConflictError(
+                "clarification_authority_changed"
+            )
         return state
-
-    def reparse_next_turn(
-        self, state: ClarificationState, supervisor: Any
-    ) -> tuple[StructuredQuery, InputReadinessStatus]:
-        """Run Step 2 (parse) + Step 3 (readiness) on the revision run.
-
-        `supervisor` is a ``SupervisorAgent`` (the only LLM-using piece — and
-        it is Step 2, not Step 3). Step 3 readiness stays deterministic.
-        """
-        from .input_readiness_service import InputReadinessService
-        from .structured_query_service import StructuredQueryService
-
-        if not state.next_run_id:
-            raise ValueError("clarification state has no next_run_id to re-parse")
-
-        sq = StructuredQueryService(
-            self.storage, self.registry, self.workflow_state, supervisor
-        ).parse(state.next_run_id)
-        readiness = InputReadinessService(
-            self.storage, self.registry, self.workflow_state
-        ).check(state.next_run_id)
-        return sq, readiness
 
     def submit_and_reparse(
         self,
@@ -201,129 +181,829 @@ class ClarificationService:
         answers: list[ClarificationAnswer] | list[dict],
         supervisor: Any,
     ) -> ClarificationRoundResult:
-        """Convenience: submit answers, then re-parse Step 2/3 on the revision."""
+        """Create/recover one revision and run missing Step 2/3 phases."""
+
         state = self.submit_clarification_answer(run_id, answers)
-        sq, readiness = self.reparse_next_turn(state, supervisor)
+        return self._reparse(state, supervisor)
+
+    def _reparse(
+        self, state: ClarificationState, supervisor: Any
+    ) -> ClarificationRoundResult:
+        self._ensure_not_routed(state.run_id)
+        if state.revision_status == "completed":
+            return self._completed_result(state)
+
+        source_raw, source_structured, source_readiness = (
+            self._load_revision_sources(state)
+        )
+        structured = None
+        if state.output_structured_query_id is None:
+            effective = self._effective_step2_input(
+                source_raw,
+                source_structured,
+                source_readiness,
+                state,
+            )
+            try:
+                structured = StructuredQueryService(
+                    self.storage,
+                    self.registry,
+                    self.workflow_state,
+                    supervisor,
+                ).parse_effective(state.run_id, effective)
+                active_structured = self.registry.get(
+                    state.run_id
+                ).active_artifacts.structured_query_id
+                if not active_structured:
+                    raise RuntimeError("clarification_step2_output_missing")
+                state = state.model_copy(
+                    update={
+                        "revision_status": "step2_completed",
+                        "output_structured_query_id": active_structured,
+                        "failure_code": None,
+                        "updated_at": now_iso(),
+                    }
+                )
+                self._write_state(state)
+            except Exception:
+                failed = state.model_copy(
+                    update={
+                        "revision_status": "reparse_failed",
+                        "failure_code": "clarification_step2_failed",
+                        "updated_at": now_iso(),
+                    }
+                )
+                self._write_state(failed)
+                raise ClarificationReparseError(
+                    "clarification_reparse_failed"
+                ) from None
+        else:
+            structured = self._load_structured_history(
+                state.run_id, state.output_structured_query_id
+            )
+            active_structured = self.registry.get(
+                state.run_id
+            ).active_artifacts.structured_query_id
+            if active_structured != state.output_structured_query_id:
+                raise ClarificationConflictError(
+                    "clarification_recovery_authority_mismatch"
+                )
+
+        try:
+            readiness = InputReadinessService(
+                self.storage, self.registry, self.workflow_state
+            ).check(state.run_id)
+            active_readiness = self.registry.get(
+                state.run_id
+            ).active_artifacts.input_readiness_status_id
+            if not active_readiness:
+                raise RuntimeError("clarification_step3_output_missing")
+            state = state.model_copy(
+                update={
+                    "revision_status": "completed",
+                    "output_input_readiness_status_id": active_readiness,
+                    "failure_code": None,
+                    "updated_at": now_iso(),
+                }
+            )
+            self._write_state(state)
+        except Exception:
+            failed = state.model_copy(
+                update={
+                    "revision_status": "reparse_failed",
+                    "failure_code": "clarification_step3_failed",
+                    "updated_at": now_iso(),
+                }
+            )
+            self._write_state(failed)
+            raise ClarificationReparseError(
+                "clarification_reparse_failed"
+            ) from None
         return ClarificationRoundResult(
             state=state,
-            next_run_id=state.next_run_id,  # type: ignore[arg-type]
-            structured_query=sq,
+            run_id=state.run_id,
+            structured_query=structured,
             input_readiness_status=readiness,
         )
 
-    # ── internals ─────────────────────────────────────────────────────────────
+    def _completed_result(
+        self, state: ClarificationState
+    ) -> ClarificationRoundResult:
+        self._validate_completed_authority(state)
+        if (
+            state.output_structured_query_id is None
+            or state.output_input_readiness_status_id is None
+        ):
+            raise ClarificationConflictError(
+                "clarification_revision_invalid"
+            )
+        return ClarificationRoundResult(
+            state=state,
+            run_id=state.run_id,
+            structured_query=self._load_structured_history(
+                state.run_id, state.output_structured_query_id
+            ),
+            input_readiness_status=self._load_readiness_history(
+                state.run_id, state.output_input_readiness_status_id
+            ),
+        )
+
+    def _validate_completed_authority(self, state: ClarificationState) -> None:
+        authority = load_input_readiness_authority(
+            run_id=state.run_id,
+            registry=self.registry,
+            storage=self.storage,
+        )
+        if (
+            state.output_structured_query_id is None
+            or state.output_input_readiness_status_id is None
+            or authority.raw_request_artifact_id
+            != state.source_raw_request_record_id
+            or authority.structured_query_artifact_id
+            != state.output_structured_query_id
+            or authority.readiness_artifact_id
+            != state.output_input_readiness_status_id
+        ):
+            raise ClarificationConflictError(
+                "clarification_recovery_authority_mismatch"
+            )
+
+    def _validate_recovery_authority(self, state: ClarificationState) -> None:
+        self._load_revision_sources(state)
+        active = self.registry.get(state.run_id).active_artifacts
+        expected_structured = (
+            state.output_structured_query_id
+            or state.source_structured_query_id
+        )
+        if (
+            active.raw_request_record_id != state.source_raw_request_record_id
+            or active.structured_query_id != expected_structured
+            or active.input_readiness_status_id
+            != state.source_input_readiness_status_id
+        ):
+            raise ClarificationConflictError(
+                "clarification_recovery_authority_mismatch"
+            )
+
+    def _matching_revision(
+        self,
+        run_id: str,
+        answers: list[ClarificationAnswer] | list[dict],
+    ) -> ClarificationState | None:
+        semantic = self._untrusted_answer_semantics(answers)
+        revisions = self._load_revisions(run_id)
+        active_revision_id = self.registry.get(
+            run_id
+        ).active_artifacts.clarification_state_id
+        if revisions and active_revision_id != revisions[-1].revision_id:
+            raise ClarificationConflictError(
+                "clarification_revision_authority_mismatch"
+            )
+        matches = [
+            revision
+            for revision in revisions
+            if self._stored_answer_semantics(revision) == semantic
+        ]
+        if matches:
+            if matches[-1].revision_id != active_revision_id:
+                raise ClarificationConflictError(
+                    "clarification_submission_conflict"
+                )
+            return matches[-1]
+        if revisions and revisions[-1].revision_status != "completed":
+            raise ClarificationConflictError(
+                "clarification_submission_conflict"
+            )
+        return None
+
+    def _load_source_authority(
+        self, run_id: str
+    ) -> ValidatedInputReadinessAuthority:
+        authority = load_input_readiness_authority(
+            run_id=run_id,
+            registry=self.registry,
+            storage=self.storage,
+        )
+        if authority.readiness.input_readiness_status != "needs_user_input":
+            raise ClarificationRequestError("clarification_source_not_ready")
+        return authority
 
     @staticmethod
+    def _eligible_requests(
+        authority: ValidatedInputReadinessAuthority,
+    ) -> dict[str, dict]:
+        requests = {
+            request.request_id: request.model_dump(mode="json")
+            for request in authority.readiness.clarification_requests
+            if not request.resolved
+            and request.severity in {"blocking", "warning"}
+        }
+        if not requests:
+            raise ClarificationRequestError("clarification_request_invalid")
+        return requests
+
     def _normalize_answers(
+        self,
+        run_id: str,
         answers: list[ClarificationAnswer] | list[dict],
         requests_by_id: dict[str, dict],
     ) -> list[ClarificationAnswer]:
         normalized: list[ClarificationAnswer] = []
         seen: set[str] = set()
         for raw_answer in answers or []:
-            if isinstance(raw_answer, ClarificationAnswer):
-                ans = raw_answer
-            elif isinstance(raw_answer, dict):
-                ans = ClarificationAnswer(
-                    request_id=str(raw_answer.get("request_id") or ""),
-                    answer_text=str(raw_answer.get("answer_text") or ""),
-                    answered_at=str(raw_answer.get("answered_at") or now_iso()),
-                    source=str(raw_answer.get("source") or "user"),
-                    target_slot_name=raw_answer.get("target_slot_name"),
-                    target_slot_category=raw_answer.get("target_slot_category"),
+            try:
+                answer = (
+                    raw_answer
+                    if isinstance(raw_answer, ClarificationAnswer)
+                    else ClarificationAnswer.model_validate(raw_answer, strict=True)
                 )
-            else:
-                raise ValueError("each clarification answer must be a dict or ClarificationAnswer")
-
-            if not ans.request_id:
-                raise ValueError("clarification answer is missing request_id")
-            if ans.request_id not in requests_by_id:
-                raise ValueError(
-                    f"unknown clarification request_id: {ans.request_id!r}"
+            except (ValidationError, TypeError):
+                raise ClarificationRequestError(
+                    "clarification_request_invalid"
+                ) from None
+            if (
+                not answer.request_id
+                or answer.request_id not in requests_by_id
+                or answer.request_id in seen
+                or not isinstance(answer.answer_text, str)
+                or not answer.answer_text.strip()
+            ):
+                raise ClarificationRequestError(
+                    "clarification_request_invalid"
                 )
-            if ans.request_id in seen:
-                # Deterministic policy: reject duplicate answers for the same
-                # request in a single submission rather than silently override.
-                raise ValueError(
-                    f"duplicate clarification answer for request_id: {ans.request_id!r}"
-                )
-            seen.add(ans.request_id)
-            if not ans.answer_text.strip():
-                raise ValueError(
-                    f"clarification answer for {ans.request_id!r} is empty"
-                )
-            # Backfill the slot identity from the matching request when absent.
-            req = requests_by_id[ans.request_id]
-            if ans.target_slot_name is None:
-                ans = ans.model_copy(update={"target_slot_name": req.get("slot_name")})
-            if ans.target_slot_category is None:
-                ans = ans.model_copy(
-                    update={"target_slot_category": req.get("slot_category")}
-                )
-            normalized.append(ans)
+            seen.add(answer.request_id)
+            request = requests_by_id[answer.request_id]
+            answer_text = answer.answer_text.strip()
+            update = {
+                "answer_text": answer_text,
+                "source": "user",
+                "target_slot_name": request.get("slot_name"),
+                "target_slot_category": request.get("slot_category"),
+            }
+            answer = answer.model_copy(update=update)
+            normalized.append(answer)
         if not normalized:
-            raise ValueError("no clarification answers were provided")
-        return normalized
+            raise ClarificationRequestError("clarification_request_invalid")
+        return sorted(normalized, key=lambda item: item.request_id)
 
-    def _build_next_run(
+    @staticmethod
+    def _untrusted_answer_semantics(
+        answers: list[ClarificationAnswer] | list[dict],
+    ) -> tuple[tuple[str, str, str], ...]:
+        semantic: list[tuple[str, str, str]] = []
+        seen: set[str] = set()
+        for raw in answers or []:
+            if isinstance(raw, ClarificationAnswer):
+                request_id = raw.request_id
+                answer_text = raw.answer_text
+                source = raw.source
+            elif isinstance(raw, dict):
+                request_id = raw.get("request_id")
+                answer_text = raw.get("answer_text")
+                source = raw.get("source") or "user"
+            else:
+                raise ClarificationRequestError(
+                    "clarification_request_invalid"
+                )
+            if (
+                not isinstance(request_id, str)
+                or not request_id
+                or request_id in seen
+                or not isinstance(answer_text, str)
+                or not answer_text.strip()
+                or source != "user"
+            ):
+                raise ClarificationRequestError(
+                    "clarification_request_invalid"
+                )
+            seen.add(request_id)
+            text = answer_text.strip()
+            semantic.append((request_id, text, "user"))
+        if not semantic:
+            raise ClarificationRequestError("clarification_request_invalid")
+        return tuple(sorted(semantic))
+
+    @staticmethod
+    def _stored_answer_semantics(
+        state: ClarificationState,
+    ) -> tuple[tuple[str, str, str], ...]:
+        return tuple(
+            sorted(
+                (
+                    answer.request_id,
+                    answer.answer_text.strip(),
+                    answer.source,
+                )
+                for answer in state.clarification_answers
+            )
+        )
+
+    @staticmethod
+    def _submission_fingerprint(
+        *,
+        source_raw_request_record_id: str,
+        source_structured_query_id: str,
+        source_input_readiness_status_id: str,
+        answers: list[ClarificationAnswer],
+    ) -> str:
+        payload = {
+            "source_ids": [
+                source_raw_request_record_id,
+                source_structured_query_id,
+                source_input_readiness_status_id,
+            ],
+            "answers": [
+                {
+                    "request_id": answer.request_id,
+                    "answer_text": answer.answer_text,
+                    "source": answer.source,
+                    "slot_name": answer.target_slot_name,
+                    "slot_category": answer.target_slot_category,
+                }
+                for answer in answers
+            ],
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        return f"clarification_submission_{hashlib.sha256(encoded).hexdigest()}"
+
+    def _effective_step2_input(
+        self,
+        raw: RawRequestRecord,
+        structured: StructuredQuery,
+        readiness: InputReadinessStatus,
+        state: ClarificationState,
+    ) -> dict:
+        payload = raw.model_dump(mode="json")
+        payload["artifact_id"] = state.source_raw_request_record_id
+        context = dict(payload.get("user_provided_context") or {})
+        intent = structured.task_intent.model_dump(mode="json")
+        context.update(
+            {
+                "previous_task_intent": {
+                    "primary_intent": intent.get("primary_intent"),
+                    "secondary_intents": intent.get("secondary_intents") or [],
+                },
+                "previous_canonical_query": structured.canonical_query,
+                "previous_missing_slots": _compact_missing_slots(
+                    [item.model_dump(mode="json") for item in structured.missing_slots]
+                ),
+                "previous_clarification_requests": _compact_requests(
+                    [
+                        item.model_dump(mode="json")
+                        for item in readiness.clarification_requests
+                    ]
+                ),
+                "clarification_answers": [
+                    {
+                        "request_id": answer.request_id,
+                        "slot_name": answer.target_slot_name,
+                        "slot_category": answer.target_slot_category,
+                        "answer_text": answer.answer_text,
+                        "answered_at": answer.answered_at,
+                    }
+                    for answer in self._cumulative_answers(state)
+                ],
+            }
+        )
+        payload["user_provided_context"] = context
+        return payload
+
+
+    def _cumulative_answers(
+        self, current: ClarificationState
+    ) -> list[ClarificationAnswer]:
+        by_slot: dict[str, ClarificationAnswer] = {}
+        for revision in self._load_revisions(current.run_id):
+            if (
+                revision.revision_id != current.revision_id
+                and revision.revision_status == "completed"
+            ):
+                for answer in revision.clarification_answers:
+                    by_slot[
+                        answer.target_slot_name or answer.request_id
+                    ] = answer
+        for answer in current.clarification_answers:
+            by_slot[answer.target_slot_name or answer.request_id] = answer
+        return list(by_slot.values())
+
+    def _load_revision_sources(
+        self, state: ClarificationState
+    ) -> tuple[RawRequestRecord, StructuredQuery, InputReadinessStatus]:
+        try:
+            raw = load_active_raw_request(
+                run_id=state.run_id,
+                registry=self.registry,
+                storage=self.storage,
+            )
+        except RawRequestAuthorityError as exc:
+            raise OrchestratorReadinessError(str(exc)) from None
+        if self.registry.get(
+            state.run_id
+        ).active_artifacts.raw_request_record_id != state.source_raw_request_record_id:
+            raise ClarificationConflictError(
+                "clarification_recovery_authority_mismatch"
+            )
+        structured = self._load_structured_history(
+            state.run_id, state.source_structured_query_id
+        )
+        readiness = self._load_readiness_history(
+            state.run_id, state.source_input_readiness_status_id
+        )
+        if (
+            structured.source_raw_request_ref.raw_request_record_id
+            != state.source_raw_request_record_id
+            or readiness.source_refs.raw_request_record_id
+            != state.source_raw_request_record_id
+            or readiness.source_refs.structured_query_id
+            != state.source_structured_query_id
+            or readiness.input_readiness_status != "needs_user_input"
+        ):
+            raise ClarificationConflictError(
+                "clarification_recovery_authority_mismatch"
+            )
+        return raw, structured, readiness
+
+    def _load_structured_history(
+        self, run_id: str, artifact_id: str
+    ) -> StructuredQuery:
+        body = self._load_versioned_body(
+            run_id=run_id,
+            artifact_id=artifact_id,
+            history_key=structured_query_history_key(artifact_id),
+            canonical_key=_STRUCTURED_CANONICAL_KEY,
+            active_id=self.registry.get(run_id).active_artifacts.structured_query_id,
+            error_code="structured_query_history_invalid",
+        )
+        try:
+            return StructuredQuery.model_validate(
+                {key: value for key, value in body.items() if key != "artifact_id"},
+                strict=True,
+            )
+        except ValidationError:
+            raise ClarificationConflictError(
+                "structured_query_history_invalid"
+            ) from None
+
+    def _load_readiness_history(
+        self, run_id: str, artifact_id: str
+    ) -> InputReadinessStatus:
+        body = self._load_versioned_body(
+            run_id=run_id,
+            artifact_id=artifact_id,
+            history_key=input_readiness_history_key(artifact_id),
+            canonical_key=_READINESS_CANONICAL_KEY,
+            active_id=self.registry.get(
+                run_id
+            ).active_artifacts.input_readiness_status_id,
+            error_code="input_readiness_status_history_invalid",
+        )
+        try:
+            return InputReadinessStatus.model_validate(
+                {key: value for key, value in body.items() if key != "artifact_id"},
+                strict=True,
+            )
+        except ValidationError:
+            raise ClarificationConflictError(
+                "input_readiness_status_history_invalid"
+            ) from None
+
+    def _load_versioned_body(
         self,
         *,
         run_id: str,
-        raw: dict,
-        sq: dict,
-        requests: list[dict],
-        answers: list[ClarificationAnswer],
-    ) -> tuple[str, RawRequestRecord]:
-        original_query = str(raw.get("raw_user_query") or "").strip()
-        task_intent = sq.get("task_intent") or {}
-        previous_task_intent = {
-            "primary_intent": task_intent.get("primary_intent"),
-            "secondary_intents": task_intent.get("secondary_intents") or [],
-        }
+        artifact_id: str,
+        history_key: str,
+        canonical_key: str,
+        active_id: str | None,
+        error_code: str,
+    ) -> dict:
+        key = self.storage.run_key(run_id, history_key)
+        if not self.storage.exists(key) and active_id == artifact_id:
+            key = self.storage.run_key(run_id, canonical_key)
+        try:
+            body = self.storage.read_json(key)
+        except Exception:
+            raise ClarificationConflictError(error_code) from None
+        if (
+            not isinstance(body, dict)
+            or body.get("artifact_id") != artifact_id
+            or body.get("run_id") != run_id
+        ):
+            raise ClarificationConflictError(error_code)
+        return body
 
-        # Carry the original context fields forward (do not clobber unrelated
-        # keys), then layer the clarification carry-over on top.
-        next_ctx: dict[str, Any] = dict(raw.get("user_provided_context") or {})
-        next_ctx["previous_task_intent"] = previous_task_intent
-        # Carry the previous LLM canonical_query so the next Step 2 turn can
-        # UPDATE it with the answers rather than re-deriving from scratch. The
-        # service only transports it — it never composes a business query.
-        prev_canonical = sq.get("canonical_query")
-        if isinstance(prev_canonical, str) and prev_canonical.strip():
-            next_ctx["previous_canonical_query"] = prev_canonical.strip()
-        next_ctx["previous_missing_slots"] = _compact_missing_slots(
-            sq.get("missing_slots") or []
+    def _materialize_active_source_history(
+        self, authority: ValidatedInputReadinessAuthority
+    ) -> None:
+        run_id = authority.raw_request.run_id
+        structured_body = self._validated_canonical_body(
+            run_id=run_id,
+            artifact_id=authority.structured_query_artifact_id,
+            canonical_key=_STRUCTURED_CANONICAL_KEY,
+            model=StructuredQuery,
+            error_code="structured_query_history_invalid",
         )
-        next_ctx["previous_clarification_requests"] = _compact_requests(requests)
-        next_ctx["clarification_answers"] = [
-            {
-                "request_id": a.request_id,
-                "slot_name": a.target_slot_name,
-                "slot_category": a.target_slot_category,
-                "answer_text": a.answer_text,
-                "answered_at": a.answered_at,
+        readiness_body = self._validated_canonical_body(
+            run_id=run_id,
+            artifact_id=authority.readiness_artifact_id,
+            canonical_key=_READINESS_CANONICAL_KEY,
+            model=InputReadinessStatus,
+            error_code="input_readiness_status_history_invalid",
+        )
+        self._materialize_history_body(
+            run_id,
+            structured_query_history_key(authority.structured_query_artifact_id),
+            structured_body,
+            "structured_query_history_invalid",
+        )
+        self._materialize_history_body(
+            run_id,
+            input_readiness_history_key(authority.readiness_artifact_id),
+            readiness_body,
+            "input_readiness_status_history_invalid",
+        )
+
+    def _materialize_revision_source_history(
+        self, state: ClarificationState
+    ) -> None:
+        structured = self._load_versioned_body(
+            run_id=state.run_id,
+            artifact_id=state.source_structured_query_id,
+            history_key=structured_query_history_key(
+                state.source_structured_query_id
+            ),
+            canonical_key=_STRUCTURED_CANONICAL_KEY,
+            active_id=self.registry.get(
+                state.run_id
+            ).active_artifacts.structured_query_id,
+            error_code="structured_query_history_invalid",
+        )
+        readiness = self._load_versioned_body(
+            run_id=state.run_id,
+            artifact_id=state.source_input_readiness_status_id,
+            history_key=input_readiness_history_key(
+                state.source_input_readiness_status_id
+            ),
+            canonical_key=_READINESS_CANONICAL_KEY,
+            active_id=self.registry.get(
+                state.run_id
+            ).active_artifacts.input_readiness_status_id,
+            error_code="input_readiness_status_history_invalid",
+        )
+        try:
+            structured_model = StructuredQuery.model_validate(
+                {
+                    key: value
+                    for key, value in structured.items()
+                    if key != "artifact_id"
+                },
+                strict=True,
+            )
+            readiness_model = InputReadinessStatus.model_validate(
+                {
+                    key: value
+                    for key, value in readiness.items()
+                    if key != "artifact_id"
+                },
+                strict=True,
+            )
+        except ValidationError:
+            raise ClarificationConflictError(
+                "clarification_revision_authority_invalid"
+            ) from None
+        if (
+            structured_model.source_raw_request_ref.raw_request_record_id
+            != state.source_raw_request_record_id
+            or readiness_model.source_refs.raw_request_record_id
+            != state.source_raw_request_record_id
+            or readiness_model.source_refs.structured_query_id
+            != state.source_structured_query_id
+        ):
+            raise ClarificationConflictError(
+                "clarification_revision_authority_invalid"
+            )
+        self._materialize_history_body(
+            state.run_id,
+            structured_query_history_key(state.source_structured_query_id),
+            structured,
+            "structured_query_history_invalid",
+        )
+        self._materialize_history_body(
+            state.run_id,
+            input_readiness_history_key(
+                state.source_input_readiness_status_id
+            ),
+            readiness,
+            "input_readiness_status_history_invalid",
+        )
+
+    def _validated_canonical_body(
+        self,
+        *,
+        run_id: str,
+        artifact_id: str,
+        canonical_key: str,
+        model: type[StructuredQuery] | type[InputReadinessStatus],
+        error_code: str,
+    ) -> dict:
+        try:
+            body = self.storage.read_json(
+                self.storage.run_key(run_id, canonical_key)
+            )
+            if (
+                not isinstance(body, dict)
+                or body.get("artifact_id") != artifact_id
+                or body.get("run_id") != run_id
+            ):
+                raise ValueError
+            model.model_validate(
+                {key: value for key, value in body.items() if key != "artifact_id"},
+                strict=True,
+            )
+        except Exception:
+            raise ClarificationConflictError(error_code) from None
+        return body
+
+    def _materialize_history_body(
+        self, run_id: str, relative_key: str, body: dict, error_code: str
+    ) -> None:
+        key = self.storage.run_key(run_id, relative_key)
+        if self.storage.exists(key):
+            try:
+                existing = self.storage.read_json(key)
+            except Exception:
+                raise ClarificationConflictError(error_code) from None
+            if existing != body:
+                raise ClarificationConflictError(error_code)
+            return
+        self.storage.write_json(key, body)
+
+    def _validate_revision_authority(self, state: ClarificationState) -> None:
+        try:
+            readiness = self._load_readiness_history(
+                state.run_id, state.source_input_readiness_status_id
+            )
+            if (
+                readiness.source_refs.raw_request_record_id
+                != state.source_raw_request_record_id
+                or readiness.source_refs.structured_query_id
+                != state.source_structured_query_id
+                or readiness.input_readiness_status != "needs_user_input"
+            ):
+                raise ValueError
+            eligible = {
+                request.request_id: request
+                for request in readiness.clarification_requests
+                if not request.resolved
+                and request.severity in {"blocking", "warning"}
             }
-            for a in answers
-        ]
+            answer_ids = [answer.request_id for answer in state.clarification_answers]
+            if len(answer_ids) != len(set(answer_ids)):
+                raise ValueError
+            for answer in state.clarification_answers:
+                request = eligible.get(answer.request_id)
+                if (
+                    request is None
+                    or answer.source != "user"
+                    or answer.target_slot_name != request.slot_name
+                    or answer.target_slot_category != request.slot_category
+                ):
+                    raise ValueError
+                if not answer.answer_text.strip():
+                    raise ValueError
+            if state.resolved_request_ids != answer_ids:
+                raise ValueError
+            unresolved = [
+                request.request_id
+                for request in readiness.clarification_requests
+                if request.request_id in eligible
+                and request.request_id not in set(answer_ids)
+            ]
+            if state.unresolved_request_ids != unresolved:
+                raise ValueError
+            expected_fingerprint = self._submission_fingerprint(
+                source_raw_request_record_id=state.source_raw_request_record_id,
+                source_structured_query_id=state.source_structured_query_id,
+                source_input_readiness_status_id=(
+                    state.source_input_readiness_status_id
+                ),
+                answers=state.clarification_answers,
+            )
+            if state.submission_fingerprint != expected_fingerprint:
+                raise ValueError
+            phase = (
+                state.revision_status,
+                state.output_structured_query_id is not None,
+                state.output_input_readiness_status_id is not None,
+                state.failure_code,
+            )
+            valid_phases = {
+                ("submitted", False, False, None),
+                ("step2_completed", True, False, None),
+                ("completed", True, True, None),
+                (
+                    "reparse_failed",
+                    False,
+                    False,
+                    "clarification_step2_failed",
+                ),
+                (
+                    "reparse_failed",
+                    True,
+                    False,
+                    "clarification_step3_failed",
+                ),
+            }
+            if phase not in valid_phases:
+                raise ValueError
+        except Exception:
+            raise ClarificationConflictError(
+                "clarification_revision_authority_invalid"
+            ) from None
 
-        # Keep the ORIGINAL query and append only a compact marker naming the
-        # answered slots — never the (possibly long) answer values, which stay
-        # in the structured clarification_answers block above.
-        answered_slots = [a.target_slot_name or "answer" for a in answers]
-        marker = (
-            f"\n\n[Clarification follow-up provided for: {', '.join(answered_slots)}]"
-            if answered_slots
-            else ""
+    def _write_state(self, state: ClarificationState) -> None:
+        self.storage.write_json(
+            self.storage.run_key(
+                state.run_id,
+                _STATE_KEY.format(revision_id=state.revision_id),
+            ),
+            {"artifact_id": state.revision_id, **state.model_dump(mode="json")},
         )
-        next_query = (original_query + marker) if original_query else marker.strip()
 
-        next_run_id = self.intake.allocate_run_id()
-        next_raw = self.intake.submit(
-            raw_user_query=next_query or original_query,
-            entry_source=raw.get("entry_source") or "api",
-            submitted_by=raw.get("submitted_by"),
-            user_provided_context=next_ctx,
-            uploaded_files=raw.get("uploaded_files") or [],
-            run_id=next_run_id,
+    def _load_revisions(self, run_id: str) -> list[ClarificationState]:
+        prefix = self.storage.run_key(run_id, _STATE_DIR)
+        revisions: list[ClarificationState] = []
+        for key in self.storage.list_prefix(prefix):
+            if not key.endswith(".json"):
+                continue
+            try:
+                body = self.storage.read_json(key)
+                revision = ClarificationState.model_validate(
+                    {
+                        name: value
+                        for name, value in body.items()
+                        if name != "artifact_id"
+                    },
+                    strict=True,
+                )
+            except Exception:
+                raise ClarificationConflictError(
+                    "clarification_revision_authority_invalid"
+                ) from None
+            if (
+                body.get("artifact_id") != revision.revision_id
+                or revision.run_id != run_id
+            ):
+                raise ClarificationConflictError(
+                    "clarification_revision_authority_invalid"
+                )
+            self._validate_revision_authority(revision)
+            revisions.append(revision)
+        numbers = [revision.revision_number for revision in revisions]
+        if len(numbers) != len(set(numbers)):
+            raise ClarificationConflictError(
+                "clarification_revision_authority_invalid"
+            )
+        return sorted(revisions, key=lambda item: item.revision_number)
+
+    def _active_source_ids(self, run_id: str) -> tuple[str | None, ...]:
+        active = self.registry.get(run_id).active_artifacts
+        return (
+            active.raw_request_record_id,
+            active.structured_query_id,
+            active.input_readiness_status_id,
         )
-        return next_run_id, next_raw
+
+    def _ensure_not_routed(self, run_id: str) -> None:
+        active = self.registry.get(run_id).active_artifacts
+        forbidden = (
+            active.run_step_plan_id,
+            active.worker_discovery_snapshot_id,
+            active.worker_routing_plan_id,
+            active.worker_routing_plan_control_id,
+            active.candidate_context_table_id,
+            active.structured_liability_summary_id,
+            active.prepared_structure_input_package_id,
+            active.structure_prediction_and_interface_results_id,
+            active.structure_variant_and_compound_screening_id,
+            active.scoring_handoff_id,
+            active.scoring_validation_id,
+            active.ranking_table_id,
+            active.scientific_evidence_table_id,
+            active.patent_prior_art_table_id,
+        )
+        if any(value is not None for value in forbidden):
+            raise ClarificationConflictError(
+                "clarification_run_already_routed"
+            )
+
+
+__all__ = [
+    "ClarificationConflictError",
+    "ClarificationRequestError",
+    "ClarificationReparseError",
+    "ClarificationRoundResult",
+    "ClarificationService",
+]

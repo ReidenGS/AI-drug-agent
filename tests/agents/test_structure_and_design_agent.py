@@ -105,6 +105,13 @@ def test_step7_builds_input_package_from_multipart_uploads(
     on the antibody candidate."""
     run_id = _seed(
         local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[
+            {
+                "id_type": "uploaded_file",
+                "value": "file_fasta",
+                "source": "antibody_heavy_chain_sequence",
+            }
+        ],
         uploaded_files=[
             {
                 "file_id": "file_pdb",
@@ -131,7 +138,9 @@ def test_step7_builds_input_package_from_multipart_uploads(
         mcp_client=_mcp(),
     )
     pkg = agent.run_step_7(run_id)
-    assert pkg.structure_preparation_status in {"ok", "partial"}
+    assert pkg.structure_preparation_status == "partial"
+    assert pkg.preparation_warnings == []
+    assert pkg.unresolved_resource_refs
     cases = {r.input_case for r in pkg.prepared_structure_inputs}
     assert "uploaded_structure_file" in cases
 
@@ -476,18 +485,30 @@ def test_step7_extracts_partial_residue_range_and_does_not_invent_when_absent(
 
 
 @pytest.mark.parametrize(
-    "filename,expected_role,expected_structure_role",
+    "filename,source,expected_role,expected_structure_role",
     [
-        ("heavy.fasta", "antibody_heavy", "antibody_only"),
-        ("antigen.fasta", "antigen", "antigen_only"),
+        (
+            "heavy.fasta",
+            "antibody_heavy_chain_sequence",
+            "antibody_heavy",
+            "antibody_only",
+        ),
+        ("antigen.fasta", "target_sequence", "antigen", "antigen_only"),
     ],
 )
-def test_step7_filename_scoped_fasta_binds_only_compatible_candidate(
+def test_step7_step2_scoped_fasta_binds_only_compatible_candidate(
     local_storage, registry_service, workflow_state_service,
-    filename, expected_role, expected_structure_role,
+    filename, source, expected_role, expected_structure_role,
 ):
     run_id = _seed(
         local_storage, registry_service, workflow_state_service,
+        referenced_inputs=[
+            {
+                "id_type": "uploaded_file",
+                "value": f"file_{expected_role}",
+                "source": source,
+            }
+        ],
         uploaded_files=[{
             "file_id": f"file_{expected_role}",
             "original_filename": filename,
@@ -510,6 +531,45 @@ def test_step7_filename_scoped_fasta_binds_only_compatible_candidate(
     assert refs[0][1].sequence is None
     assert refs[0][1].sequence_storage_ref.endswith(filename)
     assert refs[0][1].prediction_input_kind == "fasta_ref"
+
+
+@pytest.mark.parametrize("filename", ["heavy.fasta", "target_antigen.fasta"])
+def test_step7_does_not_infer_fasta_role_from_filename_without_step2_source(
+    local_storage,
+    registry_service,
+    workflow_state_service,
+    filename,
+):
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        uploaded_files=[
+            {
+                "file_id": "file_unassigned",
+                "original_filename": filename,
+                "storage_path": f"adc_pilot/runs/x/inputs/files/{filename}",
+                "content_type": "text/x-fasta",
+                "size_bytes": 64,
+            }
+        ],
+    )
+    pkg = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp(),
+    ).run_step_7(run_id)
+    assert not any(
+        ref.sequence_id == "file_unassigned"
+        for item in pkg.prepared_structure_inputs
+        for ref in item.sequence_refs_for_prediction
+    )
+    assert any(
+        ref["source_ref"] == "file_unassigned"
+        and ref["resource_binding_status"] == "unassigned"
+        for ref in pkg.unresolved_resource_refs
+    )
 
 
 def test_step7_target_sequence_role_binds_uploaded_fasta_to_antigen_candidate(
@@ -779,13 +839,104 @@ def test_step7_structure_file_material_is_consumable_by_step8_without_fake_place
     for tc in tool_calls:
         args = tc.tool_input_summary["arguments"]
         assert args["operation"] == "validate"
-        assert args["a"] > 0
+        assert args == {
+            "operation": "validate",
+            "a": 76.03,
+            "b": 134.141,
+            "c": 140.558,
+            "alpha": 90.0,
+            "beta": 92.42,
+            "gamma": 90.0,
+            "Z": 4,
+            "mw": args["mw"],
+        }
         assert args["Z"] > 0
         assert args["mw"] > 0
+        assert "space_group" not in args
         assert "pdb_id_or_path" not in args
         assert "pdb_id_or_path" not in tc.tool_input_summary
-    assert all(set(call) >= {"operation", "a", "Z", "mw"} for call in captured)
+    assert all(
+        set(call)
+        == {"operation", "a", "b", "c", "alpha", "beta", "gamma", "Z", "mw"}
+        for call in captured
+    )
     assert all("pdb_id_or_path" not in call for call in captured)
+
+
+def test_step8_crystal_args_preserve_1n8z_non_cubic_cell():
+    crystal = structure_and_design_module._extract_pdb_crystal_metadata(
+        "CRYST1   66.170  109.770  175.140  90.00  90.00  90.00 P 21 21 21    4\n",
+        source_kind="pdb_cryst1_record",
+        source_ref="file_1n8z",
+    )
+    args, missing = structure_and_design_module._step8_crystal_validation_args(
+        {
+            "crystal_metadata": crystal.model_dump(),
+            "molecular_weight_estimate": {"value": 150000.0},
+        }
+    )
+    assert missing == []
+    assert args == {
+        "operation": "validate",
+        "a": 66.17,
+        "b": 109.77,
+        "c": 175.14,
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 90.0,
+        "Z": 4,
+        "mw": 150000.0,
+    }
+    assert "space_group" not in args
+
+
+def test_step8_crystal_args_from_mmcif_preserve_full_cell():
+    crystal = structure_and_design_module._extract_cif_crystal_metadata(
+        """data_cell
+_cell.length_a 66.170
+_cell.length_b 109.770
+_cell.length_c 175.140
+_cell.angle_alpha 90.00
+_cell.angle_beta 91.25
+_cell.angle_gamma 90.00
+_cell.Z_PDB 4
+_symmetry.space_group_name_H-M 'P 21 21 21'
+""",
+        source_kind="cif_cell_metadata",
+        source_ref="file_cif",
+    )
+    args, missing = structure_and_design_module._step8_crystal_validation_args(
+        {
+            "crystal_metadata": crystal.model_dump(),
+            "molecular_weight_estimate": {"value": 150000.0},
+        }
+    )
+    assert missing == []
+    assert args["b"] == 109.77
+    assert args["beta"] == 91.25
+    assert "space_group" not in args
+
+
+@pytest.mark.parametrize("missing_name", ["b", "c", "alpha", "beta", "gamma"])
+def test_step8_crystal_args_fail_closed_without_full_unit_cell(missing_name):
+    crystal = {
+        "a": 66.17,
+        "b": 109.77,
+        "c": 175.14,
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 90.0,
+        "z_value": 4,
+    }
+    crystal[missing_name] = None
+    args, missing = structure_and_design_module._step8_crystal_validation_args(
+        {
+            "crystal_metadata": crystal,
+            "molecular_weight_estimate": {"value": 150000.0},
+        }
+    )
+    assert missing == [missing_name]
+    assert missing_name not in args
 
 
 def test_step7_name_only_routes_to_database_search_tools(
@@ -1155,6 +1306,8 @@ def test_step7_scope_failure_records_scope_unavailable(
         mcp_client=_FailingScopeClient(),
     ).run_step_7(run_id)
 
+    assert pkg.structure_preparation_status == "ok"
+    assert pkg.preparation_warnings == []
     by_name = {tc.tool_name: tc for tc in pkg.structure_tool_call_records}
     for tool in structure_and_design_module._STEP7_SCOPED_TOOLS:
         assert tool in by_name
@@ -1299,7 +1452,11 @@ def test_step7_uniprot_and_inline_sequence_semantics(
     assert uniprot.prediction_input_kind == "uniprot_id"
     assert rec.prediction_required is True
     assert rec.missing_metadata_flags == []
-    assert pkg.structure_preparation_status == "ok"
+    assert pkg.structure_preparation_status == "partial"
+    assert any(
+        warning["run_status"] == "dependency_unavailable"
+        for warning in pkg.preparation_warnings
+    )
 
 
 def test_step7_file_backed_target_sequence_material_is_fasta_ref_not_inline_path(
@@ -2335,6 +2492,73 @@ def test_step7_status_is_partial_when_selected_msa_call_fails(
         assert ">query" not in json.dumps(w)
 
 
+def test_step7_selected_dependency_unavailable_is_partial_and_blocks_openfold(
+    local_storage, registry_service, workflow_state_service
+):
+    """Test-only unavailable binding; production Step 7/8 routing remains real."""
+
+    run_id = _seed_sequence_only_antigen_antibody(
+        local_storage, registry_service, workflow_state_service
+    )
+
+    def _dependency_unavailable(**_kwargs):
+        raise NotImplementedError
+
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=_mcp_with_bindings(
+            {"NvidiaNIM_msa_search": _dependency_unavailable}
+        ),
+    )
+    pkg = agent.run_step_7(run_id)
+    selected = [
+        tc
+        for tc in pkg.structure_tool_call_records
+        if tc.tool_name == "NvidiaNIM_msa_search"
+        and tc.tool_input_summary.get("routing_decision") == "selected"
+    ]
+    assert len(selected) == 3
+    assert {tc.run_status for tc in selected} == {"dependency_unavailable"}
+    assert pkg.structure_preparation_status == "partial"
+    assert pkg.preparation_warnings == [
+        {
+            "tool_name": "NvidiaNIM_msa_search",
+            "run_status": "dependency_unavailable",
+            "reason": "wrapper_not_wired",
+            "chain_role": role,
+        }
+        for role in ("antigen", "antibody_heavy", "antibody_light")
+    ]
+    refs = [
+        ref
+        for item in pkg.prepared_structure_inputs
+        for ref in item.sequence_refs_for_prediction
+        if ref.chain_role in {"antigen", "antibody_heavy", "antibody_light"}
+    ]
+    assert refs
+    assert {ref.msa_status for ref in refs} == {"dependency_unavailable"}
+
+    results = agent.run_step_8(run_id)
+    openfold = [
+        tc
+        for tc in results.tool_call_records
+        if tc.tool_name == "NvidiaNIM_openfold3"
+    ]
+    assert openfold
+    assert all(tc.run_status == "skipped" for tc in openfold)
+    assert all(
+        tc.tool_input_summary.get("routing_decision")
+        in {"contract_unresolved", "duplicate_complex_prediction_mapping"}
+        for tc in openfold
+    )
+    assert not any(
+        tc.tool_input_summary.get("routing_decision") == "selected"
+        for tc in openfold
+    )
+
+
 def test_step7_status_stays_ok_when_only_not_applicable_skips(
     local_storage, registry_service, workflow_state_service
 ):
@@ -2458,7 +2682,7 @@ def test_step7_8_real_msa_payload_injects_openfold3_msa_and_keeps_artifacts_comp
         assert s["msa_alignment_format"] == "a3m"
         assert isinstance(s["msa_alignment_length"], int) and s["msa_alignment_length"] > 0
         assert s["msa_alignment_sha256_prefix"]
-    assert pkg.structure_preparation_status in {"ok", "partial"}
+    assert pkg.structure_preparation_status == "ok"
     # Normalized artifact carries only compact metadata — no raw seq / a3m.
     blob = json.dumps(pkg.model_dump())
     for raw in (_MSA_ANTIGEN, _MSA_HEAVY, _MSA_LIGHT):
@@ -2799,11 +3023,99 @@ def test_step8_skips_crystal_validation_when_compact_metadata_missing(
     assert crystal_calls
     assert all(tc.run_status == "skipped" for tc in crystal_calls)
     assert all(tc.tool_input_summary.get("routing_decision") == "input_missing" for tc in crystal_calls)
-    assert any("Z" in tc.tool_input_summary.get("missing", []) for tc in crystal_calls)
+    assert all(
+        set(tc.tool_input_summary.get("missing", []))
+        >= {"a", "b", "c", "alpha", "beta", "gamma", "Z", "mw"}
+        for tc in crystal_calls
+    )
     assert all("pdb_id_or_path" not in (tc.tool_input_summary.get("arguments") or {}) for tc in crystal_calls)
     pisa_calls = [tc for tc in results.tool_call_records if tc.tool_name == "PDBePISA_get_interfaces"]
     assert pisa_calls
     assert all(tc.tool_input_summary.get("routing_decision") == "not_applicable" for tc in pisa_calls)
+
+
+@pytest.mark.parametrize("missing_name", ["b", "c", "alpha", "beta", "gamma"])
+def test_step8_does_not_execute_crystal_tool_with_incomplete_unit_cell(
+    local_storage,
+    registry_service,
+    workflow_state_service,
+    missing_name,
+):
+    run_id = _seed(
+        local_storage,
+        registry_service,
+        workflow_state_service,
+        uploaded_files=[
+            {
+                "file_id": "file_pdb",
+                "original_filename": "target.pdb",
+                "storage_path": "adc_pilot/runs/x/inputs/files/file_pdb.pdb",
+                "content_type": "chemical/x-pdb",
+                "sha256": "sha256:abc",
+                "size_bytes": 1024,
+                "role": "target",
+            },
+        ],
+    )
+    raw_path = local_storage.run_key(run_id, "inputs/raw_request_record.json")
+    raw = local_storage.read_json(raw_path)
+    raw["uploaded_files"][0]["storage_path"] = local_storage.run_key(
+        run_id, "inputs/files/file_pdb.pdb"
+    )
+    local_storage.write_json(raw_path, raw)
+    local_storage.write_bytes(
+        raw["uploaded_files"][0]["storage_path"],
+        (PROJECT_ROOT / "data" / "pdb" / "S1.pdb").read_bytes(),
+    )
+
+    captured: list[dict] = []
+    agent = StructureAndDesignAgent(
+        storage=local_storage,
+        registry=registry_service,
+        workflow_state=workflow_state_service,
+        mcp_client=LocalMCPClient(
+            inventory=ToolInventoryService(
+                os.environ.get("TOOL_INVENTORY_XLSX", str(DEFAULT_XLSX))
+            ),
+            bindings={
+                **_bindings_with_step8_overrides(),
+                "CrystalStructure_validate": lambda **kwargs: captured.append(kwargs),
+            },
+        ),
+    )
+    agent.run_step_7(run_id)
+    package_key = local_storage.run_key(
+        run_id, "prepared_structure_input_package.json"
+    )
+    package = local_storage.read_json(package_key)
+    uploaded_inputs = [
+        item
+        for item in package["prepared_structure_inputs"]
+        if item["input_case"] == "uploaded_structure_file"
+    ]
+    assert uploaded_inputs
+    for item in uploaded_inputs:
+        item["crystal_metadata"][missing_name] = None
+    local_storage.write_json(package_key, package)
+
+    results = agent.run_step_8(run_id)
+    assert captured == []
+    crystal_records = [
+        record
+        for record in results.tool_call_records
+        if record.tool_name == "CrystalStructure_validate"
+        and record.tool_input_summary.get("input_case") == "uploaded_structure_file"
+    ]
+    assert crystal_records
+    assert all(record.run_status == "skipped" for record in crystal_records)
+    assert all(
+        record.tool_input_summary.get("routing_decision") == "input_missing"
+        for record in crystal_records
+    )
+    assert all(
+        missing_name in record.tool_input_summary.get("missing", [])
+        for record in crystal_records
+    )
 
 
 def test_step8_sequence_only_records_nim_prediction_route_as_unavailable(

@@ -9,6 +9,8 @@ from __future__ import annotations
 from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
+from app.utils.ids import SessionId
+
 
 class UserProvidedContext(BaseModel):
     target_or_antigen_text: Optional[str] = None
@@ -48,6 +50,8 @@ class UploadedFile(BaseModel):
 
 class RawRequestRecord(BaseModel):
     run_id: str
+    # Optional only for reading historical artifacts. New intake always sets it.
+    session_id: Optional[SessionId] = None
     run_artifact_registry_id: str
     step_id: Literal["step_01_intake"] = "step_01_intake"
     created_at: str

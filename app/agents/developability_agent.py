@@ -18,7 +18,6 @@ from ..agents.step_06_available_fields import (
     project_candidate_available_fields,
 )
 from ..agents.step_06_capability_registry import (
-    STEP_06_CAPABILITY_BY_TOOL,
     STEP_06_CAPABILITY_REGISTRY,
 )
 from ..agents.step_06_interpretation import (
@@ -93,6 +92,31 @@ class DevelopabilityAgent:
         cct = self.storage.read_json(
             self.storage.run_key(run_id, "candidate_context_table.json")
         )
+        return self._run_from_candidate_context(run_id, cct)
+
+    def run_from_artifacts(
+        self,
+        run_id: str,
+        *,
+        candidate_context_table: dict,
+    ) -> StructuredLiabilitySummary:
+        """Request-based Step 6 entry with no Step 4/run_step_plan gate.
+
+        The A2A worker has already validated the run-scoped artifact ref and
+        loaded the normalized candidate-context body from worker-owned storage.
+        This method does not reload it, re-decide routing, or inspect a
+        ``run_step_plan``. Both public entries execute the same production
+        projection, Stage 1/Stage 2 selection, resolver, MCP, persistence,
+        registry, and workflow-state path below.
+        """
+        return self._run_from_candidate_context(run_id, candidate_context_table)
+
+    def _run_from_candidate_context(
+        self,
+        run_id: str,
+        cct: dict,
+    ) -> StructuredLiabilitySummary:
+        """Shared Step 6 production business core for legacy and A2A entries."""
         candidates = cct.get("candidate_records") or []
         scoped_tools = set(self.mcp_client.list_tools(agent_name=_AGENT_NAME, step_id=_STEP_ID))
         selection_audit: dict[str, Any] = {

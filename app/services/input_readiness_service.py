@@ -42,6 +42,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import PurePosixPath
 
+from ..llm.json_task_validation import is_valid_uniprot_accession
 from ..schemas.step_03_input_readiness import (
     BasicADCInputPresence,
     ClarificationRequest,
@@ -58,6 +59,7 @@ from .workflow_state_service import WorkflowStateService
 
 
 _ARTIFACT_KEY = "inputs/input_readiness_status.json"
+_HISTORY_KEY = "inputs/history/input_readiness_status/{artifact_id}.json"
 
 
 # Deterministic, non-LLM fallback questions keyed by gap category / slot.
@@ -136,23 +138,17 @@ def _missing_slot_gap_category(slot: dict) -> str:
 _ANTIBODY_SEQUENCE_REF_ID_TYPES = {
     "antibody_heavy_chain_sequence",
     "antibody_light_chain_sequence",
-    "antibody_sequence_reference",
 }
-_SEQUENCE_REF_ID_TYPES = {"uniprot_id", *_ANTIBODY_SEQUENCE_REF_ID_TYPES}
+_SEQUENCE_REF_ID_TYPES = {
+    "uniprot_id",
+    "target_sequence",
+    *_ANTIBODY_SEQUENCE_REF_ID_TYPES,
+}
 
 # Intents where Step 2's `missing_slots` (per its required_slot_schema) owns
 # the gap assessment, so Step 3 must NOT re-impose the legacy new-ADC-design
 # checklist (target / antibody / payload / linker). For these the readiness
 # floor comes from `missing_slots` + presence signals only.
-_NON_DESIGN_INTENTS = {
-    "developability_assessment",
-    "structure_analysis",
-    "compound_screening",
-    "literature_review",
-    "patent_ip_review",
-}
-
-
 _PDB_EXTS = {".pdb", ".cif", ".mmcif", ".ent"}
 _FASTA_EXTS = {".fasta", ".fa", ".faa", ".seq"}
 _CSV_EXTS = {".csv", ".tsv", ".xlsx", ".xls"}
@@ -263,6 +259,36 @@ def _is_adc_task_intent(structured_query: dict) -> tuple[bool, str | None]:
     return False, None
 
 
+def _requires_full_adc_completeness(structured_query: dict) -> bool:
+    """Whether Step 3 should apply the legacy full-composition checklist.
+
+    Other intents rely on Step 2's explicit ``missing_slots``. This avoids
+    inventing payload/linker questions for structure-only or protein-only
+    requests while preserving full new-ADC/ranked-candidate planning.
+    """
+
+    intent = structured_query.get("task_intent") or {}
+    primary_intent = str(intent.get("primary_intent") or "").strip().lower()
+    task_type = str(intent.get("task_type") or "").strip().lower()
+    if primary_intent == "new_adc_design" or (
+        primary_intent in {"", "unclear_or_needs_clarification"}
+        and task_type == "adc_design"
+    ):
+        return True
+    requested_outputs = {
+        str(item).strip().lower()
+        for item in structured_query.get("requested_outputs") or []
+        if isinstance(item, str)
+    }
+    if "ranked_candidates" in requested_outputs:
+        return True
+    return any(
+        isinstance(slot, dict)
+        and "new_adc_design" in (slot.get("required_for") or [])
+        for slot in structured_query.get("missing_slots") or []
+    )
+
+
 class InputReadinessService:
     def __init__(
         self,
@@ -288,6 +314,45 @@ class InputReadinessService:
         ctx = raw.get("user_provided_context") or {}
         entities = sq.get("mentioned_entities") or {}
         ref_id_types = _referenced_id_types(sq)
+        has_valid_uniprot_ref = any(
+            isinstance(ref, dict)
+            and ref.get("id_type") == "uniprot_id"
+            and is_valid_uniprot_accession(ref.get("value"))
+            for ref in sq.get("referenced_inputs") or []
+        )
+        uploaded_file_sources = {
+            str(ref.get("value") or ""): str(ref.get("source") or "")
+            for ref in sq.get("referenced_inputs") or []
+            if isinstance(ref, dict)
+            and ref.get("id_type") == "uploaded_file"
+            and str(ref.get("value") or "")
+        }
+        assigned_sequence_file_ids = {
+            file_id
+            for file_id, source in uploaded_file_sources.items()
+            if source
+            in {
+                "target_sequence",
+                "antibody_heavy_chain_sequence",
+                "antibody_light_chain_sequence",
+            }
+        }
+        antibody_sequence_file_ids = {
+            file_id
+            for file_id, source in uploaded_file_sources.items()
+            if source
+            in {
+                "antibody_heavy_chain_sequence",
+                "antibody_light_chain_sequence",
+            }
+        }
+        prompt_file_ids = {
+            str(ref.get("value") or "")
+            for ref in sq.get("referenced_inputs") or []
+            if isinstance(ref, dict)
+            and ref.get("id_type") == "uploaded_file"
+            and ref.get("source") == "prompt_sequence"
+        }
         uploaded_files = raw.get("uploaded_files") or []
 
         # ── file checks ────────────────────────────────────────────────────
@@ -298,6 +363,7 @@ class InputReadinessService:
         candidate_file_evidence: str | None = None
         structure_file_evidence: str | None = None
         sequence_file_evidence: str | None = None
+        antibody_sequence_file_evidence: str | None = None
         failed_upload_count = 0
         unknown_role_count = 0
         for f in uploaded_files:
@@ -322,17 +388,32 @@ class InputReadinessService:
                     notes=note,
                 )
             )
-            if role == "pdb_or_cif_structure":
+            file_is_prompt_only = str(f.get("file_id") or "") in prompt_file_ids
+            if role == "pdb_or_cif_structure" and not file_is_prompt_only:
                 any_structure_file = True
                 if structure_file_evidence is None:
                     structure_file_evidence = (
                         "raw_request_record.uploaded_files[*].inferred_role=pdb_or_cif_structure"
                     )
-            if role == "fasta_sequence":
+            file_id = str(f.get("file_id") or "")
+            if (
+                role == "fasta_sequence"
+                and not file_is_prompt_only
+                and file_id in assigned_sequence_file_ids
+            ):
                 any_sequence_file = True
                 if sequence_file_evidence is None:
                     sequence_file_evidence = (
-                        "raw_request_record.uploaded_files[*].inferred_role=fasta_sequence"
+                        "structured_query.referenced_inputs[id_type=uploaded_file,"
+                        f"source={uploaded_file_sources[file_id]}]"
+                    )
+                if (
+                    file_id in antibody_sequence_file_ids
+                    and antibody_sequence_file_evidence is None
+                ):
+                    antibody_sequence_file_evidence = (
+                        "structured_query.referenced_inputs[id_type=uploaded_file,"
+                        f"source={uploaded_file_sources[file_id]}]"
                     )
             if role == "csv_or_table":
                 any_candidate_file = True
@@ -397,7 +478,8 @@ class InputReadinessService:
         structure_present = any_structure_file or "pdb_id" in ref_id_types
         sequence_present = (
             any_sequence_file
-            or bool(ref_id_types & _SEQUENCE_REF_ID_TYPES)
+            or bool(ref_id_types & (_SEQUENCE_REF_ID_TYPES - {"uniprot_id"}))
+            or has_valid_uniprot_ref
             or _has_explicit_chain_sequence(entities)
         )
         structure_or_sequence_present = structure_present or sequence_present
@@ -416,8 +498,10 @@ class InputReadinessService:
                 "structured_query.referenced_inputs[id_type="
                 f"{antibody_seq_ref_types[0]}]"
             )
-        elif "uniprot_id" in ref_id_types:
+        elif has_valid_uniprot_ref:
             sequence_input_ev = "structured_query.referenced_inputs[id_type=uniprot_id]"
+        elif "target_sequence" in ref_id_types:
+            sequence_input_ev = "structured_query.referenced_inputs[id_type=target_sequence]"
         elif _has_explicit_chain_sequence(entities):
             sequence_input_ev = (
                 "structured_query.mentioned_entities.antibody_candidate_text~chain_sequence"
@@ -431,14 +515,16 @@ class InputReadinessService:
         elif "pdb_id" in ref_id_types:
             structure_ev = "structured_query.referenced_inputs[id_type=pdb_id]"
         elif any_sequence_file:
-            structure_ev = "raw_request_record.uploaded_files[*].inferred_role=fasta_sequence"
+            structure_ev = sequence_file_evidence
         elif has_antibody_seq_ref:
             structure_ev = (
                 "structured_query.referenced_inputs[id_type="
                 f"{antibody_seq_ref_types[0]}]"
             )
-        elif "uniprot_id" in ref_id_types:
+        elif has_valid_uniprot_ref:
             structure_ev = "structured_query.referenced_inputs[id_type=uniprot_id]"
+        elif "target_sequence" in ref_id_types:
+            structure_ev = "structured_query.referenced_inputs[id_type=target_sequence]"
 
         constraints_present = bool(ctx.get("constraints_text") or sq.get("user_constraints"))
         constraints_ev = (
@@ -447,8 +533,10 @@ class InputReadinessService:
             else ("structured_query.user_constraints" if sq.get("user_constraints") else None)
         )
 
-        antibody_present = (
-            bool(candidate_text) or any_sequence_file or has_antibody_seq_ref
+        antibody_present = bool(
+            candidate_text
+            or antibody_sequence_file_ids
+            or has_antibody_seq_ref
         )
         antibody_ref_evidence = (
             "structured_query.referenced_inputs[id_type="
@@ -469,7 +557,7 @@ class InputReadinessService:
             candidate_file_present=any_candidate_file,
             target_evidence=target_ev,
             antibody_evidence=candidate_ev
-            or (sequence_file_evidence if any_sequence_file else None)
+            or antibody_sequence_file_evidence
             or antibody_ref_evidence,
             payload_evidence=payload_ev,
             linker_evidence=linker_ev,
@@ -491,6 +579,7 @@ class InputReadinessService:
                     message="No raw_user_query provided — Step 3 cannot judge intent",
                     category="raw_user_query",
                     evidence_field=None,
+                    recoverable=False,
                 )
             )
         if raw_user_query and not presence.adc_task_intent_present:
@@ -520,6 +609,7 @@ class InputReadinessService:
                     ),
                     category="task_intent",
                     evidence_field=None,
+                    recoverable=not non_adc_confident,
                 )
             )
         # The legacy new-ADC-design checklist (target blocking + antibody /
@@ -529,10 +619,7 @@ class InputReadinessService:
         # gap assessment, so Step 3 must NOT fabricate a target/payload/linker
         # requirement. `canonical_query`'s "unspecified" wording is never
         # parsed as a real entity here.
-        primary_intent = str(
-            ((sq or {}).get("task_intent") or {}).get("primary_intent") or ""
-        ).strip().lower()
-        apply_legacy_adc_checklist = primary_intent not in _NON_DESIGN_INTENTS
+        apply_legacy_adc_checklist = _requires_full_adc_completeness(sq)
 
         if apply_legacy_adc_checklist:
             if not presence.target_or_antigen_present:
@@ -633,18 +720,34 @@ class InputReadinessService:
         # blocking slot is always surfaced.
         self._consume_missing_slots(sq, missing)
 
-        blocking = [m.message for m in missing if m.severity == "blocking"]
-        if blocking:
-            status_val: str = "blocked"
-        elif any(m.severity == "warning" for m in missing):
-            status_val = "needs_user_input"
-        else:
-            status_val = "ready"
-
         # Clarification requests are built from the SAME gaps but are NOT
         # subject to the checklist dedupe, so a Step 2 `suggested_question`
         # survives even when its category was deduped from the checklist.
         clarification_requests = self._build_clarification_requests(sq, missing)
+
+        blocking_items = [m for m in missing if m.severity == "blocking"]
+        blocking = [m.message for m in blocking_items]
+        actionable_categories = {
+            _missing_slot_gap_category(
+                {
+                    "slot_name": request.slot_name,
+                    "slot_category": request.slot_category,
+                }
+            )
+            for request in clarification_requests
+            if not request.resolved and request.question.strip()
+        }
+        terminal_blockers = [
+            item
+            for item in blocking_items
+            if not item.recoverable or item.category not in actionable_categories
+        ]
+        if terminal_blockers:
+            status_val: str = "blocked"
+        elif blocking_items or any(m.severity == "warning" for m in missing):
+            status_val = "needs_user_input"
+        else:
+            status_val = "ready"
 
         # User-facing response is a pure passthrough of Step 2's LLM-written
         # `structured_query.response` when readiness is not `ready`. Step 3
@@ -668,14 +771,21 @@ class InputReadinessService:
         )
 
         artifact_id = new_artifact_id("input_readiness_status")
+        body = {"artifact_id": artifact_id, **status.model_dump()}
+        self.storage.write_json(
+            self.storage.run_key(
+                run_id,
+                _HISTORY_KEY.format(artifact_id=artifact_id),
+            ),
+            body,
+        )
         self.storage.write_json(
             self.storage.run_key(run_id, _ARTIFACT_KEY),
-            {"artifact_id": artifact_id, **status.model_dump()},
+            body,
         )
         self.registry.update_active(run_id, input_readiness_status_id=artifact_id)
         self.workflow_state.mark(run_id, "step_03", "completed")
         return status
-
     @staticmethod
     def _consume_missing_slots(
         structured_query: dict, missing: list[MissingInputItem]
@@ -853,3 +963,9 @@ class InputReadinessService:
         if not parts:
             parts.append("only optional gaps remain")
         return f"{status_val} — " + "; ".join(parts)
+
+
+def input_readiness_history_key(artifact_id: str) -> str:
+    """Return the same-run immutable audit key for one Step 3 artifact."""
+
+    return _HISTORY_KEY.format(artifact_id=artifact_id)

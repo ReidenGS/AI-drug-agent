@@ -1,0 +1,71 @@
+# Strict build context filter (Turn E). Keep secrets, local artifacts, raw
+# biological data, VCS, and test output OUT of the image.
+
+# ── VCS ──────────────────────────────────────────────────────────────────────
+.git
+.gitignore
+.github
+
+# ── Secrets / env ────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets/
+credentials/
+
+# ── Local dev storage / run artifacts (never bake run data into the image) ────
+.localstore/
+.localstore*
+.snapshots/
+runs/
+data/
+*.localstore
+
+# ── Raw biological material must never enter the image ────────────────────────
+*.fasta
+*.fa
+*.faa
+*.fastq
+*.pdb
+*.cif
+*.mmcif
+*.ent
+*.a3m
+*.sto
+*.hmm
+
+# ── Python build / cache ──────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# ── Test / tooling output ─────────────────────────────────────────────────────
+tests/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+manual_tests/
+htmlcov/
+.coverage
+coverage.xml
+
+# ── Editor / OS noise ─────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ── Local/private notes (not needed at runtime) ───────────────────────────────
+README_CN.md
+DEPLOYMENT_A2A.md
+
+# ── The ToolUniverse inventory is provided at runtime as a read-only bind mount,
+#    NOT copied into the image (avoids duplicating/altering the official file).
+../项目文件

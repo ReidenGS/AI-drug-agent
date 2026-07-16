@@ -10,6 +10,10 @@ from typing import Any
 
 import pytest
 
+from app.a2a.orchestrator_routing_prompt import (
+    ORCHESTRATOR_ROUTING_SYSTEM_PROMPT,
+    ORCHESTRATOR_ROUTING_USER_TASK,
+)
 from app.llm.qwen_provider import QwenProvider, QwenProviderError
 
 
@@ -28,6 +32,56 @@ def _chat_response(content: str) -> Any:
     message = SimpleNamespace(content=content)
     choice = SimpleNamespace(message=message)
     return SimpleNamespace(choices=[choice])
+
+
+def test_orchestrator_system_role_is_not_duplicated_in_user_message():
+    calls: list[dict[str, Any]] = []
+
+    def _create(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return _chat_response(
+            '{"loop_decision":"route_to_final_response","decisions":[],'
+            '"decision_summary":"No worker is needed."}'
+        )
+
+    provider = QwenProvider(api_key="qwen-fake-key", max_retries=0)
+    provider._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=_create))
+    )
+    provider.generate_json(
+        ORCHESTRATOR_ROUTING_USER_TASK,
+        schema={
+            "task": "orchestrator_worker_routing",
+            "compact_card_catalog": [
+                {
+                    "agent_id": "step_06_developability_agent",
+                    "capabilities": [
+                        {"capability_id": "step_06_developability"}
+                    ],
+                }
+            ],
+            "compact_user_intent": "Already satisfied",
+            "structured_intent": {},
+            "input_readiness_summary": {"input_readiness_status": "ready"},
+            "available_artifact_summary": [],
+            "current_routing_context": {},
+        },
+        system=ORCHESTRATOR_ROUTING_SYSTEM_PROMPT,
+    )
+
+    messages = calls[0]["messages"]
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert messages[0]["content"] == ORCHESTRATOR_ROUTING_SYSTEM_PROMPT
+    user = messages[1]["content"]
+    assert ORCHESTRATOR_ROUTING_SYSTEM_PROMPT not in user
+    assert ORCHESTRATOR_ROUTING_USER_TASK in user
+    assert user.count('"input_situation"') == 2
+    assert "Compact AgentCard catalog JSON:" in user
+    assert "step_06_developability_agent" in user
+    assert sum(
+        message["content"].count(ORCHESTRATOR_ROUTING_SYSTEM_PROMPT)
+        for message in messages
+    ) == 1
 
 
 def _chat_response_with_usage(

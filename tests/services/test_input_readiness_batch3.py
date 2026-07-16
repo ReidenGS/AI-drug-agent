@@ -207,15 +207,27 @@ def test_uploaded_fasta_inferred_as_sequence_present(
         "trastuzumab.fasta",
         "text/x-fasta",
     )
+    file_id = rec.uploaded_files[0].file_id
     _bootstrap_step_2(
         local_storage, registry_service, workflow_state_service, rec.run_id,
         target="HER2", candidate="Trastuzumab", payload="MMAE", linker="vc",
+        referenced_inputs=[
+            {
+                "id_type": "uploaded_file",
+                "value": file_id,
+                "source": "antibody_heavy_chain_sequence",
+            }
+        ],
     )
     out = InputReadinessService(
         local_storage, registry_service, workflow_state_service
     ).check(rec.run_id)
     assert out.uploaded_file_checks[0].inferred_role == "fasta_sequence"
     assert out.basic_adc_input_presence.sequence_input_present
+    assert out.basic_adc_input_presence.sequence_input_evidence == (
+        "structured_query.referenced_inputs[id_type=uploaded_file,"
+        "source=antibody_heavy_chain_sequence]"
+    )
     assert not out.basic_adc_input_presence.structure_input_present
     assert out.basic_adc_input_presence.sequence_input_evidence is not None
 
@@ -266,7 +278,7 @@ def test_missing_target_blocks_overall_status(
     out = InputReadinessService(
         local_storage, registry_service, workflow_state_service
     ).check(rec.run_id)
-    assert out.input_readiness_status == "blocked"
+    assert out.input_readiness_status == "needs_user_input"
     cats = [(m.category, m.severity) for m in out.missing_input_checklist]
     assert ("target", "blocking") in cats
 

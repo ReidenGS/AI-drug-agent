@@ -14,6 +14,7 @@ bodies, prompts, or API keys.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import json
 from typing import Any, Literal, Optional, Union
@@ -28,6 +29,31 @@ from .json_task_validation import (
 )
 
 logger = logging.getLogger(__name__)
+
+_USAGE_LOGGER_NAME = "app.telemetry.openai_usage"
+_USAGE_HANDLER_MARKER = "_adc_openai_usage_handler"
+
+
+def _configure_usage_logger() -> logging.Logger:
+    """Return an isolated, container-visible, idempotent usage logger."""
+
+    usage_logger = logging.getLogger(_USAGE_LOGGER_NAME)
+    usage_logger.setLevel(logging.INFO)
+    usage_logger.propagate = False
+    usage_logger.disabled = False
+    if not any(
+        getattr(handler, _USAGE_HANDLER_MARKER, False)
+        for handler in usage_logger.handlers
+    ):
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        setattr(handler, _USAGE_HANDLER_MARKER, True)
+        usage_logger.addHandler(handler)
+    return usage_logger
+
+
+usage_logger = _configure_usage_logger()
 
 
 class OpenAIProviderError(RuntimeError):
@@ -98,6 +124,29 @@ class _Step6Stage1Selection(BaseModel):
 class _Step6SchemaMappingStage1Response(BaseModel):
     model_config = ConfigDict(extra="forbid")
     selections: list[_Step6Stage1Selection] = Field(default_factory=list)
+
+
+class _OrchestratorRouteDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    agent_id: str = Field(min_length=1)
+    capability_id: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    selection_reason: str = Field(min_length=1)
+    priority: Literal["low", "normal", "high"]
+
+
+class _OrchestratorRoutingResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    loop_decision: Literal[
+        "dispatch_next_workers",
+        "wait_for_dependencies",
+        "route_to_final_response",
+        "request_user_input",
+        "repair_or_retry",
+        "stop_cannot_satisfy",
+    ]
+    decisions: list[_OrchestratorRouteDecision] = Field(default_factory=list)
+    decision_summary: str = Field(min_length=1)
 
 
 class _Step9Stage1Selection(BaseModel):
@@ -356,6 +405,7 @@ class _Step14PatentToolSelectionResponse(BaseModel):
 _RESPONSE_MODEL_FOR_TASK: dict[str, type[BaseModel]] = {
     "tool_selection_stage_1": _ToolSelectionStage1Response,
     "step6_schema_mapping_stage_1": _Step6SchemaMappingStage1Response,
+    "orchestrator_worker_routing": _OrchestratorRoutingResponse,
     "step14_patent_tool_selection": _Step14PatentToolSelectionResponse,
     # step6_schema_mapping_stage_2 is TEMPORARILY DISABLED from the official
     # parser path. The current Step 6 Stage 2 prompt still asks for the legacy
@@ -388,6 +438,28 @@ _PARSER_INCOMPAT_TOKENS = (
     "unsupported",
     "invalid schema",
 )
+
+# Stable routing namespace only. OpenAI still verifies the exact shared prompt
+# prefix; this key deliberately hashes no prompt/catalog/query/run content.
+_PROMPT_CACHE_LAYOUT_VERSION = "openai-json-v1"
+
+
+def _prompt_cache_key(
+    *,
+    model: str,
+    task: str,
+    layout_version: str = _PROMPT_CACHE_LAYOUT_VERSION,
+) -> str:
+    namespace = "\x1f".join(
+        (layout_version, "openai", model.strip().lower(), task.strip())
+    )
+    return "adcpc_" + hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:32]
+
+
+def _supports_24h_prompt_cache_retention(model: str) -> bool:
+    """Capability check for the GPT-5.5 model family, not a model allowlist."""
+
+    return model.strip().lower().startswith("gpt-5.5")
 
 
 def _resolve_parse_fn(client: Any) -> Any | None:
@@ -437,10 +509,6 @@ class OpenAIProvider:
         self.max_retries = max(0, max_retries)
         self.timeout = float(timeout)
         self._client: Any | None = None
-        # The task of the in-flight generate_json call. Read by the real
-        # ``_generate_content`` to choose the structured-output parser model.
-        # Never carries prompt/response content.
-        self._active_task: str | None = None
         # Compact per-attempt usage log. Each entry holds only
         # provider / model / task / attempt + token counts — never
         # prompt, system, schema, response content, or API key.
@@ -467,9 +535,6 @@ class OpenAIProvider:
         return, same validation + Step 2 normalization.
         """
         task = (schema or {}).get("task") or "structured_query"
-        # Task drives the parser-model choice inside `_generate_content`; it
-        # never carries prompt/response content.
-        self._active_task = task
         # Build the user-message body WITHOUT embedding the system block.
         # Chat Completions takes ``system`` as a dedicated role="system"
         # message via ``_generate_content``; ``_build_json_prompt`` would
@@ -490,15 +555,25 @@ class OpenAIProvider:
                     "\n\nYour previous response could not be parsed or validated as the "
                     f"required JSON object. Error: {errors[-1]}. Return corrected JSON only."
                 )
-            response = self._generate_content(base_prompt + retry_note, system=system)
+            response = self._generate_content(
+                base_prompt + retry_note,
+                system=system,
+                task=task,
+            )
             # Record per-attempt token usage as soon as a response object
             # exists, regardless of whether parsing later succeeds — a
             # retry on a malformed response still cost real tokens.
-            self.usage_events.append(
-                _build_usage_event(
-                    provider=self.name, model=self.model,
-                    task=task, attempt=attempt, response=response,
-                )
+            usage_event = _build_usage_event(
+                provider=self.name,
+                model=self.model,
+                task=task,
+                attempt=attempt,
+                response=response,
+            )
+            self.usage_events.append(usage_event)
+            usage_logger.info(
+                "OPENAI_USAGE_EVENT=%s",
+                json.dumps(usage_event, sort_keys=True, separators=(",", ":")),
             )
             try:
                 parsed = _response_to_dict(response)
@@ -522,8 +597,14 @@ class OpenAIProvider:
             f"{self.max_retries + 1} attempt(s): {joined}"
         )
 
-    def _generate_content(self, prompt: str, *, system: str | None) -> Any:
-        """Produce one raw SDK response for the in-flight task.
+    def _generate_content(
+        self,
+        prompt: str,
+        *,
+        system: str | None,
+        task: str,
+    ) -> Any:
+        """Produce one raw SDK response for this call's explicit task.
 
         For a task with a structured-output model, tries the official parser
         first and falls back to the json_object path on parser
@@ -531,14 +612,17 @@ class OpenAIProvider:
         json_object. Returns the raw SDK response object (either the parsed or
         the content shape); ``_response_to_dict`` normalizes both.
         """
-        response_model = _RESPONSE_MODEL_FOR_TASK.get(self._active_task or "")
+        response_model = _RESPONSE_MODEL_FOR_TASK.get(task)
         if response_model is not None:
             parsed_response = self._try_structured_parse(
-                prompt, system=system, response_model=response_model,
+                prompt,
+                system=system,
+                task=task,
+                response_model=response_model,
             )
             if parsed_response is not None:
                 return parsed_response
-        return self._create_json_object(prompt, system=system)
+        return self._create_json_object(prompt, system=system, task=task)
 
     def _messages(self, prompt: str, *, system: str | None) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
@@ -547,8 +631,24 @@ class OpenAIProvider:
         messages.append({"role": "user", "content": prompt})
         return messages
 
+    def _prompt_cache_kwargs(self, *, task: str) -> dict[str, str]:
+        kwargs = {
+            "prompt_cache_key": _prompt_cache_key(
+                model=self.model,
+                task=task,
+            )
+        }
+        if _supports_24h_prompt_cache_retention(self.model):
+            kwargs["prompt_cache_retention"] = "24h"
+        return kwargs
+
     def _try_structured_parse(
-        self, prompt: str, *, system: str | None, response_model: type[BaseModel],
+        self,
+        prompt: str,
+        *,
+        system: str | None,
+        task: str,
+        response_model: type[BaseModel],
     ) -> Any | None:
         """Attempt the official structured-output parser.
 
@@ -557,7 +657,6 @@ class OpenAIProvider:
         an explicit incompatibility). A compact warning is logged on fallback —
         never a silent failure, and never the prompt / response body.
         """
-        task = self._active_task
         client = self._get_client()
         parse_fn = _resolve_parse_fn(client)
         if parse_fn is None:
@@ -573,6 +672,7 @@ class OpenAIProvider:
                 messages=self._messages(prompt, system=system),
                 response_format=response_model,
                 timeout=self.timeout,
+                **self._prompt_cache_kwargs(task=task),
             )
         except Exception as exc:  # noqa: BLE001 — classify then fall back or re-raise
             if _is_parser_incompatibility(exc):
@@ -585,7 +685,13 @@ class OpenAIProvider:
                 return None
             raise
 
-    def _create_json_object(self, prompt: str, *, system: str | None) -> Any:
+    def _create_json_object(
+        self,
+        prompt: str,
+        *,
+        system: str | None,
+        task: str,
+    ) -> Any:
         """Call OpenAI Chat Completions with JSON-object response mode.
 
         Chat Completions + ``response_format={"type": "json_object"}`` is the
@@ -598,6 +704,7 @@ class OpenAIProvider:
             messages=self._messages(prompt, system=system),
             response_format={"type": "json_object"},
             timeout=self.timeout,
+            **self._prompt_cache_kwargs(task=task),
         )
 
     def _get_client(self) -> Any:

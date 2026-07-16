@@ -27,7 +27,6 @@ Hard constraints (architecture v0.1):
 
 from __future__ import annotations
 
-import json
 import hashlib
 import re
 from io import StringIO
@@ -227,6 +226,105 @@ class StructureAndDesignAgent:
             self.storage.run_key(run_id, "candidate_context_table.json")
         )
 
+        return self._run_step_7_from_artifacts(
+            run_id,
+            raw_request_record=raw,
+            structured_query=sq,
+            candidate_context_table=cct,
+        )
+
+    def run_workflow_from_artifacts(
+        self,
+        run_id: str,
+        *,
+        raw_request_record: dict,
+        structured_query: dict,
+        candidate_context_table: dict,
+    ) -> tuple[
+        PreparedStructureInputPackage,
+        StructurePredictionAndInterfaceResults,
+        CompoundScreeningArtifact,
+    ]:
+        """Run the internal Step 7 -> Step 8 -> Step 9 workflow from refs.
+
+        The Orchestrator owns routing and the run-step-plan gate. This
+        request-based entry consumes already validated artifact bodies, writes
+        each internal artifact through the existing production implementation,
+        and advances only after the preceding method has returned.
+        """
+        step7 = self._run_step_7_from_artifacts(
+            run_id,
+            raw_request_record=raw_request_record,
+            structured_query=structured_query,
+            candidate_context_table=candidate_context_table,
+        )
+        self._require_internal_artifact(
+            run_id,
+            registry_field="prepared_structure_input_package_id",
+            storage_path="prepared_structure_input_package.json",
+            step_label="Step 7",
+        )
+        step8 = self.run_step_8(run_id)
+        self._require_internal_artifact(
+            run_id,
+            registry_field="structure_prediction_and_interface_results_id",
+            storage_path="structure_prediction_and_interface_results.json",
+            step_label="Step 8",
+        )
+        step9 = self.run_step_9(run_id)
+        return step7, step8, step9
+
+    def _require_internal_artifact(
+        self,
+        run_id: str,
+        *,
+        registry_field: str,
+        storage_path: str,
+        step_label: str,
+    ) -> None:
+        registry = self.registry.get(run_id)
+        artifact_id = getattr(registry.active_artifacts, registry_field, None)
+        artifact_exists = self.storage.exists(
+            self.storage.run_key(run_id, storage_path)
+        )
+        if not artifact_id or not artifact_exists:
+            raise WorkflowStateError(
+                f"{step_label} did not persist its required internal artifact"
+            )
+        try:
+            body = self.storage.read_json(
+                self.storage.run_key(run_id, storage_path)
+            )
+        except Exception as exc:  # noqa: BLE001 - sanitized workflow boundary
+            raise WorkflowStateError(
+                f"{step_label} internal artifact identity could not be read"
+            ) from exc
+        if not isinstance(body, dict):
+            raise WorkflowStateError(
+                f"{step_label} internal artifact identity body is not an object"
+            )
+        if body.get("artifact_id") != artifact_id:
+            raise WorkflowStateError(
+                f"{step_label} internal artifact artifact_id identity mismatch"
+            )
+        if body.get("run_id") != run_id:
+            raise WorkflowStateError(
+                f"{step_label} internal artifact run_id identity mismatch"
+            )
+
+    def _run_step_7_from_artifacts(
+        self,
+        run_id: str,
+        *,
+        raw_request_record: dict,
+        structured_query: dict,
+        candidate_context_table: dict,
+    ) -> PreparedStructureInputPackage:
+        """Shared Step 7 business core used by legacy and request workflows."""
+        raw = raw_request_record
+        sq = structured_query
+        cct = candidate_context_table
+
         # Group resources once.
         uploaded = raw.get("uploaded_files") or []
         structure_files = [
@@ -241,6 +339,24 @@ class StructureAndDesignAgent:
         for r in sq.get("referenced_inputs") or []:
             if isinstance(r, dict):
                 refs_by_type.setdefault(r.get("id_type", ""), []).append(r)
+        uploaded_sequence_sources = {
+            str(ref.get("value") or ""): str(ref.get("source") or "")
+            for ref in refs_by_type.get("uploaded_file", [])
+            if str(ref.get("value") or "")
+        }
+        sequence_files = [
+            {
+                **file,
+                "source_role": uploaded_sequence_sources.get(
+                    str(file.get("file_id") or ""), "uploaded_file"
+                ),
+            }
+            for file in sequence_files
+            if uploaded_sequence_sources.get(
+                str(file.get("file_id") or ""), "uploaded_file"
+            )
+            != "prompt_sequence"
+        ]
 
         tool_call_records: list[ToolCallRecord] = []
         prepared: list[StructureInputRecord] = []
@@ -565,7 +681,7 @@ class StructureAndDesignAgent:
             sequence_refs.append(
                 SequenceRef(
                     sequence_id=sequence_id,
-                    chain_role=_chain_role_from_fasta_file(f, ctype),
+                    chain_role=_chain_role_from_fasta_authority(f),
                     sequence=None,
                     source_kind="uploaded_fasta",
                     source_ref=source_ref,
@@ -1462,6 +1578,8 @@ class StructureAndDesignAgent:
                     ).hexdigest()[:12]
                 else:
                     meta["msa_status"] = "a3m_not_found"
+            elif tc.run_status == "dependency_unavailable":
+                meta["msa_status"] = "dependency_unavailable"
             elif tc.run_status == "failed":
                 meta["msa_status"] = "upstream_error"
             else:
@@ -1790,8 +1908,11 @@ def _bind_step7_resources(
             return _one_or_none(by_type.get("antibody", []), 0.8)
         if role == "complex":
             return _one_or_none(by_type.get("adc_construct", []), 0.7)
-        if resource_kind in {"sequence"}:
-            return _one_or_none([*by_type.get("target_antigen", []), *by_type.get("antibody", [])], 0.5)
+        if resource_kind == "sequence":
+            # A chain-silent FASTA remains unassigned even when only one
+            # candidate happens to exist; candidate cardinality is not role
+            # authority and must not become a fallback classifier.
+            return [], "unassigned", 0.0
         if resource_kind in {"uniprot_id"}:
             return _one_or_none(by_type.get("target_antigen", []), 0.5)
         if resource_kind in {"structure", "pdb_id"}:
@@ -1875,6 +1996,10 @@ def _resource_role(resource: dict, resource_kind: str) -> str | None:
             if role in {"light_chain", "vl", "antibody_light_chain_sequence"}:
                 return "antibody_light"
             return role
+    if resource_kind == "sequence":
+        # Uploaded FASTA role is a Step 2 authority decision. Filename tokens
+        # identify format only and must never bind a biological role here.
+        return None
     filename = (resource.get("original_filename") or "").lower()
     if any(marker in filename for marker in ("heavy", "_vh", "-vh", "_hc", "-hc")):
         return "antibody_heavy"
@@ -2343,17 +2468,12 @@ def _chain_role_from_material(material_type: str) -> Optional[str]:
     }.get(material_type)
 
 
-def _chain_role_from_fasta_file(file_record: dict, candidate_type: str | None) -> str:
-    name = (file_record.get("original_filename") or "").lower()
-    if any(marker in name for marker in ("light", "vl", "lc")):
-        return "antibody_light"
-    if any(marker in name for marker in ("heavy", "vh", "hc")):
-        return "antibody_heavy"
-    if candidate_type == "target_antigen":
-        return "antigen"
-    if candidate_type == "antibody":
-        return "antibody_heavy"
-    return "antigen"
+def _chain_role_from_fasta_authority(file_record: dict) -> str | None:
+    return {
+        "target_sequence": "antigen",
+        "antibody_heavy_chain_sequence": "antibody_heavy",
+        "antibody_light_chain_sequence": "antibody_light",
+    }.get(str(file_record.get("source_role") or ""))
 
 
 def _chain_mapping_from_sequence_refs(sequence_refs: list[SequenceRef]) -> list[ChainMapping]:
@@ -3209,7 +3329,20 @@ def _compact_runtime_sequence_summary(item: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
-_STEP7_SELECTED_FAILURE_STATUSES = {"failed", "upstream_error"}
+_STEP7_SELECTED_FAILURE_STATUSES = {
+    "failed",
+    "upstream_error",
+    "dependency_unavailable",
+}
+
+
+def _step7_warning_reason(tc: ToolCallRecord) -> str:
+    compact = str(tc.error_message or "").strip()
+    if compact and re.fullmatch(r"[a-z0-9_:-]{1,120}", compact):
+        return compact
+    if tc.run_status == "dependency_unavailable":
+        return "selected_tool_dependency_unavailable"
+    return "selected_tool_preparation_failed"
 
 
 def _step7_selected_failure_warnings(
@@ -3232,14 +3365,11 @@ def _step7_selected_failure_warnings(
         warning: dict[str, Any] = {
             "tool_name": tc.tool_name,
             "run_status": tc.run_status,
-            "reason": _short(str(tc.error_message or "selected tool preparation failed")),
+            "reason": _step7_warning_reason(tc),
         }
         chain_role = summary.get("msa_chain_role")
         if chain_role:
             warning["chain_role"] = chain_role
-        label = summary.get("label")
-        if label:
-            warning["label"] = _short(str(label))
         out.append(warning)
     return out
 
@@ -3654,13 +3784,22 @@ def _step8_crystal_validation_args(sin: dict) -> tuple[dict[str, Any], list[str]
     mw = sin.get("molecular_weight_estimate") or {}
     args: dict[str, Any] = {"operation": "validate"}
     missing: list[str] = []
-    a = _float_or_none(crystal.get("a")) if isinstance(crystal, dict) else None
+    cell_parameters = (
+        {
+            name: _float_or_none(crystal.get(name))
+            for name in ("a", "b", "c", "alpha", "beta", "gamma")
+        }
+        if isinstance(crystal, dict)
+        else {}
+    )
     z_value = _int_or_none(crystal.get("z_value")) if isinstance(crystal, dict) else None
     mw_value = _float_or_none(mw.get("value")) if isinstance(mw, dict) else None
-    if a is None:
-        missing.append("a")
-    else:
-        args["a"] = a
+    for name in ("a", "b", "c", "alpha", "beta", "gamma"):
+        value = cell_parameters.get(name)
+        if value is None:
+            missing.append(name)
+        else:
+            args[name] = value
     if z_value is None:
         missing.append("Z")
     else:
@@ -3797,7 +3936,6 @@ def _extract_interface_analysis_records_for_step8(
 def _extract_complex_structure_refs_for_step8(
     storage: Storage, sin: dict, tool_call: ToolCallRecord
 ) -> list[ComplexStructureRef]:
-    summary = tool_call.tool_input_summary or {}
     refs: list[ComplexStructureRef] = []
     if tool_call.tool_name == "PDBePISA_get_interfaces":
         pdb_id = _step8_pdb_id(sin.get("structure_refs") or [])

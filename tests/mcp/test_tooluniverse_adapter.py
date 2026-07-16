@@ -270,7 +270,7 @@ def test_drugprops_qed_requires_smiles():
 
 
 def test_drugprops_qed_live_routes_through_tu(install_universe):
-    fake = install_universe(
+    install_universe(
         tools={"DrugProps_calculate_qed": lambda args: {"qed": 0.55, "smiles": args["smiles"]}}
     )
     out = DrugProps_calculate_qed("CC(=O)Oc1ccccc1C(=O)O", _live=True)
@@ -407,6 +407,171 @@ def test_hydrate_env_bridges_esm_key_for_esm_tools(monkeypatch):
     monkeypatch.setattr(settings, "esm_api_key", "esm-sentinel-key")
     _hydrate_env_from_settings()
     assert os.environ.get("ESM_API_KEY") == "esm-sentinel-key"
+
+
+@pytest.mark.parametrize(
+    ("settings_attr", "file_attr", "env_name"),
+    [
+        ("nvidia_api_key", "nvidia_api_key_file", "NVIDIA_API_KEY"),
+        ("esm_api_key", "esm_api_key_file", "ESM_API_KEY"),
+    ],
+)
+def test_hydrate_env_reads_optional_secret_file(
+    monkeypatch, tmp_path, settings_attr, file_attr, env_name
+):
+    from app.mcp.tooluniverse_adapter import _hydrate_env_from_settings
+    from app.settings import get_settings
+
+    secret_file = tmp_path / "credential"
+    secret_file.write_text("  fake-file-credential-sentinel  ")
+    monkeypatch.delenv(env_name, raising=False)
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, settings_attr, "")
+    monkeypatch.setattr(settings, file_attr, str(secret_file))
+
+    try:
+        _hydrate_env_from_settings()
+        assert os.environ.get(env_name) == "fake-file-credential-sentinel"
+    finally:
+        monkeypatch.delenv(env_name, raising=False)
+
+
+@pytest.mark.parametrize(
+    ("settings_attr", "file_attr", "env_name"),
+    [
+        ("nvidia_api_key", "nvidia_api_key_file", "NVIDIA_API_KEY"),
+        ("esm_api_key", "esm_api_key_file", "ESM_API_KEY"),
+    ],
+)
+def test_hydrate_env_direct_setting_wins_over_bad_file(
+    monkeypatch, tmp_path, settings_attr, file_attr, env_name
+):
+    from app.mcp.tooluniverse_adapter import _hydrate_env_from_settings
+    from app.settings import get_settings
+
+    monkeypatch.delenv(env_name, raising=False)
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, settings_attr, "  fake-direct-credential  ")
+    monkeypatch.setattr(settings, file_attr, str(tmp_path / "missing-file"))
+
+    try:
+        _hydrate_env_from_settings()
+        assert os.environ.get(env_name) == "fake-direct-credential"
+    finally:
+        monkeypatch.delenv(env_name, raising=False)
+
+
+@pytest.mark.parametrize(
+    ("settings_attr", "file_attr", "env_name"),
+    [
+        ("nvidia_api_key", "nvidia_api_key_file", "NVIDIA_API_KEY"),
+        ("esm_api_key", "esm_api_key_file", "ESM_API_KEY"),
+    ],
+)
+def test_hydrate_env_operator_value_wins_over_bad_file(
+    monkeypatch, tmp_path, settings_attr, file_attr, env_name
+):
+    from app.mcp.tooluniverse_adapter import _hydrate_env_from_settings
+    from app.settings import get_settings
+
+    monkeypatch.setenv(env_name, "fake-operator-credential")
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, settings_attr, "")
+    monkeypatch.setattr(settings, file_attr, str(tmp_path / "missing-file"))
+
+    _hydrate_env_from_settings()
+    assert os.environ.get(env_name) == "fake-operator-credential"
+
+
+@pytest.mark.parametrize(
+    ("settings_attr", "file_attr", "env_name", "kind", "error_code"),
+    [
+        (
+            "nvidia_api_key",
+            "nvidia_api_key_file",
+            "NVIDIA_API_KEY",
+            "unreadable",
+            "nvidia_api_key_file_unreadable",
+        ),
+        (
+            "nvidia_api_key",
+            "nvidia_api_key_file",
+            "NVIDIA_API_KEY",
+            "empty",
+            "nvidia_api_key_file_empty",
+        ),
+        (
+            "esm_api_key",
+            "esm_api_key_file",
+            "ESM_API_KEY",
+            "unreadable",
+            "esm_api_key_file_unreadable",
+        ),
+        (
+            "esm_api_key",
+            "esm_api_key_file",
+            "ESM_API_KEY",
+            "empty",
+            "esm_api_key_file_empty",
+        ),
+    ],
+)
+def test_hydrate_env_explicit_bad_file_fails_closed_without_leak(
+    monkeypatch,
+    tmp_path,
+    settings_attr,
+    file_attr,
+    env_name,
+    kind,
+    error_code,
+):
+    from app.mcp.tooluniverse_adapter import _hydrate_env_from_settings
+    from app.settings import get_settings
+
+    secret_path = tmp_path / "private-credential-path-sentinel"
+    if kind == "empty":
+        secret_path.write_text(" \n")
+    monkeypatch.delenv(env_name, raising=False)
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, settings_attr, "")
+    monkeypatch.setattr(settings, file_attr, str(secret_path))
+
+    with pytest.raises(ValueError, match=f"^{error_code}$") as caught:
+        _hydrate_env_from_settings()
+
+    for rendered in (str(caught.value), repr(caught.value), repr(caught.value.args)):
+        assert "private-credential-path-sentinel" not in rendered
+        assert str(tmp_path) not in rendered
+        assert "fake-" not in rendered
+    assert env_name not in os.environ
+
+
+@pytest.mark.parametrize(
+    ("settings_attr", "file_attr", "env_name"),
+    [
+        ("nvidia_api_key", "nvidia_api_key_file", "NVIDIA_API_KEY"),
+        ("esm_api_key", "esm_api_key_file", "ESM_API_KEY"),
+    ],
+)
+def test_hydrate_env_unconfigured_optional_secret_stays_absent(
+    monkeypatch, settings_attr, file_attr, env_name
+):
+    from app.mcp.tooluniverse_adapter import _hydrate_env_from_settings
+    from app.settings import get_settings
+
+    monkeypatch.delenv(env_name, raising=False)
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr(settings, settings_attr, "")
+    monkeypatch.setattr(settings, file_attr, None)
+
+    _hydrate_env_from_settings()
+
+    assert env_name not in os.environ
 
 
 def test_hydrate_env_does_not_overwrite_operator_esm_key(monkeypatch):

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -157,6 +158,109 @@ def test_no_plans_lane_is_missing_input():
     )
     assert a["assessment_status"] == "not_assessed_missing_input"
     assert a["missing_or_unassessed_items"]
+
+
+def test_all_skipped_with_missing_typed_input_is_not_assessed_not_failed():
+    records = [
+        SimpleNamespace(
+            run_status="skipped",
+            tool_input_summary={
+                "validation_status": "skipped",
+                "missing_required_fields": ["required_identifier"],
+                "runtime_resolver_audit": [],
+            },
+            tool_output_ref=None,
+            tool_call_id="tc_missing",
+        ),
+        SimpleNamespace(
+            run_status="not_run",
+            tool_input_summary={
+                "validation_status": "valid",
+                "missing_required_fields": [],
+                "runtime_resolver_audit": [
+                    {"schema_arg": "required_ref", "resolve_status": "unresolved"}
+                ],
+            },
+            tool_output_ref=None,
+            tool_call_id="tc_unresolved",
+        ),
+    ]
+
+    assessment = derive_lane_assessment(
+        lane_type="structure_interface_quality",
+        plans_present=True,
+        flags=[],
+        lane_risk_category="unknown",
+        any_success=False,
+        all_dependency_unavailable=False,
+        has_upstream_error=False,
+        any_failed=False,
+        tool_records=records,
+    )
+
+    assert assessment["assessment_status"] == "not_assessed_missing_input"
+    assert assessment["risk_label"] == "not_assessed"
+    assert "typed or invokable input" in assessment["not_assessed_reason"]
+    assert assessment["missing_or_unassessed_items"]
+    gap = assessment["missing_or_unassessed_items"][0]
+    assert gap["item"] == "required typed tool input"
+    assert gap["missing_field_names"] == ["required_identifier", "required_ref"]
+
+
+def test_attempted_failed_record_is_not_reclassified_as_missing_input():
+    assessment = derive_lane_assessment(
+        lane_type="structure_interface_quality",
+        plans_present=True,
+        flags=[],
+        lane_risk_category="unknown",
+        any_success=False,
+        all_dependency_unavailable=False,
+        has_upstream_error=False,
+        any_failed=True,
+        tool_records=[
+            SimpleNamespace(
+                run_status="failed",
+                tool_input_summary={
+                    "validation_status": "valid",
+                    "missing_required_fields": [],
+                    "runtime_resolver_audit": [],
+                },
+                tool_output_ref=None,
+                tool_call_id="tc_failed",
+            )
+        ],
+    )
+
+    assert assessment["assessment_status"] == "failed"
+    assert assessment["risk_label"] == "unknown"
+
+
+def test_policy_only_skip_is_not_reclassified_as_missing_input():
+    assessment = derive_lane_assessment(
+        lane_type="structure_interface_quality",
+        plans_present=True,
+        flags=[],
+        lane_risk_category="unknown",
+        any_success=False,
+        all_dependency_unavailable=False,
+        has_upstream_error=False,
+        any_failed=False,
+        tool_records=[
+            SimpleNamespace(
+                run_status="skipped",
+                tool_input_summary={
+                    "validation_status": "skipped",
+                    "missing_required_fields": [],
+                    "runtime_resolver_audit": [],
+                },
+                tool_output_ref=None,
+                tool_call_id="tc_policy_skip",
+            )
+        ],
+    )
+
+    assert assessment["assessment_status"] == "failed"
+    assert assessment["risk_label"] == "unknown"
 
 
 def test_interpreted_findings_map_source_tool_call_ids():

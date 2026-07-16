@@ -298,7 +298,9 @@ def _mock_step9_tool_selection_stage1(schema: dict) -> dict:
             {
                 "tool_name": entry.get("tool_name"),
                 "lane_type": entry.get("lane_type"),
-                "selection_reason": "mock selected hard-gate allowed Step 9 tool",
+                "selection_reason": (
+                    "mock selected Step 9 tool from the supplied active catalog"
+                ),
             }
             for entry in catalog
             if isinstance(entry, dict) and entry.get("tool_name") and entry.get("lane_type")
@@ -451,6 +453,80 @@ def _detect_referenced_inputs(text: str) -> list[dict]:
     return refs
 
 
+def _mock_orchestrator_worker_routing(schema: dict) -> dict:
+    """Test/offline-only deterministic routing over the supplied catalog.
+
+    This helper is not a live LLM result and is not a production-provider
+    failure fallback. It only emits agent/capability pairs present in the
+    caller-provided compact AgentCard catalog.
+    """
+    intent = str(schema.get("compact_user_intent") or "").lower()
+    available: dict[str, tuple[str, dict]] = {}
+    for agent in schema.get("compact_card_catalog", []):
+        if not isinstance(agent, dict) or not isinstance(agent.get("agent_id"), str):
+            continue
+        for capability in agent.get("capabilities", []):
+            if isinstance(capability, dict) and isinstance(
+                capability.get("capability_id"), str
+            ):
+                available[capability["capability_id"]] = (
+                    agent["agent_id"], capability
+                )
+
+    requested: list[tuple[str, str, str, str]] = []
+    if "developability" in intent:
+        requested.extend(
+            [
+                (
+                    "step_05_candidate_context",
+                    "Build normalized candidate context for downstream assessment.",
+                    "Candidate context supports the requested developability assessment.",
+                    "high",
+                ),
+                (
+                    "step_06_developability",
+                    "Assess developability and liability risks for normalized candidates.",
+                    "The user requests developability assessment.",
+                    "normal",
+                ),
+            ]
+        )
+    if any(token in intent for token in ("structure", "protein design")):
+        requested.append(
+            (
+                "structure_design_workflow",
+                "Run the sequential structure and design workflow.",
+                "The user requests structure or protein-design analysis.",
+                "high",
+            )
+        )
+    decisions = []
+    for capability_id, objective, reason, priority in requested:
+        match = available.get(capability_id)
+        if match is None:
+            continue
+        decisions.append(
+            {
+                "agent_id": match[0],
+                "capability_id": capability_id,
+                "objective": objective,
+                "selection_reason": reason,
+                "priority": priority,
+            }
+        )
+    return {
+        "loop_decision": (
+            "dispatch_next_workers" if decisions else "route_to_final_response"
+        ),
+        "decisions": decisions,
+        "decision_summary": (
+            "Selected matching capabilities from the supplied catalog."
+            if decisions
+            else "No supplied capability matches the compact user intent."
+        ),
+    }
+
+
 class MockLLMProvider:
     """Rule-based provider used for tests / no-API-key dev.
 
@@ -472,6 +548,8 @@ class MockLLMProvider:
         # Dispatch on `task` first so the selector can reuse the same
         # provider without colliding with the Supervisor parsing path.
         task = (schema or {}).get("task")
+        if task == "orchestrator_worker_routing":
+            return _mock_orchestrator_worker_routing(schema)
         if task == "tool_selection_stage_1":
             return _mock_stage1_selection(schema)
         if task == "tool_selection_stage_2":
@@ -1301,6 +1379,7 @@ _ANTIBODY_SEQUENCE_SOURCES = {
     "antibody_light_chain_sequence",
     "antibody_sequence_reference",
 }
+_TARGET_SEQUENCE_SOURCES = {"target_sequence"}
 _STRUCTURE_FILE_EXTS = (".pdb", ".cif", ".mmcif", ".ent")
 _SEQUENCE_FILE_EXTS = (".fasta", ".fa", ".faa", ".seq")
 
@@ -1341,17 +1420,33 @@ def _missing_slot_signals(
     has_sequence_ref = False
     has_structure_upload = False
     has_sequence_upload = False
+    prompt_file_ids = {
+        str(r.get("value") or "")
+        for r in referenced
+        if isinstance(r, dict)
+        and r.get("id_type") == "uploaded_file"
+        and r.get("source") == "prompt_sequence"
+    }
     for r in referenced:
         if not isinstance(r, dict):
             continue
         idt = (r.get("id_type") or "")
         src = (r.get("source") or "").lower()
         filename = (r.get("filename") or "").lower()
-        if idt in _ANTIBODY_SEQUENCE_SOURCES or src in _ANTIBODY_SEQUENCE_SOURCES:
+        if (
+            idt in _ANTIBODY_SEQUENCE_SOURCES
+            or src in _ANTIBODY_SEQUENCE_SOURCES
+            or idt in _TARGET_SEQUENCE_SOURCES
+            or src in _TARGET_SEQUENCE_SOURCES
+        ):
             has_sequence_ref = True
-        if filename.endswith(_STRUCTURE_FILE_EXTS):
+        file_is_prompt_only = (
+            idt == "uploaded_file"
+            and str(r.get("value") or "") in prompt_file_ids
+        )
+        if filename.endswith(_STRUCTURE_FILE_EXTS) and not file_is_prompt_only:
             has_structure_upload = True
-        if filename.endswith(_SEQUENCE_FILE_EXTS):
+        if filename.endswith(_SEQUENCE_FILE_EXTS) and not file_is_prompt_only:
             has_sequence_upload = True
 
     target_satisfied = bool(target) or "uniprot_id" in ref_id_types or "target_or_antigen" in norm_types

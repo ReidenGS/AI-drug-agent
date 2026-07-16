@@ -317,6 +317,27 @@ def test_step2_prompt_lists_four_field_responsibilities():
     assert "`referenced_inputs`: explicit typed inputs only" in sp
 
 
+def test_step2_prompt_closes_normalized_entity_type_enum():
+    sp = SUPERVISOR_SYSTEM_PROMPT
+    allowed = {
+        "target_or_antigen",
+        "disease_or_indication",
+        "antibody",
+        "payload",
+        "linker",
+        "linker_payload",
+        "drug",
+        "compound",
+        "protein_variant",
+        "other",
+    }
+    entity_type_rule = sp.split("`entity_type` must be exactly one of", 1)[1].split(
+        ". Never invent", 1
+    )[0]
+    assert {value for value in allowed if f"`{value}`" in entity_type_rule} == allowed
+    assert "Never invent, extend,\n  or return any other `entity_type` value." in sp
+
+
 def test_step2_prompt_adc_combination_rules_for_vc_mmae_and_t_dm1():
     sp = SUPERVISOR_SYSTEM_PROMPT
     assert "Composite ADC terms" in sp
@@ -551,7 +572,8 @@ def test_step2_prompt_reports_sequence_role_only_for_ambiguous_uploaded_fasta():
     sp = SUPERVISOR_SYSTEM_PROMPT
     assert "blocking `sequence_role`" in sp
     assert "uploaded FASTA/sequence file exists" in sp
-    assert "role is unclear from filename, metadata, query, or context" in sp
+    assert "user or explicit file `role`/`chain_role`" in sp
+    assert "Never infer this role from\n  filename tokens or sequence content" in sp
     assert "Do not emit it when no FASTA exists" in sp
     assert "or the role is clear" in sp
 
@@ -637,17 +659,20 @@ def test_normalizer_promotes_light_chain_alias_id_types():
         ), alias
 
 
-def test_normalizer_keeps_generic_antibody_sequence_as_generic():
-    """``antibody_sequence`` / ``protein_sequence`` carry no chain
-    information. The normalizer must NOT promote them to heavy; the
-    canonical generic id_type is ``antibody_sequence_reference``."""
-    for alias in ("antibody_sequence", "protein_sequence",
-                  "fasta_sequence", "amino_acid_sequence"):
+def test_normalizer_keeps_chain_silent_sequence_aliases_non_executable():
+    """Chain-silent aliases never invent heavy/light or target authority."""
+    expected = {
+        "antibody_sequence": "antibody_sequence_reference",
+        "protein_sequence": "protein_sequence",
+        "fasta_sequence": "fasta_sequence",
+        "amino_acid_sequence": "amino_acid_sequence",
+    }
+    for alias, canonical in expected.items():
         out = _normalize({"referenced_inputs": [
             {"id_type": alias, "value": "EVQLVQSGAEVKKPGSSVKVSCKAS"},
         ], "parse_warnings": []})
         new_type = out["referenced_inputs"][0]["id_type"]
-        assert new_type == "antibody_sequence_reference", (alias, new_type)
+        assert new_type == canonical, (alias, new_type)
         assert "antibody_heavy_chain_sequence" not in new_type
         assert "antibody_light_chain_sequence" not in new_type
 
@@ -670,7 +695,7 @@ def test_normalizer_repairs_uploaded_file_drifted_source_for_heavy_and_light():
     refs = out["referenced_inputs"]
     assert refs[0]["source"] == "antibody_heavy_chain_sequence"
     assert refs[1]["source"] == "antibody_light_chain_sequence"
-    assert refs[2]["source"] == "antibody_sequence_reference"
+    assert refs[2]["source"] == "protein_sequence"
     # Chain-silent uploaded_file source stays as the existing value.
     assert refs[3]["source"] == "uploaded_file"
     # file_id values untouched.

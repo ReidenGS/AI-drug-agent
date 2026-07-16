@@ -117,3 +117,27 @@ def test_mock_multilane_stage1_selects_all_matching_allowed_tools():
     selections = out["selections"]
     assert [entry["tool_name"] for entry in selections] == allowed_tools
     assert len(selections) == 5
+
+
+def test_mock_step9_stage1_audits_selection_from_supplied_active_catalog():
+    out = MockLLMProvider().generate_json(
+        "pick",
+        schema={
+            "task": "step9_tool_selection_stage_1",
+            "compact_catalog": [
+                {
+                    "tool_name": "ESM_generate_protein_sequence",
+                    "lane_type": "protein_design",
+                }
+            ],
+        },
+    )
+
+    selection = out["selections"][0]
+    assert selection["selection_reason"] == (
+        "mock selected Step 9 tool from the supplied active catalog"
+    )
+    normalized_reason = selection["selection_reason"].lower()
+    assert "hard-gate" not in normalized_reason
+    assert "hard gate" not in normalized_reason
+    assert "readiness gate" not in normalized_reason

@@ -7,15 +7,27 @@ flows through the OpenAI surface the same way it flows through Gemini.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+from threading import Barrier
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from app.a2a.orchestrator_routing_prompt import (
+    ORCHESTRATOR_ROUTING_SYSTEM_PROMPT,
+    ORCHESTRATOR_ROUTING_USER_TASK,
+)
 from app.llm.openai_provider import (
     OpenAIProvider,
     OpenAIProviderError,
+    _OrchestratorRoutingResponse,
+    _PROMPT_CACHE_LAYOUT_VERSION,
     _RESPONSE_MODEL_FOR_TASK,
     _ToolSelectionStage1Response,
     _Step6SchemaMappingStage1Response,
@@ -23,6 +35,7 @@ from app.llm.openai_provider import (
     _Step9SchemaMappingStage2Response,
     _Step9ToolSelectionStage1Response,
     _Step14PatentToolSelectionResponse,
+    _prompt_cache_key,
 )
 
 
@@ -30,11 +43,51 @@ def _provider_with_responses(responses: list[Any]) -> OpenAIProvider:
     provider = OpenAIProvider(api_key="sk-fake-key", max_retries=2)
     calls = iter(responses)
 
-    def _fake_generate_content(prompt: str, *, system: str | None = None) -> Any:
+    def _fake_generate_content(
+        prompt: str,
+        *,
+        system: str | None = None,
+        task: str,
+    ) -> Any:
         return next(calls)
 
     provider._generate_content = _fake_generate_content  # type: ignore[method-assign]
     return provider
+
+
+_EXEC_DIR = Path(__file__).resolve().parents[2]
+
+
+def _run_usage_subprocess(source: str) -> tuple[list[str], str]:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(_EXEC_DIR)
+    result = subprocess.run(
+        [sys.executable, "-c", source],
+        cwd=str(_EXEC_DIR),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    combined = "\n".join((result.stdout, result.stderr))
+    lines = [
+        line
+        for line in combined.splitlines()
+        if line.startswith("OPENAI_USAGE_EVENT=")
+    ]
+    return lines, combined
+
+
+_FAKE_SUCCESS_CALL = r'''
+from types import SimpleNamespace
+provider = OpenAIProvider(api_key="sk-subprocess-private", max_retries=0)
+message = SimpleNamespace(content='{"task_intent":{"task_type":"adc_design"},"mentioned_entities":{}}')
+usage = SimpleNamespace(prompt_tokens=11, completion_tokens=4, total_tokens=15)
+provider._generate_content = lambda *_args, **_kwargs: SimpleNamespace(
+    choices=[SimpleNamespace(message=message)], usage=usage
+)
+provider.generate_json("FASTA_PRIVATE_SUBPROCESS", schema={"raw_request_record": {}})
+'''
 
 
 def _chat_response(content: str) -> Any:
@@ -297,6 +350,40 @@ def test_usage_events_record_token_counts_per_attempt():
     }
 
 
+def test_usage_log_records_one_canonical_compact_event(caplog):
+    provider = _provider_with_responses([
+        _chat_response_with_usage(
+            '{"task_intent":{"task_type":"adc_design"},"mentioned_entities":{}}',
+            prompt=12,
+            completion=3,
+            total=15,
+        )
+    ])
+    provider.generate_json("safe prompt", schema={"raw_request_record": {}})
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("OPENAI_USAGE_EVENT=")
+    ]
+    assert len(messages) == 1
+    payload = json.loads(messages[0].removeprefix("OPENAI_USAGE_EVENT="))
+    assert payload == provider.usage_events[0]
+    assert set(payload) == {
+        "provider",
+        "model",
+        "task",
+        "attempt",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "cached_prompt_tokens",
+    }
+    assert messages[0] == "OPENAI_USAGE_EVENT=" + json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    )
+
+
 def test_usage_events_recorded_for_each_retry_attempt():
     """Each provider call costs real tokens. A retry triggered by a
     malformed first response must still log the first attempt."""
@@ -316,6 +403,31 @@ def test_usage_events_recorded_for_each_retry_attempt():
     assert provider.usage_events[1]["total_tokens"] == 92
 
 
+def test_usage_log_records_every_paid_retry_attempt(caplog):
+    provider = _provider_with_responses([
+        _chat_response_with_usage("not json", prompt=20, completion=2, total=22),
+        _chat_response_with_usage(
+            '{"task_intent":{"task_type":"adc_design"},"mentioned_entities":{}}',
+            prompt=25,
+            completion=4,
+            total=29,
+        ),
+    ])
+    provider.generate_json("safe prompt", schema={"raw_request_record": {}})
+
+    log_lines = [record.getMessage() for record in caplog.records]
+    payloads = [
+        json.loads(line.removeprefix("OPENAI_USAGE_EVENT="))
+        for line in log_lines
+        if line.startswith("OPENAI_USAGE_EVENT=")
+    ]
+    assert [payload["attempt"] for payload in payloads] == [0, 1]
+    assert [payload["total_tokens"] for payload in payloads] == [22, 29]
+    log_blob = "\n".join(log_lines)
+    assert "not json" not in log_blob
+    assert "sk-fake-key" not in log_blob
+
+
 def test_usage_event_degrades_to_null_when_response_has_no_usage_field():
     """Some SDK / proxy responses omit the usage block. The event must
     still be appended with token fields set to None — never crash."""
@@ -331,6 +443,53 @@ def test_usage_event_degrades_to_null_when_response_has_no_usage_field():
     assert evt["total_tokens"] is None
 
 
+def test_usage_log_missing_usage_is_null_and_contains_no_sensitive_content(caplog):
+    prompt_sentinel = (
+        "FASTA_SEQUENCE_PRIVATE_ACDEFGHIK "
+        "FULL_PROMPT_PRIVATE TOOLUNIVERSE_RAW_PRIVATE "
+        "https://private-endpoint.invalid /private/storage/path"
+    )
+    response_sentinel = "ATOM_PRIVATE_PDB_RESPONSE"
+    message = SimpleNamespace(
+        content=(
+            '{"task_intent":{"task_type":"adc_design"},'
+            '"mentioned_entities":{"target_or_antigen_text":"'
+            + response_sentinel
+            + '"}}'
+        )
+    )
+    provider = OpenAIProvider(api_key="sk-private-usage-log-key", max_retries=0)
+    provider._generate_content = lambda *_args, **_kwargs: SimpleNamespace(  # type: ignore[method-assign]
+        choices=[SimpleNamespace(message=message)]
+    )
+    provider.generate_json(prompt_sentinel, schema={"raw_request_record": {}})
+
+    log_lines = [record.getMessage() for record in caplog.records]
+    usage_messages = [
+        line
+        for line in log_lines
+        if line.startswith("OPENAI_USAGE_EVENT=")
+    ]
+    assert len(usage_messages) == 1
+    payload = json.loads(usage_messages[0].removeprefix("OPENAI_USAGE_EVENT="))
+    assert payload["prompt_tokens"] is None
+    assert payload["completion_tokens"] is None
+    assert payload["total_tokens"] is None
+    assert payload["cached_prompt_tokens"] is None
+    log_blob = "\n".join(log_lines)
+    for sentinel in (
+        "sk-private-usage-log-key",
+        prompt_sentinel,
+        response_sentinel,
+        "Authorization",
+        "FULL_PROMPT_PRIVATE",
+        "TOOLUNIVERSE_RAW_PRIVATE",
+        "private-endpoint",
+        "/private/storage/path",
+    ):
+        assert sentinel not in log_blob
+
+
 def test_usage_events_carry_no_prompt_response_or_api_key():
     """Defensive content check: the compact event must never include
     prompt body, response body, schema payload, or the API key."""
@@ -341,7 +500,12 @@ def test_usage_events_carry_no_prompt_response_or_api_key():
     )
     provider = OpenAIProvider(api_key="sk-very-secret-key", max_retries=0)
 
-    def _fake_generate_content(prompt: str, *, system: str | None = None) -> Any:
+    def _fake_generate_content(
+        prompt: str,
+        *,
+        system: str | None = None,
+        task: str,
+    ) -> Any:
         # The provider must NOT carry `prompt` through to the event.
         return _chat_response_with_usage(secret_response, prompt=10, completion=5, total=15)
 
@@ -354,6 +518,95 @@ def test_usage_events_carry_no_prompt_response_or_api_key():
     assert "USER PROMPT BODY" not in blob
     assert "SECRET HER2 SCAFFOLD" not in blob
     assert "HER2_SECRET" not in blob
+
+
+def test_usage_telemetry_visible_with_default_subprocess_logging():
+    lines, combined = _run_usage_subprocess(
+        "import logging\n"
+        "assert logging.getLogger().getEffectiveLevel() >= logging.WARNING\n"
+        "from app.llm.openai_provider import OpenAIProvider\n"
+        + _FAKE_SUCCESS_CALL
+    )
+
+    assert len(lines) == 1
+    payload = json.loads(lines[0].removeprefix("OPENAI_USAGE_EVENT="))
+    assert payload["attempt"] == 0
+    assert payload["total_tokens"] == 15
+    assert "sk-subprocess-private" not in combined
+    assert "FASTA_PRIVATE_SUBPROCESS" not in combined
+
+
+@pytest.mark.parametrize("configure_order", ["before_import", "after_import"])
+def test_usage_telemetry_visible_once_with_uvicorn_default_logging(configure_order):
+    if configure_order == "before_import":
+        prelude = (
+            "from uvicorn import Config\n"
+            "Config('app.main:app').configure_logging()\n"
+            "from app.llm.openai_provider import OpenAIProvider\n"
+        )
+    else:
+        prelude = (
+            "import app.llm.openai_provider as provider_module\n"
+            "from uvicorn import Config\n"
+            "Config('app.main:app').configure_logging()\n"
+            "OpenAIProvider = provider_module.OpenAIProvider\n"
+        )
+    lines, combined = _run_usage_subprocess(prelude + _FAKE_SUCCESS_CALL)
+
+    assert len(lines) == 1
+    assert json.loads(lines[0].removeprefix("OPENAI_USAGE_EVENT="))["attempt"] == 0
+    assert "sk-subprocess-private" not in combined
+    assert "FASTA_PRIVATE_SUBPROCESS" not in combined
+
+
+def test_usage_telemetry_module_reload_does_not_duplicate_handler():
+    lines, _combined = _run_usage_subprocess(
+        "import importlib\n"
+        "import app.llm.openai_provider as provider_module\n"
+        "provider_module = importlib.reload(provider_module)\n"
+        "provider_module = importlib.reload(provider_module)\n"
+        "OpenAIProvider = provider_module.OpenAIProvider\n"
+        + _FAKE_SUCCESS_CALL
+    )
+
+    assert len(lines) == 1
+    assert json.loads(lines[0].removeprefix("OPENAI_USAGE_EVENT="))["attempt"] == 0
+
+
+def test_usage_telemetry_subprocess_retry_emits_exact_attempts_without_leak():
+    source = r'''
+from types import SimpleNamespace
+from app.llm.openai_provider import OpenAIProvider
+provider = OpenAIProvider(api_key="sk-retry-private", max_retries=1)
+responses = iter([
+    SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="not json"))],
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2, total_tokens=12),
+    ),
+    SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(
+            content='{"task_intent":{"task_type":"adc_design"},"mentioned_entities":{}}'
+        ))],
+        usage=SimpleNamespace(prompt_tokens=14, completion_tokens=3, total_tokens=17),
+    ),
+])
+provider._generate_content = lambda *_args, **_kwargs: next(responses)
+provider.generate_json("A3M_PRIVATE_RETRY_PROMPT", schema={"raw_request_record": {}})
+'''
+    lines, combined = _run_usage_subprocess(source)
+
+    assert len(lines) == 2
+    payloads = [
+        json.loads(line.removeprefix("OPENAI_USAGE_EVENT=")) for line in lines
+    ]
+    assert [payload["attempt"] for payload in payloads] == [0, 1]
+    assert [payload["total_tokens"] for payload in payloads] == [12, 17]
+    for sentinel in (
+        "sk-retry-private",
+        "A3M_PRIVATE_RETRY_PROMPT",
+        "not json",
+    ):
+        assert sentinel not in combined
 
 
 # ── cached prompt tokens (OpenAI auto prompt caching) ─────────────────────
@@ -427,7 +680,12 @@ def test_cached_field_does_not_leak_prompt_or_response(monkeypatch):
     the event must not carry prompt body, response body, or API key."""
     provider = OpenAIProvider(api_key="sk-cache-secret", max_retries=0)
 
-    def _fake_generate_content(prompt: str, *, system: str | None = None) -> Any:
+    def _fake_generate_content(
+        prompt: str,
+        *,
+        system: str | None = None,
+        task: str,
+    ) -> Any:
         return _chat_response_with_cache(
             '{"task_intent":{"task_type":"adc_design"},'
             '"mentioned_entities":{"target_or_antigen_text":"HER2_CACHE_SECRET"}}',
@@ -458,7 +716,12 @@ def test_openai_system_prompt_is_not_embedded_into_user_message():
 
     provider = OpenAIProvider(api_key="sk-fake-dedup", max_retries=0)
 
-    def _fake_generate_content(prompt: str, *, system: str | None = None) -> Any:
+    def _fake_generate_content(
+        prompt: str,
+        *,
+        system: str | None = None,
+        task: str,
+    ) -> Any:
         captured["prompt"] = prompt
         captured["system"] = system
         return _chat_response(
@@ -494,7 +757,12 @@ def test_openai_handles_none_system_without_embedding_anything():
     captured: dict[str, Any] = {}
     provider = OpenAIProvider(api_key="sk-fake-no-sys", max_retries=0)
 
-    def _fake_generate_content(prompt: str, *, system: str | None = None) -> Any:
+    def _fake_generate_content(
+        prompt: str,
+        *,
+        system: str | None = None,
+        task: str,
+    ) -> Any:
         captured["prompt"] = prompt
         captured["system"] = system
         return _chat_response(
@@ -551,6 +819,177 @@ def _provider_with_client(client: Any, *, max_retries: int = 2) -> OpenAIProvide
     return provider
 
 
+def test_gpt55_structured_parser_receives_prompt_cache_kwargs():
+    parsed = _ToolSelectionStage1Response(
+        selections=[{"tool_name": "DrugProps_calculate_qed"}]
+    )
+    client = _fake_openai_client(parse=_parsed_response(parsed))
+    provider = _provider_with_client(client)
+    provider.model = "gpt-5.5"
+
+    provider.generate_json("dynamic query A", schema={"task": "tool_selection_stage_1"})
+
+    kwargs = client._calls["parse"][0]
+    assert kwargs["prompt_cache_retention"] == "24h"
+    assert kwargs["prompt_cache_key"] == _prompt_cache_key(
+        model="gpt-5.5", task="tool_selection_stage_1"
+    )
+
+
+def test_gpt55_json_object_receives_prompt_cache_kwargs():
+    client = _fake_openai_client(
+        create=_chat_response(
+            '{"task_intent":{"task_type":"adc_design"},"mentioned_entities":{}}'
+        )
+    )
+    provider = _provider_with_client(client)
+    provider.model = "gpt-5.5"
+
+    provider.generate_json("dynamic query B", schema={"raw_request_record": {}})
+
+    kwargs = client._calls["create"][0]
+    assert kwargs["prompt_cache_retention"] == "24h"
+    assert kwargs["prompt_cache_key"] == _prompt_cache_key(
+        model="gpt-5.5", task="structured_query"
+    )
+
+
+def test_parser_fallback_reuses_identical_prompt_cache_key():
+    client = _fake_openai_client(
+        parse=lambda **_kw: (_ for _ in ()).throw(
+            TypeError("response_format invalid schema")
+        ),
+        create=_chat_response(
+            json.dumps({
+                "selections": [{"tool_name": "DrugProps_calculate_qed"}]
+            })
+        ),
+    )
+    provider = _provider_with_client(client)
+    provider.model = "gpt-5.5-2026-07-15"
+
+    provider.generate_json("dynamic query", schema={"task": "tool_selection_stage_1"})
+
+    parse_kwargs = client._calls["parse"][0]
+    create_kwargs = client._calls["create"][0]
+    assert parse_kwargs["prompt_cache_key"] == create_kwargs["prompt_cache_key"]
+    assert parse_kwargs["prompt_cache_key"] == _prompt_cache_key(
+        model="gpt-5.5-2026-07-15",
+        task="tool_selection_stage_1",
+    )
+    assert parse_kwargs["prompt_cache_retention"] == "24h"
+    assert create_kwargs["prompt_cache_retention"] == "24h"
+
+
+def test_concurrent_generate_json_keeps_parser_cache_and_usage_task_local():
+    entered_parse = Barrier(2, timeout=5)
+    parsed_by_model = {
+        _ToolSelectionStage1Response: _ToolSelectionStage1Response(
+            selections=[{"tool_name": "DrugProps_calculate_qed"}]
+        ),
+        _OrchestratorRoutingResponse: _OrchestratorRoutingResponse.model_validate(
+            _orchestrator_response()
+        ),
+    }
+
+    def _parse(**kwargs: Any) -> Any:
+        entered_parse.wait()
+        return _parsed_response(parsed_by_model[kwargs["response_format"]])
+
+    client = _fake_openai_client(parse=_parse)
+    provider = _provider_with_client(client)
+    provider.model = "gpt-5.5"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        stage1_future = executor.submit(
+            provider.generate_json,
+            "stage1 dynamic prompt",
+            schema={"task": "tool_selection_stage_1"},
+        )
+        orchestrator_future = executor.submit(
+            provider.generate_json,
+            "orchestrator dynamic prompt",
+            schema={"task": "orchestrator_worker_routing"},
+        )
+        stage1_result = stage1_future.result()
+        orchestrator_result = orchestrator_future.result()
+
+    assert stage1_result["selections"][0]["tool_name"] == (
+        "DrugProps_calculate_qed"
+    )
+    assert orchestrator_result == _orchestrator_response()
+
+    calls_by_model = {
+        call["response_format"]: call for call in client._calls["parse"]
+    }
+    stage1_call = calls_by_model[_ToolSelectionStage1Response]
+    orchestrator_call = calls_by_model[_OrchestratorRoutingResponse]
+    assert stage1_call["prompt_cache_key"] == _prompt_cache_key(
+        model="gpt-5.5",
+        task="tool_selection_stage_1",
+    )
+    assert orchestrator_call["prompt_cache_key"] == _prompt_cache_key(
+        model="gpt-5.5",
+        task="orchestrator_worker_routing",
+    )
+    assert stage1_call["prompt_cache_key"] != orchestrator_call["prompt_cache_key"]
+    assert stage1_call["prompt_cache_retention"] == "24h"
+    assert orchestrator_call["prompt_cache_retention"] == "24h"
+    assert {event["task"] for event in provider.usage_events} == {
+        "tool_selection_stage_1",
+        "orchestrator_worker_routing",
+    }
+    assert not hasattr(provider, "_active_task")
+
+
+def test_prompt_cache_key_ignores_dynamic_prompt_and_changes_by_namespace(caplog):
+    parsed = _ToolSelectionStage1Response(
+        selections=[{"tool_name": "DrugProps_calculate_qed"}]
+    )
+    client = _fake_openai_client(parse=_parsed_response(parsed))
+    provider = _provider_with_client(client)
+    provider.model = "gpt-5.5"
+    dynamic_sentinels = (
+        "QUERY_PRIVATE_ONE",
+        "QUERY_PRIVATE_TWO",
+        "sk-private-cache-test",
+        "ATOM_PRIVATE_CACHE_TEST",
+    )
+
+    for prompt in dynamic_sentinels[:2]:
+        provider.generate_json(prompt, schema={"task": "tool_selection_stage_1"})
+
+    keys = [call["prompt_cache_key"] for call in client._calls["parse"]]
+    assert len(set(keys)) == 1
+    assert keys[0].startswith("adcpc_") and len(keys[0]) == 38
+    assert _prompt_cache_key(model="gpt-5.5", task="different_task") != keys[0]
+    assert _prompt_cache_key(
+        model="gpt-5.5",
+        task="tool_selection_stage_1",
+        layout_version=_PROMPT_CACHE_LAYOUT_VERSION + "-next",
+    ) != keys[0]
+    log_blob = "\n".join(record.getMessage() for record in caplog.records)
+    usage_blob = json.dumps(provider.usage_events)
+    for sentinel in (*dynamic_sentinels, keys[0]):
+        assert sentinel not in log_blob
+        assert sentinel not in usage_blob
+
+
+def test_non_gpt55_model_omits_prompt_cache_retention():
+    parsed = _ToolSelectionStage1Response(
+        selections=[{"tool_name": "DrugProps_calculate_qed"}]
+    )
+    client = _fake_openai_client(parse=_parsed_response(parsed))
+    provider = _provider_with_client(client)
+    provider.model = "gpt-4.1-mini"
+
+    provider.generate_json("dynamic query", schema={"task": "tool_selection_stage_1"})
+
+    kwargs = client._calls["parse"][0]
+    assert "prompt_cache_key" in kwargs
+    assert "prompt_cache_retention" not in kwargs
+
+
 # ── strict-schema compliance (real production requirement, not fake client) ─
 
 
@@ -589,6 +1028,7 @@ def test_parser_models_produce_real_strict_schema():
         "step9_tool_selection_stage_1",
         "step9_tool_schema_mapping_stage_2",
         "step14_patent_tool_selection",
+        "orchestrator_worker_routing",
     }
     assert "step6_schema_mapping_stage_2" not in _RESPONSE_MODEL_FOR_TASK
     for task, model in _RESPONSE_MODEL_FOR_TASK.items():
@@ -663,6 +1103,228 @@ def test_openai_step6_stage1_uses_structured_parser_and_validated():
     assert client._calls["parse"] and not client._calls["create"]
     assert client._calls["parse"][0]["response_format"] is _Step6SchemaMappingStage1Response
     assert out["selections"][0]["tool_name"] == "DrugProps_pains_filter"
+
+
+def _orchestrator_response(**overrides: Any) -> dict[str, Any]:
+    decision = {
+        "agent_id": "step_06_developability_agent",
+        "capability_id": "step_06_developability",
+        "objective": "Assess developability.",
+        "selection_reason": "The user requested developability assessment.",
+        "priority": "normal",
+    }
+    decision.update(overrides)
+    return {
+        "loop_decision": "dispatch_next_workers",
+        "decisions": [decision],
+        "decision_summary": "Dispatch the developability worker.",
+    }
+
+
+def _orchestrator_prompt_schema() -> dict[str, Any]:
+    return {
+        "task": "orchestrator_worker_routing",
+        "compact_card_catalog": [
+            {
+                "agent_id": "step_06_developability_agent",
+                "capabilities": [
+                    {"capability_id": "step_06_developability"}
+                ],
+            }
+        ],
+        "compact_user_intent": "Assess developability",
+        "structured_intent": {},
+        "input_readiness_summary": {"input_readiness_status": "ready"},
+        "available_artifact_summary": [],
+        "current_routing_context": {},
+    }
+
+
+def test_openai_orchestrator_uses_official_parser_and_returns_external_dict():
+    parsed = _OrchestratorRoutingResponse.model_validate(_orchestrator_response())
+    client = _fake_openai_client(parse=_parsed_response(parsed))
+    provider = _provider_with_client(client)
+
+    out = provider.generate_json(
+        "route", schema={"task": "orchestrator_worker_routing"}
+    )
+
+    assert len(client._calls["parse"]) == 1
+    assert client._calls["create"] == []
+    assert client._calls["parse"][0]["response_format"] is _OrchestratorRoutingResponse
+    assert isinstance(out, dict)
+    assert out == _orchestrator_response()
+
+
+def test_openai_orchestrator_system_role_is_not_duplicated_in_user_message():
+    parsed = _OrchestratorRoutingResponse.model_validate(_orchestrator_response())
+    client = _fake_openai_client(parse=_parsed_response(parsed))
+    provider = _provider_with_client(client)
+
+    provider.generate_json(
+        ORCHESTRATOR_ROUTING_USER_TASK,
+        schema=_orchestrator_prompt_schema(),
+        system=ORCHESTRATOR_ROUTING_SYSTEM_PROMPT,
+    )
+
+    messages = client._calls["parse"][0]["messages"]
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert messages[0]["content"] == ORCHESTRATOR_ROUTING_SYSTEM_PROMPT
+    user = messages[1]["content"]
+    assert ORCHESTRATOR_ROUTING_SYSTEM_PROMPT not in user
+    assert ORCHESTRATOR_ROUTING_USER_TASK in user
+    assert user.count('"input_situation"') == 2
+    assert "Compact AgentCard catalog JSON:" in user
+    assert "step_06_developability_agent" in user
+    assert sum(
+        message["content"].count(ORCHESTRATOR_ROUTING_SYSTEM_PROMPT)
+        for message in messages
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("agent_id", ""),
+        ("capability_id", ""),
+        ("objective", ""),
+        ("selection_reason", ""),
+        ("priority", "urgent"),
+    ],
+)
+def test_openai_orchestrator_parser_model_validates_decision_fields(field, value):
+    with pytest.raises(ValueError):
+        _OrchestratorRoutingResponse.model_validate(
+            _orchestrator_response(**{field: value})
+        )
+
+
+def test_openai_orchestrator_parser_model_rejects_empty_summary():
+    with pytest.raises(ValueError):
+        _OrchestratorRoutingResponse.model_validate(
+            {**_orchestrator_response(), "decision_summary": ""}
+        )
+
+
+@pytest.mark.parametrize("field", ["objective", "selection_reason"])
+def test_openai_orchestrator_empty_decision_field_retries(field):
+    bad = _orchestrator_response(**{field: ""})
+    good = _OrchestratorRoutingResponse.model_validate(_orchestrator_response())
+    sequence = iter([_parsed_response(bad), _parsed_response(good)])
+    client = _fake_openai_client(parse=lambda **kw: next(sequence))
+    provider = _provider_with_client(client, max_retries=1)
+
+    out = provider.generate_json(
+        "route", schema={"task": "orchestrator_worker_routing"}
+    )
+
+    assert len(client._calls["parse"]) == 2
+    assert out["decisions"][0][field]
+
+
+def test_openai_orchestrator_empty_summary_retries():
+    bad = {**_orchestrator_response(), "decision_summary": ""}
+    good = _OrchestratorRoutingResponse.model_validate(_orchestrator_response())
+    sequence = iter([_parsed_response(bad), _parsed_response(good)])
+    client = _fake_openai_client(parse=lambda **kw: next(sequence))
+    provider = _provider_with_client(client, max_retries=1)
+
+    out = provider.generate_json(
+        "route", schema={"task": "orchestrator_worker_routing"}
+    )
+
+    assert len(client._calls["parse"]) == 2
+    assert out["decision_summary"]
+
+
+def test_openai_orchestrator_parser_unavailable_uses_json_object_fallback():
+    client = _fake_openai_client(
+        has_parse=False,
+        create=_chat_response(json.dumps(_orchestrator_response())),
+    )
+    provider = _provider_with_client(client)
+
+    out = provider.generate_json(
+        "route", schema={"task": "orchestrator_worker_routing"}
+    )
+
+    assert client._calls["parse"] == []
+    assert len(client._calls["create"]) == 1
+    assert out == _orchestrator_response()
+
+
+def test_openai_orchestrator_schema_incompatibility_uses_fallback():
+    def _incompatible(**kw: Any) -> Any:
+        raise TypeError("response_format invalid schema")
+
+    client = _fake_openai_client(
+        parse=_incompatible,
+        create=_chat_response(json.dumps(_orchestrator_response())),
+    )
+    provider = _provider_with_client(client)
+
+    out = provider.generate_json(
+        "route", schema={"task": "orchestrator_worker_routing"}
+    )
+
+    assert len(client._calls["parse"]) == 1
+    assert len(client._calls["create"]) == 1
+    assert out == _orchestrator_response()
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError("network down"), RuntimeError("auth failed"), RuntimeError("rate limit")]
+)
+def test_openai_orchestrator_runtime_errors_do_not_silent_fallback(error):
+    def _fail(**kw: Any) -> Any:
+        raise error
+
+    client = _fake_openai_client(
+        parse=_fail,
+        create=_chat_response(json.dumps(_orchestrator_response())),
+    )
+    provider = _provider_with_client(client)
+
+    with pytest.raises(RuntimeError, match=str(error)):
+        provider.generate_json(
+            "route", schema={"task": "orchestrator_worker_routing"}
+        )
+    assert client._calls["create"] == []
+
+
+def test_openai_orchestrator_usage_event_is_compact_and_private():
+    usage = SimpleNamespace(prompt_tokens=90, completion_tokens=20, total_tokens=110)
+    parsed = _OrchestratorRoutingResponse.model_validate(_orchestrator_response())
+    client = _fake_openai_client(parse=_parsed_response(parsed, usage=usage))
+    provider = _provider_with_client(client)
+
+    provider.generate_json(
+        "FULL_PROMPT_SECRET",
+        schema={"task": "orchestrator_worker_routing", "private": "RAW_SCHEMA_SECRET"},
+        system="SYSTEM_SECRET",
+    )
+
+    assert provider.usage_events == [
+        {
+            "provider": "openai",
+            "model": provider.model,
+            "task": "orchestrator_worker_routing",
+            "attempt": 0,
+            "prompt_tokens": 90,
+            "completion_tokens": 20,
+            "total_tokens": 110,
+            "cached_prompt_tokens": None,
+        }
+    ]
+    blob = json.dumps(provider.usage_events)
+    for forbidden in (
+        "FULL_PROMPT_SECRET",
+        "SYSTEM_SECRET",
+        "RAW_SCHEMA_SECRET",
+        "sk-fake-parser",
+        "response_format",
+    ):
+        assert forbidden not in blob
 
 
 def test_openai_step14_uses_structured_parser_and_normalizes_literals():

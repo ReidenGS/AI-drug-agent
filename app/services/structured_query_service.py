@@ -16,6 +16,7 @@ from .workflow_state_service import WorkflowStateService
 
 
 _ARTIFACT_KEY = "inputs/structured_query.json"
+_HISTORY_KEY = "inputs/history/structured_query/{artifact_id}.json"
 
 
 class StructuredQueryService:
@@ -40,13 +41,44 @@ class StructuredQueryService:
         raw_payload = self.storage.read_json(
             self.storage.run_key(run_id, "inputs/raw_request_record.json")
         )
-        sq = self.supervisor.parse_raw_to_structured_query(raw_payload)
+        return self.parse_effective(run_id, raw_payload)
+
+    def parse_effective(
+        self, run_id: str, effective_raw_payload: dict
+    ) -> StructuredQuery:
+        """Parse an in-memory same-run projection without rewriting Step 1."""
+
+        reg = self.registry.get(run_id)
+        raw_id = reg.active_artifacts.raw_request_record_id
+        if (
+            not raw_id
+            or effective_raw_payload.get("run_id") != run_id
+            or effective_raw_payload.get("artifact_id") != raw_id
+        ):
+            raise WorkflowStateError("structured_query_source_invalid")
+        sq = self.supervisor.parse_raw_to_structured_query(
+            effective_raw_payload
+        )
 
         artifact_id = new_artifact_id("structured_query")
+        body = {"artifact_id": artifact_id, **sq.model_dump()}
+        self.storage.write_json(
+            self.storage.run_key(
+                run_id,
+                _HISTORY_KEY.format(artifact_id=artifact_id),
+            ),
+            body,
+        )
         self.storage.write_json(
             self.storage.run_key(run_id, _ARTIFACT_KEY),
-            {"artifact_id": artifact_id, **sq.model_dump()},
+            body,
         )
         self.registry.update_active(run_id, structured_query_id=artifact_id)
         self.workflow_state.mark(run_id, "step_02", "completed")
         return sq
+
+
+def structured_query_history_key(artifact_id: str) -> str:
+    """Return the same-run immutable audit key for one Step 2 artifact."""
+
+    return _HISTORY_KEY.format(artifact_id=artifact_id)

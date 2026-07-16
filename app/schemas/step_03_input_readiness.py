@@ -78,6 +78,9 @@ class MissingInputItem(BaseModel):
     message: str
     category: GapCategory = "other"
     evidence_field: Optional[str] = None
+    # Blocking means routing is forbidden. Recoverable says whether a
+    # concrete clarification can return the request to Step 2/3.
+    recoverable: bool = True
 
 
 class ClarificationRequest(BaseModel):

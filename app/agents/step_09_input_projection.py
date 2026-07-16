@@ -717,13 +717,15 @@ def _project_step8_fields(step8_result: dict[str, Any], candidate_id: str) -> li
                     supports_tool_args=list(_STRUCTURE_TOOL_ARGS),
                     can_resolve_at_runtime=True,
                     llm_safe_metadata={},
-                    # `validated_structure_ref` may be a material_id or a
-                    # storage path, not a usable path by itself — the actual
-                    # value is NEVER copied here. Real resolution must walk
-                    # back through Step 7 / Step 5 / storage at execution time.
+                    # `validated_structure_ref` may be a Step 7 file_id /
+                    # source_ref, a Step 5 material_id, or a storage path. The
+                    # actual storage value is NEVER copied here. Real
+                    # resolution must walk back through Step 7 / Step 5 /
+                    # storage at execution time.
                     runtime_lookup={
                         "resolution_path": [
                             "step_08.candidate_structure_results[].downstream_handoff.validated_structure_ref",
+                            "step_07.prepared_structure_inputs[].structure_refs[].file_id",
                             "step_07.prepared_structure_inputs[].structure_refs[].storage_ref",
                             "step_05.candidate_records[].materials[]",
                         ],

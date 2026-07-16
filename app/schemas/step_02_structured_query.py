@@ -203,6 +203,10 @@ class StructuredQuery(BaseModel):
     requested_outputs: list[str] = Field(default_factory=list)
     user_constraints: list[dict] = Field(default_factory=list)
     parse_warnings: list[str] = Field(default_factory=list)
+    # Deterministic normalization audit. Values count typed references removed
+    # after the LLM response failed the corresponding production validator;
+    # raw rejected values are never persisted here.
+    dropped_referenced_input_counts: dict[str, int] = Field(default_factory=dict)
     # Batch 5 additions — all default to empty so existing artifacts /
     # callers that don't populate them continue to validate.
     normalized_entities: list[NormalizedEntity] = Field(default_factory=list)

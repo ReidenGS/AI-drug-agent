@@ -57,7 +57,6 @@ from .antibody_cdr3_extraction import (
     CHAIN_TYPE_LIGHT,
     Cdr3Result,
     STATUS_DEPENDENCY_UNAVAILABLE as _CDR3_STATUS_DEPENDENCY_UNAVAILABLE,
-    STATUS_EXTRACTION_FAILED as _CDR3_STATUS_EXTRACTION_FAILED,
     STATUS_NO_VARIABLE_DOMAIN as _CDR3_STATUS_NO_VARIABLE_DOMAIN,
     STATUS_SUCCESS as _CDR3_STATUS_SUCCESS,
     extract_cdr3,
@@ -68,8 +67,6 @@ from .step_05_enrichment_registry import (
     skipped_low_information_chembl_name_queries,
 )
 from .step_05_selection_policy import (
-    SELECTION_POLICY_VERSION as STEP5_SELECTION_POLICY_VERSION,
-    Step5ToolDecision,
     select_step5_enrichment_plans,
     selection_provenance_for_tool_input_summary,
 )
@@ -194,6 +191,7 @@ _ANTIBODY_SEQUENCE_REF_ID_TYPES = (
 _ANTIBODY_SEQUENCE_REFERENCE_ID_TYPES = (
     "antibody_sequence_reference",
 )
+_TARGET_SEQUENCE_REF_ID_TYPES = ("target_sequence",)
 
 
 def _looks_like_antibody_name(text: str | None) -> bool:
@@ -232,24 +230,6 @@ def _looks_like_antibody_name(text: str | None) -> bool:
         return False
     return True
 
-_HEAVY_CHAIN_HINTS = {
-    "heavy", "heavychain", "heavy_chain", "vh", "hc", "igh", "ighv",
-}
-_LIGHT_CHAIN_HINTS = {
-    "light", "lightchain", "light_chain", "vl", "lc", "kappa", "lambda",
-    "igk", "igl", "igkv", "iglv",
-}
-_ANTIBODY_GENERIC_HINTS = {
-    "antibody",
-}
-_TARGET_FASTA_HINTS = {
-    "antigen",
-    "target",
-    "targetsequence",
-    "antigensequence",
-}
-
-
 # Structure-reference role inference. We never open the PDB; we look at
 # the filename and the surrounding user text for keywords. Each pattern
 # maps a keyword set to a more specific reference role; falls back to
@@ -275,231 +255,29 @@ _STRUCTURE_ROLE_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
-def _token_set(value: str | None) -> set[str]:
-    if not value:
-        return set()
-    return {
-        token
-        for token in re.split(r"[^a-z0-9]+", value.lower())
-        if len(token) >= 3
-    }
-
-
-def _fasta_file_tokens(file: dict[str, Any]) -> set[str]:
-    """Extract defensive sequence-file tokens from metadata.
-
-    We only rely on metadata to infer routing signals; no FASTA contents
-    are read at this stage.
-    """
-    haystack = " ".join(
-        str(file.get(key) or "")
-        for key in (
-            "original_filename",
-            "file_id",
-            "role",
-            "chain_role",
-            "material_role",
-            "description",
-            "source",
-        )
-    )
-    return _token_set(haystack)
-
-
-def _query_sentence_chunks(raw_user_query: str) -> list[str]:
-    """Split user query into compact sentence chunks for conservative matching."""
-    chunks: list[str] = []
-    for chunk in re.split(r"[.;!?\n]+", raw_user_query or ""):
-        chunk = chunk.strip()
-        if chunk:
-            chunks.append(chunk.lower())
-    return chunks
-
-
-def _sentence_targets_fasta_file(chunk: str, file: dict[str, Any]) -> bool:
-    """Return True only when chunk likely refers to this uploaded sequence file."""
-    if not chunk:
-        return False
-    chunk_l = chunk.lower()
-    filename = str(file.get("original_filename") or "").lower()
-    file_tokens = _fasta_file_tokens(file)
-    if filename and filename in chunk_l:
-        return True
-    if not file_tokens:
-        return False
-    if any(tok in chunk_l for tok in (".", "fasta", "sequence", "file")):
-        # "uploaded FASTA", "this FASTA", "this sequence file" style.
-        if "uploaded" in chunk:
-            return True
-        if "sequence" in chunk and ("file" in chunk or "fasta" in chunk):
-            # Ambiguous helper phrase should still need at least one strong
-            # filename-token fragment.
-            return bool(file_tokens.intersection(_token_set(chunk)))
-        if "this" in chunk or "that" in chunk:
-            return bool(file_tokens.intersection(_token_set(chunk)))
-    return False
-
-
-def _query_inferred_sequence_route(
-    file: dict[str, Any],
-    *,
-    target_text: str,
-    antibody_text: str,
-    raw_user_query: str,
-) -> str | None:
-    """Infer explicit sequence role from conservative raw query sentence context.
-
-    Only explicit heavy/light/target cues are accepted. A generic "antibody
-    sequence" hint without chain specificity is treated as unresolved so it is
-    not materialized as executable input.
-    """
-    if not raw_user_query:
-        return None
-    target_cues = _TARGET_FASTA_HINTS | _token_set(target_text)
-    antibody_chain_cues = (
-        _HEAVY_CHAIN_HINTS
-        | _LIGHT_CHAIN_HINTS
-        | {"vh", "vl", "vc", "hc", "lc", "igg"}
-        | {"trastuzumab", "antibody"}
-    )
-    antibody_chain_cues |= _token_set(antibody_text)
-
-    for chunk in _query_sentence_chunks(raw_user_query):
-        if not _sentence_targets_fasta_file(chunk, file):
-            continue
-
-        chunk_tokens = _token_set(chunk)
-        target_signal = bool(chunk_tokens & target_cues)
-        heavy_signal = bool(chunk_tokens & _HEAVY_CHAIN_HINTS)
-        light_signal = bool(chunk_tokens & _LIGHT_CHAIN_HINTS)
-        chain_signal = bool(chunk_tokens & antibody_chain_cues)
-
-        if target_signal and not chain_signal:
-            return "target"
-        if chain_signal and not target_signal and not heavy_signal and not light_signal:
-            # Generic antibody mention without chain-specific signal is unresolved.
-            return "antibody_sequence_unresolved"
-        if heavy_signal and not light_signal:
-            return "antibody_heavy_chain_sequence"
-        if light_signal and not heavy_signal:
-            return "antibody_light_chain_sequence"
-        if heavy_signal and light_signal:
-            return "ambiguous"
-        if target_signal and chain_signal:
-            return "ambiguous"
-
-    return None
-
-
-def _fasta_classify_sequence_file_route(
-    file: dict,
-    *,
-    target_text: str,
-    antibody_text: str,
-    raw_user_query: str,
-) -> str:
-    """Classify FASTA file metadata as antibody/target/ambiguous/unassigned.
-
-    The classifier is conservative:
-    - only explicit heavy/light cues map to concrete antibody sequence materials;
-    - generic "antibody sequence" without chain specificity stays unresolved;
-    - explicit target/antigen hints map to target sequence when unambiguous;
-    - ambiguous or unknown metadata returns "unassigned".
-    """
-    if not isinstance(file, dict):
-        return "unassigned"
-
-    explicit_role = str(file.get("role") or "").lower()
-    explicit_chain_role = str(file.get("chain_role") or "").lower()
-    if explicit_role in {"target", "target_sequence", "target_sequence_reference", "antigen"}:
-        return "target"
-    if explicit_chain_role in {"heavy", "hc", "igh", "ighv", "heavy_chain", "heavychain"}:
-        return "antibody_heavy_chain_sequence"
-    if explicit_chain_role in {"light", "lc", "igk", "igl", "igkv", "iglv", "light_chain", "lightchain"}:
-        return "antibody_light_chain_sequence"
-    if explicit_role in {"antibody_heavy_chain_sequence", "antibody_light_chain_sequence"}:
-        material_type = explicit_role
-        return material_type
-    if explicit_role in {"antibody", "antibody_sequence", "antibody_sequence_reference"}:
-        return "antibody_sequence_unresolved"
-
-    material_type = _infer_antibody_sequence_material_type(file)
-    if material_type in {"antibody_heavy_chain_sequence", "antibody_light_chain_sequence"}:
-        return material_type
-    if material_type:
-        return "antibody_sequence_unresolved"
-
-    tokens = _fasta_file_tokens(file)
-    target_tokens = _token_set(target_text)
-    antibody_tokens = _token_set(antibody_text)
-
-    target_signal = bool((tokens & _TARGET_FASTA_HINTS) or (tokens & target_tokens))
-    antibody_signal = bool((tokens & _ANTIBODY_GENERIC_HINTS) or (tokens & antibody_tokens))
-    heavy_signal = bool(tokens & _HEAVY_CHAIN_HINTS)
-    light_signal = bool(tokens & _LIGHT_CHAIN_HINTS)
-
-    if target_signal and not antibody_signal:
-        return "target"
-    if antibody_signal and not target_signal:
-        return "antibody_sequence_unresolved"
-    if heavy_signal and not light_signal and not target_signal:
-        return "antibody_heavy_chain_sequence"
-    if light_signal and not heavy_signal and not target_signal:
-        return "antibody_light_chain_sequence"
-    if heavy_signal and light_signal and not target_signal:
-        return "ambiguous"
-
-    query_signal = _query_inferred_sequence_route(
-        file,
-        target_text=target_text,
-        antibody_text=antibody_text,
-        raw_user_query=raw_user_query,
-    )
-    if query_signal == "target":
-        return "target"
-    if query_signal == "antibody_heavy_chain_sequence":
-        return "antibody_heavy_chain_sequence"
-    if query_signal == "antibody_light_chain_sequence":
-        return "antibody_light_chain_sequence"
-    if query_signal == "antibody_sequence_unresolved":
-        return "antibody_sequence_unresolved"
-    if query_signal == "ambiguous":
-        return "ambiguous"
-    return "unassigned"
-
-
-def _split_sequence_files_by_semantic_routing(
-    sequence_files: list[dict],
-    *,
-    target_text: str,
-    antibody_text: str,
-    raw_user_query: str,
+def _split_sequence_files_by_step2_authority(
+    sequence_files: list[dict], uploaded_refs: list[dict]
 ) -> tuple[list[dict], list[dict], list[dict]]:
+    source_by_file_id = {
+        str(ref.get("value") or ""): str(ref.get("source") or "")
+        for ref in uploaded_refs
+        if isinstance(ref, dict) and str(ref.get("value") or "")
+    }
     antibody_files: list[dict] = []
     target_files: list[dict] = []
     unassigned_files: list[dict] = []
-
     for file in sequence_files:
-        route = _fasta_classify_sequence_file_route(
-            file,
-            target_text=target_text,
-            antibody_text=antibody_text,
-            raw_user_query=raw_user_query,
-        )
-        if route == "target":
-            target_files.append(file)
-        elif route in {"antibody_heavy_chain_sequence", "antibody_light_chain_sequence"}:
-            antibody_files.append(file)
+        source = source_by_file_id.get(str(file.get("file_id") or ""), "")
+        routed = {**file, "_canonical_sequence_source": source}
+        if source == "target_sequence":
+            target_files.append(routed)
+        elif source in {
+            "antibody_heavy_chain_sequence",
+            "antibody_light_chain_sequence",
+        }:
+            antibody_files.append(routed)
         else:
-            if route not in {"unassigned", "ambiguous"}:
-                # Preserve compact reason for downstream audit notes.
-                file = {**file, "_sequence_route_reason": route}
-            else:
-                file = dict(file)
-                if "_sequence_route_reason" in file:
-                    del file["_sequence_route_reason"]
-            unassigned_files.append(file)
-
+            unassigned_files.append(routed)
     return antibody_files, target_files, unassigned_files
 
 
@@ -637,12 +415,60 @@ class CandidateContextAgent:
         raw = self.storage.read_json(
             self.storage.run_key(run_id, "inputs/raw_request_record.json")
         )
+        return self._build_candidate_context(
+            run_id,
+            raw=raw,
+            sq=sq,
+            sq_artifact_id=reg.active_artifacts.structured_query_id or "",
+        )
 
+    def run_from_artifacts(
+        self,
+        run_id: str,
+        *,
+        raw_request_record: dict,
+        structured_query: dict,
+        structured_query_artifact_id: str | None = None,
+    ) -> CandidateContextTable:
+        """Request-based worker entry — NO run_step_plan / Step 4 gate.
+
+        The A2A worker adapter has already validated the input artifact refs and
+        read the ``raw_request_record`` + ``structured_query`` bodies from
+        worker-owned storage. This entry runs the EXACT same shared
+        candidate-context core as the legacy :meth:`run` path (identical
+        candidate construction, LLM tool selection, MCP routing, artifact write,
+        registry + workflow-state update); it only skips the legacy registry gate
+        that requires a Step 4 ``run_step_plan``. It never reads or checks
+        ``run_step_plan_id``.
+        """
+        sq_artifact_id = structured_query_artifact_id
+        if sq_artifact_id is None:
+            sq_artifact_id = (
+                self.registry.get(run_id).active_artifacts.structured_query_id or ""
+            )
+        return self._build_candidate_context(
+            run_id,
+            raw=raw_request_record,
+            sq=structured_query,
+            sq_artifact_id=sq_artifact_id,
+        )
+
+    def _build_candidate_context(
+        self,
+        run_id: str,
+        *,
+        raw: dict,
+        sq: dict,
+        sq_artifact_id: str,
+    ) -> CandidateContextTable:
+        """Shared candidate-context core used by both :meth:`run` (legacy) and
+        :meth:`run_from_artifacts` (request-based). Identical business logic —
+        candidate construction, enrichment tool selection, MCP routing, artifact
+        persistence, registry + workflow-state update."""
         entities = sq.get("mentioned_entities") or {}
         ctx = raw.get("user_provided_context") or {}
         refs = [r for r in (sq.get("referenced_inputs") or []) if isinstance(r, dict)]
         uploaded = raw.get("uploaded_files") or []
-        sq_artifact_id = reg.active_artifacts.structured_query_id or ""
         raw_user_query = raw.get("raw_user_query") or ""
         target_text = (
             entities.get("target_or_antigen_text")
@@ -681,13 +507,14 @@ class CandidateContextAgent:
             if PurePosixPath(f.get("original_filename", "")).suffix.lower() in _FASTA_EXTS
             and str(f.get("file_id") or "") not in prompt_sequence_file_ids
         ]
-        antibody_sequence_files, target_sequence_files, unassigned_sequence_files = \
-            _split_sequence_files_by_semantic_routing(
-                sequence_files,
-                target_text=target_text or "",
-                antibody_text=antibody_text or "",
-                raw_user_query=raw_user_query,
-            )
+        (
+            antibody_sequence_files,
+            target_sequence_files,
+            unassigned_sequence_files,
+        ) = _split_sequence_files_by_step2_authority(
+            sequence_files,
+            refs_by_type.get("uploaded_file", []),
+        )
 
         tool_call_records: list[ToolCallRecord] = []
         candidate_records: list[CandidateRecord] = []
@@ -924,8 +751,13 @@ class CandidateContextAgent:
         raw_user_query: str = "",
         normalized_entities: list[dict] | None = None,
     ) -> Optional[CandidateRecord]:
-        if not (target_text or refs_by_type.get("uniprot_id") or refs_by_type.get("pdb_id")
-                or structure_files):
+        if not (
+            target_text
+            or refs_by_type.get("uniprot_id")
+            or refs_by_type.get("pdb_id")
+            or any(refs_by_type.get(item) for item in _TARGET_SEQUENCE_REF_ID_TYPES)
+            or structure_files
+        ):
             return None
 
         materials: list[Material] = []
@@ -969,6 +801,20 @@ class CandidateContextAgent:
                     role="target_sequence_reference", role_status="explicit",
                 )
             )
+        for id_type in _TARGET_SEQUENCE_REF_ID_TYPES:
+            for ref in refs_by_type.get(id_type, []):
+                value = str(ref.get("value") or "").strip()
+                if not value:
+                    continue
+                materials.append(
+                    self._material_with_role(
+                        "target_sequence",
+                        value,
+                        "amino_acid_sequence",
+                        role="target_sequence_reference",
+                        role_status="explicit",
+                    )
+                )
 
         # Protein point-mutation / variant references (Step 2
         # id_type="variant"/"mutation") are identifierized onto the target
@@ -1043,7 +889,7 @@ class CandidateContextAgent:
                     "(antibody label is not a usable name query)"
                 )
         for f in sequence_files:
-            material_type = _infer_antibody_sequence_material_type(f)
+            material_type = str(f.get("_canonical_sequence_source") or "")
             if not material_type:
                 continue
             if material_type not in _ANTIBODY_HEAVY_LIGHT_CHAIN_TYPES:
@@ -2553,35 +2399,6 @@ def _format_for_file(f: dict) -> str:
     return "pdb"
 
 
-def _infer_antibody_sequence_material_type(f: dict) -> str | None:
-    """Infer heavy/light antibody sequence role from explicit file metadata.
-
-    This is deliberately conservative: unknown FASTA files return ``None`` so
-    Step 5 does not silently treat ambiguous uploads as executable sequence
-    input.
-    """
-    parts: list[str] = []
-    for key in (
-        "original_filename", "file_id", "role", "chain_role",
-        "material_role", "description",
-    ):
-        value = f.get(key)
-        if isinstance(value, str) and value.strip():
-            parts.append(value.lower())
-    haystack = " ".join(parts)
-    tokens = set(re.split(r"[^a-z0-9]+", haystack))
-    collapsed = re.sub(r"[^a-z0-9]+", "", haystack)
-    if tokens.intersection(_HEAVY_CHAIN_HINTS) or any(
-        hint in collapsed for hint in ("heavychain", "ighv")
-    ):
-        return "antibody_heavy_chain_sequence"
-    if tokens.intersection(_LIGHT_CHAIN_HINTS) or any(
-        hint in collapsed for hint in ("lightchain", "igkv", "iglv")
-    ):
-        return "antibody_light_chain_sequence"
-    return None
-
-
 def _identifiers_for(
     refs_by_type: dict[str, list[dict]],
     id_types: tuple[str, ...],
@@ -2591,6 +2408,10 @@ def _identifiers_for(
     out: list[Identifier] = []
     for id_type in id_types:
         for ref in refs_by_type.get(id_type, []):
+            if id_type == "uniprot_id" and not _is_uniprot_accession(
+                str(ref.get("value") or "")
+            ):
+                continue
             out.append(
                 Identifier(
                     id_type=id_type,

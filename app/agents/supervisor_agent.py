@@ -26,13 +26,16 @@ must not call tools, build tool arguments, or check input completeness.
 from __future__ import annotations
 
 import re
+from pathlib import PurePosixPath
 from typing import Any, Optional
 
 from ..llm.provider import LLMProvider
 from ..schemas.step_01_raw_request_record import RawRequestRecord
 from ..llm.json_task_validation import (
     extract_protein_variant_tokens,
+    is_valid_uniprot_accession,
     looks_like_masked_prompt_sequence,
+    normalize_inline_protein_sequence,
     normalize_canonical_query,
     normalize_missing_slots,
     normalize_response,
@@ -68,6 +71,10 @@ Use these fields:
 - `normalized_entities`: canonical forms for the literal mentions. Use
   `original_text`, `canonical_name`, optional explicit `canonical_id`,
   `canonical_id_source`, `entity_type`, and `explicit_or_inferred`.
+  `entity_type` must be exactly one of `target_or_antigen`,
+  `disease_or_indication`, `antibody`, `payload`, `linker`, `linker_payload`,
+  `drug`, `compound`, `protein_variant`, or `other`. Never invent, extend,
+  or return any other `entity_type` value.
 - `entity_decompositions`: component breakdowns for composite ADC terms.
   Use `components[].canonical_name` and `component_type`; do not use
   `component_name`, `name`, `label`, or `value` inside component objects.
@@ -92,6 +99,13 @@ Input-to-output mapping:
 - Uploaded file metadata with `file_id` -> `{"id_type": "uploaded_file",
   "value": "<file_id>", "source": "uploaded_file"}`. Do not use
   filenames or storage paths as `value`.
+- For an uploaded FASTA/sequence file, `source` is its only downstream
+  biological-role authority. Use exactly one of `target_sequence`,
+  `antibody_heavy_chain_sequence`, `antibody_light_chain_sequence`, or
+  `prompt_sequence` only when the user or explicit file `role`/`chain_role`
+  metadata declares that role. Otherwise keep `source="uploaded_file"` and
+  report a blocking `sequence_role` missing slot. Never infer this role from
+  filename tokens or sequence content.
 - Payload SMILES -> `{"id_type": "smiles", "value": "<smiles>",
   "source": "payload_smiles"}`. Linker SMILES uses
   `source="linker_smiles"`. Unlabeled compound SMILES uses
@@ -101,6 +115,10 @@ Input-to-output mapping:
   lambda / IGK / IGL / IGKV / IGLV / L chain -> `antibody_light_chain_sequence`.
   If an antibody FASTA/sequence lacks heavy/light role, do not use
   `antibody_sequence_reference`; report blocking `sequence_role`.
+- An ordinary target, antigen, or generic protein sequence that is not an
+  antibody chain and not a masked generation prompt ->
+  `{"id_type": "target_sequence", "value": "<full amino-acid sequence>",
+  "source": "user"}`. Never relabel it as an antibody sequence.
 - Do not infer heavy vs light from sequence content. Do not extract CDR3
   from a full sequence. Preserve only an explicitly supplied CDR3 as
   `antibody_cdr3_sequence`; downstream runtime extracts CDR3 when needed.
@@ -212,7 +230,7 @@ required_slot_schema (satisfied_by = any one is enough):
     protein sequence, no UniProt/accession, no PDB/CIF/PDB ID).
 - conditional uploaded FASTA role:
   - blocking sequence_role ONLY when an uploaded FASTA/sequence file exists
-    and its role is unclear from filename, metadata, query, or context.
+    and neither the user nor explicit file metadata declares its role.
     Do not emit it when no FASTA exists or the role is clear.
     question: "Is the uploaded FASTA heavy chain, light chain, target/antigen, or another protein?"
 - conditional prompt_sequence:
@@ -286,6 +304,8 @@ _UPLOADED_FILE_META_FIELDS = (
     "content_type",
     "sha256",
     "size_bytes",
+    "role",
+    "chain_role",
 )
 
 
@@ -752,9 +772,29 @@ _ANTIBODY_LIGHT_ID_TYPE_ALIASES = {
 _ANTIBODY_GENERIC_ID_TYPE_ALIASES = {
     "antibody_sequence",
     "antibody_sequence_reference",
-    "protein_sequence",
-    "fasta_sequence",
-    "amino_acid_sequence",
+}
+_TARGET_SEQUENCE_ID_TYPES = {"target_sequence"}
+_TARGET_SEQUENCE_SOURCE = "target_sequence"
+_UPLOADED_SEQUENCE_SOURCES = {
+    "target_sequence",
+    "antibody_heavy_chain_sequence",
+    "antibody_light_chain_sequence",
+    "prompt_sequence",
+}
+_UPLOADED_FASTA_EXTENSIONS = {".fasta", ".fa", ".faa", ".seq"}
+_UPLOADED_ROLE_ALIASES = {
+    "target": "target_sequence",
+    "antigen": "target_sequence",
+    "target_sequence": "target_sequence",
+    "antibody_heavy_chain_sequence": "antibody_heavy_chain_sequence",
+    "antibody_light_chain_sequence": "antibody_light_chain_sequence",
+    "prompt_sequence": "prompt_sequence",
+}
+_UPLOADED_CHAIN_ROLE_ALIASES = {
+    "heavy": "antibody_heavy_chain_sequence",
+    "heavy_chain": "antibody_heavy_chain_sequence",
+    "light": "antibody_light_chain_sequence",
+    "light_chain": "antibody_light_chain_sequence",
 }
 
 
@@ -774,8 +814,7 @@ def _normalize_antibody_chain_references(payload: dict[str, Any]) -> None:
        ``source`` to the canonical chain string. The ``value`` (file_id)
        stays untouched.
 
-    Generic / chain-silent aliases (``antibody_sequence``,
-    ``protein_sequence``, ``fasta``) stay generic — they are coerced to
+    Generic antibody aliases (``antibody_sequence``) stay generic — they are coerced to
     ``antibody_sequence_reference`` so the downstream Step 5 agent sees
     a stable source string, but they are NEVER promoted to heavy.
     """
@@ -841,6 +880,178 @@ def _normalize_antibody_chain_references(payload: dict[str, Any]) -> None:
                         f"normalized referenced_inputs.source from "
                         f"{source!r} to {_ANTIBODY_GENERIC_CHAIN_SOURCE!r}"
                     )
+
+
+def _declared_uploaded_sequence_source(uploaded: dict[str, Any]) -> str | None:
+    role = str(uploaded.get("role") or "").strip().lower()
+    chain_role = str(uploaded.get("chain_role") or "").strip().lower()
+    role_source = _UPLOADED_ROLE_ALIASES.get(role)
+    chain_source = _UPLOADED_CHAIN_ROLE_ALIASES.get(chain_role)
+    if role_source and chain_source and role_source != chain_source:
+        return None
+    return role_source or chain_source
+
+
+def _normalize_uploaded_sequence_file_references(
+    payload: dict[str, Any], raw_request_record: dict | None
+) -> int:
+    """Canonicalize uploaded FASTA roles from Step2/declared metadata only."""
+    refs = payload.get("referenced_inputs")
+    if not isinstance(refs, list):
+        refs = []
+    warnings = payload.get("parse_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+        payload["parse_warnings"] = warnings
+
+    fasta_files = [
+        uploaded
+        for uploaded in (raw_request_record or {}).get("uploaded_files") or []
+        if isinstance(uploaded, dict)
+        and PurePosixPath(
+            str(uploaded.get("original_filename") or "")
+        ).suffix.lower()
+        in _UPLOADED_FASTA_EXTENSIONS
+        and str(uploaded.get("file_id") or "")
+    ]
+    unassigned_count = 0
+    normalized_refs = list(refs)
+    for uploaded in fasta_files:
+        file_id = str(uploaded["file_id"])
+        matching_indexes = [
+            index
+            for index, ref in enumerate(normalized_refs)
+            if isinstance(ref, dict)
+            and ref.get("id_type") == "uploaded_file"
+            and str(ref.get("value") or "") == file_id
+        ]
+        declared_source = _declared_uploaded_sequence_source(uploaded)
+        step2_sources = {
+            str(normalized_refs[index].get("source") or "")
+            for index in matching_indexes
+            if str(normalized_refs[index].get("source") or "")
+            in _UPLOADED_SEQUENCE_SOURCES
+        }
+        if declared_source:
+            canonical_source = declared_source
+            if step2_sources and step2_sources != {declared_source}:
+                warnings.append(
+                    "normalized uploaded FASTA source from explicit file metadata"
+                )
+        elif len(step2_sources) == 1:
+            canonical_source = next(iter(step2_sources))
+        else:
+            canonical_source = "uploaded_file"
+            if len(step2_sources) > 1:
+                warnings.append(
+                    "dropped conflicting uploaded FASTA sequence roles"
+                )
+
+        if matching_indexes:
+            first = matching_indexes[0]
+            ref = dict(normalized_refs[first])
+            ref["source"] = canonical_source
+            normalized_refs[first] = ref
+            for index in reversed(matching_indexes[1:]):
+                del normalized_refs[index]
+        elif declared_source:
+            normalized_refs.append(
+                {
+                    "id_type": "uploaded_file",
+                    "value": file_id,
+                    "source": canonical_source,
+                }
+            )
+        if canonical_source == "uploaded_file":
+            unassigned_count += 1
+
+    payload["referenced_inputs"] = normalized_refs
+    return unassigned_count
+
+
+def _normalize_uniprot_references(payload: dict[str, Any]) -> int:
+    refs = payload.get("referenced_inputs")
+    if not isinstance(refs, list):
+        return 0
+    warnings = payload.get("parse_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+        payload["parse_warnings"] = warnings
+    kept: list[Any] = []
+    dropped = 0
+    for entry in refs:
+        if not isinstance(entry, dict) or entry.get("id_type") != "uniprot_id":
+            kept.append(entry)
+            continue
+        if not is_valid_uniprot_accession(entry.get("value")):
+            warnings.append("dropped invalid uniprot_id referenced_input")
+            dropped += 1
+            continue
+        normalized = dict(entry)
+        normalized["value"] = str(entry["value"]).strip().upper()
+        kept.append(normalized)
+    payload["referenced_inputs"] = kept
+    return dropped
+
+
+def _normalize_target_sequence_references(payload: dict[str, Any]) -> int:
+    """Canonicalize validated ordinary protein sequences for downstream use."""
+    refs = payload.get("referenced_inputs")
+    if not isinstance(refs, list):
+        return 0
+    warnings = payload.get("parse_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+        payload["parse_warnings"] = warnings
+    kept: list[Any] = []
+    dropped = 0
+    for entry in refs:
+        if not isinstance(entry, dict):
+            kept.append(entry)
+            continue
+        id_type = str(entry.get("id_type") or "").lower()
+        if id_type not in _TARGET_SEQUENCE_ID_TYPES:
+            kept.append(entry)
+            continue
+        normalized = normalize_inline_protein_sequence(entry.get("value"))
+        if normalized is None:
+            warnings.append("dropped invalid target_sequence referenced_input")
+            dropped += 1
+            continue
+        entry["id_type"] = _TARGET_SEQUENCE_SOURCE
+        entry["value"] = normalized
+        entry.setdefault("source", "user")
+        kept.append(entry)
+    payload["referenced_inputs"] = kept
+    return dropped
+
+
+def _validate_inline_antibody_sequence_references(payload: dict[str, Any]) -> int:
+    refs = payload.get("referenced_inputs")
+    if not isinstance(refs, list):
+        return 0
+    warnings = payload.get("parse_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+        payload["parse_warnings"] = warnings
+    kept: list[Any] = []
+    dropped = 0
+    for entry in refs:
+        if not isinstance(entry, dict) or entry.get("id_type") not in {
+            _ANTIBODY_HEAVY_CHAIN_SOURCE,
+            _ANTIBODY_LIGHT_CHAIN_SOURCE,
+        }:
+            kept.append(entry)
+            continue
+        normalized = normalize_inline_protein_sequence(entry.get("value"))
+        if normalized is None:
+            warnings.append("dropped invalid antibody chain sequence referenced_input")
+            dropped += 1
+            continue
+        entry["value"] = normalized
+        kept.append(entry)
+    payload["referenced_inputs"] = kept
+    return dropped
 
 
 # referenced_inputs id_type aliases the LLM may use for a protein variant /
@@ -957,9 +1168,12 @@ def _ensure_blocking_missing_slot(payload: dict[str, Any], *, slot_name: str, re
     for slot in slots:
         if isinstance(slot, dict) and slot.get("slot_name") == slot_name:
             slot["severity"] = "blocking"
-            if not slot.get("reason"):
+            if not isinstance(slot.get("reason"), str) or not slot["reason"].strip():
                 slot["reason"] = reason
-            if not slot.get("suggested_question"):
+            if (
+                not isinstance(slot.get("suggested_question"), str)
+                or not slot["suggested_question"].strip()
+            ):
                 slot["suggested_question"] = question
             return
     slots.append(
@@ -973,6 +1187,32 @@ def _ensure_blocking_missing_slot(payload: dict[str, Any], *, slot_name: str, re
             "evidence": None,
         }
     )
+
+
+def _reconcile_uploaded_sequence_role_slot(
+    payload: dict[str, Any], *, unassigned_fasta_count: int
+) -> None:
+    if unassigned_fasta_count:
+        _ensure_blocking_missing_slot(
+            payload,
+            slot_name="sequence_role",
+            reason="The uploaded FASTA sequence role is not declared.",
+            question=(
+                "Is the uploaded FASTA a target sequence, antibody heavy chain, "
+                "antibody light chain, or masked generation prompt?"
+            ),
+        )
+        slots = payload.get("missing_slots")
+        slots = slots if isinstance(slots, list) else []
+        deduped: list[Any] = []
+        sequence_role_seen = False
+        for slot in slots:
+            if isinstance(slot, dict) and slot.get("slot_name") == "sequence_role":
+                if sequence_role_seen:
+                    continue
+                sequence_role_seen = True
+            deduped.append(slot)
+        payload["missing_slots"] = deduped
 
 
 def _normalize_prompt_sequence_references(
@@ -1041,6 +1281,89 @@ def _normalize_prompt_sequence_references(
         )
 
 
+def _has_compatible_structure_or_sequence(
+    refs: list[Any], raw_request_record: dict | None
+) -> bool:
+    uploaded_file_sources = {
+        str(item.get("value") or ""): str(item.get("source") or "")
+        for item in refs
+        if isinstance(item, dict) and item.get("id_type") == "uploaded_file"
+    }
+    for entry in refs:
+        if not isinstance(entry, dict):
+            continue
+        id_type = entry.get("id_type")
+        value = entry.get("value")
+        if id_type == "pdb_id" and isinstance(value, str) and re.fullmatch(
+            r"[1-9][A-Za-z0-9]{3}", value.strip()
+        ):
+            return True
+        if id_type == "uniprot_id" and is_valid_uniprot_accession(value):
+            return True
+        if id_type in {
+            "target_sequence",
+            _ANTIBODY_HEAVY_CHAIN_SOURCE,
+            _ANTIBODY_LIGHT_CHAIN_SOURCE,
+        } and normalize_inline_protein_sequence(value):
+            return True
+    for uploaded in (raw_request_record or {}).get("uploaded_files") or []:
+        if not isinstance(uploaded, dict):
+            continue
+        file_id = str(uploaded.get("file_id") or "")
+        source = uploaded_file_sources.get(file_id)
+        if source is None or source == "prompt_sequence":
+            continue
+        filename = str(uploaded.get("original_filename") or "").lower()
+        if filename.endswith((".pdb", ".cif", ".mmcif", ".ent")):
+            return True
+        if filename.endswith((".fasta", ".fa", ".faa", ".seq")) and source in {
+            "target_sequence",
+            _ANTIBODY_HEAVY_CHAIN_SOURCE,
+            _ANTIBODY_LIGHT_CHAIN_SOURCE,
+        }:
+            return True
+    return False
+
+
+def _restore_incompatible_previous_slots(
+    payload: dict[str, Any], raw_request_record: dict | None
+) -> None:
+    context = (raw_request_record or {}).get("user_provided_context") or {}
+    previous = context.get("previous_missing_slots") if isinstance(context, dict) else None
+    if not isinstance(previous, list):
+        return
+    refs = payload.get("referenced_inputs")
+    refs = refs if isinstance(refs, list) else []
+    current = payload.get("missing_slots")
+    current = current if isinstance(current, list) else []
+    names = {
+        item.get("slot_name") for item in current if isinstance(item, dict)
+    }
+    for slot in previous:
+        if not isinstance(slot, dict):
+            continue
+        slot_name = slot.get("slot_name")
+        if slot_name != "structure_or_sequence" or slot_name in names:
+            continue
+        if _has_compatible_structure_or_sequence(refs, raw_request_record):
+            continue
+        current.append(
+            {
+                "slot_name": "structure_or_sequence",
+                "slot_category": slot.get("slot_category") or "sequence",
+                "severity": slot.get("severity") or "blocking",
+                "required_for": [],
+                "reason": "The clarification did not provide a consumable structure or sequence input.",
+                "suggested_question": (
+                    "Please provide a PDB/CIF file, PDB ID, UniProt ID, or protein sequence."
+                ),
+                "evidence": None,
+            }
+        )
+        names.add(slot_name)
+    payload["missing_slots"] = current
+
+
 def normalize_llm_payload_for_step2(
     payload: dict,
     raw_request_record: dict | None = None,
@@ -1088,7 +1411,20 @@ def normalize_llm_payload_for_step2(
     _normalize_entity_components(out)
     _normalize_normalized_entity_types(out)
     _normalize_typed_smiles_fields(out, raw_request_record)
+    unassigned_fasta_count = _normalize_uploaded_sequence_file_references(
+        out, raw_request_record
+    )
     _normalize_antibody_chain_references(out)
+    dropped_invalid_uniprot = _normalize_uniprot_references(out)
+    dropped_counts = out.get("dropped_referenced_input_counts")
+    dropped_counts = dropped_counts if isinstance(dropped_counts, dict) else {}
+    if dropped_invalid_uniprot:
+        dropped_counts["uniprot_id"] = dropped_invalid_uniprot
+    out["dropped_referenced_input_counts"] = dropped_counts
+    dropped_invalid_typed_sequences = (
+        _validate_inline_antibody_sequence_references(out)
+        + _normalize_target_sequence_references(out)
+    )
     # variant drift: canonicalize protein-variant id_type aliases to the
     # stable id_type="variant", and derive a variant referenced_input from a
     # normalized_entities[entity_type="protein_variant"] mention when the LLM
@@ -1099,12 +1435,37 @@ def normalize_llm_payload_for_step2(
     # compacted with a parse_warning. Shares the provider validator's logic
     # so OpenAI/Gemini/Qwen/Mock all agree on the cleaned shape.
     normalize_missing_slots(out)
+    _reconcile_uploaded_sequence_role_slot(
+        out,
+        unassigned_fasta_count=unassigned_fasta_count,
+    )
     # prompt_sequence backstop: drops inline id_type="prompt_sequence"
     # entries missing a mask marker (never downgrades them to a plain
     # sequence), and ensures a blocking missing_slot when protein generation
     # is requested but no valid prompt_sequence survives. Runs after
     # `normalize_missing_slots` so the slot it may inject is not re-coerced.
     _normalize_prompt_sequence_references(out, raw_request_record)
+    if dropped_invalid_typed_sequences and not _has_compatible_structure_or_sequence(
+        out.get("referenced_inputs") or [], raw_request_record
+    ):
+        _ensure_blocking_missing_slot(
+            out,
+            slot_name="structure_or_sequence",
+            reason="The supplied protein sequence could not be used.",
+            question="Please provide a valid protein sequence.",
+        )
+    if dropped_invalid_uniprot and not _has_compatible_structure_or_sequence(
+        out.get("referenced_inputs") or [], raw_request_record
+    ):
+        _ensure_blocking_missing_slot(
+            out,
+            slot_name="structure_or_sequence",
+            reason="The supplied UniProt accession could not be used.",
+            question=(
+                "Please provide a valid UniProt accession, PDB ID, or protein sequence."
+            ),
+        )
+    _restore_incompatible_previous_slots(out, raw_request_record)
     # response drift: absent -> None, non-string scalar -> str, list/dict ->
     # compact string or None, over-long -> trimmed. Same shared logic as the
     # provider validator so every provider/mock agrees on the cleaned shape.
@@ -1219,6 +1580,9 @@ class SupervisorAgent:
             requested_outputs=llm_payload.get("requested_outputs") or [],
             user_constraints=llm_payload.get("user_constraints") or [],
             parse_warnings=llm_payload.get("parse_warnings") or [],
+            dropped_referenced_input_counts=(
+                llm_payload.get("dropped_referenced_input_counts") or {}
+            ),
             normalized_entities=normalized_entities,
             entity_decompositions=entity_decompositions,
             clarification_questions=llm_payload.get("clarification_questions") or [],

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 from typing import Any, Literal
 
-from pydantic import field_validator
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -43,6 +44,7 @@ class Settings(BaseSettings):
     # OpenAI provider — JSON-only LLM channel; never used to call MCP tools
     # or external biomedical APIs.
     openai_api_key: str = ""
+    openai_api_key_file: str | None = None
     # `gpt-4.1-mini` is a small JSON-capable model. Override via env for
     # heavier benchmark runs.
     openai_model: str = "gpt-4.1-mini"
@@ -60,12 +62,39 @@ class Settings(BaseSettings):
     # (for example Step 8 complex prediction tools). This is bridged into
     # os.environ as NVIDIA_API_KEY immediately before ToolUniverse is built.
     nvidia_api_key: str = ""
+    nvidia_api_key_file: str | None = None
     # EvolutionaryScale Forge credentials used by ToolUniverse ESM wrappers
     # (for example Step 9 ESM_generate_protein_sequence / ESM_score tools).
     # This is bridged into os.environ as ESM_API_KEY before ToolUniverse runs.
     esm_api_key: str = ""
+    esm_api_key_file: str | None = None
 
     api_key: str = "dev-key"
+
+    # \u2500\u2500 Multi-Agent A2A worker endpoints (Turn D) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    # Docker-internal service URLs the Orchestrator uses to DISCOVER each worker
+    # over real HTTP A2A. Discovery is never triggered at import/create_app time;
+    # it only runs when WorkerDiscoveryService.discover_for_run(run_id) is called.
+    step5_worker_url: str = "http://step5-context-agent:8005"
+    step6_worker_url: str = "http://step6-developability-agent:8006"
+    structure_worker_url: str = "http://step7-9-structure-design-agent:8009"
+
+    # Production network timeouts (seconds) for AgentCard discovery + health
+    # probes. These are explicit deployment settings (not hidden test caps) and
+    # must be > 0.
+    a2a_discovery_timeout_seconds: float = 5.0
+    a2a_health_timeout_seconds: float = 5.0
+    # Formal Turn G worker execution budget. It has no guessed production
+    # default: the deployer must choose a finite positive SLA explicitly.
+    orchestrator_worker_timeout_seconds: float | None = None
+    # Deterministic worker retry policy: attempt 0 plus attempts 1..3.
+    orchestrator_max_worker_retries: int = 3
+    # Dedicated LangGraph checkpoint database. There is deliberately no local,
+    # SQLite, or in-memory production default; the runtime factory fails closed
+    # when this secret is absent.
+    langgraph_checkpoint_database_url: SecretStr | None = None
+    # Finite budget for connection acquisition plus official checkpoint setup.
+    langgraph_checkpoint_startup_timeout_seconds: float = 30.0
 
     tool_inventory_xlsx: str = "../\u9879\u76ee\u6587\u4ef6/ToolUniversity_inventory_v0.2.xlsx"
 
@@ -122,6 +151,34 @@ class Settings(BaseSettings):
         if not allowlist:
             return True
         return tool_name in allowlist
+
+    @field_validator(
+        "a2a_discovery_timeout_seconds",
+        "a2a_health_timeout_seconds",
+        "langgraph_checkpoint_startup_timeout_seconds",
+    )
+    @classmethod
+    def _positive_a2a_timeout(cls, v: float) -> float:
+        """Production network/startup budgets must be finite and positive."""
+        if v is None or not math.isfinite(float(v)) or float(v) <= 0:
+            raise ValueError("timeout seconds must be finite and > 0")
+        return float(v)
+
+    @field_validator("orchestrator_max_worker_retries")
+    @classmethod
+    def _worker_retry_limit(cls, v: int) -> int:
+        if int(v) != 3:
+            raise ValueError("ORCHESTRATOR_MAX_WORKER_RETRIES must equal 3")
+        return int(v)
+
+    @field_validator("orchestrator_worker_timeout_seconds")
+    @classmethod
+    def _optional_worker_timeout(cls, v: float | None) -> float | None:
+        if v is None:
+            return None
+        if not math.isfinite(float(v)) or float(v) <= 0:
+            raise ValueError("timeout seconds must be finite and > 0")
+        return float(v)
 
     @field_validator("llm_provider", mode="before")
     @classmethod

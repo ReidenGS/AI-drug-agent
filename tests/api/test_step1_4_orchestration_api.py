@@ -25,12 +25,15 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 import app.deps as deps
 from app.main import app
+from app.services.workflow_setup_service import WorkflowSetupService
+from app.utils.errors import WorkflowStateError
 
 
 _PDB_BYTES = (
@@ -77,13 +80,44 @@ def _create_run(client: TestClient, ctx: dict, *, query="HER2 ADC") -> str:
 
 
 def _run_steps_2_3_4(client: TestClient, run_id: str) -> dict:
-    """Execute Step 2 → 3 → 4 in sequence, returning the final-step response."""
+    """Run Step 2/3 APIs plus the retained legacy plan builder directly.
+
+    Turn G replaces the production Step 4 endpoint with the durable A2A
+    Orchestrator. This suite retains old plan-builder regression coverage
+    without representing that builder as the production API path.
+    """
     r2 = client.post(f"/runs/{run_id}/steps/2/execute")
     assert r2.status_code == 200, r2.text
     r3 = client.post(f"/runs/{run_id}/steps/3/execute")
     assert r3.status_code == 200, r3.text
-    r4 = client.post(f"/runs/{run_id}/steps/4/execute")
+    r4 = _legacy_plan_response(run_id)
     return {"step_2": r2, "step_3": r3, "step_4": r4}
+
+
+def _legacy_plan_response(run_id: str) -> SimpleNamespace:
+    try:
+        body = WorkflowSetupService(
+            storage=deps.get_storage(),
+            registry=deps.get_registry_service(),
+            workflow_state=deps.get_workflow_state_service(),
+        ).plan(run_id).model_dump()
+        r4 = SimpleNamespace(
+            status_code=200,
+            text=json.dumps(body),
+            json=lambda: body,
+        )
+    except WorkflowStateError as exc:
+        body = {
+            "code": exc.code,
+            "message": exc.message,
+            "detail": exc.detail,
+        }
+        r4 = SimpleNamespace(
+            status_code=exc.status_code,
+            text=json.dumps(body),
+            json=lambda: body,
+        )
+    return r4
 
 
 def _registry_artifacts(run_id: str) -> dict:
@@ -166,8 +200,8 @@ def test_scenario_B_step5_api_is_gated_with_409(client: TestClient):
 def test_scenario_C_blocked_does_not_create_a_ready_plan(client: TestClient):
     run_id = _create_run(
         client,
-        ctx={},  # no target → readiness=blocked
-        query="Help me get started — no specifics yet",
+        ctx={},  # empty request is terminally invalid, not clarifiable
+        query="",
     )
     r2 = client.post(f"/runs/{run_id}/steps/2/execute")
     assert r2.status_code == 200
@@ -175,9 +209,9 @@ def test_scenario_C_blocked_does_not_create_a_ready_plan(client: TestClient):
     assert r3.status_code == 200
     assert r3.json()["input_readiness_status"] == "blocked"
 
-    # Step 4 refuses to plan — surfaces 409 (WorkflowStateError) with the
+    # The retained legacy builder refuses to plan with the same 409 shape and
     # blocking reasons attached. The plan must NOT be written.
-    r4 = client.post(f"/runs/{run_id}/steps/4/execute")
+    r4 = _legacy_plan_response(run_id)
     assert r4.status_code == 409, r4.text
     body = r4.json()
     assert body["code"] == "workflow_state_error"
@@ -195,12 +229,14 @@ def test_scenario_C_blocked_does_not_create_a_ready_plan(client: TestClient):
 # ── D. multipart upload metadata flows to Step 3 file-role readiness ──────
 
 
-def test_multipart_upload_flows_to_step3_role_inference_without_file_bytes(
+def test_unassigned_multipart_fasta_blocks_without_reading_file_bytes(
     client: TestClient, monkeypatch
 ):
-    """Step 1 multipart accepts a PDB + FASTA; Step 3 sees the inferred
-    roles via metadata ONLY. We patch `read_bytes` to assert no Step 3
-    code path tries to read the persisted file contents."""
+    """File formats are metadata-visible, but FASTA semantics stay unassigned.
+
+    Step 2/3 may not read uploaded bytes or infer target/heavy/light/prompt
+    role from the filename, FASTA body, or vague query text.
+    """
     resp = client.post(
         "/runs/multipart",
         data={
@@ -264,10 +300,31 @@ def test_multipart_upload_flows_to_step3_role_inference_without_file_bytes(
     # And no uploaded-file byte was read.
     assert sentinel["forbidden_calls"] == 0
 
-    # Plan is ready_to_execute (full ADC context + a structure/sequence file).
+    blocking_role_items = [
+        item
+        for item in readiness["missing_input_checklist"]
+        if item["category"] == "structure_or_sequence"
+        and item["severity"] == "blocking"
+        and "slot_name=sequence_role" in item["field"]
+    ]
+    assert len(blocking_role_items) == 1
+    role_requests = [
+        item
+        for item in readiness["clarification_requests"]
+        if item["slot_name"] == "sequence_role"
+        and item["severity"] == "blocking"
+    ]
+    assert len(role_requests) == 1
+    assert readiness["input_readiness_status"] == "needs_user_input"
+
+    # The retained legacy plan records the wait state; no runnable plan is made.
     plan_key = storage.run_key(run_id, "inputs/run_step_plan.json")
     plan = storage.read_json(plan_key)
-    assert plan["plan_status"] == "ready_to_execute"
+    assert plan["plan_status"] == "wait_for_input"
+    active = deps.get_registry_service().get(run_id).active_artifacts
+    assert active.worker_routing_plan_id is None
+    assert active.candidate_context_table_id is None
+    assert active.prepared_structure_input_package_id is None
 
 
 # ── no live Gemini / no MCP touched anywhere in this suite ────────────────

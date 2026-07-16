@@ -755,7 +755,7 @@ def test_pubtator_annotations_live_upstream_error(install_universe):
 
 # ── SAbDab_get_structure (Step 7 carve-out: completes Step 7 6/6) ──────────
 
-from app.mcp.tools.sabdab import SAbDab_get_structure
+from app.mcp.tools.sabdab import SAbDab_get_structure  # noqa: E402
 
 
 def test_sabdab_get_structure_mock_unchanged():
@@ -803,7 +803,7 @@ def test_sabdab_get_structure_live_upstream_error(install_universe):
 
 # ── RCSBAdvSearch_search_structures (Step 7 6/6 close-out) ────────────────
 
-from app.mcp.tools.rcsb_pdbe import RCSBAdvSearch_search_structures
+from app.mcp.tools.rcsb_pdbe import RCSBAdvSearch_search_structures  # noqa: E402
 
 
 def test_rcsb_advsearch_mock_unchanged():
@@ -2133,6 +2133,190 @@ def test_alphamissense_live_routes(install_universe):
         "uniprot_id": "P00533",
         "variant": "L858R",
     }
+    assert out["normalization_status"] == "normalized"
+    assert out["normalized_result"]["pathogenicity_score"] == 0.81
+    assert out["normalized_result"]["classification"] == "pathogenic"
+
+
+def _alphamissense_raw_response(**overrides):
+    raw = {
+        "uid": "P04626",
+        "aa": "V",
+        "resi": 777,
+        "benign": "",
+        "ambiguous": "",
+        "pathogenic": "5:A,E,G,L,M",
+        "mean": 0.9075200000000001,
+        "benign_all": "1:I",
+        "ambiguous_all": None,
+        "pathogenic_all": "18:A,C,D,E,F,G,H,K,L,M,N,P,Q,R,S,T,W,Y",
+        "mean_all": 0.915221052631579,
+    }
+    raw.update(overrides)
+    return {"data": {"raw_response": raw}}
+
+
+def test_alphamissense_real_v777l_shape_normalizes_pathogenic(install_universe):
+    fake = install_universe(
+        tools={
+            "AlphaMissense_get_variant_score": lambda _args: (
+                _alphamissense_raw_response()
+            )
+        }
+    )
+
+    out = AlphaMissense_get_variant_score(
+        uniprot_id="P04626", variant="p.V777L", _live=True
+    )
+
+    assert len(fake.calls) == 1
+    assert out["status"] == "ok"
+    assert out["normalization_status"] == "normalized"
+    assert out["normalized_result"] == {
+        "uniprot_id": "P04626",
+        "variant": "V777L",
+        "position": 777,
+        "reference_aa": "V",
+        "variant_aa": "L",
+        "classification": "pathogenic",
+        "classification_source": "raw_response.pathogenic_all",
+        "pathogenicity_score": None,
+        "pathogenicity_score_source": None,
+        "residue_mean_snv_score": 0.9075200000000001,
+        "residue_mean_all_substitutions_score": 0.915221052631579,
+    }
+    assert out["payload"]["data"]["raw_response"]["mean"] == 0.9075200000000001
+
+
+@pytest.mark.parametrize(
+    ("raw_overrides", "classification", "source"),
+    [
+        (
+            {"benign_all": "2:I,L", "pathogenic_all": "1:A"},
+            "benign",
+            "raw_response.benign_all",
+        ),
+        (
+            {
+                "ambiguous_all": "1:L",
+                "pathogenic_all": "1:A",
+                "benign_all": "1:I",
+            },
+            "ambiguous",
+            "raw_response.ambiguous_all",
+        ),
+    ],
+)
+def test_alphamissense_bin_classification(
+    install_universe, raw_overrides, classification, source
+):
+    install_universe(
+        tools={
+            "AlphaMissense_get_variant_score": lambda _args: (
+                _alphamissense_raw_response(**raw_overrides)
+            )
+        }
+    )
+
+    out = AlphaMissense_get_variant_score(
+        uniprot_id="P04626", variant="V777L", _live=True
+    )
+
+    assert out["normalization_status"] == "normalized"
+    assert out["normalized_result"]["classification"] == classification
+    assert out["normalized_result"]["classification_source"] == source
+    assert out["normalized_result"]["pathogenicity_score"] is None
+
+
+@pytest.mark.parametrize(
+    "raw_overrides",
+    [
+        {
+            "benign_all": "malformed",
+            "ambiguous_all": None,
+            "pathogenic_all": "1:A",
+        },
+        {
+            "benign_all": "1:I",
+            "ambiguous_all": None,
+            "pathogenic_all": "1:A",
+        },
+        {
+            "benign_all": "1:L",
+            "ambiguous_all": "1:L",
+            "pathogenic_all": "1:A",
+        },
+    ],
+)
+def test_alphamissense_unavailable_classification_does_not_guess(
+    install_universe, raw_overrides
+):
+    install_universe(
+        tools={
+            "AlphaMissense_get_variant_score": lambda _args: (
+                _alphamissense_raw_response(**raw_overrides)
+            )
+        }
+    )
+
+    out = AlphaMissense_get_variant_score(
+        uniprot_id="P04626", variant="V777L", _live=True
+    )
+
+    assert out["status"] == "ok"
+    assert out["normalization_status"] == "classification_unavailable"
+    assert out["normalized_result"]["classification"] is None
+    assert out["normalized_result"]["pathogenicity_score"] is None
+
+
+@pytest.mark.parametrize(
+    "raw_overrides",
+    [{"uid": "P99999"}, {"aa": "A"}, {"resi": 778}, {"uid": None}],
+)
+def test_alphamissense_raw_identity_mismatch_fails_closed(
+    install_universe, raw_overrides
+):
+    install_universe(
+        tools={
+            "AlphaMissense_get_variant_score": lambda _args: (
+                _alphamissense_raw_response(**raw_overrides)
+            )
+        }
+    )
+
+    out = AlphaMissense_get_variant_score(
+        uniprot_id="P04626", variant="V777L", _live=True
+    )
+
+    assert out["status"] == "upstream_error"
+    assert out["normalization_status"] == "identity_mismatch"
+    assert out["normalized_result"] is None
+    assert out["error_message"] == "alphamissense_response_identity_mismatch"
+    assert "P99999" not in out["error_message"]
+
+
+def test_alphamissense_direct_numeric_score_is_preserved(install_universe):
+    install_universe(
+        tools={
+            "AlphaMissense_get_variant_score": lambda _args: {
+                "uniprot_id": "P04626",
+                "variant": "V777L",
+                "pathogenicity_score": 0.72,
+            }
+        }
+    )
+
+    out = AlphaMissense_get_variant_score(
+        uniprot_id="P04626", variant="V777L", _live=True
+    )
+
+    normalized = out["normalized_result"]
+    assert normalized["pathogenicity_score"] == 0.72
+    assert normalized["pathogenicity_score_source"] == "payload.pathogenicity_score"
+    assert normalized["classification"] == "pathogenic"
+    assert normalized["classification_source"] == (
+        "payload.pathogenicity_score_threshold"
+    )
 
 
 def test_alphamissense_live_upstream_error(install_universe):
@@ -2148,6 +2332,8 @@ def test_alphamissense_live_upstream_error(install_universe):
         uniprot_id="P00533", variant="Z9999A", _live=True
     )
     assert out["status"] == "upstream_error"
+    assert out["normalization_status"] == "upstream_error"
+    assert out["normalized_result"] is None
 
 
 # Step 9 P2 migration: DynaMut2 / ESM_generate remain thin ToolUniverse
