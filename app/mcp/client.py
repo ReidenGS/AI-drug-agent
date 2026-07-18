@@ -21,6 +21,12 @@ import asyncio
 import json
 from typing import Any, Callable, Protocol, runtime_checkable
 
+from .outcome import (
+    dependency_unavailable_envelope,
+    failed_envelope,
+    invoke_wrapper,
+    normalize_mcp_outcome,
+)
 from .scope_filter import AGENT_STEP_MAP, ScopeRequest, filter_inventory
 from .tools._registry import _all_bindings
 from ..services.tool_inventory_service import InventoryEntry, ToolInventoryService
@@ -118,28 +124,10 @@ class LocalMCPClient:
                     call_kwargs["_live"] = True
             except Exception:  # noqa: BLE001 - settings must never break tool dispatch
                 pass
-        try:
-            payload = fn(**call_kwargs)
-            return {
-                "run_status": "success",
-                "tool_name": tool_name,
-                "payload": payload,
-                "executor": _classify_executor(payload),
-            }
-        except NotImplementedError:
-            return {
-                "run_status": "dependency_unavailable",
-                "tool_name": tool_name,
-                "reason": "wrapper_not_wired",
-                "executor": "deferred",
-            }
-        except Exception as e:  # noqa: BLE001
-            return {
-                "run_status": "failed",
-                "tool_name": tool_name,
-                "error_message": str(e),
-                "executor": "error",
-            }
+        envelope = invoke_wrapper(
+            tool_name=tool_name, wrapper=fn, kwargs=call_kwargs
+        )
+        return normalize_mcp_outcome(tool_name=tool_name, envelope=envelope)
 
 
 class FastMCPClient:
@@ -273,8 +261,13 @@ class FastMCPClient:
             response = self._dispatch_sync(tool_name, kwargs)
         except NotImplementedError:
             return _dep_unavailable_payload(tool_name)
-        except Exception as e:  # noqa: BLE001
-            return {"run_status": "failed", "tool_name": tool_name, "error_message": str(e)}
+        except Exception:  # noqa: BLE001 - never expose transport exception text
+            return normalize_mcp_outcome(
+                tool_name=tool_name,
+                envelope=failed_envelope(
+                    tool_name=tool_name, reason_code="fastmcp_transport_exception"
+                ),
+            )
         return _normalize_response(response, tool_name)
 
     async def async_call_tool(
@@ -287,8 +280,13 @@ class FastMCPClient:
             response = await self._dispatch_async(tool_name, kwargs)
         except NotImplementedError:
             return _dep_unavailable_payload(tool_name)
-        except Exception as e:  # noqa: BLE001
-            return {"run_status": "failed", "tool_name": tool_name, "error_message": str(e)}
+        except Exception:  # noqa: BLE001 - never expose transport exception text
+            return normalize_mcp_outcome(
+                tool_name=tool_name,
+                envelope=failed_envelope(
+                    tool_name=tool_name, reason_code="fastmcp_transport_exception"
+                ),
+            )
         return _normalize_response(response, tool_name)
 
     # ── transport dispatch ──────────────────────────────────────────────────
@@ -346,32 +344,28 @@ def _skipped_payload(agent_name: str, step_id: str, tool_name: str) -> dict:
 
 
 def _dep_unavailable_payload(tool_name: str) -> dict:
-    return {
-        "run_status": "dependency_unavailable",
-        "tool_name": tool_name,
-        "reason": "wrapper_not_wired",
-    }
+    return normalize_mcp_outcome(
+        tool_name=tool_name,
+        envelope=dependency_unavailable_envelope(
+            tool_name=tool_name, reason_code="wrapper_not_wired"
+        ),
+    )
 
 
 def _normalize_response(response: Any, tool_name: str) -> dict:
     if getattr(response, "is_error", False):
-        return {
-            "run_status": "failed",
-            "tool_name": tool_name,
-            "error_message": _extract_text(response),
-        }
-    return {
-        "run_status": "success",
-        "tool_name": tool_name,
-        "payload": _extract_payload(response),
-    }
-
-
-def _extract_text(response: Any) -> str:
-    parts = getattr(response, "content", None) or []
-    return " ".join(
-        (p.get("text") if isinstance(p, dict) else str(p)) for p in parts
-    ).strip()
+        envelope = failed_envelope(
+            tool_name=tool_name,
+            reason_code="fastmcp_transport_error",
+        )
+    else:
+        envelope = _extract_payload(response)
+        if not isinstance(envelope, dict):
+            envelope = failed_envelope(
+                tool_name=tool_name,
+                reason_code="fastmcp_invalid_envelope",
+            )
+    return normalize_mcp_outcome(tool_name=tool_name, envelope=envelope)
 
 
 def _extract_payload(response: Any) -> Any:

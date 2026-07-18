@@ -18,7 +18,28 @@ from app.services.tool_inventory_service import ToolInventoryService
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2].parent
-DEFAULT_XLSX = PROJECT_ROOT / "\u9879\u76ee\u6587\u4ef6" / "ToolUniversity_inventory_v0.2.xlsx"
+DEFAULT_XLSX = (
+    PROJECT_ROOT / "\u9879\u76ee\u6587\u4ef6" / "ToolUniversity_inventory_v0.2.xlsx"
+)
+
+EXPECTED_PATENT_EVIDENCE_STEP13 = {
+    "LiteratureSearchTool",
+    "EuropePMC_search_articles",
+    "openalex_search_works",
+    "PubTator3_LiteratureSearch",
+    "PubTator3_get_annotations",
+    "SemanticScholar_search_papers",
+    "ChEMBL_search_documents",
+    "MultiAgentLiteratureSearch",
+}
+EXPECTED_PATENT_EVIDENCE_STEP14 = {
+    "PubChem_get_associated_patents_by_CID",
+    "FDA_OrangeBook_get_patent_info",
+    "drugbank_get_drug_references_by_drug_name_or_id",
+}
+EXPECTED_PATENT_EVIDENCE_TOOLS = (
+    EXPECTED_PATENT_EVIDENCE_STEP13 | EXPECTED_PATENT_EVIDENCE_STEP14
+)
 
 
 @pytest.fixture
@@ -37,7 +58,9 @@ def test_fastmcp_client_list_tools_blocks_other_steps(server):
     from app.mcp.client import FastMCPClient
 
     client = FastMCPClient.attach_server(server, inventory=server.inventory)
-    step5 = set(client.list_tools(agent_name="candidate_context_agent", step_id="step_05"))
+    step5 = set(
+        client.list_tools(agent_name="candidate_context_agent", step_id="step_05")
+    )
     assert "ChEMBL_search_molecules" in step5
     # Step 6/7/8 tools must not appear:
     assert "ProteinsPlus_profile_structure_quality" not in step5
@@ -82,7 +105,10 @@ def test_fastmcp_client_dispatches_in_scope_tool(server):
 
     fm = server._fastmcp
     assert "ChEMBL_search_molecules" in fm.tools
-    fm.tools["ChEMBL_search_molecules"].handler = lambda **kw: {"echoed_query": kw.get("query")}
+    fm.tools["ChEMBL_search_molecules"].handler = lambda **kw: {
+        "status": "ok",
+        "payload": {"echoed_query": kw.get("query")},
+    }
 
     client = FastMCPClient.attach_server(server, inventory=server.inventory)
     assert "step_05" in AGENT_STEP_MAP["candidate_context_agent"]
@@ -93,7 +119,8 @@ def test_fastmcp_client_dispatches_in_scope_tool(server):
         query="MMAE",
     )
     assert res["run_status"] == "success", res
-    assert res["payload"] == {"echoed_query": "MMAE"}
+    assert res["envelope_status"] == "ok"
+    assert res["payload"]["payload"] == {"echoed_query": "MMAE"}
 
 
 def test_fastmcp_client_requires_python_a2a():
@@ -105,3 +132,33 @@ def test_fastmcp_client_requires_python_a2a():
 
     with pytest.raises(ImportError):
         FastMCPClient(fastmcp=None, remote_client=None)
+
+
+def test_patent_evidence_scope_parity_with_real_inventory_and_fastmcp(server):
+    from app.mcp.client import FastMCPClient, LocalMCPClient
+
+    local = LocalMCPClient(inventory=server.inventory)
+    fast = FastMCPClient.attach_server(server, inventory=server.inventory)
+
+    local13 = set(
+        local.list_tools(agent_name="patent_evidence_agent", step_id="step_13")
+    )
+    local14 = set(
+        local.list_tools(agent_name="patent_evidence_agent", step_id="step_14")
+    )
+    fast13 = set(fast.list_tools(agent_name="patent_evidence_agent", step_id="step_13"))
+    fast14 = set(fast.list_tools(agent_name="patent_evidence_agent", step_id="step_14"))
+
+    assert local13 == EXPECTED_PATENT_EVIDENCE_STEP13
+    assert local14 == EXPECTED_PATENT_EVIDENCE_STEP14
+    assert fast13 == local13
+    assert fast14 == local14
+
+    registered = set(server.registered_tool_names())
+    assert EXPECTED_PATENT_EVIDENCE_TOOLS <= registered
+
+    unrelated = set(
+        fast.list_tools(agent_name="developability_agent", step_id="step_06")
+    )
+    assert unrelated.isdisjoint(EXPECTED_PATENT_EVIDENCE_TOOLS)
+    assert fast.list_tools(agent_name="patent_evidence_agent", step_id="step_06") == []

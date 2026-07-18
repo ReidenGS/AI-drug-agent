@@ -13,6 +13,9 @@ AGENT_STEP_MAP: dict[str, set[str]] = {
     "structure_and_design_agent": {"step_07", "step_08", "step_09"},
     "evidence_agent": {"step_13"},
     "patent_ip_agent": {"step_14"},
+    # Turn PE-A unified selection surface. Inventory step ownership remains
+    # authoritative: evidence rows stay Step 13 and patent rows stay Step 14.
+    "patent_evidence_agent": {"step_13", "step_14"},
 }
 
 

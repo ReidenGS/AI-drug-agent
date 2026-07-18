@@ -291,6 +291,85 @@ def _mock_step14_patent_tool_selection(schema: dict) -> dict:
     return {"tool_plans": plans}
 
 
+def _mock_patent_evidence_tool_selection(schema: dict) -> dict:
+    """Catalog/scope/ref-driven unified planner; no hard-coded tool names."""
+    catalog = schema.get("tool_catalog") or []
+    input_refs = schema.get("input_refs") or []
+    scope = schema.get("search_scope") or {}
+    requested_lane_order = list(scope.get("requested_lanes") or [])
+    requested_lanes = set(requested_lane_order)
+    allowed_roles = set(scope.get("allowed_roles") or [])
+    antibody_allowed = bool(scope.get("antibody_search_allowed"))
+    plans: list[dict] = []
+    for ref in input_refs:
+        if not isinstance(ref, dict):
+            continue
+        role = str(ref.get("role") or "")
+        if role == "antibody" and not antibody_allowed:
+            continue
+        if role not in allowed_roles:
+            continue
+        supports = {str(v).lower() for v in ref.get("supports_tool_args") or []}
+        for tool in catalog:
+            if not isinstance(tool, dict) or tool.get("search_lane") not in requested_lanes:
+                continue
+            if not (tool.get("runtime_availability") or {}).get("can_execute", False):
+                continue
+            mapping = {
+                str(k).lower(): str(v)
+                for k, v in (tool.get("supports_to_schema_arg") or {}).items()
+            }
+            token = next(
+                (str(v) for v in tool.get("acceptable_supports") or [] if str(v).lower() in supports),
+                None,
+            )
+            if token is None or token.lower() not in mapping:
+                continue
+            schema_arg = mapping[token.lower()]
+            allowed_arg_roles = set(
+                (tool.get("schema_arg_allowed_ref_roles") or {}).get(schema_arg)
+                or []
+            )
+            if role not in allowed_arg_roles:
+                continue
+            plans.append(
+                {
+                    "tool_name": tool.get("tool_name"),
+                    "can_invoke": True,
+                    "argument_mappings": [
+                        {
+                            "schema_arg": schema_arg,
+                            "input_ref_id": ref.get("ref_id"),
+                        }
+                    ],
+                    "argument_literals": [],
+                    "missing_required_args": [],
+                    "selection_reason": "mock mapped supplied catalog to supplied ref",
+                }
+            )
+    planned_lanes = {
+        tool.get("search_lane")
+        for plan in plans
+        for tool in catalog
+        if isinstance(tool, dict) and tool.get("tool_name") == plan.get("tool_name")
+    }
+    return {
+        "lane_assessments": [
+            {
+                "search_lane": lane,
+                "status": "planned" if lane in planned_lanes else "missing_inputs",
+                "reason": (
+                    "supplied refs support at least one runtime-available catalog tool"
+                    if lane in planned_lanes
+                    else "no supplied ref supports a runtime-available catalog tool"
+                ),
+            }
+            for lane in requested_lane_order
+        ],
+        "tool_plans": plans,
+    }
+
+
 def _mock_step9_tool_selection_stage1(schema: dict) -> dict:
     catalog = schema.get("compact_catalog") or []
     return {
@@ -568,6 +647,8 @@ class MockLLMProvider:
             return _mock_step9_tool_schema_mapping_stage2(schema)
         if task == "step14_patent_tool_selection":
             return _mock_step14_patent_tool_selection(schema)
+        if task == "patent_evidence_tool_selection":
+            return _mock_patent_evidence_tool_selection(schema)
 
         raw = (schema or {}).get("raw_request_record") or {}
         ctx = raw.get("user_provided_context") or {}

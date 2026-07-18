@@ -61,3 +61,22 @@ def test_europepmc_not_leaked_to_unrelated_agent_step():
         entries, ScopeRequest(agent_name="developability_agent", step_id="step_06")
     )
     assert out == []
+
+
+def test_patent_evidence_agent_preserves_inventory_step_ownership():
+    entries = [
+        _entry("EuropePMC_search_articles", step="step_13", runtime="ok"),
+        _entry("PubChem_get_associated_patents_by_CID", step="step_14", runtime="ok"),
+    ]
+    evidence = filter_inventory(
+        entries,
+        ScopeRequest(agent_name="patent_evidence_agent", step_id="step_13"),
+    )
+    patent = filter_inventory(
+        entries,
+        ScopeRequest(agent_name="patent_evidence_agent", step_id="step_14"),
+    )
+    assert [entry.tool_name for entry in evidence] == ["EuropePMC_search_articles"]
+    assert [entry.tool_name for entry in patent] == [
+        "PubChem_get_associated_patents_by_CID"
+    ]

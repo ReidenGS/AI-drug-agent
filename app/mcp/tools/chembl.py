@@ -231,6 +231,7 @@ def ChEMBL_search_documents(
     document_id: str = "",
     *,
     title_contains: str = "",
+    title__contains: str = "",
     limit: int = 20,
     offset: int = 0,
     _live: bool = False,
@@ -242,12 +243,15 @@ def ChEMBL_search_documents(
     Legacy `title_contains` maps to TU's `title__contains` (double
     underscore — TU's standard Django-style lookup suffix).
     """
+    from ._arg_compat import pick
+
+    title_filter = pick(title__contains, title_contains, name="title__contains") or ""
     if not _live:
         return {
             "status": "mocked",
             "source": "ChEMBL_search_documents",
             "document_id": document_id,
-            "title_contains": title_contains,
+            "title_contains": title_filter,
             "documents": [],
         }
     args: dict[str, Any] = {
@@ -256,8 +260,8 @@ def ChEMBL_search_documents(
     }
     if document_id:
         args["document_id"] = document_id
-    if title_contains:
-        args["title__contains"] = title_contains
+    if title_filter:
+        args["title__contains"] = title_filter
     return _tu("ChEMBL_search_documents", args)
 
 

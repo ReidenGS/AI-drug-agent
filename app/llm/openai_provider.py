@@ -399,6 +399,24 @@ class _Step14PatentToolSelectionResponse(BaseModel):
         return {"tool_plans": plans_out}
 
 
+class _PatentEvidenceLaneAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    search_lane: Literal["evidence", "patent"]
+    status: Literal["planned", "missing_inputs", "not_applicable"]
+    reason: str
+
+
+class _PatentEvidenceToolSelectionResponse(_Step14PatentToolSelectionResponse):
+    lane_assessments: list[_PatentEvidenceLaneAssessment] = Field(default_factory=list)
+
+    def to_external_dict(self) -> dict:
+        out = super().to_external_dict()
+        out["lane_assessments"] = [
+            assessment.model_dump() for assessment in self.lane_assessments
+        ]
+        return out
+
+
 # Tasks whose output uses the official structured-output parser. Every other
 # task (structured_query, tool_selection_stage_2, *_multi_lane, *_multi_tool)
 # keeps the json_object path unchanged.
@@ -407,6 +425,7 @@ _RESPONSE_MODEL_FOR_TASK: dict[str, type[BaseModel]] = {
     "step6_schema_mapping_stage_1": _Step6SchemaMappingStage1Response,
     "orchestrator_worker_routing": _OrchestratorRoutingResponse,
     "step14_patent_tool_selection": _Step14PatentToolSelectionResponse,
+    "patent_evidence_tool_selection": _PatentEvidenceToolSelectionResponse,
     # step6_schema_mapping_stage_2 is TEMPORARILY DISABLED from the official
     # parser path. The current Step 6 Stage 2 prompt still asks for the legacy
     # dynamic-dict shape ({"argument_mapping": {schema_arg: field_ref},
@@ -460,6 +479,26 @@ def _supports_24h_prompt_cache_retention(model: str) -> bool:
     """Capability check for the GPT-5.5 model family, not a model allowlist."""
 
     return model.strip().lower().startswith("gpt-5.5")
+
+
+def _cache_layout_for_schema(schema: dict[str, Any], task: str) -> str:
+    """Return a non-sensitive cache namespace layout discriminator.
+
+    The unified selector hashes its stable official catalog plus its explicit
+    layout version. Run/query/ref data is excluded, so dynamic requests share
+    a namespace while catalog or layout changes cannot reuse the old key.
+    """
+    if task != "patent_evidence_tool_selection":
+        return _PROMPT_CACHE_LAYOUT_VERSION
+    layout = str(schema.get("prompt_cache_layout_version") or "missing_layout")
+    catalog = sorted(
+        [entry for entry in schema.get("tool_catalog") or [] if isinstance(entry, dict)],
+        key=lambda entry: str(entry.get("tool_name") or ""),
+    )
+    digest = hashlib.sha256(
+        json.dumps(catalog, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{layout}:{digest}"
 
 
 def _resolve_parse_fn(client: Any) -> Any | None:
@@ -535,6 +574,12 @@ class OpenAIProvider:
         return, same validation + Step 2 normalization.
         """
         task = (schema or {}).get("task") or "structured_query"
+        cache_layout_version = _cache_layout_for_schema(schema or {}, task)
+        routed_task = (
+            f"{task}\x1e{cache_layout_version}"
+            if task == "patent_evidence_tool_selection"
+            else task
+        )
         # Build the user-message body WITHOUT embedding the system block.
         # Chat Completions takes ``system`` as a dedicated role="system"
         # message via ``_generate_content``; ``_build_json_prompt`` would
@@ -558,7 +603,7 @@ class OpenAIProvider:
             response = self._generate_content(
                 base_prompt + retry_note,
                 system=system,
-                task=task,
+                task=routed_task,
             )
             # Record per-attempt token usage as soon as a response object
             # exists, regardless of whether parsing later succeeds — a
@@ -612,17 +657,23 @@ class OpenAIProvider:
         json_object. Returns the raw SDK response object (either the parsed or
         the content shape); ``_response_to_dict`` normalizes both.
         """
-        response_model = _RESPONSE_MODEL_FOR_TASK.get(task)
+        base_task, separator, routed_layout = task.partition("\x1e")
+        cache_layout_version = routed_layout if separator else _PROMPT_CACHE_LAYOUT_VERSION
+        response_model = _RESPONSE_MODEL_FOR_TASK.get(base_task)
         if response_model is not None:
             parsed_response = self._try_structured_parse(
                 prompt,
                 system=system,
-                task=task,
+                task=base_task,
                 response_model=response_model,
+                cache_layout_version=cache_layout_version,
             )
             if parsed_response is not None:
                 return parsed_response
-        return self._create_json_object(prompt, system=system, task=task)
+        return self._create_json_object(
+            prompt, system=system, task=base_task,
+            cache_layout_version=cache_layout_version,
+        )
 
     def _messages(self, prompt: str, *, system: str | None) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
@@ -631,11 +682,15 @@ class OpenAIProvider:
         messages.append({"role": "user", "content": prompt})
         return messages
 
-    def _prompt_cache_kwargs(self, *, task: str) -> dict[str, str]:
+    def _prompt_cache_kwargs(
+        self, *, task: str,
+        layout_version: str = _PROMPT_CACHE_LAYOUT_VERSION,
+    ) -> dict[str, str]:
         kwargs = {
             "prompt_cache_key": _prompt_cache_key(
                 model=self.model,
                 task=task,
+                layout_version=layout_version,
             )
         }
         if _supports_24h_prompt_cache_retention(self.model):
@@ -649,6 +704,7 @@ class OpenAIProvider:
         system: str | None,
         task: str,
         response_model: type[BaseModel],
+        cache_layout_version: str = _PROMPT_CACHE_LAYOUT_VERSION,
     ) -> Any | None:
         """Attempt the official structured-output parser.
 
@@ -672,7 +728,9 @@ class OpenAIProvider:
                 messages=self._messages(prompt, system=system),
                 response_format=response_model,
                 timeout=self.timeout,
-                **self._prompt_cache_kwargs(task=task),
+                **self._prompt_cache_kwargs(
+                    task=task, layout_version=cache_layout_version
+                ),
             )
         except Exception as exc:  # noqa: BLE001 — classify then fall back or re-raise
             if _is_parser_incompatibility(exc):
@@ -691,6 +749,7 @@ class OpenAIProvider:
         *,
         system: str | None,
         task: str,
+        cache_layout_version: str = _PROMPT_CACHE_LAYOUT_VERSION,
     ) -> Any:
         """Call OpenAI Chat Completions with JSON-object response mode.
 
@@ -704,7 +763,9 @@ class OpenAIProvider:
             messages=self._messages(prompt, system=system),
             response_format={"type": "json_object"},
             timeout=self.timeout,
-            **self._prompt_cache_kwargs(task=task),
+            **self._prompt_cache_kwargs(
+                task=task, layout_version=cache_layout_version
+            ),
         )
 
     def _get_client(self) -> Any:

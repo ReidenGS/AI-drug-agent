@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..outcome import dependency_unavailable_envelope
+
 
 def _mocked(*, source: str, **payload: Any) -> dict[str, Any]:
     return {"status": "mocked", "source": source, **payload}
@@ -62,8 +64,9 @@ def drugbank_get_drug_references_by_drug_name_or_id(
     # DrugBank is license-gated. We deliberately do NOT route this through
     # ToolUniverse — TU may carry a DrugBank tool but invoking it requires
     # credentials we don't provision in this project.
-    raise NotImplementedError(
-        "drugbank live mode is key_required and not wired"
+    return dependency_unavailable_envelope(
+        tool_name="drugbank_get_drug_references_by_drug_name_or_id",
+        reason_code="drugbank_license_required",
     )
 
 
@@ -88,6 +91,8 @@ def FDA_OrangeBook_get_patent_info(
         args["brand_name"] = brand_name
     if application_number:
         args["application_number"] = application_number
+    if operation:
+        args["operation"] = operation
     return _tu("FDA_OrangeBook_get_patent_info", args)
 
 

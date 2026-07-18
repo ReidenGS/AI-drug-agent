@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..outcome import composite_scope_block_envelope
+
 
 def _mocked(*, source: str, query: Any, **extra: Any) -> dict[str, Any]:
     return {
@@ -53,41 +55,108 @@ def LiteratureSearchTool(
         )
     if not _live:
         return _mocked(source="LiteratureSearchTool", query=payload)
+    blocked = composite_scope_block_envelope("LiteratureSearchTool")
+    if blocked is not None:
+        return blocked
     return _tu("LiteratureSearchTool", {"research_topic": payload})
 
 
 def EuropePMC_search_articles(
-    query: str, *, page_size: int = 25, _live: bool = False, **_extra: Any,
+    query: str,
+    *,
+    limit: int | None = None,
+    require_has_ft: bool | None = None,
+    fulltext_terms: list[str] | None = None,
+    enrich_missing_abstract: bool | None = None,
+    extract_terms_from_fulltext: list[str] | None = None,
+    page_size: int | None = None,
+    _live: bool = False,
 ) -> dict[str, Any]:
+    if limit is not None and page_size is not None:
+        raise ValueError("alias_conflict:limit|page_size")
     if not query:
         raise ValueError("EuropePMC_search_articles requires a non-empty query")
     if not _live:
         return _mocked(source="EuropePMC_search_articles", query=query)
-    return _tu("EuropePMC_search_articles", {"query": query, "limit": page_size})
+    args: dict[str, Any] = {"query": query}
+    for name, value in (
+        ("limit", limit),
+        ("require_has_ft", require_has_ft),
+        ("fulltext_terms", fulltext_terms),
+        ("enrich_missing_abstract", enrich_missing_abstract),
+        ("extract_terms_from_fulltext", extract_terms_from_fulltext),
+        ("page_size", page_size),
+    ):
+        if value is not None:
+            args[name] = value
+    return _tu("EuropePMC_search_articles", args)
 
 
-def openalex_search_works(query: str, *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
-    if not query:
-        raise ValueError("openalex_search_works requires a non-empty query")
+def openalex_search_works(
+    query: str | None = None,
+    *,
+    search: str | None = None,
+    filter: str | None = None,
+    require_has_fulltext: bool | None = None,
+    fulltext_terms: list[str] | None = None,
+    per_page: int | None = None,
+    limit: int | None = None,
+    page: int | None = None,
+    sort: str | None = None,
+    mailto: str | None = None,
+    _live: bool = False,
+) -> dict[str, Any]:
+    if query is not None and search is not None:
+        raise ValueError("alias_conflict:query|search")
+    if per_page is not None and limit is not None:
+        raise ValueError("alias_conflict:per_page|limit")
+    if not query and not search:
+        raise ValueError("openalex_search_works requires a non-empty query / search")
+    display_query = query or search
     if not _live:
-        return _mocked(source="openalex_search_works", query=query)
-    return _tu("openalex_search_works", {"query": query})
+        return _mocked(source="openalex_search_works", query=display_query)
+    args: dict[str, Any] = {}
+    for name, value in (
+        ("query", query),
+        ("search", search),
+        ("filter", filter),
+        ("require_has_fulltext", require_has_fulltext),
+        ("fulltext_terms", fulltext_terms),
+        ("per_page", per_page),
+        ("limit", limit),
+        ("page", page),
+        ("sort", sort),
+        ("mailto", mailto),
+    ):
+        if value is not None:
+            args[name] = value
+    return _tu("openalex_search_works", args)
 
 
-def PubTator3_LiteratureSearch(query: str, *, _live: bool = False, **_extra: Any) -> dict[str, Any]:
+def PubTator3_LiteratureSearch(
+    query: str,
+    *,
+    page: int = 0,
+    page_size: int = 10,
+    limit: int | None = None,
+    _live: bool = False,
+) -> dict[str, Any]:
     if not query:
         raise ValueError("PubTator3_LiteratureSearch requires a non-empty query")
     if not _live:
         return _mocked(source="PubTator3_LiteratureSearch", query=query)
-    return _tu("PubTator3_LiteratureSearch", {"query": query})
+    args: dict[str, Any] = {"query": query, "page": page, "page_size": page_size}
+    if limit is not None:
+        args["limit"] = limit
+    return _tu("PubTator3_LiteratureSearch", args)
 
 
 def PubTator3_get_annotations(
     pmid: str = "",
     *,
     pmids: str = "",
+    concepts: str = "gene,disease,chemical,species,mutation,cellline",
     _live: bool = False,
-    **_extra: Any,
 ) -> dict[str, Any]:
     """Legacy wrapper accepts a single `pmid`; TU's official schema requires
     `pmids` (comma-separated). Both kwargs are accepted; if both are
@@ -99,29 +168,40 @@ def PubTator3_get_annotations(
         raise ValueError("PubTator3_get_annotations requires pmid / pmids")
     if not _live:
         return _mocked(source="PubTator3_get_annotations", query=value)
-    return _tu("PubTator3_get_annotations", {"pmids": value})
+    return _tu("PubTator3_get_annotations", {"pmids": value, "concepts": concepts})
 
 
 def SemanticScholar_search_papers(
-    query: str, *, limit: int = 5, _live: bool = False, **_extra: Any,
+    query: str,
+    *,
+    limit: int = 5,
+    year: str | None = None,
+    sort: str | None = None,
+    include_abstract: bool = False,
+    _live: bool = False,
 ) -> dict[str, Any]:
     if not query:
         raise ValueError("SemanticScholar_search_papers requires a non-empty query")
     if not _live:
         return _mocked(source="SemanticScholar_search_papers", query=query)
-    return _tu(
-        "SemanticScholar_search_papers",
-        {"query": query, "limit": max(1, min(int(limit), 100))},
-    )
+    args: dict[str, Any] = {
+        "query": query,
+        "limit": limit,
+        "include_abstract": include_abstract,
+    }
+    if year is not None:
+        args["year"] = year
+    if sort is not None:
+        args["sort"] = sort
+    return _tu("SemanticScholar_search_papers", args)
 
 
 def MultiAgentLiteratureSearch(
     query: str,
     max_iterations: int = 1,
-    quality_threshold: float = 0.5,
+    quality_threshold: float = 0.7,
     *,
     _live: bool = False,
-    **_extra: Any,
 ) -> dict[str, Any]:
     """Iterative multi-agent literature search (TU `ComposeTool`).
 
@@ -130,23 +210,27 @@ def MultiAgentLiteratureSearch(
     Running the live path requires an LLM key recognized by ToolUniverse
     (e.g. `GEMINI_API_KEY`) present in the environment.
 
-    `max_iterations` is **clamped to 1** for now to keep cost predictable
+    `max_iterations` is **restricted to exactly 1** for now to keep cost predictable
     while the agentic execution policy stabilizes — a single iteration
     still exercises the full pipeline and surfaces enough signal for
-    Step 13. Raise the clamp here later if/when richer iteration is
+    Step 13. Relax the disclosed constraint later if/when richer iteration is
     needed.
     """
     if not query:
         raise ValueError("MultiAgentLiteratureSearch requires a non-empty query")
     if not _live:
         return _mocked(source="MultiAgentLiteratureSearch", query=query, total_papers=0)
-    clamped_iters = max(1, min(int(max_iterations), 1))  # hard clamp to 1
+    if isinstance(max_iterations, bool) or int(max_iterations) != 1:
+        raise ValueError("MultiAgentLiteratureSearch runtime policy requires max_iterations=1")
+    blocked = composite_scope_block_envelope("MultiAgentLiteratureSearch")
+    if blocked is not None:
+        return blocked
     return _tu(
         "MultiAgentLiteratureSearch",
         {
             "query": query,
-            "max_iterations": clamped_iters,
-            "quality_threshold": float(quality_threshold),
+            "max_iterations": 1,
+            "quality_threshold": quality_threshold,
         },
     )
 

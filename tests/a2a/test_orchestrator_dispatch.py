@@ -1388,10 +1388,14 @@ async def test_empty_eligible_and_empty_prepared_is_noop_without_checkpoint():
 
 # -- production Step 5 integration ------------------------------------------
 def _local_mcp() -> LocalMCPClient:
-    """Test-only deterministic local bindings; no live MCP or ToolUniverse."""
+    """Test-fixture envelopes; not live MCP or ToolUniverse evidence."""
 
     def binding(payload):
-        return lambda **_kwargs: payload
+        return lambda **_kwargs: {
+            "status": "ok",
+            "executor": "test_fixture",
+            "payload": payload,
+        }
 
     return LocalMCPClient(
         bindings={

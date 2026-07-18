@@ -74,7 +74,10 @@ _LLM_STYLE_CASES = [
         "evidence_agent",
         "step_13",
         {"pmids": "12345"},
-        {"pmids": "12345"},
+        {
+            "pmids": "12345",
+            "concepts": "gene,disease,chemical,species,mutation,cellline",
+        },
     ),
 ]
 
@@ -119,8 +122,8 @@ def test_official_and_legacy_contradiction_raises():
     assert "contradictory" in res["error_message"].lower()
 
 
-def test_legacy_only_still_works():
-    """Old call sites passing `pmid` unchanged keep mocking cleanly."""
+def test_legacy_only_mock_is_preserved_but_not_claimed_as_success():
+    """Legacy alias still reaches the wrapper; mocked is not live success."""
     client = LocalMCPClient()
     res = client.call_tool(
         agent_name="evidence_agent",
@@ -128,7 +131,8 @@ def test_legacy_only_still_works():
         tool_name="PubTator3_get_annotations",
         pmid="12345",
     )
-    assert res["run_status"] == "success"
+    assert res["run_status"] == "failed"
+    assert res["executor"] == "mock"
     assert res["payload"]["status"] == "mocked"
 
 
@@ -199,12 +203,6 @@ def test_zinc_official_args_still_intentionally_disabled(
     assert res["executor"] == "deferred"
     assert fake.calls == []
     # Mock envelope (no _live) must still NOT claim live_ready / ZINC22.
-    mock = client.call_tool(
-        agent_name="structure_and_design_agent",
-        step_id="step_09",
-        tool_name=tool,
-        **args,
-    )
     # In mock mode without live, run_status==success and we can read the mock body.
     # Re-call without the live env (allowlist hit but inject only fires when env truthy).
     # ZINC raises NotImplementedError on _live=True regardless — we've already proved

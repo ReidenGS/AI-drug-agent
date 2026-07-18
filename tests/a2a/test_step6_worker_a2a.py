@@ -63,14 +63,18 @@ def _no_proxy(monkeypatch):
 
 
 def _success_mcp() -> LocalMCPClient:
-    """Test-only mocked local success binding, not a live MCP execution.
+    """Test-fixture success binding, not live MCP/ToolUniverse evidence.
 
     This fixture does not demonstrate success from a real ToolUniverse tool.
     Production has no corresponding mock-success fallback.
     """
 
     def _pains(**_kwargs):
-        return {"status": "mocked", "alerts": [], "passes": True}
+        return {
+            "status": "ok",
+            "executor": "test_fixture",
+            "payload": {"alerts": [], "passes": True},
+        }
 
     return LocalMCPClient(bindings={"DrugProps_pains_filter": _pains})
 

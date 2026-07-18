@@ -41,6 +41,24 @@ def _mcp() -> LocalMCPClient:
     return LocalMCPClient(inventory=_inventory())
 
 
+def _evidence_fixture_mcp() -> LocalMCPClient:
+    """Complete test envelopes; not live MCP/ToolUniverse evidence."""
+    bindings = _bind_fixed(
+        {
+            "LiteratureSearchTool": {
+                "results": [{"title": "Fixture literature review", "doi": "10.1/FIXTURE"}],
+            },
+            "EuropePMC_search_articles": {
+                "results": [{"title": "Fixture Europe PMC result", "pmid": "1"}],
+            },
+            "PubTator3_LiteratureSearch": {
+                "results": [{"title": "Fixture PubTator result", "pmid": "2"}],
+            },
+        }
+    )
+    return LocalMCPClient(inventory=_inventory(), bindings=bindings)
+
+
 def _seed_through_step_12(local_storage, registry_service, workflow_state_service):
     intake = IntakeService(local_storage, registry_service, workflow_state_service)
     rec = intake.submit(
@@ -85,7 +103,7 @@ def test_step13_builds_evidence_records_from_target_payload_candidates(
     run_id = _seed_through_step_12(local_storage, registry_service, workflow_state_service)
     table = EvidenceAgent(
         storage=local_storage, registry=registry_service,
-        workflow_state=workflow_state_service, mcp_client=_mcp(),
+        workflow_state=workflow_state_service, mcp_client=_evidence_fixture_mcp(),
     ).run(run_id)
 
     # Tool routing fired for target, payload, and candidates.
@@ -103,12 +121,11 @@ def test_step13_builds_evidence_records_from_target_payload_candidates(
 def test_step13_raw_payload_not_in_normalized_artifact(
     local_storage, registry_service, workflow_state_service
 ):
-    """Mock wrappers stamp `"mocked"` into envelopes; that string must not
-    leak into evidence_records / table top-level fields."""
+    """Test fixture envelopes must not leak into normalized evidence rows."""
     run_id = _seed_through_step_12(local_storage, registry_service, workflow_state_service)
     table = EvidenceAgent(
         storage=local_storage, registry=registry_service,
-        workflow_state=workflow_state_service, mcp_client=_mcp(),
+        workflow_state=workflow_state_service, mcp_client=_evidence_fixture_mcp(),
     ).run(run_id)
 
     blob = json.dumps([r.model_dump() for r in table.evidence_records])
@@ -192,13 +209,26 @@ def _seed_through_step_5(
 
 
 def _bind_fixed(canned: dict[str, dict]) -> dict:
-    """Bindings that return a fixed payload regardless of query args."""
+    """Complete test envelopes; not live MCP/ToolUniverse evidence."""
 
-    def make(payload):
+    def make(tool_name, payload):
         def _fn(**_kw):
-            return payload
+            inner = dict(payload)
+            inner.pop("status", None)
+            if tool_name == "LiteratureSearchTool":
+                inner["tool_call_records"] = [
+                    {
+                        "tool_name": "MedicalLiteratureReviewer",
+                        "run_status": "success",
+                    }
+                ]
+            return {
+                "status": "ok",
+                "executor": "test_fixture",
+                **inner,
+            }
         return _fn
-    return {name: make(p) for name, p in canned.items()}
+    return {name: make(name, p) for name, p in canned.items()}
 
 
 # ── 1. downstream hints drive query construction ─────────────────────────────
