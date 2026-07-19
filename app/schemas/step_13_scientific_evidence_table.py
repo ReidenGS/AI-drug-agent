@@ -6,6 +6,10 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 from .common import ToolCallRecord
+from .patent_evidence_audit import (
+    PatentEvidencePlanningAudit,
+    PatentEvidenceResolverAuditEntry,
+)
 
 
 class EvidenceRecord(BaseModel):
@@ -40,6 +44,12 @@ class ScientificEvidenceTable(BaseModel):
     run_id: str
     step_id: str = "step_13_evidence"
     created_at: str
-    review_status: Literal["ok", "partial", "failed"] = "partial"
+    review_status: Literal["ok", "partial", "failed", "not_requested"] = "partial"
     evidence_records: list[EvidenceRecord] = Field(default_factory=list)
     tool_call_records: list[ToolCallRecord] = Field(default_factory=list)
+    patent_evidence_planning_audit: PatentEvidencePlanningAudit = Field(
+        default_factory=PatentEvidencePlanningAudit
+    )
+    patent_evidence_resolver_audit: list[PatentEvidenceResolverAuditEntry] = Field(
+        default_factory=list
+    )

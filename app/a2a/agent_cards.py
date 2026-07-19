@@ -45,6 +45,7 @@ _FORBID = ConfigDict(extra="forbid")
 CAP_STEP5_CANDIDATE_CONTEXT = "step_05_candidate_context"
 CAP_STEP6_DEVELOPABILITY = "step_06_developability"
 CAP_STRUCTURE_DESIGN_WORKFLOW = "structure_design_workflow"
+CAP_PATENT_EVIDENCE_WORKFLOW = "patent_evidence_workflow"
 
 # Structure worker internal step ids (NOT A2A capabilities).
 STEP_07_STRUCTURE_INPUT = "step_07_structure_input"
@@ -55,6 +56,7 @@ STEP_09_STRUCTURE_DESIGN = "step_09_structure_design"
 AGENT_ID_STEP5 = "step_05_candidate_context_agent"
 AGENT_ID_STEP6 = "step_06_developability_agent"
 AGENT_ID_STRUCTURE = "structure_and_design_agent"
+AGENT_ID_PATENT_EVIDENCE = "patent_evidence_agent"
 
 _REQUIRED_DISPATCH_MODES = ["python_a2a"]
 _CONTRACT_KEY = "adc_agent_contract"
@@ -171,6 +173,102 @@ _STRUCTURE_PREDICTION = ContractArtifactRef(
     artifact_name="structure_prediction_and_interface_results",
     storage_path="structure_prediction_and_interface_results.json",
 )
+
+
+def build_patent_evidence_agent_card(url: str) -> AgentCard:
+    """Unified Step 13/14 Patent-Evidence worker contract."""
+    contract = AdcAgentContract(
+        agent_id=AGENT_ID_PATENT_EVIDENCE,
+        agent_role="worker",
+        step_id="step_13_14_patent_evidence",
+        display_name="Patent and Evidence Agent",
+        description=(
+            "Performs cross-source scientific evidence review, patent discovery, "
+            "and regulatory reference lookup from validated run artifacts."
+        ),
+        capabilities=[
+            AgentCapabilityContract(
+                capability_id=CAP_PATENT_EVIDENCE_WORKFLOW,
+                skill_name="Patent and evidence workflow",
+                capability_summary=(
+                    "Plan and execute scientific evidence, patent discovery, and "
+                    "regulatory reference lanes from typed artifact references."
+                ),
+                execution_mode="single_step",
+                supported_step_ids=["step_13_evidence", "step_14_patent_ip"],
+                supported_intents=[
+                    "literature_review",
+                    "patent_ip_review",
+                    "new_adc_design",
+                    "existing_adc_evaluation",
+                    "optimization",
+                ],
+                supported_lane_flags=[
+                    "scientific_evidence_lane",
+                    "patent_prior_art_lane",
+                    "regulatory_reference_lane",
+                ],
+                required_input_artifacts=[
+                    _STRUCTURED_QUERY,
+                    _CANDIDATE_CONTEXT_TABLE,
+                ],
+                optional_input_artifacts=[],
+                required_artifact_fields={
+                    "structured_query": ArtifactFieldRequirement(
+                        required_field_keys=[
+                            "task_intent",
+                            "referenced_inputs",
+                            "normalized_entities",
+                            "entity_decompositions",
+                            "requested_outputs",
+                            "canonical_query",
+                        ]
+                    ),
+                    "candidate_context_table": ArtifactFieldRequirement(
+                        required_field_keys=[
+                            "candidate_records",
+                            "downstream_query_hints",
+                        ],
+                        entity_type="candidate",
+                        default_selection_mode="all_in_artifact",
+                    ),
+                },
+                required_control_context=["orchestrator_routing_decision"],
+                output_artifacts=[
+                    ContractArtifactRef(
+                        artifact_name="scientific_evidence_table",
+                        storage_path="scientific_evidence_table.json",
+                        readiness_status_field="review_status",
+                        ready_status_values=["ok", "partial", "not_requested"],
+                    ),
+                    ContractArtifactRef(
+                        artifact_name="patent_prior_art_table",
+                        storage_path="patent_prior_art_table.json",
+                        readiness_status_field="patent_review_status",
+                        ready_status_values=[
+                            "completed",
+                            "completed_with_warnings",
+                            "partial",
+                            "not_requested",
+                        ],
+                    ),
+                ],
+                uses_llm=True,
+                uses_mcp=True,
+            )
+        ],
+        dispatch_modes=["python_a2a"],
+        routable=True,
+        status="active",
+        uses_llm=True,
+        uses_mcp=True,
+        privacy_notes=[
+            "Reads validated run artifacts by reference.",
+            "A2A payloads and compact audits exclude resolved values, raw tool "
+            "payloads, prompts, credentials, and raw LLM responses.",
+        ],
+    )
+    return _build_agent_card(contract=contract, url=url)
 
 
 def _build_agent_card(*, contract: AdcAgentContract, url: str) -> AgentCard:
@@ -771,6 +869,9 @@ __all__ = [
     "build_step5_agent_card",
     "build_step6_agent_card",
     "build_structure_agent_card",
+    "build_patent_evidence_agent_card",
+    "AGENT_ID_PATENT_EVIDENCE",
+    "CAP_PATENT_EVIDENCE_WORKFLOW",
     "parse_adc_agent_contract",
     "validate_adc_agent_contract",
     "build_compact_card_for_agent",

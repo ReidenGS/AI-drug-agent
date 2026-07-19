@@ -261,6 +261,7 @@ def test_catalog_query_role_is_limited_to_generic_evidence_and_drugbank_query():
     drugbank = by_tool["drugbank_get_drug_references_by_drug_name_or_id"]
     assert drugbank["schema_arg_allowed_ref_roles"]["query"] == [
         "drug_name",
+        "drugbank_id",
         "query",
     ]
     assert drugbank["runtime_availability"] == {
@@ -285,6 +286,15 @@ def test_query_ref_dual_lane_plans_evidence_but_not_license_gated_drugbank():
         plan.tool_name != "drugbank_get_drug_references_by_drug_name_or_id"
         for plan in result.tool_plans
     )
+    assert result.eligible_tool_names_by_lane == {
+        "evidence": [
+            "EuropePMC_search_articles",
+            "PubTator3_LiteratureSearch",
+            "SemanticScholar_search_papers",
+            "openalex_search_works",
+        ],
+        "patent": [],
+    }
 
 
 class _FakeLLM:
@@ -548,7 +558,7 @@ def test_prompt_requires_nonplanned_lanes_to_emit_no_tool_plan():
                 {"schema_arg": "limit", "literal_value_json": "5"},
                 {"schema_arg": "page_size", "literal_value_json": "5"},
             ],
-            "mutually_exclusive_schema_args:limit|page_size",
+            "mutually_exclusive_schema_args",
         ),
         (
             "openalex_search_works",
@@ -557,7 +567,7 @@ def test_prompt_requires_nonplanned_lanes_to_emit_no_tool_plan():
                 {"schema_arg": "search", "input_ref_id": "r_search"},
             ],
             [],
-            "mutually_exclusive_schema_args:query|search",
+            "mutually_exclusive_schema_args",
         ),
         (
             "openalex_search_works",
@@ -566,7 +576,7 @@ def test_prompt_requires_nonplanned_lanes_to_emit_no_tool_plan():
                 {"schema_arg": "per_page", "literal_value_json": "10"},
                 {"schema_arg": "limit", "literal_value_json": "10"},
             ],
-            "mutually_exclusive_schema_args:per_page|limit",
+            "mutually_exclusive_schema_args",
         ),
     ],
 )
@@ -621,7 +631,7 @@ def test_tool_specific_role_contract_rejects_globally_valid_support_mapping():
         "r_payload"
     ]
     assert result.rejected_tool_plans[0].reason == (
-        "ref_role_not_allowed_for_schema_arg:query"
+        "ref_role_not_allowed_for_schema_arg"
     )
 
 
@@ -702,6 +712,49 @@ def test_drugbank_license_gate_prevents_invocable_plan():
     assert mock_only.lane_assessments[0].status == "missing_inputs"
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "schema_arg", "ref_id", "role", "support"),
+    [
+        (
+            "FDA_OrangeBook_get_patent_info",
+            "brand_name",
+            "r_brand",
+            "brand_name",
+            "brand_name",
+        ),
+        (
+            "FDA_OrangeBook_get_patent_info",
+            "application_number",
+            "r_application",
+            "application_number",
+            "application_number",
+        ),
+        (
+            "PubChem_get_associated_patents_by_CID",
+            "cid",
+            "r_cid",
+            "pubchem_cid",
+            "cid",
+        ),
+    ],
+)
+def test_explicit_typed_patent_identifier_mapping_is_accepted(
+    tool_name, schema_arg, ref_id, role, support
+):
+    result = plan_patent_evidence_tool_calls(
+        llm=_FakeLLM(
+            [_plan(tool_name, schema_arg, ref_id)],
+            assessments=[
+                {"search_lane": "patent", "status": "planned", "reason": "typed"}
+            ],
+        ),
+        request=_request(_ref(ref_id, role, support), lanes=["patent"]),
+    )
+    assert [(plan.tool_name, plan.can_invoke) for plan in result.tool_plans] == [
+        (tool_name, True)
+    ]
+
+
 def test_planned_lane_without_any_accepted_plan_fails_closed():
     plan = _plan("MultiAgentLiteratureSearch", "query", "r_query")
     plan["argument_literals"] = [
@@ -740,7 +793,7 @@ def test_planned_lane_without_any_accepted_plan_fails_closed():
         ),
         (
             [{"search_lane": "evidence", "status": "missing_inputs", "reason": "x"}],
-            "lane_assessment_nonplanned_with_tool_plan",
+            "lane_assessment_missing_inputs_with_eligible_tool",
         ),
     ],
 )
@@ -752,4 +805,32 @@ def test_lane_assessments_fail_closed(assessments, error):
                 assessments=assessments,
             ),
             request=_request(_ref("r_query", "payload", "query"), lanes=["evidence"]),
+        )
+
+
+def test_missing_inputs_with_query_and_cid_eligible_tools_fails_closed():
+    with pytest.raises(
+        PatentEvidenceSelectionValidationError,
+        match="lane_assessment_missing_inputs_with_eligible_tool",
+    ):
+        plan_patent_evidence_tool_calls(
+            llm=_FakeLLM(
+                [],
+                assessments=[
+                    {
+                        "search_lane": "evidence",
+                        "status": "missing_inputs",
+                        "reason": "fixture contradiction",
+                    },
+                    {
+                        "search_lane": "patent",
+                        "status": "missing_inputs",
+                        "reason": "fixture contradiction",
+                    },
+                ],
+            ),
+            request=_request(
+                _ref("r_query", "query", "query"),
+                _ref("r_cid", "pubchem_cid", "cid"),
+            ),
         )

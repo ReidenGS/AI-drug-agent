@@ -413,6 +413,11 @@ class PatentEvidenceRejectedPlan(BaseModel):
 class PatentEvidencePlanningResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     catalog_tool_names: list[str]
+    eligible_tool_names: list[str] = Field(default_factory=list)
+    eligible_tool_names_by_lane: dict[
+        Literal["evidence", "patent"], list[str]
+    ] = Field(default_factory=dict)
+    llm_selected_plan_count: int = 0
     tool_plans: list[PatentEvidenceToolPlan] = Field(default_factory=list)
     lane_assessments: list[PatentEvidenceLaneAssessment] = Field(default_factory=list)
     rejected_tool_plans: list[PatentEvidenceRejectedPlan] = Field(default_factory=list)
@@ -472,6 +477,42 @@ def plan_patent_evidence_tool_calls(
     ref_by_id = {ref.ref_id: ref for ref in request.input_refs}
     requested_lanes = set(request.search_scope.requested_lanes)
     allowed_roles = set(request.search_scope.allowed_roles)
+    def entry_is_eligible(entry: dict[str, Any]) -> bool:
+        return bool(
+            entry["runtime_availability"].get("can_execute")
+            and any(
+                ref.role in allowed_roles
+                and (
+                    ref.role != "antibody"
+                    or request.search_scope.antibody_search_allowed
+                )
+                and any(
+                    entry["supports_to_schema_arg"].get(token)
+                    in entry["schema_arg_allowed_ref_roles"]
+                    and ref.role
+                    in entry["schema_arg_allowed_ref_roles"][
+                        entry["supports_to_schema_arg"][token]
+                    ]
+                    for token in ref.supports_tool_args
+                    if token in entry["supports_to_schema_arg"]
+                )
+                for ref in request.input_refs
+            )
+        )
+
+    eligible_tool_names_by_lane = {
+        lane: sorted(
+            entry["tool_name"]
+            for entry in catalog
+            if entry["search_lane"] == lane and entry_is_eligible(entry)
+        )
+        for lane in request.search_scope.requested_lanes
+    }
+    eligible_tool_names = sorted(
+        tool_name
+        for names in eligible_tool_names_by_lane.values()
+        for tool_name in names
+    )
     payload = build_patent_evidence_selection_payload(request=request, catalog=catalog)
     response = llm.generate_json(
         PATENT_EVIDENCE_SELECTION_USER_PROMPT,
@@ -484,8 +525,8 @@ def plan_patent_evidence_tool_calls(
     audit: list[dict[str, Any]] = []
     exact_seen: set[str] = set()
     raw_known_plan_lanes: set[str] = set()
-    for index, raw in enumerate((response or {}).get("tool_plans") or []):
-        tool_name = raw.get("tool_name") if isinstance(raw, dict) else f"index:{index}"
+    for raw in (response or {}).get("tool_plans") or []:
+        tool_name = raw.get("tool_name") if isinstance(raw, dict) else "unknown_tool"
         if not isinstance(raw, dict):
             rejected.append(
                 PatentEvidenceRejectedPlan(
@@ -496,7 +537,7 @@ def plan_patent_evidence_tool_calls(
         if tool_name not in by_tool:
             rejected.append(
                 PatentEvidenceRejectedPlan(
-                    tool_name=str(tool_name), reason="unknown_tool"
+                    tool_name="unknown_tool", reason="unknown_tool"
                 )
             )
             continue
@@ -531,14 +572,14 @@ def plan_patent_evidence_tool_calls(
                 continue
             arg, ref_id = mapping.get("schema_arg"), mapping.get("input_ref_id")
             if arg not in props:
-                errors.append(f"unknown_schema_arg:{arg}")
+                errors.append("unknown_schema_arg")
                 continue
             if arg in seen_args:
-                errors.append(f"duplicate_schema_arg:{arg}")
+                errors.append("duplicate_schema_arg")
                 continue
             ref = ref_by_id.get(ref_id)
             if ref is None:
-                errors.append(f"unknown_input_ref_id:{ref_id}")
+                errors.append("unknown_input_ref_id")
                 continue
             if (
                 ref.role == "antibody"
@@ -547,20 +588,20 @@ def plan_patent_evidence_tool_calls(
                 errors.append("antibody_search_not_allowed")
                 continue
             if ref.role not in allowed_roles:
-                errors.append(f"role_not_allowed:{ref.role}")
+                errors.append("role_not_allowed")
                 continue
             supported = {
                 owned.supports_to_schema_arg.get(token.lower())
                 for token in ref.supports_tool_args
             }
             if arg not in supported:
-                errors.append(f"input_ref_cannot_satisfy_schema_arg:{arg}")
+                errors.append("input_ref_cannot_satisfy_schema_arg")
                 continue
             allowed_arg_roles = set(
                 entry["schema_arg_allowed_ref_roles"].get(arg) or []
             )
             if ref.role not in allowed_arg_roles:
-                errors.append(f"ref_role_not_allowed_for_schema_arg:{arg}")
+                errors.append("ref_role_not_allowed_for_schema_arg")
                 continue
             seen_args.add(arg)
             mappings.append(
@@ -572,13 +613,13 @@ def plan_patent_evidence_tool_calls(
                 continue
             arg = literal.get("schema_arg")
             if arg not in props:
-                errors.append(f"unknown_schema_arg:{arg}")
+                errors.append("unknown_schema_arg")
                 continue
             if arg in seen_args:
-                errors.append(f"duplicate_schema_arg:{arg}")
+                errors.append("duplicate_schema_arg")
                 continue
             if arg in {a for group in owned.identity_groups for a in group}:
-                errors.append(f"identity_literal_not_allowed:{arg}")
+                errors.append("identity_literal_not_allowed")
                 continue
             try:
                 value = (
@@ -587,11 +628,11 @@ def plan_patent_evidence_tool_calls(
                     else literal.get("literal_value")
                 )
             except (TypeError, ValueError):
-                errors.append(f"invalid_literal_json:{arg}")
+                errors.append("invalid_literal_json")
                 continue
             schema_error = _json_schema_literal_error(props[arg], value)
             if schema_error is not None:
-                errors.append(f"literal_schema_invalid:{arg}:{schema_error}")
+                errors.append(f"literal_schema_invalid:{schema_error}")
                 continue
             runtime_constraint = next(
                 (
@@ -608,7 +649,7 @@ def plan_patent_evidence_tool_calls(
                 )
                 is not None
             ):
-                errors.append(f"runtime_constraint_violation:{arg}")
+                errors.append("runtime_constraint_violation")
                 continue
             seen_args.add(arg)
             literals.append(
@@ -617,13 +658,16 @@ def plan_patent_evidence_tool_calls(
         for group in entry["mutually_exclusive_schema_arg_groups"]:
             if len(set(group) & seen_args) > 1:
                 errors.append(
-                    "mutually_exclusive_schema_args:" + "|".join(group)
+                    "mutually_exclusive_schema_args"
                 )
         if raw.get("can_invoke") is not True:
             errors.append("can_invoke_must_be_true_for_tool_plan")
         if errors:
             rejected.append(
-                PatentEvidenceRejectedPlan(tool_name=tool_name, reason=";".join(errors))
+                PatentEvidenceRejectedPlan(
+                    tool_name=tool_name,
+                    reason=";".join(dict.fromkeys(errors)),
+                )
             )
             continue
         satisfied = set(seen_args)
@@ -721,6 +765,13 @@ def plan_patent_evidence_tool_calls(
     invocable_lanes = {plan.search_lane for plan in accepted if plan.can_invoke}
     for lane in request.search_scope.requested_lanes:
         assessment = assessment_by_lane[lane]
+        if (
+            assessment.status == "missing_inputs"
+            and eligible_tool_names_by_lane[lane]
+        ):
+            raise PatentEvidenceSelectionValidationError(
+                "lane_assessment_missing_inputs_with_eligible_tool"
+            )
         if assessment.status == "planned" and lane not in invocable_lanes:
             raise PatentEvidenceSelectionValidationError(
                 "lane_assessment_planned_without_accepted_plan"
@@ -733,6 +784,9 @@ def plan_patent_evidence_tool_calls(
             )
     return PatentEvidencePlanningResult(
         catalog_tool_names=list(PATENT_EVIDENCE_TOOL_NAMES),
+        eligible_tool_names=eligible_tool_names,
+        eligible_tool_names_by_lane=eligible_tool_names_by_lane,
+        llm_selected_plan_count=len((response or {}).get("tool_plans") or []),
         tool_plans=accepted,
         lane_assessments=[
             assessment_by_lane[lane] for lane in request.search_scope.requested_lanes

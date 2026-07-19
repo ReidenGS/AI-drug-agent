@@ -91,6 +91,7 @@ class PatentEvidenceSearchScope(BaseModel):
             "brand_name",
             "application_number",
             "drug_name",
+            "drugbank_id",
             "query",
             "pmid",
             "pmids",

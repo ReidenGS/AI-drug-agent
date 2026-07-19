@@ -17,6 +17,7 @@ PatentEvidenceInputRole = Literal[
     "brand_name",
     "application_number",
     "drug_name",
+    "drugbank_id",
     "query",
     "pmid",
     "pmids",
@@ -79,8 +80,26 @@ PATENT_EVIDENCE_SCHEMA_ARG_ALLOWED_ROLES: dict[
         "application_number": frozenset({"application_number"}),
     },
     "drugbank_get_drug_references_by_drug_name_or_id": {
-        "query": frozenset({"drug_name", "query"})
+        "query": frozenset({"drug_name", "drugbank_id", "query"})
     },
+}
+
+# Explicit upstream identifier type -> typed reference authority.  Consumers
+# must not infer these roles from material strings, filenames, or content.
+PATENT_EVIDENCE_ID_TYPE_REF_AUTHORITY: dict[str, tuple[str, tuple[str, ...]]] = {
+    "pubchem_cid": ("pubchem_cid", ("cid", "pubchem_cid")),
+    "application_number": ("application_number", ("application_number",)),
+    "patent_application_number": (
+        "application_number",
+        ("application_number",),
+    ),
+    "pmid": ("pmid", ("pmid", "pmids")),
+    "pmids": ("pmids", ("pmids",)),
+    "document_id": ("document_id", ("document_id",)),
+    "title": ("title", ("title",)),
+    "brand_name": ("brand_name", ("brand_name",)),
+    "drug_name": ("drug_name", ("drug_name_or_id",)),
+    "drugbank_id": ("drugbank_id", ("drug_name_or_id",)),
 }
 
 PATENT_EVIDENCE_SUPPORT_TO_SCHEMA_ARG: dict[str, dict[str, str]] = {
