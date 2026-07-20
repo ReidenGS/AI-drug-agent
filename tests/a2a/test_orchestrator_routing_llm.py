@@ -2,6 +2,7 @@ import inspect
 
 from app.a2a.agent_cards import (
     build_compact_card_catalog,
+    build_patent_evidence_agent_card,
     build_step5_agent_card,
     build_step6_agent_card,
     build_structure_agent_card,
@@ -15,6 +16,7 @@ def _schema(intent: str, *, remove_capabilities: set[str] | None = None):
             build_step5_agent_card("http://step5-worker:8005"),
             build_step6_agent_card("http://step6-worker:8006"),
             build_structure_agent_card("http://structure-worker:8009"),
+            build_patent_evidence_agent_card("http://patent-worker:8014"),
         ]
     )
     remove_capabilities = remove_capabilities or set()
@@ -43,12 +45,12 @@ def test_mock_developability_uses_only_catalog_routes():
 
 
 def test_mock_structure_and_unrelated():
-    assert (
-        MockLLMProvider().generate_json(
+    assert [
+        item["capability_id"]
+        for item in MockLLMProvider().generate_json(
             "route", schema=_schema("structure and protein design")
-        )["decisions"][0]["capability_id"]
-        == "structure_design_workflow"
-    )
+        )["decisions"]
+    ] == ["step_05_candidate_context", "structure_design_workflow"]
     out = MockLLMProvider().generate_json("route", schema=_schema("already satisfied"))
     assert out["loop_decision"] == "route_to_final_response" and out["decisions"] == []
 
@@ -64,6 +66,41 @@ def test_mock_never_invents_removed_step6_capability():
     assert [item["capability_id"] for item in out["decisions"]] == [
         "step_05_candidate_context"
     ]
+
+
+def test_mock_routes_patent_evidence_semantics_and_requested_outputs():
+    for intent in (
+        "review scientific literature evidence",
+        "search patent prior-art and IP",
+        "find regulatory reference",
+    ):
+        out = MockLLMProvider().generate_json("route", schema=_schema(intent))
+        assert [item["capability_id"] for item in out["decisions"]] == [
+            "step_05_candidate_context",
+            "patent_evidence_workflow",
+        ]
+
+    schema = _schema("evaluate this program")
+    schema["structured_intent"] = {
+        "requested_outputs": ["patent_prior_art_table"]
+    }
+    out = MockLLMProvider().generate_json("route", schema=schema)
+    assert [item["capability_id"] for item in out["decisions"]] == [
+        "step_05_candidate_context",
+        "patent_evidence_workflow"
+    ]
+
+
+def test_mock_never_invents_removed_patent_evidence_capability():
+    out = MockLLMProvider().generate_json(
+        "route",
+        schema=_schema(
+            "review literature evidence and patent IP",
+            remove_capabilities={"patent_evidence_workflow"},
+        ),
+    )
+    assert out["loop_decision"] == "route_to_final_response"
+    assert out["decisions"] == []
 
 
 def test_mock_with_no_matching_catalog_capability_emits_no_route_or_task():

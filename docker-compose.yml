@@ -1,6 +1,6 @@
 # Multi-Agent A2A v1 — production HTTP worker topology (Turn G).
 #
-# Four business services on one internal network. The three workers are only
+# Five business services on one internal network. The four workers are only
 # reachable INSIDE the network (expose, no host ports). The orchestrator is the
 # only service with a host port, configured via ORCHESTRATOR_HOST_PORT.
 #
@@ -16,7 +16,7 @@ x-adc-image: &adc-image
     context: .
     dockerfile: Dockerfile
 
-# Shared runtime env for all four business services: same object storage, same
+# Shared runtime env for all five business services: same object storage, same
 # shared local-storage root, same inventory path. LLM/tool-live modes have no
 # silent deployment default: the operator must choose both explicitly.
 x-adc-common-env: &adc-common-env
@@ -48,6 +48,7 @@ services:
       STEP5_WORKER_URL: "http://step5-context-agent:8005"
       STEP6_WORKER_URL: "http://step6-developability-agent:8006"
       STRUCTURE_WORKER_URL: "http://step7-9-structure-design-agent:8009"
+      PATENT_EVIDENCE_WORKER_URL: "http://step13-14-patent-evidence-agent:8014"
       LANGGRAPH_CHECKPOINT_DATABASE_URL: ${LANGGRAPH_CHECKPOINT_DATABASE_URL:?LANGGRAPH_CHECKPOINT_DATABASE_URL must be set explicitly}
       ORCHESTRATOR_WORKER_TIMEOUT_SECONDS: ${ORCHESTRATOR_WORKER_TIMEOUT_SECONDS:?ORCHESTRATOR_WORKER_TIMEOUT_SECONDS must be set explicitly}
     volumes:
@@ -148,7 +149,33 @@ services:
       start_period: 20s
     restart: unless-stopped
 
-# Single shared named volume so the orchestrator and all three workers see the
+  # ── Step 13/14 Patent-Evidence worker (internal only) ───────────────
+  step13-14-patent-evidence-agent:
+    container_name: step13-14-patent-evidence-agent
+    <<: *adc-image
+    image: synagentics-adc-a2a:latest
+    command: ["python", "-m", "app.a2a.patent_evidence_worker_main"]
+    environment:
+      <<: *adc-common-env
+      PATENT_EVIDENCE_WORKER_URL: "http://step13-14-patent-evidence-agent:8014"
+      WORKER_BIND_HOST: "0.0.0.0"
+      WORKER_BIND_PORT: "8014"
+    volumes:
+      - adc_local_store:/data/localstore
+      - *adc-inventory-mount
+    expose:
+      - "8014"
+    networks:
+      - adc_a2a_net
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.a2a.container_healthcheck", "--url", "http://127.0.0.1:8014/health", "--agent-id", "patent_evidence_agent", "--capability", "patent_evidence_workflow", "--timeout", "3"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+# Single shared named volume so the orchestrator and all four workers see the
 # SAME run artifacts / registry / workflow-state under LOCAL_STORAGE_ROOT.
 volumes:
   adc_local_store:

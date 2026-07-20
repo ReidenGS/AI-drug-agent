@@ -5,7 +5,7 @@ Static + import-level checks over the real ``docker-compose.yml`` / ``Dockerfile
 or start containers (that real smoke is run separately); they lock the skeleton's
 contract so it cannot silently drift:
 
-- exactly the four business services, correct names;
+- exactly the five business services, correct names;
 - no mem0 / postgres / pgvector / vector-db service;
 - workers internal-only (expose, no host ports); orchestrator the only host port;
 - shared local-artifact volume + identical LOCAL_STORAGE_ROOT everywhere;
@@ -41,11 +41,13 @@ _BUSINESS_SERVICES = {
     "step5-context-agent",
     "step6-developability-agent",
     "step7-9-structure-design-agent",
+    "step13-14-patent-evidence-agent",
 }
 _WORKERS = {
     "step5-context-agent",
     "step6-developability-agent",
     "step7-9-structure-design-agent",
+    "step13-14-patent-evidence-agent",
 }
 _INVENTORY_CONTAINER_PATH = "/opt/adc/inventory/ToolUniversity_inventory_v0.2.xlsx"
 _STORAGE_ROOT = "/data/localstore"
@@ -81,7 +83,7 @@ def _volume_pairs(service: dict) -> list[tuple[str, str]]:
 
 
 # ── 1. service names ─────────────────────────────────────────────────────────
-def test_exact_four_business_services(compose):
+def test_exact_five_business_services(compose):
     assert set(compose["services"]) == _BUSINESS_SERVICES
     assert {
         name: service["container_name"]
@@ -114,7 +116,7 @@ def test_no_postgres_service(compose):
 
 
 def test_no_pgvector_or_vector_db(compose):
-    # Only the four business services exist; none uses a vector-db image.
+    # Only the five business services exist; none uses a vector-db image.
     assert set(compose["services"]) == _BUSINESS_SERVICES
     for img in _service_images(compose):
         for banned in ("pgvector", "weaviate", "qdrant", "milvus", "chroma", "vector"):
@@ -131,6 +133,7 @@ def test_workers_use_expose_no_host_ports(compose):
     assert compose["services"]["step5-context-agent"]["expose"] == ["8005"]
     assert compose["services"]["step6-developability-agent"]["expose"] == ["8006"]
     assert compose["services"]["step7-9-structure-design-agent"]["expose"] == ["8009"]
+    assert compose["services"]["step13-14-patent-evidence-agent"]["expose"] == ["8014"]
 
 
 def test_only_orchestrator_maps_a_host_port(compose):
@@ -150,6 +153,9 @@ def test_orchestrator_internal_worker_urls(compose):
     assert env["STRUCTURE_WORKER_URL"] == (
         "http://step7-9-structure-design-agent:8009"
     )
+    assert env["PATENT_EVIDENCE_WORKER_URL"] == (
+        "http://step13-14-patent-evidence-agent:8014"
+    )
     assert "must be set explicitly" in env[
         "LANGGRAPH_CHECKPOINT_DATABASE_URL"
     ]
@@ -163,6 +169,7 @@ def test_default_settings_use_production_container_dns_names(monkeypatch):
         "STEP5_WORKER_URL",
         "STEP6_WORKER_URL",
         "STRUCTURE_WORKER_URL",
+        "PATENT_EVIDENCE_WORKER_URL",
     ):
         monkeypatch.delenv(name, raising=False)
     settings = Settings(_env_file=None)
@@ -170,6 +177,9 @@ def test_default_settings_use_production_container_dns_names(monkeypatch):
     assert settings.step6_worker_url == "http://step6-developability-agent:8006"
     assert settings.structure_worker_url == (
         "http://step7-9-structure-design-agent:8009"
+    )
+    assert settings.patent_evidence_worker_url == (
+        "http://step13-14-patent-evidence-agent:8014"
     )
 
 
@@ -306,9 +316,11 @@ def test_target_architecture_boundary_is_documented_without_compose_pin(compose)
 
 # ── 10-14. worker entrypoints ─────────────────────────────────────────────────
 def test_worker_entrypoints_call_existing_run_functions():
+    import app.a2a.patent_evidence_worker_main as mpe
     import app.a2a.step5_worker_main as m5
     import app.a2a.step6_worker_main as m6
     import app.a2a.structure_worker_main as ms
+    from app.a2a.patent_evidence_worker import run_patent_evidence_worker
     from app.a2a.step5_worker import run_step5_worker
     from app.a2a.step6_worker import run_step6_worker
     from app.a2a.structure_worker import run_structure_worker
@@ -316,7 +328,8 @@ def test_worker_entrypoints_call_existing_run_functions():
     assert m5.run_step5_worker is run_step5_worker
     assert m6.run_step6_worker is run_step6_worker
     assert ms.run_structure_worker is run_structure_worker
-    for m in (m5, m6, ms):
+    assert mpe.run_patent_evidence_worker is run_patent_evidence_worker
+    for m in (m5, m6, ms, mpe):
         assert callable(m.main)
 
 
@@ -327,7 +340,12 @@ def test_worker_entrypoints_do_not_call_domain_agents_or_scan_ports():
     # substrings of prose.
     import ast
 
-    for fname in ("step5_worker_main.py", "step6_worker_main.py", "structure_worker_main.py"):
+    for fname in (
+        "step5_worker_main.py",
+        "step6_worker_main.py",
+        "structure_worker_main.py",
+        "patent_evidence_worker_main.py",
+    ):
         path = _EXEC_DIR / "app" / "a2a" / fname
         src = path.read_text()
         tree = ast.parse(src)
@@ -351,7 +369,15 @@ def test_worker_entrypoints_do_not_call_domain_agents_or_scan_ports():
         for banned in ("send_task_async", "execute_request", "run", "run_from_artifacts"):
             assert banned not in called, f"{fname} must not call {banned}()"
         # Must delegate to the existing run_step*_worker entrypoint.
-        assert "run_step5_worker" in src or "run_step6_worker" in src or "run_structure_worker" in src
+        assert any(
+            entrypoint in src
+            for entrypoint in (
+                "run_step5_worker",
+                "run_step6_worker",
+                "run_structure_worker",
+                "run_patent_evidence_worker",
+            )
+        )
 
 
 def test_compose_advertised_url_matches_worker_bind_port(compose):
@@ -359,6 +385,7 @@ def test_compose_advertised_url_matches_worker_bind_port(compose):
         ("step5-context-agent", "STEP5_WORKER_URL"),
         ("step6-developability-agent", "STEP6_WORKER_URL"),
         ("step7-9-structure-design-agent", "STRUCTURE_WORKER_URL"),
+        ("step13-14-patent-evidence-agent", "PATENT_EVIDENCE_WORKER_URL"),
     ):
         env = _env(compose["services"][name])
         advertised = env[url_key]
@@ -379,6 +406,11 @@ def test_worker_commands_use_module_entrypoints_not_inline_python(compose):
             "python",
             "-m",
             "app.a2a.structure_worker_main",
+        ],
+        "step13-14-patent-evidence-agent": [
+            "python",
+            "-m",
+            "app.a2a.patent_evidence_worker_main",
         ],
     }
     for name, cmd in expected.items():
@@ -422,6 +454,11 @@ def test_worker_healthchecks_use_exact_identity_module(compose):
             "http://127.0.0.1:8009/health",
             "structure_and_design_agent",
             "structure_design_workflow",
+        ),
+        "step13-14-patent-evidence-agent": (
+            "http://127.0.0.1:8014/health",
+            "patent_evidence_agent",
+            "patent_evidence_workflow",
         ),
     }
     for service_name, (url, agent_id, capability) in expected.items():
@@ -513,6 +550,9 @@ def test_docker_compose_config_is_valid_with_explicit_modes():
     assert orchestrator_env["STRUCTURE_WORKER_URL"] == (
         "http://step7-9-structure-design-agent:8009"
     )
+    assert orchestrator_env["PATENT_EVIDENCE_WORKER_URL"] == (
+        "http://step13-14-patent-evidence-agent:8014"
+    )
     assert "ports" in resolved["services"]["orchestrator"]
     for name in _WORKERS:
         assert "ports" not in resolved["services"][name]
@@ -547,7 +587,7 @@ def test_docker_compose_config_services_are_exact():
     )
     assert result.returncode == 0, result.stderr
     lines = result.stdout.splitlines()
-    assert len(lines) == 4
+    assert len(lines) == 5
     assert set(lines) == _BUSINESS_SERVICES
 
 
@@ -708,6 +748,7 @@ def test_no_memory_or_compose_database_service_added():
         _EXEC_DIR / "app" / "a2a" / "step5_worker_main.py",
         _EXEC_DIR / "app" / "a2a" / "step6_worker_main.py",
         _EXEC_DIR / "app" / "a2a" / "structure_worker_main.py",
+        _EXEC_DIR / "app" / "a2a" / "patent_evidence_worker_main.py",
     ]
     for path in code_files:
         low = path.read_text().lower()

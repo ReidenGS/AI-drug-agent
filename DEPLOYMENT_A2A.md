@@ -1,6 +1,6 @@
 # Multi-Agent A2A v1 — production Orchestrator deployment (Turn G)
 
-Single-server Docker Compose topology for the FastAPI Orchestrator and three
+Single-server Docker Compose topology for the FastAPI Orchestrator and four
 HTTP A2A workers. Step 4 performs run-scoped discovery, validated routing,
 durable Postgres checkpointing, HTTP dispatch, ingestion, retry and resume. The
 stack itself still creates no database, vector store, or Mem0 service.
@@ -38,18 +38,21 @@ core`; the legacy serial graph is not this API's execution path.
 | `step5-context-agent`                | `python -m app.a2a.step5_worker_main`     | 8005 (expose) | none (internal only)               |
 | `step6-developability-agent`         | `python -m app.a2a.step6_worker_main`     | 8006 (expose) | none (internal only)               |
 | `step7-9-structure-design-agent`     | `python -m app.a2a.structure_worker_main` | 8009 (expose) | none (internal only)               |
+| `step13-14-patent-evidence-agent`    | `python -m app.a2a.patent_evidence_worker_main` | 8014 (expose) | none (internal only)          |
 
 - Each service key is also its explicit `container_name` and Docker DNS name:
   `orchestrator`, `step5-context-agent`, `step6-developability-agent`, and
-  `step7-9-structure-design-agent`. Turn D discovery defaults therefore resolve
+  `step7-9-structure-design-agent`, and `step13-14-patent-evidence-agent`.
+  Discovery defaults therefore resolve
   `http://step5-context-agent:8005`,
   `http://step6-developability-agent:8006`, and
-  `http://step7-9-structure-design-agent:8009`.
+  `http://step7-9-structure-design-agent:8009`, and
+  `http://step13-14-patent-evidence-agent:8014`.
 - Network logical key: `adc_a2a_net` (bridge). Compose creates a project-scoped
   resource such as `synagentics-a2a-v1_adc_a2a_net`; no global `name` override
   bypasses project isolation. Workers are reachable only inside it.
 - One shared image (`synagentics-adc-a2a:latest`) is built once and reused by all
-  four services; only the `command` differs.
+  five services; only the `command` differs.
 
 ## Host port
 
@@ -97,9 +100,9 @@ modified**. It is mounted read-only at runtime:
 - Source (host): `../项目文件/ToolUniversity_inventory_v0.2.xlsx`
   (relative to the compose file; resolves to
   `程序/项目文件/ToolUniversity_inventory_v0.2.xlsx`).
-- Container path (identical for all four services):
+- Container path (identical for all five services):
   `/opt/adc/inventory/ToolUniversity_inventory_v0.2.xlsx`
-- Env for all four services: `TOOL_INVENTORY_XLSX=/opt/adc/inventory/ToolUniversity_inventory_v0.2.xlsx`
+- Env for all five services: `TOOL_INVENTORY_XLSX=/opt/adc/inventory/ToolUniversity_inventory_v0.2.xlsx`
 
 The image itself installs the production Python runtimes through
 `.[deployment,admet]`: pinned `tooluniverse==1.2.2`, ESM metadata version
@@ -159,14 +162,14 @@ docker compose \
 ```
 
 The overlay declares `openai_api_key` from the host `OPENAI_API_KEY` and mounts
-that same secret into all four services. Containers receive only
+that same secret into all five services. Containers receive only
 `OPENAI_API_KEY_FILE=/run/secrets/openai_api_key`; the key value is not a
 container environment variable. Application resolution keeps a non-empty
 direct `OPENAI_API_KEY` first for existing host workflows, otherwise reads and
 strips `OPENAI_API_KEY_FILE`, and fails closed if neither yields a key.
 
 For the first real LLM smoke, use `MCP_LIVE_TOOLS=false`. That disables live MCP
-tool calls only: the Orchestrator, Step 5, Step 6, and Step 7–9 worker LLM
+tool calls only: the Orchestrator, Step 5, Step 6, Step 7–9, and Patent-Evidence worker LLM
 providers are still real GPT-5.5 through `OpenAIProvider`, not
 `MockLLMProvider`. This is not evidence of live MCP or ToolUniverse execution.
 
@@ -204,11 +207,11 @@ offline or mocked success.
 
 The external Postgres database stores compact LangGraph checkpoints only; it is
 not an artifact database. `ArtifactRegistryService` and `WorkflowStateService`
-both use the shared `Storage`. All four services therefore see the same run
+both use the shared `Storage`. All five services therefore see the same run
 artifacts:
 
 - `STORAGE_MODE=local`: the logical volume `adc_local_store` is mounted at
-  `/data/localstore` in all four services, with
+  `/data/localstore` in all five services, with
   `LOCAL_STORAGE_ROOT=/data/localstore` everywhere. Compose creates a
   project-scoped resource such as
   `synagentics-a2a-v1_adc_local_store`; there is no fixed global volume name.

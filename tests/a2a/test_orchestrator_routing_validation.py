@@ -12,9 +12,11 @@ from flask import Flask, jsonify
 from werkzeug.serving import make_server
 
 from app.a2a.agent_cards import (
+    AGENT_ID_PATENT_EVIDENCE,
     AGENT_ID_STEP5,
     AGENT_ID_STEP6,
     AGENT_ID_STRUCTURE,
+    CAP_PATENT_EVIDENCE_WORKFLOW,
     CAP_STEP5_CANDIDATE_CONTEXT,
     CAP_STEP6_DEVELOPABILITY,
     CAP_STRUCTURE_DESIGN_WORKFLOW,
@@ -22,6 +24,7 @@ from app.a2a.agent_cards import (
     AgentCapabilityContract,
     ArtifactFieldRequirement,
     ContractArtifactRef,
+    build_patent_evidence_agent_card,
     build_step5_agent_card,
     build_step6_agent_card,
     build_structure_agent_card,
@@ -79,6 +82,7 @@ def _contracts():
         parse_adc_agent_contract(build_step5_agent_card("http://step5")),
         parse_adc_agent_contract(build_step6_agent_card("http://step6")),
         parse_adc_agent_contract(build_structure_agent_card("http://structure")),
+        parse_adc_agent_contract(build_patent_evidence_agent_card("http://patent")),
     ]
 
 
@@ -199,6 +203,81 @@ def test_step5_step6_missing_candidate_builds_card_derived_dependency(
     ]
     assert [item.decision.capability_id for item in result.ready_decisions] == [
         CAP_STEP5_CANDIDATE_CONTEXT
+    ]
+
+
+def test_step5_patent_dependency_is_derived_from_artifact_contracts(
+    local_storage, registry_service
+):
+    run_id = _init_run(registry_service, "run_step5_patent_contract_dag")
+    _persist_step5_inputs(local_storage, registry_service, run_id)
+    result = _validate(
+        local_storage,
+        registry_service,
+        run_id,
+        _proposal(
+            (AGENT_ID_STEP5, CAP_STEP5_CANDIDATE_CONTEXT, "Build context"),
+            (
+                AGENT_ID_PATENT_EVIDENCE,
+                CAP_PATENT_EVIDENCE_WORKFLOW,
+                "Review evidence and patent prior art",
+            ),
+        ),
+    )
+    by_cap = _by_capability(result)
+    assert by_cap[CAP_STEP5_CANDIDATE_CONTEXT].decision.validation_status == "ready"
+    patent = by_cap[CAP_PATENT_EVIDENCE_WORKFLOW]
+    assert patent.decision.validation_status == "waiting_for_dependencies"
+    assert "candidate_context_table" not in patent.input_artifact_refs
+    assert [edge.model_dump() for edge in result.dependency_edges] == [
+        {
+            "artifact_name": "candidate_context_table",
+            "producer_agent_id": AGENT_ID_STEP5,
+            "producer_capability_id": CAP_STEP5_CANDIDATE_CONTEXT,
+            "consumer_agent_id": AGENT_ID_PATENT_EVIDENCE,
+            "consumer_capability_id": CAP_PATENT_EVIDENCE_WORKFLOW,
+        }
+    ]
+
+
+def test_patent_is_ready_from_existing_candidate_without_selected_producer(
+    local_storage, registry_service
+):
+    run_id = _init_run(registry_service, "run_patent_existing_candidate")
+    _persist_step5_inputs(local_storage, registry_service, run_id)
+    _persist(
+        local_storage,
+        registry_service,
+        run_id,
+        name="candidate_context_table",
+        path="candidate_context_table.json",
+        fields={
+            "candidate_records": [],
+            "downstream_query_hints": [],
+            "context_build_status": "ok",
+        },
+    )
+    result = _validate(
+        local_storage,
+        registry_service,
+        run_id,
+        _proposal(
+            (
+                AGENT_ID_PATENT_EVIDENCE,
+                CAP_PATENT_EVIDENCE_WORKFLOW,
+                "Review evidence and patent prior art",
+            )
+        ),
+    )
+    patent = _by_capability(result)[CAP_PATENT_EVIDENCE_WORKFLOW]
+    assert patent.decision.validation_status == "ready"
+    assert set(patent.input_artifact_refs) == {
+        "structured_query",
+        "candidate_context_table",
+    }
+    assert result.dependency_edges == []
+    assert [item.decision.capability_id for item in result.ready_decisions] == [
+        CAP_PATENT_EVIDENCE_WORKFLOW
     ]
 
 

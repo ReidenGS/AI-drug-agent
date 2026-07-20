@@ -28,6 +28,7 @@ import threading
 import time
 import uuid
 from collections import Counter
+from types import SimpleNamespace
 
 import pytest
 from werkzeug.serving import make_server
@@ -36,12 +37,15 @@ from python_a2a import A2AClient, A2AServer
 from python_a2a.server.http import create_flask_app
 
 from app.a2a.agent_cards import (
+    AGENT_ID_PATENT_EVIDENCE,
     AGENT_ID_STEP5,
     AGENT_ID_STEP6,
     AGENT_ID_STRUCTURE,
+    CAP_PATENT_EVIDENCE_WORKFLOW,
     CAP_STEP5_CANDIDATE_CONTEXT,
     CAP_STEP6_DEVELOPABILITY,
     CAP_STRUCTURE_DESIGN_WORKFLOW,
+    build_patent_evidence_agent_card,
     build_step5_agent_card,
     build_step6_agent_card,
     build_structure_agent_card,
@@ -52,6 +56,7 @@ from app.a2a.orchestrator_discovery import (
     ExpectedWorkerEndpoint,
     WorkerDiscoveryService,
     WorkerUnavailableError,
+    default_expected_workers,
 )
 
 _CONTRACT_KEY = "adc_agent_contract"
@@ -211,6 +216,68 @@ def _one_step5(stub_url) -> list:
 
 def _status_by_agent(snapshot):
     return {w.agent_id: w for w in snapshot.worker_statuses}
+
+
+def test_default_expected_workers_are_four_in_stable_order():
+    settings = SimpleNamespace(
+        step5_worker_url="http://step5:8005",
+        step6_worker_url="http://step6:8006",
+        structure_worker_url="http://structure:8009",
+        patent_evidence_worker_url="http://patent:8014",
+    )
+    expected = default_expected_workers(settings)
+    assert [item.agent_id for item in expected] == [
+        AGENT_ID_STEP5,
+        AGENT_ID_STEP6,
+        AGENT_ID_STRUCTURE,
+        AGENT_ID_PATENT_EVIDENCE,
+    ]
+    assert [item.capability_ids for item in expected] == [
+        (CAP_STEP5_CANDIDATE_CONTEXT,),
+        (CAP_STEP6_DEVELOPABILITY,),
+        (CAP_STRUCTURE_DESIGN_WORKFLOW,),
+        (CAP_PATENT_EVIDENCE_WORKFLOW,),
+    ]
+
+
+def test_all_four_real_http_discovery_and_frozen_cache_counts(
+    local_storage, registry_service
+):
+    stubs = [
+        _agentserver_stub(base_builder=build_step5_agent_card),
+        _agentserver_stub(base_builder=build_step6_agent_card),
+        _agentserver_stub(base_builder=build_structure_agent_card),
+        _agentserver_stub(base_builder=build_patent_evidence_agent_card),
+    ]
+    try:
+        expected = [
+            ExpectedWorkerEndpoint(
+                AGENT_ID_STEP5, (CAP_STEP5_CANDIDATE_CONTEXT,), stubs[0].url
+            ),
+            ExpectedWorkerEndpoint(
+                AGENT_ID_STEP6, (CAP_STEP6_DEVELOPABILITY,), stubs[1].url
+            ),
+            ExpectedWorkerEndpoint(
+                AGENT_ID_STRUCTURE, (CAP_STRUCTURE_DESIGN_WORKFLOW,), stubs[2].url
+            ),
+            ExpectedWorkerEndpoint(
+                AGENT_ID_PATENT_EVIDENCE,
+                (CAP_PATENT_EVIDENCE_WORKFLOW,),
+                stubs[3].url,
+            ),
+        ]
+        run_id = _run(registry_service)
+        service = _service(expected, local_storage, registry_service)
+        first = service.discover_for_run(run_id)
+        first_counts = [dict(stub.hits) for stub in stubs]
+        second = service.discover_for_run(run_id)
+        assert first == second
+        assert first.available_agent_ids == [item.agent_id for item in expected]
+        assert first_counts == [{"card": 2, "health": 1}] * 4
+        assert [dict(stub.hits) for stub in stubs] == first_counts
+    finally:
+        for stub in stubs:
+            stub.close()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

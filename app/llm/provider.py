@@ -500,6 +500,8 @@ def _looks_like_smiles(token: str) -> bool:
 def _detect_referenced_inputs(text: str) -> list[dict]:
     seen: set[tuple[str, str]] = set()
     refs: list[dict] = []
+    pubchem_matches = list(_RE_PUBCHEM.finditer(text))
+    pubchem_spans = [match.span() for match in pubchem_matches]
 
     def _add(id_type: str, value: str, *, source: str = "raw_request_text") -> None:
         key = (id_type, value.upper())
@@ -509,6 +511,12 @@ def _detect_referenced_inputs(text: str) -> list[dict]:
         refs.append({"id_type": id_type, "value": value, "source": source})
 
     for m in _RE_PDB.finditer(text):
+        pdb_start, pdb_end = m.span(1)
+        if any(
+            pubchem_start < pdb_end and pdb_start < pubchem_end
+            for pubchem_start, pubchem_end in pubchem_spans
+        ):
+            continue
         _add("pdb_id", m.group(1).upper())
     for m in _RE_UNIPROT.finditer(text):
         _add("uniprot_id", m.group(1).upper())
@@ -523,7 +531,7 @@ def _detect_referenced_inputs(text: str) -> list[dict]:
         _add("chembl_id", m.group(1).upper())
     for m in _RE_DRUGBANK.finditer(text):
         _add("drugbank_id", m.group(1))
-    for m in _RE_PUBCHEM.finditer(text):
+    for m in pubchem_matches:
         _add("pubchem_cid", m.group(1))
     for m in _RE_SMILES_TOKEN.finditer(" " + text + " "):
         tok = m.group(1).strip()
@@ -540,6 +548,25 @@ def _mock_orchestrator_worker_routing(schema: dict) -> dict:
     caller-provided compact AgentCard catalog.
     """
     intent = str(schema.get("compact_user_intent") or "").lower()
+    structured_intent = schema.get("structured_intent")
+    if not isinstance(structured_intent, dict):
+        structured_intent = {}
+    semantic_text = " ".join(
+        [
+            intent,
+            str(structured_intent.get("primary_intent") or "").lower(),
+            " ".join(
+                str(value).lower()
+                for value in structured_intent.get("secondary_intents", [])
+                if isinstance(value, str)
+            ),
+            " ".join(
+                str(value).lower()
+                for value in structured_intent.get("requested_outputs", [])
+                if isinstance(value, str)
+            ),
+        ]
+    )
     available: dict[str, tuple[str, dict]] = {}
     for agent in schema.get("compact_card_catalog", []):
         if not isinstance(agent, dict) or not isinstance(agent.get("agent_id"), str):
@@ -553,7 +580,7 @@ def _mock_orchestrator_worker_routing(schema: dict) -> dict:
                 )
 
     requested: list[tuple[str, str, str, str]] = []
-    if "developability" in intent:
+    if "developability" in semantic_text:
         requested.extend(
             [
                 (
@@ -570,7 +597,7 @@ def _mock_orchestrator_worker_routing(schema: dict) -> dict:
                 ),
             ]
         )
-    if any(token in intent for token in ("structure", "protein design")):
+    if any(token in semantic_text for token in ("structure", "protein design")):
         requested.append(
             (
                 "structure_design_workflow",
@@ -579,6 +606,64 @@ def _mock_orchestrator_worker_routing(schema: dict) -> dict:
                 "high",
             )
         )
+    if any(
+        token in semantic_text
+        for token in (
+            "literature",
+            "scientific evidence",
+            "evidence",
+            "patent",
+            "prior-art",
+            "prior art",
+            "intellectual property",
+            "regulatory reference",
+            "scientific_evidence_table",
+            "patent_prior_art_table",
+        )
+    ):
+        requested.append(
+            (
+                "patent_evidence_workflow",
+                "Review scientific evidence, patent prior art, and regulatory references.",
+                "The user intent or requested outputs require patent-evidence review.",
+                "normal",
+            )
+        )
+    available_artifacts = {
+        str(item.get("artifact_name"))
+        for item in schema.get("available_artifact_summary", [])
+        if isinstance(item, dict) and item.get("available") is True
+    }
+    requested_ids = {item[0] for item in requested}
+    prerequisites: list[tuple[str, str, str, str]] = []
+    for capability_id, *_rest in requested:
+        match = available.get(capability_id)
+        if match is None:
+            continue
+        capability = match[1]
+        for artifact_name in capability.get("required_input_artifact_names", []):
+            if artifact_name in available_artifacts:
+                continue
+            producer = next(
+                (
+                    producer_id
+                    for producer_id, (_agent_id, producer_capability) in available.items()
+                    if artifact_name
+                    in producer_capability.get("output_artifact_names", [])
+                ),
+                None,
+            )
+            if producer is not None and producer not in requested_ids:
+                prerequisites.append(
+                    (
+                        producer,
+                        f"Produce required artifact {artifact_name}.",
+                        "The selected capability requires an artifact produced by this catalog capability.",
+                        "high",
+                    )
+                )
+                requested_ids.add(producer)
+    requested = [*prerequisites, *requested]
     decisions = []
     for capability_id, objective, reason, priority in requested:
         match = available.get(capability_id)
@@ -1353,6 +1438,29 @@ def _classify_primary_intent(
     elif non_adc:
         primary = "unclear_or_needs_clarification"
         confidence = 0.2
+
+    # Preserve explicit multi-intent review requests even when another strong
+    # cue (for example a known ADC or developability request) owns the primary
+    # intent. This remains test/offline Mock behavior; production providers
+    # receive the same catalog and typed schema without this heuristic.
+    if any(
+        keyword in text
+        for keyword in ("patent", "ip ", "prior art", "freedom to operate", "fto")
+    ):
+        secondary.append("patent_ip_review")
+        outputs.append("patent_or_ip_summary")
+    if any(
+        keyword in text
+        for keyword in (
+            "literature",
+            "papers",
+            "scientific evidence",
+            "review the literature",
+            "review papers",
+        )
+    ):
+        secondary.append("literature_review")
+        outputs.append("literature_review_summary")
 
     # Deduplicate while preserving order.
     secondary_unique: list[str] = []
