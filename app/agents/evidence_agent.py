@@ -549,7 +549,7 @@ def _extract_hits(
     query_role: str,
     query_term: str,
     candidate_id: str = "",
-    limit: int = DEFAULT_PER_QUERY_LIMIT,
+    limit: Optional[int] = DEFAULT_PER_QUERY_LIMIT,
 ) -> list[_RawHit]:
     if not isinstance(payload, dict):
         return []
@@ -560,7 +560,8 @@ def _extract_hits(
             items = v
             break
     out: list[_RawHit] = []
-    for raw in items[:limit]:
+    selected_items = items if limit is None else items[:limit]
+    for raw in selected_items:
         if not isinstance(raw, dict):
             continue
         out.append(

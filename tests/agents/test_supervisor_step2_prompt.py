@@ -153,6 +153,42 @@ def test_step2_extracts_explicit_ids(query, id_type, value):
     assert (id_type, value) in ids
 
 
+def test_step2_explicit_pubchem_span_suppresses_only_overlapping_pdb_match():
+    agent = SupervisorAgent(llm=MockLLMProvider())
+    pubchem_only = agent.parse_raw_to_structured_query(
+        _raw(query="Use PubChem CID 2244 as a baseline.")
+    )
+    assert pubchem_only.referenced_inputs == [
+        {
+            "id_type": "pubchem_cid",
+            "value": "2244",
+            "source": "raw_request_text",
+        }
+    ]
+
+    mixed = agent.parse_raw_to_structured_query(
+        _raw(query="PDB 1N8Z and PubChem CID 2244")
+    )
+    assert mixed.referenced_inputs == [
+        {"id_type": "pdb_id", "value": "1N8Z", "source": "raw_request_text"},
+        {
+            "id_type": "pubchem_cid",
+            "value": "2244",
+            "source": "raw_request_text",
+        },
+    ]
+
+
+def test_step2_non_overlapping_numeric_pdb_id_remains_allowed():
+    agent = SupervisorAgent(llm=MockLLMProvider())
+    structured = agent.parse_raw_to_structured_query(
+        _raw(query="Use PDB 2244 as the reference structure.")
+    )
+    assert structured.referenced_inputs == [
+        {"id_type": "pdb_id", "value": "2244", "source": "raw_request_text"}
+    ]
+
+
 def test_step2_zinc_id_never_labeled_zinc22():
     agent = SupervisorAgent(llm=MockLLMProvider())
     sq = agent.parse_raw_to_structured_query(

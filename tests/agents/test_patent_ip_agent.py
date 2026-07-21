@@ -33,6 +33,21 @@ def _inventory():
     return ToolInventoryService(xlsx)
 
 
+def _fda_fixture_mcp() -> LocalMCPClient:
+    """Observed-shape test envelope; not live MCP/ToolUniverse evidence."""
+
+    def _fda(**_kwargs):
+        return {
+            "status": "ok",
+            "executor": "test_fixture",
+            "payload": {"data": {"drugs": []}},
+        }
+
+    return LocalMCPClient(
+        inventory=_inventory(), bindings={"FDA_OrangeBook_get_patent_info": _fda}
+    )
+
+
 def _seed_through_step_9(local_storage, registry_service, workflow_state_service, *, referenced_inputs=None):
     intake = IntakeService(local_storage, registry_service, workflow_state_service)
     rec = intake.submit(
@@ -114,7 +129,7 @@ def test_step14_orangebook_uses_canonical_normalized_fields(
     table = PatentIPAgent(
         storage=local_storage, registry=registry_service,
         workflow_state=workflow_state_service,
-        mcp_client=LocalMCPClient(inventory=_inventory()),
+        mcp_client=_fda_fixture_mcp(),
     ).run(run_id)
     ob = [r for r in table.patent_records if r.source_database == "FDA_OrangeBook"]
     assert ob, "expected at least one Orange Book row"
@@ -132,11 +147,11 @@ def test_step14_orangebook_raw_payload_not_in_normalized_record(
     table = PatentIPAgent(
         storage=local_storage, registry=registry_service,
         workflow_state=workflow_state_service,
-        mcp_client=LocalMCPClient(inventory=_inventory()),
+        mcp_client=_fda_fixture_mcp(),
     ).run(run_id)
     blob = json.dumps([r.model_dump() for r in table.patent_records])
-    # Mock OB wrapper stamps `"status": "mocked"` plus echoes the inputs
-    # into a `records: []` field. Normalized rows must NOT carry that raw
+    # The observed-shape test fixture carries nested `data.drugs`. Normalized
+    # rows must NOT carry that raw
     # envelope — the storage_ref is the only allowed escape hatch.
     assert "mocked" not in blob
     assert '"records":' not in blob.replace(" ", "")  # raw OB list field
@@ -149,7 +164,8 @@ def test_step14_orangebook_raw_payload_not_in_normalized_record(
     assert refs
     for ref in refs:
         raw = local_storage.read_json(ref)
-        assert raw["output"]["source"] == "FDA_OrangeBook_get_patent_info"
+        assert raw["output"]["executor"] == "test_fixture"
+        assert raw["output"]["payload"] == {"data": {"drugs": []}}
 
 
 def test_step14_partial_when_wrappers_unwired(

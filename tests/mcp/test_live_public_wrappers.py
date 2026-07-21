@@ -54,7 +54,8 @@ def test_europepmc_live_routes_through_tu(install_universe):
     assert out["executor"] == "tooluniverse"
     assert out["status"] == "ok"
     assert fake.calls[0]["name"] == "EuropePMC_search_articles"
-    assert fake.calls[0]["arguments"] == {"query": "HER2 ADC", "limit": 25}
+    # Unspecified options are omitted so ToolUniverse applies official defaults.
+    assert fake.calls[0]["arguments"] == {"query": "HER2 ADC"}
 
 
 def test_europepmc_live_empty_results(install_universe):
@@ -187,7 +188,8 @@ def test_local_client_does_not_inject_live_by_default(monkeypatch):
         tool_name="EuropePMC_search_articles",
         query="HER2",
     )
-    assert out["run_status"] == "success"
+    assert out["run_status"] == "failed"
+    assert out["executor"] == "mock"
     assert "_live" not in captured
 
 

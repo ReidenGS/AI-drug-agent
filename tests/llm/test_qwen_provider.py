@@ -122,6 +122,22 @@ def test_structured_query_accepts_valid_json():
     assert out["parse_warnings"] == []
 
 
+def test_patent_evidence_lane_assessments_use_shared_validation():
+    provider = _provider_with_responses(
+        [
+            _chat_response(
+                '{"lane_assessments":['
+                '{"search_lane":"evidence","status":"planned","reason":"query ref"}],'
+                '"tool_plans":[]}'
+            )
+        ]
+    )
+    out = provider.generate_json(
+        "plan", schema={"task": "patent_evidence_tool_selection"}
+    )
+    assert out["lane_assessments"][0]["status"] == "planned"
+
+
 def test_step6_schema_mapping_stage1_accepts_valid_payload_without_task_intent():
     provider = _provider_with_responses([
         _chat_response(

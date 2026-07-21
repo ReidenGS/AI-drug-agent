@@ -18,13 +18,16 @@ from langgraph.checkpoint.memory import InMemorySaver
 from werkzeug.serving import make_server
 
 from app.a2a.agent_cards import (
+    AGENT_ID_PATENT_EVIDENCE,
     AGENT_ID_STEP5,
     AGENT_ID_STEP6,
     AGENT_ID_STRUCTURE,
+    CAP_PATENT_EVIDENCE_WORKFLOW,
     CAP_STEP5_CANDIDATE_CONTEXT,
     CAP_STEP6_DEVELOPABILITY,
     CAP_STRUCTURE_DESIGN_WORKFLOW,
 )
+from app.a2a.patent_evidence_worker import create_patent_evidence_flask_app
 from app.a2a.orchestrator_discovery import (
     ExpectedWorkerEndpoint,
     WorkerDiscoveryService,
@@ -45,6 +48,7 @@ from app.graph.orchestrator_execution_graph import (
     execution_graph_config,
 )
 from app.llm.provider import MockLLMProvider
+from app.mcp.client import LocalMCPClient
 from app.services.artifact_registry_service import ArtifactRegistryService
 from app.services.input_readiness_service import InputReadinessService
 from app.services.intake_service import IntakeService
@@ -53,6 +57,10 @@ from app.services.structured_query_service import StructuredQueryService
 from app.services.workflow_state_service import WorkflowStateService
 from tests.a2a.test_orchestrator_dispatch import _RecordingStep5, _local_mcp
 from tests.a2a.test_orchestrator_routing_intent import QUERY
+from tests.a2a.test_patent_evidence_worker_a2a import (
+    _RecordingWorker as _RecordingPatentEvidenceWorker,
+    _bindings as _patent_evidence_bindings,
+)
 from tests.a2a.test_step6_worker_a2a import (
     _RecordingStep6Worker,
     _success_mcp,
@@ -91,6 +99,7 @@ class _TimedStep6(_RecordingStep6Worker):
     def execute_request(self, request):
         started = time.monotonic()
         try:
+            self.dispatch_barrier.wait(timeout=30)
             return super().execute_request(request)
         finally:
             self.window = (started, time.monotonic())
@@ -100,6 +109,17 @@ class _TimedStructure(_RecordingStructureWorker):
     def execute_request(self, request):
         started = time.monotonic()
         try:
+            self.dispatch_barrier.wait(timeout=30)
+            return super().execute_request(request)
+        finally:
+            self.window = (started, time.monotonic())
+
+
+class _TimedPatentEvidence(_RecordingPatentEvidenceWorker):
+    def execute_request(self, request):
+        started = time.monotonic()
+        try:
+            self.dispatch_barrier.wait(timeout=30)
             return super().execute_request(request)
         finally:
             self.window = (started, time.monotonic())
@@ -192,26 +212,41 @@ def _tool_records(artifacts):
             "tool_call_records", []
         )
     )
+    records.extend(artifacts["scientific_evidence_table"].get("tool_call_records", []))
+    records.extend(artifacts["patent_prior_art_table"].get("tool_call_records", []))
     return records
 
 
 @pytest.mark.asyncio
-async def test_real_three_worker_http_parallel_smoke_without_retry(local_storage):
+async def test_real_four_worker_http_parallel_smoke_without_retry(local_storage):
     base_storage, base_registry, base_workflow = _independent_services(local_storage)
     record = IntakeService(base_storage, base_registry, base_workflow).submit(
-        raw_user_query=QUERY,
+        raw_user_query=(
+            QUERY
+            + " Review scientific literature evidence and patent prior art for "
+            "PubChem CID:2244."
+        ),
         user_provided_context={
             "target_or_antigen_text": "HER2",
             "candidate_text": "trastuzumab-like antibody",
             "payload_linker_text": "vc-MMAE",
         },
     )
-    StructuredQueryService(
+    structured = StructuredQueryService(
         base_storage,
         base_registry,
         base_workflow,
         SupervisorAgent(llm=MockLLMProvider()),
     ).parse(record.run_id)
+    assert any(
+        item.get("id_type") == "pubchem_cid"
+        and item.get("value") == "2244"
+        for item in structured.referenced_inputs
+    )
+    assert not any(
+        item.get("id_type") == "pdb_id" and item.get("value") == "2244"
+        for item in structured.referenced_inputs
+    )
     assert InputReadinessService(
         base_storage, base_registry, base_workflow
     ).check(record.run_id).input_readiness_status == "ready"
@@ -219,6 +254,7 @@ async def test_real_three_worker_http_parallel_smoke_without_retry(local_storage
     step5_services = _independent_services(local_storage)
     step6_services = _independent_services(local_storage)
     structure_services = _independent_services(local_storage)
+    patent_services = _independent_services(local_storage)
     step5 = _serve(
         _TimedStep5,
         create_step5_flask_app,
@@ -243,6 +279,18 @@ async def test_real_three_worker_http_parallel_smoke_without_retry(local_storage
         workflow=structure_services[2],
         mcp=_auditable_local_mcp(),
     )
+    patent = _serve(
+        _TimedPatentEvidence,
+        create_patent_evidence_flask_app,
+        storage=patent_services[0],
+        registry=patent_services[1],
+        workflow=patent_services[2],
+        mcp=LocalMCPClient(bindings=_patent_evidence_bindings()),
+    )
+    second_round_barrier = threading.Barrier(3)
+    step6.worker.dispatch_barrier = second_round_barrier
+    structure.worker.dispatch_barrier = second_round_barrier
+    patent.worker.dispatch_barrier = second_round_barrier
     try:
         discovery = WorkerDiscoveryService(
             expected_workers=[
@@ -260,6 +308,11 @@ async def test_real_three_worker_http_parallel_smoke_without_retry(local_storage
                     AGENT_ID_STRUCTURE,
                     (CAP_STRUCTURE_DESIGN_WORKFLOW,),
                     structure.url,
+                ),
+                ExpectedWorkerEndpoint(
+                    AGENT_ID_PATENT_EVIDENCE,
+                    (CAP_PATENT_EVIDENCE_WORKFLOW,),
+                    patent.url,
                 ),
             ],
             storage=base_storage,
@@ -282,6 +335,7 @@ async def test_real_three_worker_http_parallel_smoke_without_retry(local_storage
             AGENT_ID_STEP5: "ready",
             AGENT_ID_STEP6: "waiting_for_dependencies",
             AGENT_ID_STRUCTURE: "waiting_for_dependencies",
+            AGENT_ID_PATENT_EVIDENCE: "waiting_for_dependencies",
         }
         assert [item.decision.agent_id for item in routing.prepared_tasks] == [
             AGENT_ID_STEP5
@@ -307,17 +361,78 @@ async def test_real_three_worker_http_parallel_smoke_without_retry(local_storage
         step5.close()
         step6.close()
         structure.close()
+        patent.close()
 
+    if loop.outcome != "completed":
+        active_debug = base_registry.get(record.run_id).active_artifacts
+        evidence_debug = base_storage.read_json(
+            base_storage.run_key(record.run_id, "scientific_evidence_table.json")
+        )
+        patent_debug = base_storage.read_json(
+            base_storage.run_key(record.run_id, "patent_prior_art_table.json")
+        )
+        print(
+            "PARALLEL_SMOKE_NONTERMINAL="
+            + json.dumps(
+                {
+                    "outcome": loop.outcome,
+                    "tasks": {
+                        task.agent_id: {
+                            "dispatch_status": task.dispatch_status,
+                            "execution_status": task.execution_status,
+                            "result_status": task.result_status,
+                            "agent_failure_reason": task.agent_failure_reason,
+                            "error_code": task.terminal_error_code,
+                        }
+                        for task in loop.state.worker_tasks.values()
+                    },
+                    "patent_output_debug": {
+                        "evidence_status": evidence_debug.get("review_status"),
+                        "patent_status": patent_debug.get("patent_review_status"),
+                        "evidence_identity_matches": evidence_debug.get("artifact_id")
+                        == active_debug.scientific_evidence_table_id,
+                        "patent_identity_matches": patent_debug.get("artifact_id")
+                        == active_debug.patent_prior_art_table_id,
+                        "evidence_fields": sorted(evidence_debug),
+                        "patent_fields": sorted(patent_debug),
+                        "patent_tool_calls": [
+                            {
+                                "tool_name": item.get("tool_name"),
+                                "run_status": item.get("run_status"),
+                                "error_message": item.get("error_message"),
+                            }
+                            for item in patent_debug.get("tool_call_records", [])
+                        ],
+                        "lane_assessments": patent_debug.get(
+                            "patent_evidence_planning_audit", {}
+                        ).get("lane_assessments", []),
+                    },
+                },
+                sort_keys=True,
+            )
+        )
     assert loop.outcome == "completed"
     assert loop.dispatch_round_count == 2
-    assert loop.dispatch_attempt_count == 3
-    assert step5.hits["task"] == step6.hits["task"] == structure.hits["task"] == 1
-    assert step5.hits["card"] == step6.hits["card"] == structure.hits["card"] == 3
-    assert step5.hits["health"] == step6.hits["health"] == structure.hits["health"] == 1
+    assert loop.dispatch_attempt_count == 4
+    assert {
+        step5.hits["task"], step6.hits["task"], structure.hits["task"], patent.hits["task"]
+    } == {1}
+    assert {
+        step5.hits["card"], step6.hits["card"], structure.hits["card"], patent.hits["card"]
+    } == {3}
+    assert {
+        step5.hits["health"], step6.hits["health"], structure.hits["health"], patent.hits["health"]
+    } == {1}
     assert all(task.retry_attempt == 0 for task in loop.state.worker_tasks.values())
-    assert len(loop.state.worker_tasks) == 3
-    assert step6.worker.window[0] < structure.worker.window[1]
-    assert structure.worker.window[0] < step6.worker.window[1]
+    assert len(loop.state.worker_tasks) == 4
+    second_round_windows = [
+        step6.worker.window,
+        structure.worker.window,
+        patent.worker.window,
+    ]
+    assert max(window[0] for window in second_round_windows) < min(
+        window[1] for window in second_round_windows
+    )
 
     active = base_registry.get(record.run_id).active_artifacts
     artifact_specs = {
@@ -340,6 +455,14 @@ async def test_real_three_worker_http_parallel_smoke_without_retry(local_storage
         "structure_variant_and_compound_screening": (
             "compound_screening_artifact.json",
             active.structure_variant_and_compound_screening_id,
+        ),
+        "scientific_evidence_table": (
+            "scientific_evidence_table.json",
+            active.scientific_evidence_table_id,
+        ),
+        "patent_prior_art_table": (
+            "patent_prior_art_table.json",
+            active.patent_prior_art_table_id,
         ),
     }
     artifacts = {}
@@ -365,7 +488,12 @@ async def test_real_three_worker_http_parallel_smoke_without_retry(local_storage
         task.agent_id: loop.completion_proofs[task.task_id]
         for task in loop.state.worker_tasks.values()
     }
-    assert set(proofs) == {AGENT_ID_STEP5, AGENT_ID_STEP6, AGENT_ID_STRUCTURE}
+    assert set(proofs) == {
+        AGENT_ID_STEP5,
+        AGENT_ID_STEP6,
+        AGENT_ID_STRUCTURE,
+        AGENT_ID_PATENT_EVIDENCE,
+    }
     assert all(proof.execution_status == "completed" for proof in proofs.values())
     assert all(proof.result_status in {"success", "partial"} for proof in proofs.values())
     assert all(proof.error_code is None for proof in proofs.values())
@@ -388,6 +516,33 @@ async def test_real_three_worker_http_parallel_smoke_without_retry(local_storage
     ]
     step9 = artifacts["structure_variant_and_compound_screening"]
     audit = step9
+    candidate_identifiers = [
+        identifier
+        for candidate in artifacts["candidate_context_table"].get(
+            "candidate_records", []
+        )
+        for identifier in candidate.get("identifiers", [])
+    ]
+    assert any(
+        identifier.get("id_type") == "pubchem_cid"
+        and identifier.get("id_value") == "2244"
+        for identifier in candidate_identifiers
+    )
+    assert not any(
+        identifier.get("id_type") == "pdb_id"
+        and identifier.get("id_value") == "2244"
+        for identifier in candidate_identifiers
+    )
+    assert "identifier:pdb_id:2244" not in json.dumps(
+        audit.get("step9_stage2_mapped_tools", []), sort_keys=True
+    )
+    patent_audit = artifacts["patent_prior_art_table"]
+    evidence_audit = artifacts["scientific_evidence_table"]
+    assert patent_audit["patent_records"] == []
+    assert patent_audit["lookup_summaries"]
+    assert {
+        item["source_type"] for item in patent_audit["lookup_summaries"]
+    } == {"pubchem_associated_reference"}
     initial_task_ids = {
         str(item.task.id) for item in routing.prepared_tasks
     }
@@ -396,7 +551,9 @@ async def test_real_three_worker_http_parallel_smoke_without_retry(local_storage
         for task_id, item in loop.prepared_task_history.items()
         if task_id not in initial_task_ids
     )
-    assert second_round_agents == sorted([AGENT_ID_STEP6, AGENT_ID_STRUCTURE])
+    assert second_round_agents == sorted(
+        [AGENT_ID_STEP6, AGENT_ID_STRUCTURE, AGENT_ID_PATENT_EVIDENCE]
+    )
     inspection = {
         "initial_decisions": initial_decisions,
         "dependency_edges": [
@@ -407,11 +564,13 @@ async def test_real_three_worker_http_parallel_smoke_without_retry(local_storage
             AGENT_ID_STEP5: step5.hits["task"],
             AGENT_ID_STEP6: step6.hits["task"],
             AGENT_ID_STRUCTURE: structure.hits["task"],
+            AGENT_ID_PATENT_EVIDENCE: patent.hits["task"],
         },
         "windows": {
             AGENT_ID_STEP5: step5.worker.window,
             AGENT_ID_STEP6: step6.worker.window,
             AGENT_ID_STRUCTURE: structure.worker.window,
+            AGENT_ID_PATENT_EVIDENCE: patent.worker.window,
         },
         "proofs": {
             agent_id: {
@@ -433,6 +592,45 @@ async def test_real_three_worker_http_parallel_smoke_without_retry(local_storage
                 "screening_status": body.get("screening_status"),
             }
             for name, body in artifacts.items()
+        },
+        "patent_evidence": {
+            "lane_assessments": evidence_audit[
+                "patent_evidence_planning_audit"
+            ]["lane_assessments"],
+            "eligible_count": evidence_audit["patent_evidence_planning_audit"][
+                "eligible_count"
+            ],
+            "selected_count": evidence_audit["patent_evidence_planning_audit"][
+                "selected_count"
+            ],
+            "accepted_count": evidence_audit["patent_evidence_planning_audit"][
+                "accepted_count"
+            ],
+            "executed_count": evidence_audit["patent_evidence_planning_audit"][
+                "executed_count"
+            ],
+            "lookup_summaries": patent_audit["lookup_summaries"],
+            "patent_records": len(patent_audit["patent_records"]),
+            "tool_calls": [
+                {
+                    "tool_name": item["tool_name"],
+                    "run_status": item["run_status"],
+                }
+                for item in [
+                    *evidence_audit["tool_call_records"],
+                    *patent_audit["tool_call_records"],
+                ]
+            ],
+        },
+        "identifier_overlap": {
+            "structured_query_refs": structured.referenced_inputs,
+            "candidate_identifiers": candidate_identifiers,
+            "step9_contains_pdb_2244_mapping": (
+                "identifier:pdb_id:2244"
+                in json.dumps(
+                    audit.get("step9_stage2_mapped_tools", []), sort_keys=True
+                )
+            ),
         },
         "tool_status_distribution": dict(distribution),
         "success_tools": success_tools,
@@ -483,6 +681,8 @@ async def test_real_three_worker_http_parallel_smoke_without_retry(local_storage
                 "RCSBData_get_assembly",
                 "get_refinement_resolution_by_pdb_id",
                 "PDBePISA_get_interfaces",
+                "EuropePMC_search_articles",
+                "PubChem_get_associated_patents_by_CID",
             }
         ),
     }

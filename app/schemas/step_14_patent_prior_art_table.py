@@ -12,6 +12,10 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 from .common import ToolCallRecord
+from .patent_evidence_audit import (
+    PatentEvidencePlanningAudit,
+    PatentEvidenceResolverAuditEntry,
+)
 
 
 PatentSourceDatabase = Literal["PubChem", "DrugBank", "FDA_OrangeBook", "USPTO", "other"]
@@ -72,12 +76,22 @@ class PatentRecord(BaseModel):
     relevance_rationale: Optional[str] = None
 
 
+class PatentLookupSummary(BaseModel):
+    tool_name: str
+    source_type: Literal[
+        "pubchem_associated_reference", "fda_orange_book_application_row"
+    ]
+    record_count: int = Field(ge=0)
+    tool_output_ref: str
+    functional_limitation: str
+
+
 class PatentPriorArtTable(BaseModel):
     run_id: str
     step_id: str = "step_14_patent_ip"
     created_at: str
     patent_review_status: Literal[
-        "completed", "completed_with_warnings", "partial", "failed"
+        "completed", "completed_with_warnings", "partial", "failed", "not_requested"
     ] = "partial"
     legal_disclaimer: str = (
         "For demonstration purposes only. Not a formal legal opinion. "
@@ -109,3 +123,10 @@ class PatentPriorArtTable(BaseModel):
     step14_llm_rejected_tool_plans: list[dict] = Field(default_factory=list)
     step14_runtime_resolver_audit: list[dict] = Field(default_factory=list)
     step14_request_source: str = "request"
+    patent_evidence_planning_audit: PatentEvidencePlanningAudit = Field(
+        default_factory=PatentEvidencePlanningAudit
+    )
+    patent_evidence_resolver_audit: list[PatentEvidenceResolverAuditEntry] = Field(
+        default_factory=list
+    )
+    lookup_summaries: list[PatentLookupSummary] = Field(default_factory=list)

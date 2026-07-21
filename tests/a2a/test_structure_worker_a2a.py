@@ -113,19 +113,27 @@ def _no_proxy(monkeypatch):
 
 
 def _mocked_local_mcp() -> LocalMCPClient:
-    """Test-only mocked local binding; not a live ToolUniverse success."""
+    """Test-fixture envelope; not live MCP or ToolUniverse evidence."""
 
     def _entry(**kwargs):
-        return {"status": "mocked", "pdb_id": kwargs.get("pdb_id")}
+        return {
+            "status": "ok",
+            "executor": "test_fixture",
+            "payload": {"pdb_id": kwargs.get("pdb_id")},
+        }
 
     return LocalMCPClient(bindings={"RCSBData_get_entry": _entry})
 
 
 def _auditable_local_mcp() -> LocalMCPClient:
-    """Test-only bindings producing honest success/dependency/failed records."""
+    """Test-fixture envelopes producing success/dependency/failed records."""
 
     def _success(**kwargs):
-        return {"status": "mocked", "pdb_id": kwargs.get("pdb_id")}
+        return {
+            "status": "ok",
+            "executor": "test_fixture",
+            "payload": {"pdb_id": kwargs.get("pdb_id")},
+        }
 
     def _dependency(**_kwargs):
         raise NotImplementedError
@@ -830,13 +838,18 @@ async def test_real_http_upload_file_id_reaches_proteinmpnn_as_structure_text(
 
     def _proteinmpnn(**kwargs):
         captured.append(dict(kwargs))
-        return {"status": "mocked", "designed_sequences": ["MKTAYIAK"]}
+        return {
+            "status": "ok",
+            "executor": "test_fixture",
+            "payload": {"designed_sequences": ["MKTAYIAK"]},
+        }
 
     mcp = LocalMCPClient(
         bindings={
             "CrystalStructure_validate": lambda **_kwargs: {
-                "status": "mocked",
-                "validated": True,
+                "status": "ok",
+                "executor": "test_fixture",
+                "payload": {"validated": True},
             },
             "NvidiaNIM_proteinmpnn": _proteinmpnn,
         }

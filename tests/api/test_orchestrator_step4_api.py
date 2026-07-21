@@ -17,6 +17,20 @@ from app.a2a.orchestrator_application_service import (
     OrchestratorApplicationService,
 )
 from app.a2a.orchestrator_discovery import DispatchTarget
+from app.a2a.orchestrator_discovery import (
+    ExpectedWorkerEndpoint,
+    WorkerDiscoveryService,
+)
+from app.a2a.agent_cards import (
+    AGENT_ID_PATENT_EVIDENCE,
+    AGENT_ID_STEP5,
+    AGENT_ID_STEP6,
+    AGENT_ID_STRUCTURE,
+    CAP_PATENT_EVIDENCE_WORKFLOW,
+    CAP_STEP5_CANDIDATE_CONTEXT,
+    CAP_STEP6_DEVELOPABILITY,
+    CAP_STRUCTURE_DESIGN_WORKFLOW,
+)
 from app.a2a.orchestrator_routing_service import OrchestratorRoutingService
 from app.agents.supervisor_agent import SupervisorAgent
 from app.graph.orchestrator_execution_graph import (
@@ -28,12 +42,28 @@ from app.graph.orchestrator_checkpoint_runtime import (
 )
 from app.main import create_app
 from app.llm.provider import MockLLMProvider
+from app.mcp.client import LocalMCPClient
 from app.services.input_readiness_service import InputReadinessService
 from app.services.intake_service import IntakeService
 from app.services.structured_query_service import StructuredQueryService
 from app.settings import get_settings
 from app.utils.ids import new_file_id
 from tests.a2a.test_orchestrator_dispatch import _serve_task_handler
+from tests.a2a.test_orchestrator_dispatch import _RecordingStep5, _local_mcp
+from tests.a2a.test_parallel_worker_http_smoke import _independent_services, _serve
+from tests.a2a.test_patent_evidence_worker_a2a import (
+    _RecordingWorker as _RecordingPatentEvidenceWorker,
+    _bindings as _patent_evidence_bindings,
+)
+from tests.a2a.test_step6_worker_a2a import _RecordingStep6Worker, _success_mcp
+from tests.a2a.test_structure_worker_a2a import (
+    _RecordingStructureWorker,
+    _auditable_local_mcp,
+)
+from app.a2a.step5_worker import create_step5_flask_app
+from app.a2a.step6_worker import create_step6_flask_app
+from app.a2a.structure_worker import create_structure_flask_app
+from app.a2a.patent_evidence_worker import create_patent_evidence_flask_app
 from tests.a2a.test_orchestrator_post_ingestion import (
     RUN_ID,
     _contract,
@@ -574,3 +604,171 @@ def test_fresh_concurrent_execute_status_and_resume_are_idempotent_over_http(
         "api_key",
     ):
         assert forbidden not in serialized
+
+
+def test_step4_api_runs_patent_evidence_dependency_and_replays_without_http(
+    monkeypatch, local_storage
+):
+    _configure_lifespan(monkeypatch)
+    base_storage, base_registry, base_workflow = _independent_services(local_storage)
+    raw = IntakeService(base_storage, base_registry, base_workflow).submit(
+        raw_user_query=(
+            "Review scientific literature evidence and patent prior art for a "
+            "HER2 ADC using PubChem CID:2244."
+        ),
+        user_provided_context={
+            "target_or_antigen_text": "HER2",
+            "candidate_text": "trastuzumab-like antibody",
+            "payload_linker_text": "vc-MMAE",
+        },
+    )
+    structured = StructuredQueryService(
+        base_storage,
+        base_registry,
+        base_workflow,
+        SupervisorAgent(llm=MockLLMProvider()),
+    ).parse(raw.run_id)
+    assert {"literature_review_summary", "patent_or_ip_summary"} <= set(
+        structured.requested_outputs
+    )
+    assert any(
+        item.get("id_type") == "pubchem_cid"
+        for item in structured.referenced_inputs
+    )
+    assert InputReadinessService(
+        base_storage, base_registry, base_workflow
+    ).check(raw.run_id).input_readiness_status == "ready"
+
+    step5_services = _independent_services(local_storage)
+    step6_services = _independent_services(local_storage)
+    structure_services = _independent_services(local_storage)
+    patent_services = _independent_services(local_storage)
+    step5 = _serve(
+        _RecordingStep5,
+        create_step5_flask_app,
+        storage=step5_services[0],
+        registry=step5_services[1],
+        workflow=step5_services[2],
+        mcp=_local_mcp(),
+    )
+    step6 = _serve(
+        _RecordingStep6Worker,
+        create_step6_flask_app,
+        storage=step6_services[0],
+        registry=step6_services[1],
+        workflow=step6_services[2],
+        mcp=_success_mcp(),
+    )
+    structure = _serve(
+        _RecordingStructureWorker,
+        create_structure_flask_app,
+        storage=structure_services[0],
+        registry=structure_services[1],
+        workflow=structure_services[2],
+        mcp=_auditable_local_mcp(),
+    )
+    patent = _serve(
+        _RecordingPatentEvidenceWorker,
+        create_patent_evidence_flask_app,
+        storage=patent_services[0],
+        registry=patent_services[1],
+        workflow=patent_services[2],
+        mcp=LocalMCPClient(bindings=_patent_evidence_bindings()),
+    )
+    discovery = WorkerDiscoveryService(
+        expected_workers=[
+            ExpectedWorkerEndpoint(
+                AGENT_ID_STEP5, (CAP_STEP5_CANDIDATE_CONTEXT,), step5.url
+            ),
+            ExpectedWorkerEndpoint(
+                AGENT_ID_STEP6, (CAP_STEP6_DEVELOPABILITY,), step6.url
+            ),
+            ExpectedWorkerEndpoint(
+                AGENT_ID_STRUCTURE, (CAP_STRUCTURE_DESIGN_WORKFLOW,), structure.url
+            ),
+            ExpectedWorkerEndpoint(
+                AGENT_ID_PATENT_EVIDENCE,
+                (CAP_PATENT_EVIDENCE_WORKFLOW,),
+                patent.url,
+            ),
+        ],
+        storage=base_storage,
+        registry=base_registry,
+        discovery_timeout_seconds=3,
+        health_timeout_seconds=3,
+    )
+    routing_llm = MockLLMProvider()
+    routing_service = OrchestratorRoutingService(
+        discovery=discovery,
+        storage=base_storage,
+        registry=base_registry,
+        llm=routing_llm,
+    )
+    runtime = _MemoryRuntime()
+
+    def service_factory(started_runtime):
+        assert started_runtime is runtime
+        return OrchestratorApplicationService(
+            checkpoint_runtime=runtime,
+            routing_service=routing_service,
+            discovery=discovery,
+            registry=base_registry,
+            storage=base_storage,
+            worker_timeout_seconds=60,
+            max_worker_retries=3,
+        )
+
+    app = create_app(
+        checkpoint_runtime_factory=lambda _settings: runtime,
+        orchestrator_service_factory=service_factory,
+    )
+    try:
+        with TestClient(app) as client:
+            first = client.post(f"/runs/{raw.run_id}/steps/4/execute")
+            status = client.get(f"/runs/{raw.run_id}/steps/4/status")
+            replay = client.post(f"/runs/{raw.run_id}/steps/4/execute")
+    finally:
+        step5.close()
+        step6.close()
+        structure.close()
+        patent.close()
+        get_settings.cache_clear()
+
+    print(
+        "STEP4_PATENT_INSPECTION="
+        + repr(
+            {
+                "first": first.json(),
+                "status": status.json(),
+                "replay_status_code": replay.status_code,
+                "replay": replay.json(),
+                "posts": {
+                    "step5": step5.hits["task"],
+                    "step6": step6.hits["task"],
+                    "structure": structure.hits["task"],
+                    "patent": patent.hits["task"],
+                },
+            }
+        )
+    )
+    assert first.status_code == status.status_code == replay.status_code == 200
+    assert first.json()["outcome"] == status.json()["outcome"] == "completed"
+    assert first.json()["dispatch_attempt_count"] == 3
+    assert replay.json()["checkpoint_reused"] is True
+    assert replay.json()["llm_routing_called"] is False
+    assert replay.json()["dispatch_attempt_count"] == 0
+    assert step5.hits["task"] == patent.hits["task"] == 1
+    assert step6.hits["task"] == 1
+    assert structure.hits["task"] == 0
+    assert {
+        "step5": step5.hits["card"],
+        "step6": step6.hits["card"],
+        "structure": structure.hits["card"],
+        "patent": patent.hits["card"],
+    } == {"step5": 3, "step6": 3, "structure": 2, "patent": 3}
+    assert all(worker.hits["health"] == 1 for worker in (step5, step6, structure, patent))
+    active = base_registry.get(raw.run_id).active_artifacts
+    assert active.candidate_context_table_id is not None
+    assert active.scientific_evidence_table_id is not None
+    assert active.patent_prior_art_table_id is not None
+    assert status.json()["task_counts"]["completed"] == 3

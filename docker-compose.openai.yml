@@ -29,6 +29,13 @@ services:
     secrets:
       - openai_api_key
 
+  step13-14-patent-evidence-agent:
+    environment:
+      OPENAI_API_KEY_FILE: /run/secrets/openai_api_key
+      OPENAI_MODEL: ${OPENAI_MODEL:?OPENAI_MODEL must be set explicitly}
+    secrets:
+      - openai_api_key
+
 secrets:
   openai_api_key:
     environment: OPENAI_API_KEY

@@ -38,9 +38,11 @@ import requests
 from python_a2a import A2AClient, AgentCard
 
 from .agent_cards import (
+    AGENT_ID_PATENT_EVIDENCE,
     AGENT_ID_STEP5,
     AGENT_ID_STEP6,
     AGENT_ID_STRUCTURE,
+    CAP_PATENT_EVIDENCE_WORKFLOW,
     CAP_STEP5_CANDIDATE_CONTEXT,
     CAP_STEP6_DEVELOPABILITY,
     CAP_STRUCTURE_DESIGN_WORKFLOW,
@@ -148,7 +150,7 @@ class WorkerDiscoveryRunCache:
 
 
 def default_expected_workers(settings: Any) -> list[ExpectedWorkerEndpoint]:
-    """Fixed three-worker identity contract, in canonical order Step5/6/Structure."""
+    """Fixed four-worker identity contract in canonical deployment order."""
     return [
         ExpectedWorkerEndpoint(
             agent_id=AGENT_ID_STEP5,
@@ -164,6 +166,11 @@ def default_expected_workers(settings: Any) -> list[ExpectedWorkerEndpoint]:
             agent_id=AGENT_ID_STRUCTURE,
             capability_ids=(CAP_STRUCTURE_DESIGN_WORKFLOW,),
             endpoint_url=settings.structure_worker_url,
+        ),
+        ExpectedWorkerEndpoint(
+            agent_id=AGENT_ID_PATENT_EVIDENCE,
+            capability_ids=(CAP_PATENT_EVIDENCE_WORKFLOW,),
+            endpoint_url=settings.patent_evidence_worker_url,
         ),
     ]
 

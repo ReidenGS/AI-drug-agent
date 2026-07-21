@@ -78,6 +78,9 @@ class Settings(BaseSettings):
     step5_worker_url: str = "http://step5-context-agent:8005"
     step6_worker_url: str = "http://step6-developability-agent:8006"
     structure_worker_url: str = "http://step7-9-structure-design-agent:8009"
+    patent_evidence_worker_url: str = (
+        "http://step13-14-patent-evidence-agent:8014"
+    )
 
     # Production network timeouts (seconds) for AgentCard discovery + health
     # probes. These are explicit deployment settings (not hidden test caps) and

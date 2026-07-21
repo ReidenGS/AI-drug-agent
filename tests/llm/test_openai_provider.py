@@ -35,6 +35,7 @@ from app.llm.openai_provider import (
     _Step9SchemaMappingStage2Response,
     _Step9ToolSelectionStage1Response,
     _Step14PatentToolSelectionResponse,
+    _PatentEvidenceToolSelectionResponse,
     _prompt_cache_key,
 )
 
@@ -1028,6 +1029,7 @@ def test_parser_models_produce_real_strict_schema():
         "step9_tool_selection_stage_1",
         "step9_tool_schema_mapping_stage_2",
         "step14_patent_tool_selection",
+        "patent_evidence_tool_selection",
         "orchestrator_worker_routing",
     }
     assert "step6_schema_mapping_stage_2" not in _RESPONSE_MODEL_FOR_TASK
@@ -1360,6 +1362,38 @@ def test_step14_strict_parser_schema_uses_literal_value_json_only():
     assert "literal_value_json" in schema_json
     # The strict parser shape must NOT expose a bare `literal_value` field.
     assert '"literal_value"' not in schema_json
+
+
+def test_openai_patent_evidence_strict_parser_includes_lane_assessments():
+    parsed = _PatentEvidenceToolSelectionResponse(
+        lane_assessments=[
+            {"search_lane": "evidence", "status": "planned", "reason": "query ref"},
+            {
+                "search_lane": "patent",
+                "status": "missing_inputs",
+                "reason": "no patent identifier ref",
+            },
+        ],
+        tool_plans=[
+            {
+                "tool_name": "EuropePMC_search_articles",
+                "can_invoke": True,
+                "argument_mappings": [
+                    {"schema_arg": "query", "input_ref_id": "r_query"}
+                ],
+                "argument_literals": [],
+                "missing_required_args": [],
+                "selection_reason": "query ref",
+            }
+        ],
+    )
+    client = _fake_openai_client(parse=_parsed_response(parsed))
+    provider = _provider_with_client(client)
+    out = provider.generate_json(
+        "plan", schema={"task": "patent_evidence_tool_selection"}
+    )
+    assert client._calls["parse"][0]["response_format"] is _PatentEvidenceToolSelectionResponse
+    assert out["lane_assessments"][1]["status"] == "missing_inputs"
 
 
 def test_openai_step9_stage1_uses_structured_parser_and_returns_dict():

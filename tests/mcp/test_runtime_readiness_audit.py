@@ -92,6 +92,9 @@ def test_step5_candidate_context_live_path(
     )
     assert res["run_status"] == "success"
     assert res["executor"] == "tooluniverse"
+    assert res["attempted_execution_count"] == 1
+    assert res["successful_execution_count"] == 1
+    assert res["actual_execution_count"] == 1
     assert res["payload"]["executor"] == "tooluniverse"
     assert len(fake.calls) == 1
 
@@ -112,6 +115,8 @@ def test_step5_empty_allowlist_is_all_live(monkeypatch, install_universe):
     )
     assert res["run_status"] == "success"
     assert res["executor"] == "tooluniverse"
+    assert res["attempted_execution_count"] == 1
+    assert res["successful_execution_count"] == 1
     assert len(fake.calls) == 1
 
 
@@ -129,8 +134,9 @@ def test_step5_nonempty_allowlist_miss_keeps_mock(monkeypatch, install_universe)
         tool_name="ChEMBL_search_molecules",
         query="imatinib",
     )
-    assert res["run_status"] == "success"
+    assert res["run_status"] == "failed"
     assert res["executor"] == "mock"
+    assert res["reason"] == "unknown_wrapper_status"
     assert res["payload"]["status"] == "mocked"
     assert fake.calls == []
 
@@ -147,6 +153,7 @@ def test_step5_live_disabled_keeps_mock(monkeypatch, install_universe):
         tool_name="ChEMBL_search_molecules",
         query="x",
     )
+    assert res["run_status"] == "failed"
     assert res["executor"] == "mock"
     assert fake.calls == []
 
@@ -243,12 +250,8 @@ def test_step6_admetai_surfaces_upstream_error_when_admet_ai_missing(
 ):
     """If the runtime ``admet_ai`` package is missing the TU
     ``ADMETAITool`` reports an error. The adapter normalises this to
-    an envelope carrying ``status="upstream_error"`` — the wrapper does
-    NOT raise (so LocalMCPClient still records ``run_status="success"``
-    + ``executor="tooluniverse"``), but the persisted envelope's
-    ``status`` is preserved so post-hoc inspection can audit it. This
-    matches the path the Step 5 agent already uses to distinguish a
-    real upstream error from a real success."""
+    an envelope carrying ``status="upstream_error"``. Shared outcome
+    normalization must preserve that envelope and set outer status failed."""
     fake = install_universe(
         tools={"ADMETAI_predict_toxicity": lambda args: {
             "status": "error",
@@ -263,9 +266,7 @@ def test_step6_admetai_surfaces_upstream_error_when_admet_ai_missing(
         tool_name="ADMETAI_predict_toxicity",
         smiles="CCO",
     )
-    # LocalMCPClient run_status reflects whether the wrapper raised; it
-    # did not. The TU upstream error is preserved INSIDE the envelope.
-    assert res["run_status"] == "success"
+    assert res["run_status"] == "failed"
     assert res["executor"] == "tooluniverse"
     payload = res["payload"]
     assert payload["status"] == "upstream_error"
@@ -318,8 +319,8 @@ def test_step9_alphamissense_live_path(monkeypatch, install_universe):
         uniprot_id="P00533",
         variant="L858R",
     )
-    assert res["run_status"] == "success"
-    assert res["executor"] == "tooluniverse"
+    assert res["run_status"] == "failed"
+    assert res["envelope_status"] == "upstream_error"
     assert fake.calls[0]["arguments"] == {
         "uniprot_id": "P00533",
         "variant": "L858R",
@@ -477,8 +478,8 @@ def test_step13_europepmc_live_path(monkeypatch, install_universe):
     )
     assert res["run_status"] == "success"
     assert res["executor"] == "tooluniverse"
-    # EuropePMC wrapper forwards `query` + default `page_size=25` as `limit`.
-    assert fake.calls[0]["arguments"]["query"] == "HER2 imatinib"
+    # Unspecified official options are left to ToolUniverse's schema defaults.
+    assert fake.calls[0]["arguments"] == {"query": "HER2 imatinib"}
 
 
 def test_step13_multi_agent_literature_search_live_path(
@@ -500,13 +501,15 @@ def test_step13_multi_agent_literature_search_live_path(
         step_id="step_13",
         tool_name="MultiAgentLiteratureSearch",
         query="ADC payload class",
-        max_iterations=8,  # caller asks for 8, wrapper clamps to 1
-        quality_threshold=0.5,
+        max_iterations=1,  # disclosed runtime policy; violations fail closed
+        quality_threshold=0.7,
     )
-    assert res["run_status"] == "success"
-    assert res["executor"] == "tooluniverse"
-    # Hard clamp invariant — must hold even from the agent path.
-    assert fake.calls[0]["arguments"]["max_iterations"] == 1
+    assert res["run_status"] == "dependency_unavailable"
+    assert res["executor"] == "deferred"
+    assert res["reason"] == "uncontained_tooluniverse_full_discovery"
+    assert res["actual_execution_count"] == 0
+    assert res["tool_call_records"] == []
+    assert fake.calls == []
 
 
 def test_step13_tool_not_visible_outside_step13(
@@ -640,7 +643,8 @@ def test_executor_unknown_when_wrapper_returns_non_dict(install_universe):
             step_id="step_99",
             tool_name="NonDictTool",
         )
-        assert res["run_status"] == "success"
+        assert res["run_status"] == "failed"
+        assert res["reason"] == "invalid_wrapper_envelope"
         assert res["executor"] == "unknown"
     finally:
         sf.AGENT_STEP_MAP["__audit__"].discard("step_99")

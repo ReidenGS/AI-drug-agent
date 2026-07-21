@@ -92,6 +92,29 @@ def test_stage1_accepts_json_mode_text_response():
     assert out["selections"][0]["tool_name"] == "DrugProps_calculate_qed"
 
 
+def test_patent_evidence_lane_assessments_use_shared_validation():
+    provider = _provider_with_responses(
+        [
+            SimpleNamespace(
+                parsed={
+                    "lane_assessments": [
+                        {
+                            "search_lane": "evidence",
+                            "status": "missing_inputs",
+                            "reason": "no query ref",
+                        }
+                    ],
+                    "tool_plans": [],
+                }
+            )
+        ]
+    )
+    out = provider.generate_json(
+        "plan", schema={"task": "patent_evidence_tool_selection"}
+    )
+    assert out["lane_assessments"][0]["status"] == "missing_inputs"
+
+
 def test_stage2_accepts_parsed_dict_response():
     provider = _provider_with_responses(
         [

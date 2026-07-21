@@ -643,6 +643,14 @@ def test_openalex_live_routes(install_universe):
     assert fake.calls[0]["arguments"] == {"query": "HER2 ADC"}
 
 
+def test_openalex_official_search_alias_reaches_adapter(install_universe):
+    fake = install_universe(
+        tools={"openalex_search_works": lambda args: {"results": []}}
+    )
+    openalex_search_works(search="HER2 ADC", _live=True)
+    assert fake.calls[0]["arguments"] == {"search": "HER2 ADC"}
+
+
 def test_openalex_live_upstream_error(install_universe):
     install_universe(
         tools={"openalex_search_works": lambda args: {"status": "error", "error": "rate"}}
@@ -669,13 +677,17 @@ def test_semantic_scholar_live_routes(install_universe):
     )
     out = SemanticScholar_search_papers("HER2 ADC", limit=3, _live=True)
     assert out["executor"] == "tooluniverse"
-    assert fake.calls[0]["arguments"] == {"query": "HER2 ADC", "limit": 3}
+    assert fake.calls[0]["arguments"] == {
+        "query": "HER2 ADC",
+        "limit": 3,
+        "include_abstract": False,
+    }
 
 
-def test_semantic_scholar_live_clamps_limit(install_universe):
+def test_semantic_scholar_live_forwards_limit_without_hidden_clamp(install_universe):
     fake = install_universe(tools={"SemanticScholar_search_papers": lambda args: {"papers": []}})
     SemanticScholar_search_papers("x", limit=9999, _live=True)
-    assert fake.calls[0]["arguments"]["limit"] == 100
+    assert fake.calls[0]["arguments"]["limit"] == 9999
 
 
 def test_semantic_scholar_live_upstream_error(install_universe):
@@ -704,7 +716,11 @@ def test_pubtator_search_live_routes(install_universe):
     )
     out = PubTator3_LiteratureSearch("HER2", _live=True)
     assert out["executor"] == "tooluniverse"
-    assert fake.calls[0]["arguments"] == {"query": "HER2"}
+    assert fake.calls[0]["arguments"] == {
+        "query": "HER2",
+        "page": 0,
+        "page_size": 10,
+    }
 
 
 def test_pubtator_search_live_upstream_error(install_universe):
@@ -735,7 +751,10 @@ def test_pubtator_annotations_live_maps_pmid_to_pmids(install_universe):
     )
     out = PubTator3_get_annotations("33205991", _live=True)
     assert out["executor"] == "tooluniverse"
-    assert fake.calls[0]["arguments"] == {"pmids": "33205991"}
+    assert fake.calls[0]["arguments"] == {
+        "pmids": "33205991",
+        "concepts": "gene,disease,chemical,species,mutation,cellline",
+    }
     assert "pmid" not in fake.calls[0]["arguments"]
 
 
@@ -896,18 +915,21 @@ def test_literature_search_live_routes_through_tu_with_research_topic(install_un
         }
     )
     out = LiteratureSearchTool(query="HER2 ADC", _live=True)
-    assert out["executor"] == "tooluniverse"
-    assert out["status"] == "ok"
-    # Wrapper must forward only `research_topic`, never the legacy `query`.
-    assert fake.calls[0]["arguments"] == {"research_topic": "HER2 ADC"}
+    assert out["executor"] == "deferred"
+    assert out["status"] == "dependency_unavailable"
+    assert out["reason_code"] == (
+        "medical_literature_reviewer_outside_approved_inventory"
+    )
+    assert fake.calls == []
 
 
 def test_literature_search_live_accepts_research_topic_alias(install_universe):
     fake = install_universe(
         tools={"LiteratureSearchTool": lambda args: {"summary": ".", "papers": []}}
     )
-    LiteratureSearchTool(research_topic="EGFR", _live=True)
-    assert fake.calls[0]["arguments"] == {"research_topic": "EGFR"}
+    out = LiteratureSearchTool(research_topic="EGFR", _live=True)
+    assert out["status"] == "dependency_unavailable"
+    assert fake.calls == []
 
 
 def test_literature_search_live_upstream_error(install_universe):
@@ -920,7 +942,7 @@ def test_literature_search_live_upstream_error(install_universe):
         }
     )
     out = LiteratureSearchTool(query="HER2", _live=True)
-    assert out["status"] == "upstream_error"
+    assert out["status"] == "dependency_unavailable"
 
 
 def test_multi_agent_literature_mock_unchanged():
@@ -944,30 +966,30 @@ def test_multi_agent_literature_live_routes_through_tu(install_universe):
         }
     )
     out = MultiAgentLiteratureSearch(query="HER2 ADC", _live=True)
-    assert out["executor"] == "tooluniverse"
-    assert out["status"] == "ok"
-    assert fake.calls[0]["arguments"] == {
-        "query": "HER2 ADC",
-        "max_iterations": 1,  # default
-        "quality_threshold": 0.5,
-    }
+    assert out["executor"] == "deferred"
+    assert out["status"] == "dependency_unavailable"
+    assert out["reason_code"] == "uncontained_tooluniverse_full_discovery"
+    assert out["scope_audit"]["scope_policy_version"] == "patent_evidence_compose_scope_v1"
+    assert "prior_observed_unscoped_tool_count" not in out["scope_audit"]
+    assert fake.calls == []
 
 
-def test_multi_agent_literature_live_clamps_max_iterations_to_1(install_universe):
-    """Caller cannot bypass the safety clamp."""
-    fake = install_universe(
+def test_multi_agent_literature_live_rejects_max_iterations_above_policy(install_universe):
+    """Caller cannot bypass the disclosed runtime constraint."""
+    install_universe(
         tools={"MultiAgentLiteratureSearch": lambda args: {"total_papers": 0}}
     )
-    MultiAgentLiteratureSearch(query="x", max_iterations=99, _live=True)
-    assert fake.calls[0]["arguments"]["max_iterations"] == 1
+    with pytest.raises(ValueError, match="requires max_iterations=1"):
+        MultiAgentLiteratureSearch(query="x", max_iterations=99, _live=True)
 
 
 def test_multi_agent_literature_live_forwards_quality_threshold(install_universe):
     fake = install_universe(
         tools={"MultiAgentLiteratureSearch": lambda args: {"total_papers": 0}}
     )
-    MultiAgentLiteratureSearch(query="x", quality_threshold=0.8, _live=True)
-    assert fake.calls[0]["arguments"]["quality_threshold"] == 0.8
+    out = MultiAgentLiteratureSearch(query="x", quality_threshold=0.8, _live=True)
+    assert out["status"] == "dependency_unavailable"
+    assert fake.calls == []
 
 
 def test_multi_agent_literature_live_upstream_error(install_universe):
@@ -980,7 +1002,7 @@ def test_multi_agent_literature_live_upstream_error(install_universe):
         }
     )
     out = MultiAgentLiteratureSearch(query="HER2", _live=True)
-    assert out["status"] == "upstream_error"
+    assert out["status"] == "dependency_unavailable"
 
 
 # ── ChEMBL_search_documents (Step 13 mechanical wire-up) ──────────────────
@@ -1006,6 +1028,14 @@ def test_chembl_search_documents_live_routes(install_universe):
     assert fake.calls[0]["arguments"] == {
         "title__contains": "HER2", "limit": 5, "offset": 10,
     }
+
+
+def test_chembl_official_title_arg_reaches_adapter(install_universe):
+    fake = install_universe(
+        tools={"ChEMBL_search_documents": lambda args: {"documents": []}}
+    )
+    ChEMBL_search_documents(title__contains="HER2", _live=True)
+    assert fake.calls[0]["arguments"]["title__contains"] == "HER2"
 
 
 def test_chembl_search_documents_live_omits_unset_filters(install_universe):

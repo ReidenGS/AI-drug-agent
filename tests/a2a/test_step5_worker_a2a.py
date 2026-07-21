@@ -107,10 +107,14 @@ def _setup_run(local_storage, registry_service, workflow_state_service, *, plan:
 
 
 def _mcp() -> LocalMCPClient:
-    """Deterministic LOCAL MCP bindings (NOT live)."""
+    """Test-fixture envelopes; not live MCP or ToolUniverse evidence."""
     def make(payload):
         def _fn(**_kwargs):
-            return payload
+            return {
+                "status": "ok",
+                "executor": "test_fixture",
+                "payload": payload,
+            }
 
         return _fn
 

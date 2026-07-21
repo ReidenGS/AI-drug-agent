@@ -436,6 +436,12 @@ _STEP14_SELECTION_DYNAMIC_KEYS: tuple[str, ...] = (
     "patent_scope",
 )
 
+_PATENT_EVIDENCE_SELECTION_DYNAMIC_KEYS: tuple[str, ...] = (
+    "user_query",
+    "input_refs",
+    "search_scope",
+)
+
 
 def _split_prompt_schema(schema: dict, task: str) -> tuple[dict | None, dict]:
     """Return ``(stable_schema, dynamic_schema)`` for prompt rendering.
@@ -606,6 +612,26 @@ def _split_prompt_schema(schema: dict, task: str) -> tuple[dict | None, dict]:
             }
             return stable_schema, dynamic_schema
 
+    if task == "patent_evidence_tool_selection":
+        if any(k in schema for k in _PATENT_EVIDENCE_SELECTION_DYNAMIC_KEYS):
+            stable_schema = {
+                k: v
+                for k, v in schema.items()
+                if k not in _PATENT_EVIDENCE_SELECTION_DYNAMIC_KEYS
+            }
+            catalog = stable_schema.get("tool_catalog")
+            if isinstance(catalog, list):
+                stable_schema["tool_catalog"] = sorted(
+                    [entry for entry in catalog if isinstance(entry, dict)],
+                    key=lambda entry: str(entry.get("tool_name") or ""),
+                )
+            dynamic_schema = {
+                k: schema[k]
+                for k in _PATENT_EVIDENCE_SELECTION_DYNAMIC_KEYS
+                if k in schema
+            }
+            return stable_schema, dynamic_schema
+
     # Step 2 structured_query: trim ``raw_request_record`` out of the
     # dynamic dump so it never reaches a real provider's prompt text.
     if task == "structured_query" and "prompt_inputs" in schema:
@@ -627,9 +653,15 @@ def shape_instruction(task: str) -> str:
             '"selection_reason":"string","priority":"low|normal|high"}],'
             '"decision_summary":"string"}'
         )
-    if task == "step14_patent_tool_selection":
+    if task in {"step14_patent_tool_selection", "patent_evidence_tool_selection"}:
+        lane_prefix = (
+            '"lane_assessments":[{"search_lane":"evidence|patent",'
+            '"status":"planned|missing_inputs|not_applicable","reason":"string"}],'
+            if task == "patent_evidence_tool_selection"
+            else ""
+        )
         return (
-            '{"tool_plans":[{"tool_name":"string","can_invoke":true,'
+            "{" + lane_prefix + '"tool_plans":[{"tool_name":"string","can_invoke":true,'
             '"argument_mappings":[{"schema_arg":"string","input_ref_id":"string"}],'
             '"argument_literals":[{"schema_arg":"string","literal_value_json":"json text"}],'
             '"missing_required_args":["string"],"selection_reason":"string"}]}'
@@ -830,7 +862,36 @@ def validate_task_shape(data: dict, task: str, *, error_factory: ErrorFactory) -
             raise error_factory(
                 "orchestrator_worker_routing response violates routing proposal schema"
             ) from exc
-    if task == "step14_patent_tool_selection":
+    if task in {"step14_patent_tool_selection", "patent_evidence_tool_selection"}:
+        if task == "patent_evidence_tool_selection":
+            assessments = data.get("lane_assessments")
+            if not isinstance(assessments, list):
+                raise error_factory(
+                    "patent_evidence_tool_selection requires list `lane_assessments`"
+                )
+            for i, assessment in enumerate(assessments):
+                if not isinstance(assessment, dict):
+                    raise error_factory(
+                        f"patent_evidence_tool_selection lane_assessments[{i}] must be an object"
+                    )
+                if assessment.get("search_lane") not in {"evidence", "patent"}:
+                    raise error_factory(
+                        f"patent_evidence_tool_selection lane_assessments[{i}] has invalid search_lane"
+                    )
+                if assessment.get("status") not in {
+                    "planned",
+                    "missing_inputs",
+                    "not_applicable",
+                }:
+                    raise error_factory(
+                        f"patent_evidence_tool_selection lane_assessments[{i}] has invalid status"
+                    )
+                if not isinstance(assessment.get("reason"), str) or not assessment.get(
+                    "reason"
+                ):
+                    raise error_factory(
+                        f"patent_evidence_tool_selection lane_assessments[{i}] requires reason"
+                    )
         plans = data.get("tool_plans")
         if not isinstance(plans, list):
             raise error_factory(

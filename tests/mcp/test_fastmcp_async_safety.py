@@ -31,7 +31,7 @@ def client_with_in_scope_handler():
     server = ToolUniversityInventoryMCPServer(inventory=ToolInventoryService(xlsx))
     server.build()
     server._fastmcp.tools["ChEMBL_search_molecules"].handler = (
-        lambda **kw: {"echoed": kw.get("query")}
+        lambda **kw: {"status": "ok", "payload": {"echoed": kw.get("query")}}
     )
     from app.mcp.client import FastMCPClient
 
@@ -46,7 +46,8 @@ def test_sync_call_tool_works_outside_event_loop(client_with_in_scope_handler):
         query="MMAE",
     )
     assert res["run_status"] == "success"
-    assert res["payload"] == {"echoed": "MMAE"}
+    assert res["envelope_status"] == "ok"
+    assert res["payload"]["payload"] == {"echoed": "MMAE"}
 
 
 def test_sync_call_tool_refuses_inside_running_loop(client_with_in_scope_handler):
@@ -73,7 +74,8 @@ def test_async_call_tool_works_inside_running_loop(client_with_in_scope_handler)
 
     res = asyncio.run(_inner())
     assert res["run_status"] == "success"
-    assert res["payload"] == {"echoed": "MMAE"}
+    assert res["envelope_status"] == "ok"
+    assert res["payload"]["payload"] == {"echoed": "MMAE"}
 
 
 def test_async_call_tool_still_enforces_scope(client_with_in_scope_handler):
